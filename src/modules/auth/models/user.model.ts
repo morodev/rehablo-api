@@ -13,6 +13,13 @@ export interface UserAttributes {
     isSuperAdmin: boolean;
     isTenant: boolean;
     isPremium: boolean;
+    // --- Dati identificativi del professionista sanitario, richiesti per il tracciato Sistema
+    // Tessera Sanitaria (identificazione dell'erogatore) e per i metadati FSE/CDA2 (autore del
+    // documento clinico). Il fisioterapista è "professione sanitaria riabilitativa" ex L. 3/2018,
+    // iscritta all'Albo unico TSRM-PSTRP. ---
+    taxCode?: string | null;
+    professionalRegisterNumber?: string | null;
+    professionalRegisterProvince?: string | null;
 }
 
 export type UserCreationAttributes = Optional<
@@ -32,6 +39,9 @@ export class User extends Model<UserAttributes, UserCreationAttributes> implemen
     declare isSuperAdmin: boolean;
     declare isTenant: boolean;
     declare isPremium: boolean;
+    declare taxCode: string | null;
+    declare professionalRegisterNumber: string | null;
+    declare professionalRegisterProvince: string | null;
 }
 
 User.init(
@@ -46,7 +56,10 @@ User.init(
         isActive: { type: DataTypes.BOOLEAN, defaultValue: false },
         isSuperAdmin: { type: DataTypes.BOOLEAN, defaultValue: false },
         isTenant: { type: DataTypes.BOOLEAN, defaultValue: false },
-        isPremium: { type: DataTypes.BOOLEAN, defaultValue: false }
+        isPremium: { type: DataTypes.BOOLEAN, defaultValue: false },
+        taxCode: { type: DataTypes.STRING(16), allowNull: true },
+        professionalRegisterNumber: { type: DataTypes.STRING, allowNull: true },
+        professionalRegisterProvince: { type: DataTypes.STRING(2), allowNull: true }
     },
     {
         sequelize,

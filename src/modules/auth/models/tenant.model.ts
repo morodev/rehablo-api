@@ -14,11 +14,24 @@ export interface TenantAttributes {
     structureQuantity: number;
     maxStructureQuantity: number;
     MBQuantity: number;
+    // --- Dati fiscali obbligatori per l'invio dati al Sistema Tessera Sanitaria e per la
+    // corretta emissione di fatture/ricevute sanitarie (esenti da fatturazione elettronica SDI
+    // ai sensi del DM 19/10/2020 e succ. proroghe, art. 10-bis DL 119/2018). ---
+    taxCode?: string | null;
+    pec?: string | null;
+    /** Codice destinatario SDI, usato SOLO per righe non sanitarie (es. vendita prodotti) fatturate elettronicamente. */
+    sdiRecipientCode?: string | null;
+    address?: string | null;
+    city?: string | null;
+    province?: string | null;
+    zipCode?: string | null;
+    /** Progressivo dell'ultimo numero fattura/ricevuta emesso per anno fiscale: { "2026": 42 }. */
+    lastDocumentNumberByYear: Record<string, number>;
 }
 
 export type TenantCreationAttributes = Optional<
     TenantAttributes,
-    'id' | 'isActive' | 'isPremium' | 'userQuantity' | 'structureQuantity' | 'MBQuantity'
+    'id' | 'isActive' | 'isPremium' | 'userQuantity' | 'structureQuantity' | 'MBQuantity' | 'lastDocumentNumberByYear'
 >;
 
 export class Tenant extends Model<TenantAttributes, TenantCreationAttributes> implements TenantAttributes {
@@ -34,6 +47,14 @@ export class Tenant extends Model<TenantAttributes, TenantCreationAttributes> im
     declare structureQuantity: number;
     declare maxStructureQuantity: number;
     declare MBQuantity: number;
+    declare taxCode: string | null;
+    declare pec: string | null;
+    declare sdiRecipientCode: string | null;
+    declare address: string | null;
+    declare city: string | null;
+    declare province: string | null;
+    declare zipCode: string | null;
+    declare lastDocumentNumberByYear: Record<string, number>;
 }
 
 Tenant.init(
@@ -49,7 +70,15 @@ Tenant.init(
         maxUserQuantity: { type: DataTypes.INTEGER, allowNull: false },
         structureQuantity: { type: DataTypes.INTEGER, defaultValue: 1 },
         maxStructureQuantity: { type: DataTypes.INTEGER, allowNull: false },
-        MBQuantity: { type: DataTypes.INTEGER, defaultValue: 100 }
+        MBQuantity: { type: DataTypes.INTEGER, defaultValue: 100 },
+        taxCode: { type: DataTypes.STRING(16), allowNull: true },
+        pec: { type: DataTypes.STRING, allowNull: true },
+        sdiRecipientCode: { type: DataTypes.STRING(7), allowNull: true },
+        address: { type: DataTypes.STRING, allowNull: true },
+        city: { type: DataTypes.STRING, allowNull: true },
+        province: { type: DataTypes.STRING(2), allowNull: true },
+        zipCode: { type: DataTypes.STRING(10), allowNull: true },
+        lastDocumentNumberByYear: { type: DataTypes.JSONB, defaultValue: {} }
     },
     { sequelize, modelName: 'tenant', tableName: 'tenants' }
 );

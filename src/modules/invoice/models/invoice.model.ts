@@ -23,11 +23,29 @@ export interface InvoiceAttributes {
     discountAmount?: number | null;
     status?: string | null;
     paymentTerms?: Date | null;
+    // --- Adempimenti fiscali per prestazioni sanitarie (fisioterapista libero professionista) ---
+    /** Numero progressivo del documento nell'anno fiscale (obbligatorio, non deve avere "buchi"). */
+    documentNumber?: number | null;
+    /** Anno fiscale di riferimento della numerazione progressiva. */
+    documentYear?: number | null;
+    /** 'fattura' | 'ricevuta_fiscale' | 'nota_di_credito'. */
+    documentType: string;
+    /** Natura IVA (es. "N4" = operazioni esenti art.10 DPR 633/72, tipico delle prestazioni sanitarie).
+     *  Le prestazioni sanitarie sono ESENTI da fattura elettronica via SDI (DM 19/10/2020): il documento
+     *  va emesso "fuori SDI" (cartaceo/PDF) e i relativi dati trasmessi al Sistema Tessera Sanitaria. */
+    vatNature?: string | null;
+    // --- Sistema Tessera Sanitaria (D.Lgs. 175/2014, D.M. 31/07/2015 e succ. specifiche tecniche) ---
+    /** Codice "tipologia di spesa" della tabella ministeriale Sistema TS (va verificato/aggiornato annualmente). */
+    stsExpenseTypeCode?: string | null;
+    /** true se il documento NON deve essere incluso nell'invio Sistema TS (opposizione paziente o non sanitario). */
+    stsExcluded: boolean;
+    stsSent: boolean;
+    stsSentAt?: Date | null;
 }
 
 export type InvoiceCreationAttributes = Optional<
     InvoiceAttributes,
-    'id' | 'isCashPro' | 'isRivals' | 'isTaxWithholding' | 'isStamp'
+    'id' | 'isCashPro' | 'isRivals' | 'isTaxWithholding' | 'isStamp' | 'documentType' | 'stsExcluded' | 'stsSent'
 >;
 
 /**
@@ -60,6 +78,14 @@ export class Invoice extends Model<InvoiceAttributes, InvoiceCreationAttributes>
     declare discountAmount: number | null;
     declare status: string | null;
     declare paymentTerms: Date | null;
+    declare documentNumber: number | null;
+    declare documentYear: number | null;
+    declare documentType: string;
+    declare vatNature: string | null;
+    declare stsExpenseTypeCode: string | null;
+    declare stsExcluded: boolean;
+    declare stsSent: boolean;
+    declare stsSentAt: Date | null;
 }
 
 Invoice.init(
@@ -84,7 +110,15 @@ Invoice.init(
         discountType: DataTypes.STRING,
         discountAmount: DataTypes.DECIMAL(10, 2),
         status: DataTypes.STRING,
-        paymentTerms: DataTypes.DATEONLY
+        paymentTerms: DataTypes.DATEONLY,
+        documentNumber: DataTypes.INTEGER,
+        documentYear: DataTypes.INTEGER,
+        documentType: { type: DataTypes.STRING, defaultValue: 'fattura' },
+        vatNature: DataTypes.STRING,
+        stsExpenseTypeCode: DataTypes.STRING,
+        stsExcluded: { type: DataTypes.BOOLEAN, defaultValue: false },
+        stsSent: { type: DataTypes.BOOLEAN, defaultValue: false },
+        stsSentAt: DataTypes.DATE
     },
     { sequelize, modelName: 'invoice', tableName: 'invoices' }
 );

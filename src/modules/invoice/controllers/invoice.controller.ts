@@ -2,12 +2,16 @@ import { Request, Response } from 'express';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
+import { sequelize } from '../../../config/database.js';
 import Invoice from '../models/invoice.model.js';
 import InvoiceProduct from '../models/invoiceProduct.model.js';
 import InvoiceService from '../models/invoiceService.model.js';
 import Product from '../../products-services/models/product.model.js';
 import Service from '../../products-services/models/service.model.js';
+import Patient from '../../patients/models/patient.model.js';
+import Tenant from '../../auth/models/tenant.model.js';
 import { evalTotals } from '../utils/evalTotals.js';
+import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
 
 /**
  * Builds tenant-scoped model variants and (re)declares the M2M associations on them.
@@ -54,7 +58,39 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
 
     const totals = evalTotals({ ...invoiceFields, products });
 
-    const invoice = await InvoiceScoped.create({ ...invoiceFields, ...totals });
+    // --- Adempimenti fiscali: numerazione progressiva senza "buchi" per anno fiscale, e
+    // verifica automatica dell'eventuale opposizione del paziente all'invio Sistema TS. ---
+    const tenantId = req.user!.tenants[0].id;
+    const fiscalYear =
+        invoiceFields.documentYear ?? new Date(invoiceFields.emissionDate ?? Date.now()).getFullYear();
+
+    const documentNumber = await sequelize.transaction(async (t) => {
+        const tenant = await Tenant.findByPk(tenantId, { transaction: t, lock: t.LOCK.UPDATE });
+        if (!tenant) {
+            throw new Error('Tenant non trovato: impossibile assegnare il numero progressivo del documento');
+        }
+        const counters: Record<string, number> = { ...(tenant.get('lastDocumentNumberByYear') as Record<string, number>) };
+        const nextNumber = (counters[fiscalYear] || 0) + 1;
+        counters[fiscalYear] = nextNumber;
+        await tenant.update({ lastDocumentNumberByYear: counters }, { transaction: t });
+        return nextNumber;
+    });
+
+    let stsExcluded = Boolean(invoiceFields.stsExcluded);
+    if (invoiceFields.patientID) {
+        const patient = await Patient.schema(schema).findByPk(invoiceFields.patientID);
+        if (patient?.get('stsOppositionToDataSending')) {
+            stsExcluded = true;
+        }
+    }
+
+    const invoice = await InvoiceScoped.create({
+        ...invoiceFields,
+        ...totals,
+        documentNumber,
+        documentYear: fiscalYear,
+        stsExcluded
+    });
 
     await Promise.all([
         ...products.map((product: any) =>
@@ -166,5 +202,75 @@ export const deleteInvoice = asyncHandler(async (req: Request, res: Response) =>
     return sendSuccessResponse(res, 200, { removedInvoice }, 'Fattura eliminata correttamente');
 });
 
-export default { saveInvoice, findAllInvoices, searchInvoices, findOneInvoice, updateInvoice, deleteInvoice };
+/**
+ * Genera il file XML di export per il Sistema Tessera Sanitaria (spese sanitarie detraibili),
+ * relativo ai documenti dell'anno fiscale richiesto non ancora inviati e non esclusi
+ * (per opposizione del paziente ex D.Lgs. 175/2014).
+ *
+ * NOTA BENE: l'export prodotto va validato con l'ultimo tracciato ufficiale prima della
+ * trasmissione reale al Sistema TS (vedi commenti in `utils/sistemaTS.ts`).
+ */
+export const exportSistemaTS = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const { InvoiceScoped } = getScopedModels(schema);
+    const year = parseInt((req.query.year as string) ?? `${new Date().getFullYear()}`, 10);
+    const markAsSent = req.query.markAsSent === 'true';
+    const tenantId = req.user!.tenants[0].id;
+
+    const tenant = await Tenant.findByPk(tenantId);
+    if (!tenant) {
+        return sendErrorResponse(res, 404, 'Struttura/tenant non trovato');
+    }
+
+    const invoices = await InvoiceScoped.findAll({
+        where: { documentYear: year, stsExcluded: false, stsSent: false }
+    });
+
+    const records: SistemaTSRecord[] = [];
+    const includedInvoiceIds: string[] = [];
+
+    for (const invoice of invoices) {
+        const patientID = invoice.get('patientID') as string | null;
+        if (!patientID) continue;
+
+        const patient = await Patient.schema(schema).findByPk(patientID);
+        if (!patient || !patient.get('fiscalCode')) continue;
+
+        try {
+            records.push(
+                buildSistemaTSRecord({
+                    invoice: invoice.get({ plain: true }) as any,
+                    patient: patient.get({ plain: true }) as any,
+                    tenant: tenant.get({ plain: true }) as any
+                })
+            );
+            includedInvoiceIds.push(invoice.get('id') as string);
+        } catch (err) {
+            console.warn(`[sistemaTS] fattura ${invoice.get('id')} esclusa dall'export:`, (err as Error).message);
+        }
+    }
+
+    const xml = generateSistemaTSXml(records, year);
+
+    if (markAsSent && includedInvoiceIds.length > 0) {
+        await InvoiceScoped.update(
+            { stsSent: true, stsSentAt: new Date() },
+            { where: { id: { [Op.in]: includedInvoiceIds } } }
+        );
+    }
+
+    res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="sistema-ts-${year}.xml"`);
+    return res.status(200).send(xml);
+});
+
+export default {
+    saveInvoice,
+    findAllInvoices,
+    searchInvoices,
+    findOneInvoice,
+    updateInvoice,
+    deleteInvoice,
+    exportSistemaTS
+};
 

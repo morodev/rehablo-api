@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
+import Patient from '../../patients/models/patient.model.js';
 import {
     Evaluation,
     HumanBodySymptom,
@@ -27,21 +28,32 @@ import {
  */
 export const createEvaluation = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { patientId, date, title, notes, status } = req.body as {
+    const { patientId, date, title, notes, status, structureId } = req.body as {
         patientId?: string;
         date?: string;
         title?: string;
         notes?: string;
         status?: 'DRAFT' | 'COMPLETED';
+        structureId?: string;
     };
 
     if (!patientId) {
         return sendErrorResponse(res, 400, 'patientId is required');
     }
 
+    // Se la struttura non è indicata esplicitamente per questa valutazione, si ricade sulla
+    // struttura di riferimento anagrafico del paziente (necessaria per instradare correttamente
+    // un futuro invio al FSE regionale in base alla Regione della struttura).
+    let resolvedStructureId = structureId ?? null;
+    if (!resolvedStructureId) {
+        const patient = await Patient.schema(schema).findByPk(patientId);
+        resolvedStructureId = (patient?.get('structureId') as string | undefined) ?? null;
+    }
+
     const evaluation = await Evaluation.schema(schema).create({
         patientId,
         userId: req.user!.id,
+        structureId: resolvedStructureId,
         date: date ? new Date(date) : new Date(),
         title: title ?? null,
         notes: notes ?? null,
