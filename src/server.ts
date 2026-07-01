@@ -11,6 +11,7 @@ import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
 import { registerAuthAssociations, syncAuthModels } from './modules/auth/models/index.js';
 import { registerTenantModels } from './tenantModelsRegistry.js';
 import { registerCatalogAssociations, syncCatalogModels, seedCatalogData } from './modules/human-body/models/catalog/index.js';
+import { registerProtocolCatalogAssociations, syncProtocolCatalogModels } from './modules/protocols/models/catalog/index.js';
 
 import authRoutes from './modules/auth/routes/auth.routes.js';
 import patientRoutes from './modules/patients/routes/patient.routes.js';
@@ -19,6 +20,8 @@ import invoiceRoutes from './modules/invoice/routes/invoice.routes.js';
 import agendaRoutes from './modules/agenda/routes/agenda.routes.js';
 import configurationRoutes from './modules/configuration/routes/configuration.routes.js';
 import humanBodyRoutes from './modules/human-body/routes/human-body.routes.js';
+import protocolRoutes from './modules/protocols/routes/protocol.routes.js';
+import evaluationRoutes from './modules/evaluations/routes/evaluation.routes.js';
 
 async function bootstrap() {
     const app = express();
@@ -39,6 +42,8 @@ async function bootstrap() {
     app.use(agendaRoutes);
     app.use(configurationRoutes);
     app.use(humanBodyRoutes);
+    app.use(protocolRoutes);
+    app.use(evaluationRoutes);
 
     app.use(notFoundHandler);
     app.use(errorHandler);
@@ -56,6 +61,11 @@ async function bootstrap() {
     await syncCatalogModels();
     await seedCatalogData();
 
+    // Public-schema rehabilitation protocols catalog (exercises + reusable protocol templates,
+    // shared by every tenant). No seed data yet: managed via the /exercises and /protocol-templates CRUD.
+    registerProtocolCatalogAssociations();
+    await syncProtocolCatalogModels();
+
     // Tenant-scoped models registry (synced lazily per-tenant via ensureTenantSchema)
     registerTenantModels();
 
@@ -68,4 +78,3 @@ bootstrap().catch((err) => {
     console.error('[rehablo-api] failed to start', err);
     process.exit(1);
 });
-

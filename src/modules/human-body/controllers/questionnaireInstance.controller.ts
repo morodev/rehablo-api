@@ -15,11 +15,18 @@ interface AnswerInstanceInput {
 
 export const saveQuestionnaireInstance = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const body = req.body as { userId?: string; patientId?: string; questionnaireId: string; questions: AnswerInstanceInput[] };
+    const body = req.body as {
+        userId?: string;
+        patientId?: string;
+        evaluationId?: string;
+        questionnaireId: string;
+        questions: AnswerInstanceInput[];
+    };
 
     const instance = await HumanBodyQuestionnaireInstance.schema(schema).create({
         userId: body.userId,
         patientId: body.patientId,
+        evaluationId: body.evaluationId ?? null,
         humanBodyQuestionnaireId: body.questionnaireId
     });
 
@@ -42,8 +49,14 @@ export const saveQuestionnaireInstance = asyncHandler(async (req: Request, res: 
 
 export const getQuestionnaireInstances = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
+    const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
+
+    const where: Record<string, unknown> = {};
+    if (patientId) where.patientId = patientId;
+    if (evaluationId) where.evaluationId = evaluationId;
 
     const instances = await HumanBodyQuestionnaireInstance.schema(schema).findAll({
+        where,
         include: [
             { model: HumanBodyQuestionnaire.schema(schema), attributes: ['title', 'description'] },
             {

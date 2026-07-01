@@ -5,6 +5,7 @@ export interface UserScaleInstanceAttributes {
     id: string;
     userId?: string | null;
     patientId?: string | null;
+    evaluationId?: string | null;
     scaleId: string;
 }
 
@@ -20,6 +21,7 @@ export class UserScaleInstance
     declare id: string;
     declare userId: string | null;
     declare patientId: string | null;
+    declare evaluationId: string | null;
     declare scaleId: string;
 }
 
@@ -28,6 +30,7 @@ UserScaleInstance.init(
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
         userId: { type: DataTypes.UUID, allowNull: true },
         patientId: { type: DataTypes.UUID, allowNull: true },
+        evaluationId: { type: DataTypes.UUID, allowNull: true },
         scaleId: { type: DataTypes.UUID, allowNull: false }
     },
     { sequelize, modelName: 'userScaleInstance', tableName: 'user_scale_instances' }

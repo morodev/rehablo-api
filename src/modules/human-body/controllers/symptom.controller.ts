@@ -64,12 +64,13 @@ export const deleteSymptom = asyncHandler(async (req: Request, res: Response) =>
 /** Was previously an empty stub. Completed here as a real search by body part / sub part. */
 export const getSymptomsByBodyPart = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { bodyPart, bodySubPart, patientId } = req.query;
+    const { bodyPart, bodySubPart, patientId, evaluationId } = req.query;
 
     const where: Record<string, unknown> = {};
     if (bodyPart) where.bodyPart = sequelizeWhere(fn('LOWER', col('bodyPart')), 'LIKE', `%${String(bodyPart).toLowerCase()}%`);
     if (bodySubPart) where.bodySubPart = sequelizeWhere(fn('LOWER', col('bodySubPart')), 'LIKE', `%${String(bodySubPart).toLowerCase()}%`);
     if (patientId) where.patientId = patientId;
+    if (evaluationId) where.evaluationId = evaluationId;
 
     const symptoms = await HumanBodySymptom.schema(schema).findAll({ where: { [Op.and]: where } });
     return sendSuccessResponse(res, 200, symptoms, 'Human body symptoms loaded');

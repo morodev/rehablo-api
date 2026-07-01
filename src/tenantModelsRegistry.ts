@@ -11,6 +11,7 @@ import AgendaEvent from './modules/agenda/models/agendaEvent.model.js';
 import AgendaEventException from './modules/agenda/models/agendaEventException.model.js';
 import Dashboard from './modules/configuration/models/dashboard.model.js';
 import Widget from './modules/configuration/models/widget.model.js';
+import { registerProtocolAssociations, ProtocolInstance, ProtocolPhaseInstance, ProtocolExerciseLog } from './modules/protocols/models/index.js';
 import {
     registerHumanBodyAssociations,
     HumanBodyArea,
@@ -28,6 +29,7 @@ import {
     UserAnswer,
     TestInstance
 } from './modules/human-body/models/index.js';
+import { registerEvaluationAssociations, Evaluation } from './modules/evaluations/models/index.js';
 
 /**
  * Registers every tenant-scoped model (i.e. living in the dynamic "rehablo_<tenantId>" schema)
@@ -35,8 +37,15 @@ import {
  */
 export function registerTenantModels(): void {
     registerHumanBodyAssociations();
+    registerProtocolAssociations();
+    // Must run after `registerHumanBodyAssociations()`: it adds the `Evaluation` -> symptoms/
+    // articularities/strengths/questionnaires/scales/tests associations on top of those models.
+    registerEvaluationAssociations();
 
     registerTenantScopedModel(Patient);
+    // Evaluation references `patients` (FK) and is in turn referenced by the human-body instance
+    // tables below (FK), so it must be synced right after Patient and before those tables.
+    registerTenantScopedModel(Evaluation);
     registerTenantScopedModel(Product);
     registerTenantScopedModel(Service);
     registerTenantScopedModel(Invoice);
@@ -47,6 +56,10 @@ export function registerTenantModels(): void {
     registerTenantScopedModel(AgendaEventException);
     registerTenantScopedModel(Dashboard);
     registerTenantScopedModel(Widget);
+
+    registerTenantScopedModel(ProtocolInstance);
+    registerTenantScopedModel(ProtocolPhaseInstance);
+    registerTenantScopedModel(ProtocolExerciseLog);
 
     registerTenantScopedModel(HumanBodyArea);
     registerTenantScopedModel(HumanBodyPoint);
@@ -63,6 +76,3 @@ export function registerTenantModels(): void {
     registerTenantScopedModel(UserAnswer);
     registerTenantScopedModel(TestInstance);
 }
-
-
-

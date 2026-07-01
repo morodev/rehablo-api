@@ -62,12 +62,13 @@ export const deleteStrength = asyncHandler(async (req: Request, res: Response) =
 /** Was previously an empty stub. Completed here. */
 export const getStrengthByBodyPart = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { bodyPart, bodySubPart, patientId } = req.query;
+    const { bodyPart, bodySubPart, patientId, evaluationId } = req.query;
 
     const where: Record<string, unknown> = {};
     if (bodyPart) where.bodyPart = sequelizeWhere(fn('LOWER', col('bodyPart')), 'LIKE', `%${String(bodyPart).toLowerCase()}%`);
     if (bodySubPart) where.bodySubPart = sequelizeWhere(fn('LOWER', col('bodySubPart')), 'LIKE', `%${String(bodySubPart).toLowerCase()}%`);
     if (patientId) where.patientId = patientId;
+    if (evaluationId) where.evaluationId = evaluationId;
 
     const strength = await HumanBodyStrength.schema(schema).findAll({ where: { [Op.and]: where } });
     return sendSuccessResponse(res, 200, strength, 'Human body strength loaded');

@@ -5,6 +5,7 @@ export interface HumanBodyQuestionnaireInstanceAttributes {
     id: string;
     userId?: string | null;
     patientId?: string | null;
+    evaluationId?: string | null;
     humanBodyQuestionnaireId: string;
 }
 
@@ -20,6 +21,7 @@ export class HumanBodyQuestionnaireInstance
     declare id: string;
     declare userId: string | null;
     declare patientId: string | null;
+    declare evaluationId: string | null;
     declare humanBodyQuestionnaireId: string;
 }
 
@@ -28,6 +30,7 @@ HumanBodyQuestionnaireInstance.init(
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
         userId: { type: DataTypes.UUID, allowNull: true },
         patientId: { type: DataTypes.UUID, allowNull: true },
+        evaluationId: { type: DataTypes.UUID, allowNull: true },
         humanBodyQuestionnaireId: { type: DataTypes.UUID, allowNull: false }
     },
     { sequelize, modelName: 'humanBodyQuestionnaireInstance', tableName: 'human_body_questionnaire_instances' }

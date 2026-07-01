@@ -4,6 +4,7 @@ import { sequelize } from '../../../config/database.js';
 export interface HumanBodySymptomAttributes {
     id: string;
     humanBodyPointId: string;
+    evaluationId?: string | null;
     symptom: string;
     bodyPart: string;
     bodySubPart?: string | null;
@@ -25,6 +26,7 @@ export class HumanBodySymptom
     implements HumanBodySymptomAttributes {
     declare id: string;
     declare humanBodyPointId: string;
+    declare evaluationId: string | null;
     declare symptom: string;
     declare bodyPart: string;
     declare bodySubPart: string | null;
@@ -42,6 +44,7 @@ HumanBodySymptom.init(
     {
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
         humanBodyPointId: { type: DataTypes.UUID, allowNull: false },
+        evaluationId: { type: DataTypes.UUID, allowNull: true },
         symptom: { type: DataTypes.STRING, allowNull: false },
         bodyPart: { type: DataTypes.STRING, allowNull: false },
         bodySubPart: { type: DataTypes.STRING, allowNull: true },

@@ -4,6 +4,7 @@ import { sequelize } from '../../../config/database.js';
 export interface HumanBodyStrengthAttributes {
     id: string;
     humanBodyPointId: string;
+    evaluationId?: string | null;
     bodyPart: string;
     bodySubPart?: string | null;
     valueStrength: number;
@@ -22,6 +23,7 @@ export class HumanBodyStrength
     implements HumanBodyStrengthAttributes {
     declare id: string;
     declare humanBodyPointId: string;
+    declare evaluationId: string | null;
     declare bodyPart: string;
     declare bodySubPart: string | null;
     declare valueStrength: number;
@@ -36,6 +38,7 @@ HumanBodyStrength.init(
     {
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
         humanBodyPointId: { type: DataTypes.UUID, allowNull: false },
+        evaluationId: { type: DataTypes.UUID, allowNull: true },
         bodyPart: { type: DataTypes.STRING, allowNull: false },
         bodySubPart: { type: DataTypes.STRING, allowNull: true },
         valueStrength: { type: DataTypes.INTEGER, allowNull: false },

@@ -4,6 +4,7 @@ import { sequelize } from '../../../config/database.js';
 export interface HumanBodyArticularityAttributes {
     id: string;
     humanBodyPointId: string;
+    evaluationId?: string | null;
     articularity: string;
     movement: string;
     bodyPart: string;
@@ -30,6 +31,7 @@ export class HumanBodyArticularity
     implements HumanBodyArticularityAttributes {
     declare id: string;
     declare humanBodyPointId: string;
+    declare evaluationId: string | null;
     declare articularity: string;
     declare movement: string;
     declare bodyPart: string;
@@ -55,6 +57,7 @@ HumanBodyArticularity.init(
     {
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
         humanBodyPointId: { type: DataTypes.UUID, allowNull: false },
+        evaluationId: { type: DataTypes.UUID, allowNull: true },
         articularity: { type: DataTypes.STRING, allowNull: false },
         movement: { type: DataTypes.STRING, allowNull: false },
         bodyPart: { type: DataTypes.STRING, allowNull: false },

@@ -12,8 +12,14 @@ export const saveTest = asyncHandler(async (req: Request, res: Response) => {
 
 export const getUserTestInstances = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
+    const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
+
+    const where: Record<string, unknown> = {};
+    if (patientId) where.patientId = patientId;
+    if (evaluationId) where.evaluationId = evaluationId;
 
     const instances = await TestInstance.schema(schema).findAll({
+        where,
         include: [{ model: Test, required: false }]
     });
 

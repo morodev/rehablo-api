@@ -14,6 +14,7 @@ export const saveArticularity = asyncHandler(async (req: Request, res: Response)
     }
 
     const articularities = (req.body.articularities ?? []).map((art: Record<string, unknown>) => ({
+        evaluationId: req.body.evaluationId ?? null,
         ...art,
         humanBodyPointId
     }));
@@ -69,12 +70,13 @@ export const deleteArticularity = asyncHandler(async (req: Request, res: Respons
 /** Was previously an empty stub. Completed here. */
 export const getArticularityByBodyPart = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { bodyPart, bodySubPart, patientId } = req.query;
+    const { bodyPart, bodySubPart, patientId, evaluationId } = req.query;
 
     const where: Record<string, unknown> = {};
     if (bodyPart) where.bodyPart = sequelizeWhere(fn('LOWER', col('bodyPart')), 'LIKE', `%${String(bodyPart).toLowerCase()}%`);
     if (bodySubPart) where.bodySubPart = sequelizeWhere(fn('LOWER', col('bodySubPart')), 'LIKE', `%${String(bodySubPart).toLowerCase()}%`);
     if (patientId) where.patientId = patientId;
+    if (evaluationId) where.evaluationId = evaluationId;
 
     const articularity = await HumanBodyArticularity.schema(schema).findAll({ where: { [Op.and]: where } });
     return sendSuccessResponse(res, 200, articularity, 'Human body articularity loaded');
