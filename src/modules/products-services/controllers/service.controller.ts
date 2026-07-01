@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
-import Service from '../models/service.model.js';
+import { Service, Category } from '../models/index.js';
 
 function paginate<T>(items: T[], page: number, size: number) {
     const length = items.length;
@@ -26,10 +26,15 @@ export const saveService = asyncHandler(async (req: Request, res: Response) => {
 });
 
 export const findAllServices = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
     const page = parseInt((req.query.page as string) ?? '0', 10);
     const size = parseInt((req.query.size as string) ?? '10', 10);
+    const includeInactive = req.query.includeInactive === 'true';
 
-    const services = await Service.schema(req.tenantSchema!).findAll();
+    const services = await Service.schema(schema).findAll({
+        where: includeInactive ? {} : { isActive: true },
+        include: [{ model: Category.schema(schema) }]
+    });
     const { items, pagination } = paginate(services, page, size);
 
     return sendSuccessResponse(res, 200, { pagination, services: items }, 'Servizi caricati correttamente');
@@ -40,6 +45,7 @@ export const searchServices = asyncHandler(async (req: Request, res: Response) =
 
     const services = await Service.schema(req.tenantSchema!).findAll({
         where: {
+            isActive: true,
             [Op.or]: [
                 sequelizeWhere(fn('LOWER', col('name')), 'LIKE', `%${query.toLowerCase()}%`),
                 sequelizeWhere(fn('LOWER', col('description')), 'LIKE', `%${query.toLowerCase()}%`)
@@ -51,7 +57,10 @@ export const searchServices = asyncHandler(async (req: Request, res: Response) =
 });
 
 export const findOneService = asyncHandler(async (req: Request, res: Response) => {
-    const service = await Service.schema(req.tenantSchema!).findByPk(req.params.serviceId);
+    const schema = req.tenantSchema!;
+    const service = await Service.schema(schema).findByPk(req.params.serviceId, {
+        include: [{ model: Category.schema(schema) }]
+    });
     if (!service) {
         return sendErrorResponse(res, 404, 'Nessun servizio trovato');
     }
@@ -70,10 +79,16 @@ export const updateService = asyncHandler(async (req: Request, res: Response) =>
     return sendSuccessResponse(res, 200, updatedService, 'Servizio aggiornato correttamente');
 });
 
+/** "Elimina" un servizio = lo disattiva (soft-delete). Vedi commento analogo su product.controller.ts. */
 export const deleteService = asyncHandler(async (req: Request, res: Response) => {
     const id = req.params.serviceId;
+    const [rowsUpdated] = await Service.schema(req.tenantSchema!).update({ isActive: false }, { where: { id } });
+
+    if (rowsUpdated === 0) {
+        return sendErrorResponse(res, 404, 'Servizio non trovato');
+    }
+
     const removedService = await Service.schema(req.tenantSchema!).findByPk(id);
-    await Service.schema(req.tenantSchema!).destroy({ where: { id } });
 
     return sendSuccessResponse(res, 200, { removedService }, 'Servizio eliminato correttamente');
 });

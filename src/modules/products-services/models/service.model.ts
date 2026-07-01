@@ -8,11 +8,14 @@ export interface ServiceAttributes {
     code?: string | null;
     productVat?: string | null;
     sellingPrice?: number | null;
-    categoryId?: number | null;
+    /** FK verso `Category` (vedi category.model.ts). UUID, coerente col resto dello schema. */
+    categoryId?: string | null;
     description?: string | null;
+    /** Soft-delete: vedi commento analogo su `product.model.ts`. */
+    isActive: boolean;
 }
 
-export type ServiceCreationAttributes = Optional<ServiceAttributes, 'id' | 'type'>;
+export type ServiceCreationAttributes = Optional<ServiceAttributes, 'id' | 'type' | 'isActive'>;
 
 /** Tenant-scoped model: always access through `Service.schema(req.tenantSchema)`. */
 export class Service extends Model<ServiceAttributes, ServiceCreationAttributes> implements ServiceAttributes {
@@ -22,8 +25,9 @@ export class Service extends Model<ServiceAttributes, ServiceCreationAttributes>
     declare code: string | null;
     declare productVat: string | null;
     declare sellingPrice: number | null;
-    declare categoryId: number | null;
+    declare categoryId: string | null;
     declare description: string | null;
+    declare isActive: boolean;
 }
 
 Service.init(
@@ -34,8 +38,9 @@ Service.init(
         code: { type: DataTypes.STRING, unique: true },
         productVat: DataTypes.STRING,
         sellingPrice: DataTypes.DECIMAL(10, 2),
-        categoryId: DataTypes.INTEGER,
-        description: DataTypes.STRING
+        categoryId: DataTypes.UUID,
+        description: DataTypes.STRING,
+        isActive: { type: DataTypes.BOOLEAN, defaultValue: true }
     },
     { sequelize, modelName: 'service', tableName: 'services' }
 );

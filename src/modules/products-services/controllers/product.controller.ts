@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
-import Product from '../models/product.model.js';
+import { Product, Category } from '../models/index.js';
 
 function paginate<T>(items: T[], page: number, size: number) {
     const length = items.length;
@@ -26,10 +26,15 @@ export const saveProduct = asyncHandler(async (req: Request, res: Response) => {
 });
 
 export const findAllProduct = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
     const page = parseInt((req.query.page as string) ?? '0', 10);
     const size = parseInt((req.query.size as string) ?? '10', 10);
+    const includeInactive = req.query.includeInactive === 'true';
 
-    const products = await Product.schema(req.tenantSchema!).findAll();
+    const products = await Product.schema(schema).findAll({
+        where: includeInactive ? {} : { isActive: true },
+        include: [{ model: Category.schema(schema) }]
+    });
     const { items, pagination } = paginate(products, page, size);
 
     return sendSuccessResponse(res, 200, { pagination, products: items }, 'Prodotti caricati correttamente');
@@ -40,6 +45,7 @@ export const searchProducts = asyncHandler(async (req: Request, res: Response) =
 
     const products = await Product.schema(req.tenantSchema!).findAll({
         where: {
+            isActive: true,
             [Op.or]: [
                 sequelizeWhere(fn('LOWER', col('name')), 'LIKE', `%${query.toLowerCase()}%`),
                 sequelizeWhere(fn('LOWER', col('description')), 'LIKE', `%${query.toLowerCase()}%`)
@@ -51,7 +57,10 @@ export const searchProducts = asyncHandler(async (req: Request, res: Response) =
 });
 
 export const findOneProduct = asyncHandler(async (req: Request, res: Response) => {
-    const product = await Product.schema(req.tenantSchema!).findByPk(req.params.productId);
+    const schema = req.tenantSchema!;
+    const product = await Product.schema(schema).findByPk(req.params.productId, {
+        include: [{ model: Category.schema(schema) }]
+    });
     if (!product) {
         return sendErrorResponse(res, 404, 'Prodotto non trovato');
     }
@@ -70,10 +79,21 @@ export const updateProduct = asyncHandler(async (req: Request, res: Response) =>
     return sendSuccessResponse(res, 200, updatedProduct, 'Prodotto aggiornato correttamente');
 });
 
+/**
+ * "Elimina" un prodotto = lo disattiva (soft-delete). Un prodotto già usato in fatture emesse
+ * non può essere cancellato fisicamente: le righe storiche (`invoice_products`) mantengono
+ * comunque un proprio snapshot di nome/prezzo/IVA, ma il riferimento ProductId deve continuare
+ * a esistere per non rompere l'integrità del documento fiscale.
+ */
 export const deleteProduct = asyncHandler(async (req: Request, res: Response) => {
     const id = req.params.productId;
+    const [rowsUpdated] = await Product.schema(req.tenantSchema!).update({ isActive: false }, { where: { id } });
+
+    if (rowsUpdated === 0) {
+        return sendErrorResponse(res, 404, 'Prodotto non trovato');
+    }
+
     const removedProduct = await Product.schema(req.tenantSchema!).findByPk(id);
-    await Product.schema(req.tenantSchema!).destroy({ where: { id } });
 
     return sendSuccessResponse(res, 200, { removedProduct }, 'Prodotto eliminato correttamente');
 });

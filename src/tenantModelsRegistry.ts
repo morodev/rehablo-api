@@ -1,8 +1,7 @@
 import { registerTenantScopedModel } from './utils/tenantSchema.js';
 
 import Patient from './modules/patients/models/patient.model.js';
-import Product from './modules/products-services/models/product.model.js';
-import Service from './modules/products-services/models/service.model.js';
+import { registerProductsServicesAssociations, Category, Product, Service } from './modules/products-services/models/index.js';
 import Invoice from './modules/invoice/models/invoice.model.js';
 import InvoiceProduct from './modules/invoice/models/invoiceProduct.model.js';
 import InvoiceService from './modules/invoice/models/invoiceService.model.js';
@@ -41,11 +40,13 @@ export function registerTenantModels(): void {
     // Must run after `registerHumanBodyAssociations()`: it adds the `Evaluation` -> symptoms/
     // articularities/strengths/questionnaires/scales/tests associations on top of those models.
     registerEvaluationAssociations();
+    registerProductsServicesAssociations();
 
     registerTenantScopedModel(Patient);
     // Evaluation references `patients` (FK) and is in turn referenced by the human-body instance
     // tables below (FK), so it must be synced right after Patient and before those tables.
     registerTenantScopedModel(Evaluation);
+    registerTenantScopedModel(Category);
     registerTenantScopedModel(Product);
     registerTenantScopedModel(Service);
     registerTenantScopedModel(Invoice);

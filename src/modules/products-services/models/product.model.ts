@@ -10,11 +10,18 @@ export interface ProductAttributes {
     productVat?: string | null;
     sellingPrice?: number | null;
     purchaseCost?: number | null;
-    categoryId?: number | null;
+    /** FK verso `Category` (vedi category.model.ts). UUID, coerente col resto dello schema. */
+    categoryId?: string | null;
     description?: string | null;
+    // Soft-delete: un prodotto già usato in fatture emesse non va mai cancellato fisicamente
+    // (le righe storiche in `invoice_products` conservano comunque un proprio snapshot di nome/
+    // prezzo/IVA, ma il riferimento ProductId deve continuare a esistere). "Eliminare" un prodotto
+    // dal catalogo equivale quindi a disattivarlo (`isActive: false`): sparisce dalle liste/ricerche
+    // per le nuove fatture ma resta consultabile per lo storico.
+    isActive: boolean;
 }
 
-export type ProductCreationAttributes = Optional<ProductAttributes, 'id' | 'type'>;
+export type ProductCreationAttributes = Optional<ProductAttributes, 'id' | 'type' | 'isActive'>;
 
 /** Tenant-scoped model: always access through `Product.schema(req.tenantSchema)`. */
 export class Product extends Model<ProductAttributes, ProductCreationAttributes> implements ProductAttributes {
@@ -26,8 +33,9 @@ export class Product extends Model<ProductAttributes, ProductCreationAttributes>
     declare productVat: string | null;
     declare sellingPrice: number | null;
     declare purchaseCost: number | null;
-    declare categoryId: number | null;
+    declare categoryId: string | null;
     declare description: string | null;
+    declare isActive: boolean;
 }
 
 Product.init(
@@ -40,8 +48,9 @@ Product.init(
         productVat: DataTypes.STRING,
         sellingPrice: DataTypes.DECIMAL(10, 2),
         purchaseCost: DataTypes.DECIMAL(10, 2),
-        categoryId: DataTypes.INTEGER,
-        description: DataTypes.STRING
+        categoryId: DataTypes.UUID,
+        description: DataTypes.STRING,
+        isActive: { type: DataTypes.BOOLEAN, defaultValue: true }
     },
     { sequelize, modelName: 'product', tableName: 'products' }
 );

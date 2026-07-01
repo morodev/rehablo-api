@@ -10,6 +10,10 @@ export interface InvoiceServiceAttributes {
     totalPrice?: number | null;
     percentageDiscount?: number | null;
     discountAmount?: number | null;
+    // --- Snapshot fiscale al momento dell'emissione (vedi invoiceProduct.model.ts per il razionale). ---
+    serviceName?: string | null;
+    /** Aliquota/natura IVA applicata a questa riga al momento dell'emissione (es. "22", "N4"). */
+    serviceVat?: string | null;
 }
 
 export type InvoiceServiceCreationAttributes = Optional<InvoiceServiceAttributes, 'id'>;
@@ -26,6 +30,8 @@ export class InvoiceService
     declare totalPrice: number | null;
     declare percentageDiscount: number | null;
     declare discountAmount: number | null;
+    declare serviceName: string | null;
+    declare serviceVat: string | null;
 }
 
 InvoiceService.init(
@@ -37,7 +43,9 @@ InvoiceService.init(
         servicePrice: DataTypes.DECIMAL(10, 2),
         totalPrice: DataTypes.DECIMAL(10, 2),
         percentageDiscount: DataTypes.INTEGER,
-        discountAmount: DataTypes.DECIMAL(10, 2)
+        discountAmount: DataTypes.DECIMAL(10, 2),
+        serviceName: DataTypes.STRING,
+        serviceVat: DataTypes.STRING
     },
     { sequelize, modelName: 'invoiceService', tableName: 'invoice_services' }
 );

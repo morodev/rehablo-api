@@ -10,6 +10,13 @@ export interface InvoiceProductAttributes {
     totalPrice?: number | null;
     percentageDiscount?: number | null;
     discountAmount?: number | null;
+    // --- Snapshot fiscale al momento dell'emissione: una fattura è un documento immutabile.
+    // Se il prodotto viene rinominato, ri-prezzato o disattivato in seguito, questi campi
+    // garantiscono che la fattura storica continui a mostrare nome e aliquota IVA corretti
+    // dell'epoca, indipendentemente da cosa succede poi al catalogo (vedi invoice.controller.ts). ---
+    productName?: string | null;
+    /** Aliquota/natura IVA applicata a questa riga al momento dell'emissione (es. "22", "N4"). */
+    productVat?: string | null;
 }
 
 export type InvoiceProductCreationAttributes = Optional<InvoiceProductAttributes, 'id'>;
@@ -26,6 +33,8 @@ export class InvoiceProduct
     declare totalPrice: number | null;
     declare percentageDiscount: number | null;
     declare discountAmount: number | null;
+    declare productName: string | null;
+    declare productVat: string | null;
 }
 
 InvoiceProduct.init(
@@ -37,7 +46,9 @@ InvoiceProduct.init(
         productPrice: DataTypes.DECIMAL(10, 2),
         totalPrice: DataTypes.DECIMAL(10, 2),
         percentageDiscount: DataTypes.INTEGER,
-        discountAmount: DataTypes.DECIMAL(10, 2)
+        discountAmount: DataTypes.DECIMAL(10, 2),
+        productName: DataTypes.STRING,
+        productVat: DataTypes.STRING
     },
     { sequelize, modelName: 'invoiceProduct', tableName: 'invoice_products' }
 );
