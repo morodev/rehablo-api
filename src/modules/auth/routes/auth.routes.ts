@@ -20,6 +20,7 @@ router.get('/tenant/:tenantId', requireAuth, tenantController.findTenantById);
 
 // --- Public account flows (no auth required: token-in-url based) ---
 router.put('/user/verify/:verificationToken', userController.verificationAccount);
+router.post('/send-verification', userController.sendVerificationEmail);
 router.get('/user/forgot-password', userController.forgotPassword);
 router.put('/user/reset-password/:resetPasswordToken', userController.resetPassword);
 

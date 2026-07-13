@@ -131,6 +131,30 @@ export const verificationAccount = asyncHandler(async (req: Request, res: Respon
     return sendSuccessResponse(res, 200, {}, 'User activated');
 });
 
+/**
+ * Resends the account-verification e-mail (e.g. when the user tries to log in but the account
+ * is still inactive). Ported from the legacy `rehablo-authentication` `/send-verification` route,
+ * which was dropped during the monolith migration.
+ */
+export const sendVerificationEmail = asyncHandler(async (req: Request, res: Response) => {
+    const email = req.body.email;
+
+    const user = await User.findOne({ where: { email } });
+    if (!user) {
+        return sendErrorResponse(res, 409, 'Email non trovata.');
+    }
+
+    const verificationToken = jwt.sign({ email }, licenseSecret, { expiresIn: '12h' });
+
+    // Fire-and-forget, same reasoning as forgotPassword/signup: don't let a slow/unreachable SMTP
+    // delay the HTTP response.
+    signUpSendMail(email, verificationToken).catch((err) => {
+        console.error('[sendVerificationEmail] verification email could not be sent:', err);
+    });
+
+    return sendSuccessResponse(res, 200, {}, 'Verification email sent');
+});
+
 export const forgotPassword = asyncHandler(async (req: Request, res: Response) => {
     const email = req.query.email as string;
 
@@ -159,6 +183,7 @@ export default {
     deleteUser,
     resetPassword,
     verificationAccount,
+    sendVerificationEmail,
     forgotPassword
 };
 

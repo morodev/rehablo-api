@@ -25,7 +25,7 @@ export function registerAuthAssociations(): void {
 }
 
 export async function syncAuthModels(): Promise<void> {
-    await Tenant.sync();
+    await Tenant.sync({ alter: true });
     await User.sync({ alter: true });
     await UserAvailability.sync({ alter: true });
     await Structure.sync({ alter: true });
