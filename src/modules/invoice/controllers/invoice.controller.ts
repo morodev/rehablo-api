@@ -16,18 +16,29 @@ import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../
 /**
  * NOTA SULL'INTEGRITÀ REFERENZIALE: in questa architettura multi-tenant, `Invoice`/`InvoiceProduct`/
  * `InvoiceService`/`Product`/`Service` vivono in uno schema Postgres dinamico per-tenant, sincronizzato
- * via `.schema(schema).sync({ alter: true })` PRIMA che le associazioni `belongsToMany` qui sotto
- * vengano dichiarate (le associazioni sono ridichiarate ad ogni request in `getScopedModels`, solo per
- * generare i JOIN nelle query — non esistono a livello di `sync`). Di conseguenza NON esistono vincoli
- * FK reali a livello database su queste tabelle: l'integrità referenziale (id prodotto/servizio
- * esistente, pulizia righe orfane alla cancellazione, ecc.) è garantita qui a livello applicativo
- * (vedi `resolveCatalogLines`, `deleteInvoice`).
+ * via `.schema(schema).sync({ alter: true })` in `ensureTenantSchema()`. Le associazioni tra questi
+ * modelli sono dichiarate UNA SOLA VOLTA a boot in `../models/index.ts` (vedi `getScopedModels` sotto),
+ * non a livello di `sync`: di conseguenza NON esistono vincoli FK reali a livello database su queste
+ * tabelle. L'integrità referenziale (id prodotto/servizio esistente, pulizia righe orfane alla
+ * cancellazione, ecc.) è garantita qui a livello applicativo (vedi `resolveCatalogLines`, `deleteInvoice`).
  */
 
 /**
- * Builds tenant-scoped model variants and (re)declares the M2M associations on them.
- * Sequelize associations are normally declared once at boot, but since every tenant has its
- * own dynamic Postgres schema, we must re-bind them per schema, exactly like the legacy code did.
+ * Builds tenant-scoped model variants for querying (`.schema(schema)` on each model).
+ *
+ * NOTA: le associazioni Invoice -> InvoiceProduct/InvoiceService NON vengono (ri)dichiarate qui:
+ * sono registrate UNA SOLA VOLTA a boot in `../models/index.ts` (`registerInvoiceAssociations`,
+ * chiamata da `registerTenantModels()`), esattamente come per gli altri moduli tenant-scoped
+ * (vedi `registerEvaluationAssociations`, `registerProductsServicesAssociations`). Ridichiarare
+ * l'associazione ad ogni richiesta (come faceva questa funzione in precedenza) causa l'errore
+ * Sequelize "You have used the alias X in two separate associations..." dalla seconda richiesta
+ * in poi, perché `Model.schema()` crea un clone che eredita (senza copiarla) la stessa mappa
+ * `associations` del modello base, condivisa da tutte le richieste/tenant nel processo.
+ *
+ * L'associazione è `hasMany` verso `InvoiceProduct`/`InvoiceService` (non `belongsToMany` verso il
+ * catalogo Product/Service): il frontend si aspetta che `invoice.products`/`invoice.services` siano
+ * DIRETTAMENTE le righe snapshot della tabella ponte (`ProductId`/`ServiceId`, `productName`/
+ * `serviceName`, `productPrice`/`servicePrice`, `productVat`/`serviceVat`, `quantity`, ecc.).
  */
 function getScopedModels(schema: string) {
     const InvoiceScoped = Invoice.schema(schema);
@@ -36,27 +47,6 @@ function getScopedModels(schema: string) {
     const InvoiceProductScoped = InvoiceProduct.schema(schema);
     const InvoiceServiceScoped = InvoiceService.schema(schema);
 
-    InvoiceScoped.belongsToMany(ProductScoped, {
-        through: InvoiceProductScoped,
-        foreignKey: 'InvoiceId',
-        otherKey: 'ProductId'
-    });
-    ProductScoped.belongsToMany(InvoiceScoped, {
-        through: InvoiceProductScoped,
-        foreignKey: 'ProductId',
-        otherKey: 'InvoiceId'
-    });
-
-    InvoiceScoped.belongsToMany(ServiceScoped, {
-        through: InvoiceServiceScoped,
-        foreignKey: 'InvoiceId',
-        otherKey: 'ServiceId'
-    });
-    ServiceScoped.belongsToMany(InvoiceScoped, {
-        through: InvoiceServiceScoped,
-        foreignKey: 'ServiceId',
-        otherKey: 'InvoiceId'
-    });
 
     return { InvoiceScoped, ProductScoped, ServiceScoped, InvoiceProductScoped, InvoiceServiceScoped };
 }
@@ -224,7 +214,10 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     });
 
     const invoiceWithLines = await InvoiceScoped.findByPk(invoice.get('id') as string, {
-        include: [{ model: ProductScoped }, { model: ServiceScoped }]
+        include: [
+            { model: InvoiceProductScoped, as: 'products' },
+            { model: InvoiceServiceScoped, as: 'services' }
+        ]
     });
 
     return sendSuccessResponse(res, 201, invoiceWithLines, 'Invoice Created');
@@ -232,13 +225,16 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
 
 export const findAllInvoices = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { InvoiceScoped, ProductScoped, ServiceScoped } = getScopedModels(schema);
+    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped } = getScopedModels(schema);
 
     const page = parseInt((req.query.page as string) ?? '1', 10);
     const size = parseInt((req.query.size as string) ?? '10', 10);
 
     const { count, rows } = await InvoiceScoped.findAndCountAll({
-        include: [{ model: ProductScoped }, { model: ServiceScoped }],
+        include: [
+            { model: InvoiceProductScoped, as: 'products' },
+            { model: InvoiceServiceScoped, as: 'services' }
+        ],
         limit: size,
         offset: (page - 1) * size,
         distinct: true
@@ -274,10 +270,13 @@ export const searchInvoices = asyncHandler(async (req: Request, res: Response) =
 
 export const findOneInvoice = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { InvoiceScoped, ProductScoped, ServiceScoped } = getScopedModels(schema);
+    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped } = getScopedModels(schema);
 
     const invoice = await InvoiceScoped.findByPk(req.params.invoiceId, {
-        include: [{ model: ProductScoped }, { model: ServiceScoped }]
+        include: [
+            { model: InvoiceProductScoped, as: 'products' },
+            { model: InvoiceServiceScoped, as: 'services' }
+        ]
     });
 
     if (!invoice) {
@@ -388,7 +387,10 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
     }
 
     const updatedInvoice = await InvoiceScoped.findByPk(id, {
-        include: [{ model: ProductScoped }, { model: ServiceScoped }]
+        include: [
+            { model: InvoiceProductScoped, as: 'products' },
+            { model: InvoiceServiceScoped, as: 'services' }
+        ]
     });
     return sendSuccessResponse(res, 200, updatedInvoice, 'Fattura aggiornata correttamente');
 });

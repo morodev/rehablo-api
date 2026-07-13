@@ -2,14 +2,11 @@ import { registerTenantScopedModel } from './utils/tenantSchema.js';
 
 import Patient from './modules/patients/models/patient.model.js';
 import { registerProductsServicesAssociations, Category, Product, Service } from './modules/products-services/models/index.js';
-import Invoice from './modules/invoice/models/invoice.model.js';
-import InvoiceProduct from './modules/invoice/models/invoiceProduct.model.js';
-import InvoiceService from './modules/invoice/models/invoiceService.model.js';
+import { registerInvoiceAssociations, Invoice, InvoiceProduct, InvoiceService } from './modules/invoice/models/index.js';
 import EventType from './modules/agenda/models/eventType.model.js';
 import AgendaEvent from './modules/agenda/models/agendaEvent.model.js';
 import AgendaEventException from './modules/agenda/models/agendaEventException.model.js';
-import Dashboard from './modules/configuration/models/dashboard.model.js';
-import Widget from './modules/configuration/models/widget.model.js';
+import { registerConfigurationAssociations, Dashboard, Widget } from './modules/configuration/models/index.js';
 import { registerProtocolAssociations, ProtocolInstance, ProtocolPhaseInstance, ProtocolExerciseLog } from './modules/protocols/models/index.js';
 import {
     registerHumanBodyAssociations,
@@ -41,6 +38,8 @@ export function registerTenantModels(): void {
     // articularities/strengths/questionnaires/scales/tests associations on top of those models.
     registerEvaluationAssociations();
     registerProductsServicesAssociations();
+    registerInvoiceAssociations();
+    registerConfigurationAssociations();
 
     registerTenantScopedModel(Patient);
     // Evaluation references `patients` (FK) and is in turn referenced by the human-body instance

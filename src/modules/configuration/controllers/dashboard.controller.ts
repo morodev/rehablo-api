@@ -4,12 +4,17 @@ import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.
 import Dashboard from '../models/dashboard.model.js';
 import Widget from '../models/widget.model.js';
 
+/**
+ * Builds tenant-scoped model variants for querying. Le associazioni Dashboard <-> Widget sono
+ * registrate una sola volta a boot in `../models/index.ts` (`registerConfigurationAssociations`),
+ * NON qui: dichiararle ad ogni richiesta causa l'errore Sequelize "You have used the alias X in
+ * two separate associations..." dalla seconda richiesta in poi (vedi invoice.controller.ts per il
+ * dettaglio del perché).
+ */
 function getScopedModels(schema: string) {
     const DashboardScoped = Dashboard.schema(schema);
     const WidgetScoped = Widget.schema(schema);
 
-    DashboardScoped.hasMany(WidgetScoped, { onDelete: 'cascade', foreignKey: { allowNull: false }, hooks: true });
-    WidgetScoped.belongsTo(DashboardScoped, { onDelete: 'cascade', foreignKey: { allowNull: false }, hooks: true });
 
     return { DashboardScoped, WidgetScoped };
 }
