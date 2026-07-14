@@ -27,11 +27,24 @@ export const getAllSymptomByPoint = asyncHandler(async (req: Request, res: Respo
 
 export const getSymptomById = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const symptom = await HumanBodySymptom.schema(schema).findByPk(req.params.symptomId);
-    if (!symptom) {
-        return sendErrorResponse(res, 404, 'Human body symptom not found');
+    const humanBodyPointId = req.query.humanBodyPointId as string;
+
+    // NOTE: despite the name (kept for backward compatibility with the route/frontend
+    // already wired to it), this never actually looked up anything by an `:symptomId`
+    // route param - the `/human-body-symptom` GET route only ever receives
+    // `humanBodyPointId` as a query string (see human-white-body.component.ts), so
+    // `req.params.symptomId` was always undefined and this always 404'd. Query by
+    // humanBodyPointId instead, exactly like getAllSymptomByPoint below.
+    if (!humanBodyPointId) {
+        return sendErrorResponse(res, 400, 'humanBodyPointId is required');
     }
-    return sendSuccessResponse(res, 200, symptom, 'Human body symptom loaded');
+
+    const symptoms = await HumanBodySymptom.schema(schema).findAll({
+        where: { humanBodyPointId },
+        order: [['date', 'DESC']]
+    });
+
+    return sendSuccessResponse(res, 200, symptoms, 'Human body symptoms loaded');
 });
 
 /**

@@ -64,6 +64,7 @@ router.delete('/questionnaire/:questionnaireId', questionnaireController.deleteQ
 router.get('/questionnaire/:questionnaireId', questionnaireController.getQuestionnaireById);
 router.post('/questionnaire-instance', questionnaireInstanceController.saveQuestionnaireInstance);
 router.get('/questionnaire-instance', questionnaireInstanceController.getQuestionnaireInstances);
+router.get('/questionnaire-instance-by-point', questionnaireInstanceController.getQuestionnaireInstancesByPoint);
 
 // Standardized scales catalog (public schema) + per-tenant compiled instances
 router.get('/scales', scaleController.getAllScales);

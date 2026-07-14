@@ -6,6 +6,7 @@ import HumanBodyAnswerInstance from '../models/humanBodyAnswerInstance.model.js'
 import HumanBodyQuestionnaire from '../models/humanBodyQuestionnaire.model.js';
 import HumanBodyQuestion from '../models/humanBodyQuestion.model.js';
 import HumanBodyAnswer from '../models/humanBodyAnswer.model.js';
+import { resolveHumanBodyPointId } from './humanBodyPoint.helper.js';
 
 interface AnswerInstanceInput {
     questionId: string;
@@ -23,10 +24,17 @@ export const saveQuestionnaireInstance = asyncHandler(async (req: Request, res: 
         questions: AnswerInstanceInput[];
     };
 
+    // Same pattern as saveSymptom/saveArticularity: attach the compiled questionnaire to
+    // an existing point (`humanBodyPointId`) or create one on the fly (`pointToCreate`),
+    // so it can be tracked/drawn on the body diagram exactly like symptoms and
+    // articularity already are.
+    const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body);
+
     const instance = await HumanBodyQuestionnaireInstance.schema(schema).create({
         userId: body.userId,
         patientId: body.patientId,
         evaluationId: body.evaluationId ?? null,
+        humanBodyPointId,
         humanBodyQuestionnaireId: body.questionnaireId
     });
 
@@ -88,9 +96,48 @@ export const getQuestionnaireInstances = asyncHandler(async (req: Request, res: 
     return sendSuccessResponse(res, 200, simplified, 'Compiled questionnaires fetched');
 });
 
+/**
+ * Get the compiled questionnaires attached to a given human body point (used to show
+ * them in the point-selected drawer, exactly like symptoms/articularity).
+ */
+export const getQuestionnaireInstancesByPoint = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const humanBodyPointId = req.query.humanBodyPointId as string;
+
+    const instances = await HumanBodyQuestionnaireInstance.schema(schema).findAll({
+        where: { humanBodyPointId },
+        include: [
+            { model: HumanBodyQuestionnaire.schema(schema), attributes: ['title', 'description'] },
+            {
+                model: HumanBodyAnswerInstance.schema(schema),
+                include: [
+                    { model: HumanBodyQuestion.schema(schema), attributes: ['text'] },
+                    { model: HumanBodyAnswer.schema(schema), attributes: ['text', 'isCorrect'] }
+                ]
+            }
+        ],
+        order: [['createdAt', 'DESC']]
+    });
+
+    const simplified = instances.map((instance: any) => ({
+        id: instance.id,
+        createdAt: instance.createdAt,
+        title: instance.humanBodyQuestionnaire?.title,
+        description: instance.humanBodyQuestionnaire?.description,
+        answers: instance.humanBodyAnswerInstances?.map((answer: any) => ({
+            question: answer.humanBodyQuestion?.text,
+            answer: answer.humanBodyAnswer?.text,
+            customAnswer: answer.customAnswer
+        }))
+    }));
+
+    return sendSuccessResponse(res, 200, simplified, 'Compiled questionnaires for point fetched');
+});
+
 export default {
     saveQuestionnaireInstance,
-    getQuestionnaireInstances
+    getQuestionnaireInstances,
+    getQuestionnaireInstancesByPoint
 };
 
 
