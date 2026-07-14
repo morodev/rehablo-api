@@ -9,6 +9,12 @@ import AgendaEventException from '../models/agendaEventException.model.js';
 import EventType from '../models/eventType.model.js';
 import Patient from '../../patients/models/patient.model.js';
 
+// Simple RFC-4122 UUID matcher used to reject malformed ids (e.g. a stray numeric
+// placeholder like `1`) with a clean 400 instead of letting Postgres blow up with
+// "invalid input syntax for type uuid" (which the generic error handler turns into
+// an opaque 500).
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export const eventDashboardWithFilter = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const startDate = new Date(req.query.startDate as string);
@@ -36,6 +42,8 @@ export const findAllAgendaEvents = asyncHandler(async (req: Request, res: Respon
         where: { start: { [Op.between]: [startDate, endDate] } }
     });
 
+    console.log(agendaEvents);
+
     return sendSuccessResponse(res, 200, { agendaEvents }, 'Agenda events loaded');
 });
 
@@ -58,6 +66,10 @@ export const findAgendaEventsByUsers = asyncHandler(async (req: Request, res: Re
 export const findAppointmentsForPatientById = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const patientId = req.query.patientId as string;
+
+    if (!patientId || !UUID_REGEX.test(patientId)) {
+        return sendErrorResponse(res, 400, 'Invalid or missing patientId');
+    }
 
     const patient = await Patient.schema(schema).findByPk(patientId);
     if (!patient) {
