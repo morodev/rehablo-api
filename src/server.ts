@@ -12,6 +12,7 @@ import { registerAuthAssociations, syncAuthModels } from './modules/auth/models/
 import { registerTenantModels } from './tenantModelsRegistry.js';
 import { registerCatalogAssociations, syncCatalogModels, seedCatalogData } from './modules/human-body/models/catalog/index.js';
 import { registerProtocolCatalogAssociations, syncProtocolCatalogModels } from './modules/protocols/models/catalog/index.js';
+import { syncMeasurementCatalogModels, seedMeasurementCatalogData } from './modules/measurements/models/catalog/index.js';
 
 import authRoutes from './modules/auth/routes/auth.routes.js';
 import patientRoutes from './modules/patients/routes/patient.routes.js';
@@ -22,6 +23,7 @@ import configurationRoutes from './modules/configuration/routes/configuration.ro
 import humanBodyRoutes from './modules/human-body/routes/human-body.routes.js';
 import protocolRoutes from './modules/protocols/routes/protocol.routes.js';
 import evaluationRoutes from './modules/evaluations/routes/evaluation.routes.js';
+import measurementsRoutes from './modules/measurements/routes/measurements.routes.js';
 
 async function bootstrap() {
     const app = express();
@@ -44,6 +46,7 @@ async function bootstrap() {
     app.use(humanBodyRoutes);
     app.use(protocolRoutes);
     app.use(evaluationRoutes);
+    app.use(measurementsRoutes);
 
     app.use(notFoundHandler);
     app.use(errorHandler);
@@ -65,6 +68,11 @@ async function bootstrap() {
     // shared by every tenant). No seed data yet: managed via the /exercises and /protocol-templates CRUD.
     registerProtocolCatalogAssociations();
     await syncProtocolCatalogModels();
+
+    // Public-schema measurement dictionary (Clinical Data Dictionary): definizioni metriche condivise
+    // da tutti i tenant. È il fondamento del modello canonico (docs/REHABLO_OS_GAP_ANALYSIS.md §3).
+    await syncMeasurementCatalogModels();
+    await seedMeasurementCatalogData();
 
     // Tenant-scoped models registry (synced lazily per-tenant via ensureTenantSchema)
     registerTenantModels();

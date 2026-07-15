@@ -26,6 +26,7 @@ import {
     TestInstance
 } from './modules/human-body/models/index.js';
 import { registerEvaluationAssociations, Evaluation } from './modules/evaluations/models/index.js';
+import { registerMeasurementAssociations, Observation, DeviceConnection } from './modules/measurements/models/index.js';
 
 /**
  * Registers every tenant-scoped model (i.e. living in the dynamic "rehablo_<tenantId>" schema)
@@ -40,11 +41,17 @@ export function registerTenantModels(): void {
     registerProductsServicesAssociations();
     registerInvoiceAssociations();
     registerConfigurationAssociations();
+    registerMeasurementAssociations();
 
     registerTenantScopedModel(Patient);
     // Evaluation references `patients` (FK) and is in turn referenced by the human-body instance
     // tables below (FK), so it must be synced right after Patient and before those tables.
     registerTenantScopedModel(Evaluation);
+    // Observation (misure canoniche): riferisce patientId/metricCode come colonne logiche, nessuna
+    // FK cross-schema, quindi l'ordine relativo non è vincolante.
+    registerTenantScopedModel(Observation);
+    // DeviceConnection (connessioni ai dispositivi del centro, con credenziali cifrate).
+    registerTenantScopedModel(DeviceConnection);
     registerTenantScopedModel(Category);
     registerTenantScopedModel(Product);
     registerTenantScopedModel(Service);

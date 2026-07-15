@@ -21,6 +21,10 @@ export const env = {
     jwtSecret: required('JWT_SECRET', 'change-me-please-use-a-long-random-string'),
     jwtExpiresIn: process.env.JWT_EXPIRES_IN || '7d',
 
+    // Segreto per cifrare le credenziali dei dispositivi (API key dei vendor salvate per tenant).
+    // In produzione impostare DEVICE_CREDENTIALS_SECRET a una stringa lunga e casuale.
+    deviceCredentialsSecret: required('DEVICE_CREDENTIALS_SECRET', 'change-me-device-credentials-secret'),
+
     stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
 
     emailHost: process.env.EMAIL_HOST || '',
