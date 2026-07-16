@@ -11,7 +11,7 @@ services:
     runtime: node
     plan: free
     region: frankfurt
-    branch: main
+    branch: master
     buildCommand: npm ci && npm run build
     startCommand: npm start
     envVars:
