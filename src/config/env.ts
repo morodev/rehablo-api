@@ -10,6 +10,22 @@ function required(name: string, fallback?: string): string {
     return value;
 }
 
+/**
+ * La libreria `ms` (usata da jsonwebtoken per `expiresIn`) interpreta una stringa puramente
+ * numerica SENZA unità (es. "7") come MILLISECONDI, non giorni: un errore di configurazione
+ * facile da fare che produce token con vita utile ~0 (scaduti all'istante). Se in JWT_EXPIRES_IN
+ * arriva un valore composto solo da cifre, assumiamo fosse inteso in giorni e aggiungiamo "d".
+ */
+function normalizeExpiresIn(value: string): string {
+    if (/^\d+$/.test(value.trim())) {
+        console.warn(
+            `[env] JWT_EXPIRES_IN="${value}" non ha un'unità (d/h/m/s): verrebbe interpretato come ${value}ms da jsonwebtoken. Normalizzato in "${value}d".`
+        );
+        return `${value.trim()}d`;
+    }
+    return value;
+}
+
 export const env = {
     nodeEnv: process.env.NODE_ENV || 'development',
     isProduction: process.env.NODE_ENV === 'production',
@@ -19,7 +35,7 @@ export const env = {
     dbSsl: process.env.DB_SSL === 'true',
 
     jwtSecret: required('JWT_SECRET', 'change-me-please-use-a-long-random-string'),
-    jwtExpiresIn: process.env.JWT_EXPIRES_IN || '7d',
+    jwtExpiresIn: normalizeExpiresIn(process.env.JWT_EXPIRES_IN || '7d'),
 
     // Segreto per cifrare le credenziali dei dispositivi (API key dei vendor salvate per tenant).
     // In produzione impostare DEVICE_CREDENTIALS_SECRET a una stringa lunga e casuale.
