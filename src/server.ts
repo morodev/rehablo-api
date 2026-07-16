@@ -51,6 +51,42 @@ async function bootstrap() {
 
     app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+    // Endpoint diagnostico TEMPORANEO per capire se il timeout SMTP è un blocco di rete
+    // (Render -> Hostinger) o altro. Da rimuovere una volta risolto il problema email.
+    app.get('/debug/smtp-check', async (_req, res) => {
+        const net = await import('net');
+        const { transporter } = await import('./services/email.service.js');
+        const result: Record<string, unknown> = { host: env.emailHost, port: env.emailPort };
+
+        // 1) Connessione TCP grezza (bypassa completamente Nodemailer/TLS)
+        const tcpStart = Date.now();
+        result.tcp = await new Promise((resolve) => {
+            const socket = net.connect({ host: env.emailHost, port: env.emailPort, timeout: 8000 });
+            socket.once('connect', () => {
+                socket.destroy();
+                resolve({ ok: true, ms: Date.now() - tcpStart });
+            });
+            socket.once('timeout', () => {
+                socket.destroy();
+                resolve({ ok: false, error: 'ETIMEDOUT (raw TCP)', ms: Date.now() - tcpStart });
+            });
+            socket.once('error', (err: any) => {
+                resolve({ ok: false, error: err?.code || err?.message, ms: Date.now() - tcpStart });
+            });
+        });
+
+        // 2) Verify completo Nodemailer (TCP + TLS + AUTH)
+        const smtpStart = Date.now();
+        try {
+            await transporter.verify();
+            result.smtpVerify = { ok: true, ms: Date.now() - smtpStart };
+        } catch (err: any) {
+            result.smtpVerify = { ok: false, error: err?.code || err?.message, ms: Date.now() - smtpStart };
+        }
+
+        res.json(result);
+    });
+
     // --- Domain routers (every module owns its own URL prefix-free routes, mounted at root) ---
     app.use(authRoutes);
     app.use(patientRoutes);
