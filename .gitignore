@@ -4,5 +4,5 @@ dist/
 *.log
 .idea/
 .DS_Store
-storage/
+/storage/
 
