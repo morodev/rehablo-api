@@ -7,6 +7,7 @@ import HumanBodyQuestionnaire from '../models/humanBodyQuestionnaire.model.js';
 import HumanBodyQuestion from '../models/humanBodyQuestion.model.js';
 import HumanBodyAnswer from '../models/humanBodyAnswer.model.js';
 import { resolveHumanBodyPointId } from './humanBodyPoint.helper.js';
+import { assertEvaluationEditable } from '../../evaluations/services/evaluationGuard.js';
 
 interface AnswerInstanceInput {
     questionId: string;
@@ -23,6 +24,8 @@ export const saveQuestionnaireInstance = asyncHandler(async (req: Request, res: 
         questionnaireId: string;
         questions: AnswerInstanceInput[];
     };
+
+    await assertEvaluationEditable(schema, body.evaluationId);
 
     // Same pattern as saveSymptom/saveArticularity: attach the compiled questionnaire to
     // an existing point (`humanBodyPointId`) or create one on the fly (`pointToCreate`),
@@ -69,9 +72,10 @@ export const getQuestionnaireInstances = asyncHandler(async (req: Request, res: 
             { model: HumanBodyQuestionnaire.schema(schema), attributes: ['title', 'description'] },
             {
                 model: HumanBodyAnswerInstance.schema(schema),
+                as: 'answers',
                 include: [
-                    { model: HumanBodyQuestion.schema(schema), attributes: ['text'] },
-                    { model: HumanBodyAnswer.schema(schema), attributes: ['text', 'isCorrect'] }
+                    { model: HumanBodyQuestion.schema(schema), as: 'question', attributes: ['text'] },
+                    { model: HumanBodyAnswer.schema(schema), as: 'answer', attributes: ['text', 'isCorrect'] }
                 ]
             }
         ]
@@ -86,9 +90,9 @@ export const getQuestionnaireInstances = asyncHandler(async (req: Request, res: 
             title: instance.humanBodyQuestionnaire?.title,
             description: instance.humanBodyQuestionnaire?.description
         },
-        answers: instance.humanBodyAnswerInstances?.map((answer: any) => ({
-            question: answer.humanBodyQuestion?.text,
-            answer: answer.humanBodyAnswer?.text,
+        answers: instance.answers?.map((answer: any) => ({
+            question: answer.question?.text,
+            answer: answer.answer?.text,
             customAnswer: answer.customAnswer
         }))
     }));
@@ -110,9 +114,10 @@ export const getQuestionnaireInstancesByPoint = asyncHandler(async (req: Request
             { model: HumanBodyQuestionnaire.schema(schema), attributes: ['title', 'description'] },
             {
                 model: HumanBodyAnswerInstance.schema(schema),
+                as: 'answers',
                 include: [
-                    { model: HumanBodyQuestion.schema(schema), attributes: ['text'] },
-                    { model: HumanBodyAnswer.schema(schema), attributes: ['text', 'isCorrect'] }
+                    { model: HumanBodyQuestion.schema(schema), as: 'question', attributes: ['text'] },
+                    { model: HumanBodyAnswer.schema(schema), as: 'answer', attributes: ['text', 'isCorrect'] }
                 ]
             }
         ],
@@ -124,9 +129,9 @@ export const getQuestionnaireInstancesByPoint = asyncHandler(async (req: Request
         createdAt: instance.createdAt,
         title: instance.humanBodyQuestionnaire?.title,
         description: instance.humanBodyQuestionnaire?.description,
-        answers: instance.humanBodyAnswerInstances?.map((answer: any) => ({
-            question: answer.humanBodyQuestion?.text,
-            answer: answer.humanBodyAnswer?.text,
+        answers: instance.answers?.map((answer: any) => ({
+            question: answer.question?.text,
+            answer: answer.answer?.text,
             customAnswer: answer.customAnswer
         }))
     }));

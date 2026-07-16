@@ -3,6 +3,7 @@ import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import HumanBodyPoint from '../models/humanBodyPoint.model.js';
 import HumanBodyEvent from '../models/humanBodyEvent.model.js';
+import { assertEvaluationEditable } from '../../evaluations/services/evaluationGuard.js';
 
 interface HumanBodyEventInput {
     eventType: string;
@@ -10,6 +11,7 @@ interface HumanBodyEventInput {
 
 export const createHumanBodyPoint = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
+    await assertEvaluationEditable(schema, req.body?.evaluationId);
     const events: HumanBodyEventInput[] = req.body.humanBodyEvents ?? [];
 
     const point = await HumanBodyPoint.schema(schema).create(req.body);
@@ -26,9 +28,20 @@ export const createHumanBodyPoint = asyncHandler(async (req: Request, res: Respo
 export const getAllHumanBodyPointsWithEvents = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const userId = req.user!.id;
+    const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
+
+    // FASE E: quando è indicata una valutazione, i punti sono scoperti per `evaluationId` (una
+    // valutazione è condivisa dagli operatori del centro, quindi NON si filtra più per `userId`).
+    // Senza `evaluationId` (uso legacy) si mantiene il comportamento storico filtrando per operatore.
+    const where: Record<string, unknown> = { patientId };
+    if (evaluationId) {
+        where.evaluationId = evaluationId;
+    } else {
+        where.userId = userId;
+    }
 
     const points = await HumanBodyPoint.schema(schema).findAll({
-        where: { patientId: req.query.patientId as string, userId },
+        where,
         include: { model: HumanBodyEvent.schema(schema), required: false },
         raw: true
     });
@@ -52,10 +65,16 @@ export const getAllHumanBodyPointsWithEvents = asyncHandler(async (req: Request,
 export const getAllHumanBodyPoints = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const userId = req.user!.id;
+    const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
 
-    const points = await HumanBodyPoint.schema(schema).findAll({
-        where: { patientId: req.query.patientId as string, userId }
-    });
+    const where: Record<string, unknown> = { patientId };
+    if (evaluationId) {
+        where.evaluationId = evaluationId;
+    } else {
+        where.userId = userId;
+    }
+
+    const points = await HumanBodyPoint.schema(schema).findAll({ where });
 
     return sendSuccessResponse(res, 200, { points }, 'Human body points loaded');
 });

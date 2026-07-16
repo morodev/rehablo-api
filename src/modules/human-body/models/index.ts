@@ -44,10 +44,14 @@ export function registerHumanBodyAssociations(): void {
     HumanBodyQuestionnaire.hasMany(HumanBodyQuestionnaireInstance, { foreignKey: 'humanBodyQuestionnaireId' });
     HumanBodyQuestionnaireInstance.belongsTo(HumanBodyQuestionnaire, { foreignKey: 'humanBodyQuestionnaireId' });
 
-    HumanBodyQuestionnaireInstance.hasMany(HumanBodyAnswerInstance, { foreignKey: 'humanBodyQuestionnaireInstanceId' });
+    // Short aliases (`answers`/`question`/`answer`) on purpose: when this chain is loaded nested under
+    // `Evaluation` (Evaluation->humanBodyQuestionnaireInstances->answers->question), the default long
+    // aliases exceeded Postgres' 63-char identifier limit and got truncated to the SAME string,
+    // triggering "table name specified more than once". Keeping them short avoids the collision.
+    HumanBodyQuestionnaireInstance.hasMany(HumanBodyAnswerInstance, { foreignKey: 'humanBodyQuestionnaireInstanceId', as: 'answers' });
     HumanBodyAnswerInstance.belongsTo(HumanBodyQuestionnaireInstance, { foreignKey: 'humanBodyQuestionnaireInstanceId' });
-    HumanBodyAnswerInstance.belongsTo(HumanBodyQuestion, { foreignKey: 'humanBodyQuestionId' });
-    HumanBodyAnswerInstance.belongsTo(HumanBodyAnswer, { foreignKey: 'humanBodyAnswerId' });
+    HumanBodyAnswerInstance.belongsTo(HumanBodyQuestion, { foreignKey: 'humanBodyQuestionId', as: 'question' });
+    HumanBodyAnswerInstance.belongsTo(HumanBodyAnswer, { foreignKey: 'humanBodyAnswerId', as: 'answer' });
 
     UserScaleInstance.hasMany(UserAnswer, { foreignKey: 'userScaleInstanceId' });
     UserAnswer.belongsTo(UserScaleInstance, { foreignKey: 'userScaleInstanceId' });

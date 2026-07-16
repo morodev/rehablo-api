@@ -5,6 +5,7 @@ import { listDeviceSources } from '../mapping/deviceMappings.js';
 import { applyMapping, inspectCsv } from '../mapping/mappingEngine.js';
 import { resolveDeviceMapping } from '../mapping/mappingResolver.js';
 import { ingestObservations, loadMetricInfo, type ObservationInput } from '../services/observation.service.js';
+import { assertEvaluationEditable } from '../../evaluations/services/evaluationGuard.js';
 
 /**
  * Elenco delle sorgenti/dispositivi disponibili per l'import (alimenta il menù a tendina del frontend,
@@ -38,11 +39,20 @@ export const importCsv = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const tenantId = req.user!.tenants[0].id;
     const operatorId = req.user!.id;
-    const { sourceId, patientId, csv } = req.body as { sourceId?: string; patientId?: string; csv?: string };
+    const { sourceId, patientId, csv, evaluationId, humanBodyPointId } = req.body as {
+        sourceId?: string;
+        patientId?: string;
+        csv?: string;
+        evaluationId?: string;
+        humanBodyPointId?: string;
+    };
 
     if (!sourceId || !patientId || !csv) {
         return sendErrorResponse(res, 400, 'sourceId, patientId e csv sono obbligatori');
     }
+
+    // FASE E: se l'import è agganciato a una valutazione, questa deve essere ancora modificabile.
+    await assertEvaluationEditable(schema, evaluationId);
 
     const mapping = await resolveDeviceMapping(sourceId);
     if (!mapping) {
@@ -57,9 +67,12 @@ export const importCsv = asyncHandler(async (req: Request, res: Response) => {
     const dictionary = await loadMetricInfo();
     const { measurements, warnings } = applyMapping(csv, mapping, dictionary);
 
-    // Da misura mappata -> input canonico per l'imbuto, agganciando il paziente scelto dall'operatore.
+    // Da misura mappata -> input canonico per l'imbuto, agganciando il paziente scelto dall'operatore
+    // e, quando presenti (FASE E), la valutazione e il punto del corpo umano.
     const inputs: ObservationInput[] = measurements.map((m) => ({
         patientId,
+        evaluationId: evaluationId ?? null,
+        humanBodyPointId: humanBodyPointId ?? null,
         metricCode: m.metricCode,
         value: m.value,
         unit: m.unit,

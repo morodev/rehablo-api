@@ -17,6 +17,12 @@ export function errorHandler(err: any, req: Request, res: Response, next: NextFu
         return sendErrorResponse(res, 422, 'Validation error', err.errors);
     }
 
+    // F0.1: errori di upload (multer), es. file troppo grande (`LIMIT_FILE_SIZE`).
+    if (err?.name === 'MulterError') {
+        const statusCode = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+        return sendErrorResponse(res, statusCode, `Upload error: ${err.message}`, err.code);
+    }
+
     const statusCode = err?.statusCode || 500;
     sendErrorResponse(res, statusCode, err?.message || 'Internal server error');
 }

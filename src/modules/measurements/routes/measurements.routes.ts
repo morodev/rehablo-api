@@ -6,6 +6,7 @@ import importController from '../controllers/import.controller.js';
 import importProfileController from '../controllers/importProfile.controller.js';
 import deviceController from '../controllers/device.controller.js';
 import metricController from '../controllers/metric.controller.js';
+import rawFileController from '../controllers/rawFile.controller.js';
 
 const router = Router();
 
@@ -39,6 +40,10 @@ router.post('/device-catalog', deviceController.upsertDevice);
 router.get('/device-catalog/:sourceId/metrics', deviceController.deviceMetrics);
 router.post('/device-connections', deviceController.createConnection);
 router.get('/device-connections', deviceController.listConnections);
+
+// --- F0.1: RawFile (file grezzo originale di un import/upload) ---
+router.post('/raw-files', rawFileController.uploadMiddleware, rawFileController.upload);
+router.get('/raw-files/:id/download', rawFileController.download);
 
 export default router;
 

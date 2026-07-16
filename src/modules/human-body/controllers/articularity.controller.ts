@@ -4,9 +4,11 @@ import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import HumanBodyArticularity from '../models/humanBodyArticularity.model.js';
 import { resolveHumanBodyPointId } from './humanBodyPoint.helper.js';
+import { assertEvaluationEditable } from '../../evaluations/services/evaluationGuard.js';
 
 export const saveArticularity = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
+    await assertEvaluationEditable(schema, req.body?.evaluationId);
     const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body);
 
     if (!humanBodyPointId) {

@@ -17,6 +17,12 @@ export interface EvaluationAttributes {
     title?: string | null;
     notes?: string | null;
     status: EvaluationStatus;
+    /**
+     * Valutazione da cui questa è stata DERIVATA (FASE E, "Duplica in nuova valutazione"). Una
+     * `COMPLETED` è immutabile: per modificarla si crea una nuova `DRAFT` che copia i suoi dati e ne
+     * riferisce l'origine qui. Nullable per le valutazioni create ex-novo.
+     */
+    parentEvaluationId?: string | null;
 }
 
 export type EvaluationCreationAttributes = Optional<EvaluationAttributes, 'id' | 'date' | 'status'>;
@@ -38,6 +44,7 @@ export class Evaluation
     declare title: string | null;
     declare notes: string | null;
     declare status: EvaluationStatus;
+    declare parentEvaluationId: string | null;
 }
 
 Evaluation.init(
@@ -53,7 +60,8 @@ Evaluation.init(
             type: DataTypes.ENUM('DRAFT', 'COMPLETED'),
             allowNull: false,
             defaultValue: 'COMPLETED'
-        }
+        },
+        parentEvaluationId: { type: DataTypes.UUID, allowNull: true }
     },
     { sequelize, modelName: 'evaluation', tableName: 'evaluations' }
 );

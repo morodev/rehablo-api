@@ -4,6 +4,7 @@ import { sendSuccessResponse } from '../../../utils/response.js';
 import { Scale, QuestionScale, AnswerScale } from '../models/catalog/index.js';
 import UserScaleInstance from '../models/userScaleInstance.model.js';
 import UserAnswer from '../models/userAnswer.model.js';
+import { assertEvaluationEditable } from '../../evaluations/services/evaluationGuard.js';
 
 interface ScaleAnswerInput {
     questionId: string;
@@ -13,11 +14,20 @@ interface ScaleAnswerInput {
 
 export const saveScale = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const body = req.body as { userId?: string; patientId?: string; scaleId: string; questions: ScaleAnswerInput[] };
+    const body = req.body as {
+        userId?: string;
+        patientId?: string;
+        evaluationId?: string;
+        scaleId: string;
+        questions: ScaleAnswerInput[];
+    };
+
+    await assertEvaluationEditable(schema, body.evaluationId);
 
     const newScaleInstance = await UserScaleInstance.schema(schema).create({
         userId: body.userId,
         patientId: body.patientId,
+        evaluationId: body.evaluationId ?? null,
         scaleId: body.scaleId
     });
 

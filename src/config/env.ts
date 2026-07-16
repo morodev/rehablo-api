@@ -25,6 +25,12 @@ export const env = {
     // In produzione impostare DEVICE_CREDENTIALS_SECRET a una stringa lunga e casuale.
     deviceCredentialsSecret: required('DEVICE_CREDENTIALS_SECRET', 'change-me-device-credentials-secret'),
 
+    // F0.1 — RawFile: directory locale dove vengono conservati i file grezzi (CSV/Excel/PDF) dei
+    // dispositivi. In futuro sostituibile da un adapter S3/MinIO senza cambiare il resto del modulo
+    // (vedi docs/REHABLO_OS_IMPLEMENTATION_PLAN.md, StorageAdapter).
+    rawFileStorageDir: process.env.RAW_FILE_STORAGE_DIR || './storage/raw-files',
+    maxUploadSizeMb: parseInt(process.env.MAX_UPLOAD_SIZE_MB || '20', 10),
+
     stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
 
     emailHost: process.env.EMAIL_HOST || '',

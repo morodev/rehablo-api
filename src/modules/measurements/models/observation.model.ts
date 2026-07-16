@@ -19,6 +19,13 @@ export interface ObservationAttributes {
     patientId: string;
     evaluationId?: string | null;
     sessionId?: string | null;
+    /**
+     * Punto del corpo umano a cui questa misura è agganciata (FASE E): quando l'operatore clicca un
+     * punto e sceglie "Device/CSV", le Observation risultanti puntano a quel `humanBodyPointId`, così
+     * ricliccando il punto si rivedono le misure come sintomi/ROM. Nullable per le misure non ancorate
+     * a un punto (es. import massivo di seduta). Riferimento logico, nessuna FK cross-schema.
+     */
+    humanBodyPointId?: string | null;
     /** Riferimento logico a MetricDefinition.code (schema public). Non è una FK cross-schema. */
     metricCode: string;
     /** Valore numerico (per la maggior parte delle metriche). */
@@ -61,6 +68,7 @@ export class Observation
     declare patientId: string;
     declare evaluationId: string | null;
     declare sessionId: string | null;
+    declare humanBodyPointId: string | null;
     declare metricCode: string;
     declare value: number | null;
     declare valueJson: Record<string, unknown> | null;
@@ -85,6 +93,7 @@ Observation.init(
         patientId: { type: DataTypes.UUID, allowNull: false },
         evaluationId: { type: DataTypes.UUID, allowNull: true },
         sessionId: { type: DataTypes.UUID, allowNull: true },
+        humanBodyPointId: { type: DataTypes.UUID, allowNull: true },
         metricCode: { type: DataTypes.STRING, allowNull: false },
         value: { type: DataTypes.DOUBLE, allowNull: true },
         valueJson: { type: DataTypes.JSONB, allowNull: true },
@@ -123,7 +132,9 @@ Observation.init(
         indexes: [
             { fields: ['patientId'] },
             { fields: ['metricCode'] },
-            { fields: ['patientId', 'metricCode'] }
+            { fields: ['patientId', 'metricCode'] },
+            { fields: ['evaluationId'] },
+            { fields: ['humanBodyPointId'] }
         ]
     }
 );

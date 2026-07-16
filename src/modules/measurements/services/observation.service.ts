@@ -26,6 +26,8 @@ export interface ObservationInput {
     metadata?: Record<string, unknown> | null;
     evaluationId?: string | null;
     sessionId?: string | null;
+    /** Punto del corpo umano a cui agganciare la misura (FASE E: import "Device/CSV" da un punto). */
+    humanBodyPointId?: string | null;
 }
 
 export interface IngestContext {
@@ -93,6 +95,7 @@ export async function ingestObservations(
             patientId: input.patientId,
             evaluationId: input.evaluationId ?? null,
             sessionId: input.sessionId ?? null,
+            humanBodyPointId: input.humanBodyPointId ?? null,
             metricCode: input.metricCode,
             value: numericValue,
             unit,
@@ -119,13 +122,17 @@ export async function ingestObservations(
 export interface ListObservationsFilter {
     patientId?: string;
     metricCode?: string;
+    humanBodyPointId?: string;
+    evaluationId?: string;
 }
 
-/** Lettura delle Observation di un paziente (o filtrate per metrica). */
+/** Lettura delle Observation di un paziente (o filtrate per metrica/punto/valutazione). */
 export async function listObservations(schema: string, filter: ListObservationsFilter): Promise<Observation[]> {
     const where: Record<string, unknown> = {};
     if (filter.patientId) where.patientId = filter.patientId;
     if (filter.metricCode) where.metricCode = filter.metricCode;
+    if (filter.humanBodyPointId) where.humanBodyPointId = filter.humanBodyPointId;
+    if (filter.evaluationId) where.evaluationId = filter.evaluationId;
 
     return Observation.schema(schema).findAll({
         where,

@@ -2,8 +2,12 @@ import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import Patient from '../../patients/models/patient.model.js';
+import Observation from '../../measurements/models/observation.model.js';
+import { assertEvaluationEditable, assertNotFutureDate } from '../services/evaluationGuard.js';
+import { cloneEvaluation } from '../services/evaluationClone.js';
 import {
     Evaluation,
+    HumanBodyPoint,
     HumanBodySymptom,
     HumanBodyArticularity,
     HumanBodyStrength,
@@ -41,6 +45,9 @@ export const createEvaluation = asyncHandler(async (req: Request, res: Response)
         return sendErrorResponse(res, 400, 'patientId is required');
     }
 
+    // FASE E: la data della valutazione non può essere futura (solo oggi o nel passato).
+    assertNotFutureDate(date);
+
     // Se la struttura non è indicata esplicitamente per questa valutazione, si ricade sulla
     // struttura di riferimento anagrafico del paziente (necessaria per instradare correttamente
     // un futuro invio al FSE regionale in base alla Regione della struttura).
@@ -57,7 +64,9 @@ export const createEvaluation = asyncHandler(async (req: Request, res: Response)
         date: date ? new Date(date) : new Date(),
         title: title ?? null,
         notes: notes ?? null,
-        status: status ?? 'COMPLETED'
+        // FASE E: una nuova valutazione nasce come DRAFT (in lavorazione) e diventa COMPLETED solo con
+        // "Salva e chiudi". Prima era COMPLETED di default (flusso legacy senza ciclo di vita).
+        status: status ?? 'DRAFT'
     });
 
     return sendSuccessResponse(res, 201, evaluation, 'Valutazione creata correttamente');
@@ -83,6 +92,7 @@ export const getEvaluationById = asyncHandler(async (req: Request, res: Response
 
     const evaluation = await Evaluation.schema(schema).findByPk(evaluationId, {
         include: [
+            { model: HumanBodyPoint.schema(schema) },
             { model: HumanBodySymptom.schema(schema) },
             { model: HumanBodyArticularity.schema(schema) },
             { model: HumanBodyStrength.schema(schema) },
@@ -92,9 +102,10 @@ export const getEvaluationById = asyncHandler(async (req: Request, res: Response
                     { model: HumanBodyQuestionnaire.schema(schema), attributes: ['title', 'description'] },
                     {
                         model: HumanBodyAnswerInstance.schema(schema),
+                        as: 'answers',
                         include: [
-                            { model: HumanBodyQuestion.schema(schema), attributes: ['text'] },
-                            { model: HumanBodyAnswer.schema(schema), attributes: ['text', 'isCorrect'] }
+                            { model: HumanBodyQuestion.schema(schema), as: 'question', attributes: ['text'] },
+                            { model: HumanBodyAnswer.schema(schema), as: 'answer', attributes: ['text', 'isCorrect'] }
                         ]
                     }
                 ]
@@ -120,12 +131,27 @@ export const getEvaluationById = asyncHandler(async (req: Request, res: Response
         return sendErrorResponse(res, 404, 'Valutazione non trovata');
     }
 
-    return sendSuccessResponse(res, 200, evaluation, 'Valutazione caricata correttamente');
+    // Le Observation (misure device/CSV/manuale) vivono nel modulo measurements: le carichiamo con
+    // una query separata per `evaluationId` invece di un'associazione cross-modulo, e le agganciamo
+    // alla risposta come `observations` (FASE E).
+    const observations = await Observation.schema(schema).findAll({
+        where: { evaluationId },
+        order: [['effectiveDateTime', 'DESC']]
+    });
+
+    const payload = { ...evaluation.get({ plain: true }), observations };
+    return sendSuccessResponse(res, 200, payload, 'Valutazione caricata correttamente');
 });
 
 export const updateEvaluation = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const id = req.params.evaluationId;
+
+    // Guard immutabilità (FASE E): si può aggiornare solo una valutazione ancora editabile (DRAFT di
+    // oggi). Questo consente la transizione di chiusura (DRAFT→COMPLETED) e blocca ogni modifica a una
+    // valutazione già chiusa. La data, se presente, non può essere futura.
+    await assertEvaluationEditable(schema, id);
+    assertNotFutureDate(req.body?.date);
 
     const [rowsUpdated] = await Evaluation.schema(schema).update(req.body, { where: { id } });
     if (rowsUpdated === 0) {
@@ -134,6 +160,19 @@ export const updateEvaluation = asyncHandler(async (req: Request, res: Response)
 
     const updated = await Evaluation.schema(schema).findByPk(id);
     return sendSuccessResponse(res, 200, updated, 'Valutazione aggiornata correttamente');
+});
+
+/**
+ * "Duplica in nuova valutazione" (FASE E): crea una nuova valutazione DRAFT derivata dalla sorgente,
+ * copiando tutti i sotto-record (punti, sintomi, ROM, forza, questionari, scale, test, observations)
+ * con nuovi id. Serve a modificare i dati senza alterare la valutazione originale (immutabile).
+ */
+export const cloneEvaluationHandler = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const sourceId = req.params.evaluationId;
+
+    const created = await cloneEvaluation(schema, sourceId, { userId: req.user!.id });
+    return sendSuccessResponse(res, 201, created, 'Valutazione duplicata correttamente');
 });
 
 /** Deleting an evaluation cascades to every symptom/articularity/strength/questionnaire/scale/test attached to it. */
@@ -151,6 +190,7 @@ export default {
     getEvaluations,
     getEvaluationById,
     updateEvaluation,
+    cloneEvaluationHandler,
     deleteEvaluation
 };
 

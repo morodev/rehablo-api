@@ -11,6 +11,7 @@ router.post('/evaluation', evaluationController.createEvaluation);
 router.get('/evaluation', evaluationController.getEvaluations);
 router.get('/evaluation/:evaluationId', evaluationController.getEvaluationById);
 router.put('/evaluation/:evaluationId', evaluationController.updateEvaluation);
+router.post('/evaluation/:evaluationId/clone', evaluationController.cloneEvaluationHandler);
 router.delete('/evaluation/:evaluationId', evaluationController.deleteEvaluation);
 
 export default router;
