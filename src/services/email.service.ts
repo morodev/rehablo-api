@@ -9,7 +9,12 @@ export const transporter = Nodemailer.createTransport({
     auth: {
         user: env.emailUser,
         pass: env.emailPass
-    }
+    },
+    // Il default di Nodemailer è ~2 minuti: troppo per un fire-and-forget. Se l'host SMTP non è
+    // raggiungibile (es. porta filtrata dal provider/hosting cloud), falliamo più velocemente.
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 10_000
 });
 
 const emailDomain = process.env.EMAIL_DOMAIN || 'http://localhost:4200';
