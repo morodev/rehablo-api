@@ -51,47 +51,6 @@ async function bootstrap() {
 
     app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-    // Endpoint diagnostico TEMPORANEO per capire se il timeout SMTP è un blocco di rete generale
-    // di Render verso le porte SMTP, oppure specifico verso Hostinger. Accetta ?host=&port= per
-    // testare target diversi senza dover ridistribuire il codice. Da rimuovere a problema risolto.
-    app.get('/debug/smtp-check', async (req, res) => {
-        const net = await import('net');
-        const host = (req.query.host as string) || env.emailHost;
-        const port = parseInt((req.query.port as string) || String(env.emailPort), 10);
-        const result: Record<string, unknown> = { host, port };
-
-        // 1) Connessione TCP grezza (bypassa completamente Nodemailer/TLS) verso l'host/porta richiesti
-        const tcpStart = Date.now();
-        result.tcp = await new Promise((resolve) => {
-            const socket = net.connect({ host, port, timeout: 8000 });
-            socket.once('connect', () => {
-                socket.destroy();
-                resolve({ ok: true, ms: Date.now() - tcpStart });
-            });
-            socket.once('timeout', () => {
-                socket.destroy();
-                resolve({ ok: false, error: 'ETIMEDOUT (raw TCP)', ms: Date.now() - tcpStart });
-            });
-            socket.once('error', (err: any) => {
-                resolve({ ok: false, error: err?.code || err?.message, ms: Date.now() - tcpStart });
-            });
-        });
-
-        // 2) Verify completo Nodemailer (TCP + TLS + AUTH), solo se non sono stati passati host/port
-        // custom (altrimenti le credenziali in env non sono valide per l'host di test).
-        if (!req.query.host) {
-            const { transporter } = await import('./services/email.service.js');
-            const smtpStart = Date.now();
-            try {
-                await transporter.verify();
-                result.smtpVerify = { ok: true, ms: Date.now() - smtpStart };
-            } catch (err: any) {
-                result.smtpVerify = { ok: false, error: err?.code || err?.message, ms: Date.now() - smtpStart };
-            }
-        }
-
-        res.json(result);
-    });
 
     // --- Domain routers (every module owns its own URL prefix-free routes, mounted at root) ---
     app.use(authRoutes);
