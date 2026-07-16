@@ -51,17 +51,19 @@ async function bootstrap() {
 
     app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-    // Endpoint diagnostico TEMPORANEO per capire se il timeout SMTP è un blocco di rete
-    // (Render -> Hostinger) o altro. Da rimuovere una volta risolto il problema email.
-    app.get('/debug/smtp-check', async (_req, res) => {
+    // Endpoint diagnostico TEMPORANEO per capire se il timeout SMTP è un blocco di rete generale
+    // di Render verso le porte SMTP, oppure specifico verso Hostinger. Accetta ?host=&port= per
+    // testare target diversi senza dover ridistribuire il codice. Da rimuovere a problema risolto.
+    app.get('/debug/smtp-check', async (req, res) => {
         const net = await import('net');
-        const { transporter } = await import('./services/email.service.js');
-        const result: Record<string, unknown> = { host: env.emailHost, port: env.emailPort };
+        const host = (req.query.host as string) || env.emailHost;
+        const port = parseInt((req.query.port as string) || String(env.emailPort), 10);
+        const result: Record<string, unknown> = { host, port };
 
-        // 1) Connessione TCP grezza (bypassa completamente Nodemailer/TLS)
+        // 1) Connessione TCP grezza (bypassa completamente Nodemailer/TLS) verso l'host/porta richiesti
         const tcpStart = Date.now();
         result.tcp = await new Promise((resolve) => {
-            const socket = net.connect({ host: env.emailHost, port: env.emailPort, timeout: 8000 });
+            const socket = net.connect({ host, port, timeout: 8000 });
             socket.once('connect', () => {
                 socket.destroy();
                 resolve({ ok: true, ms: Date.now() - tcpStart });
@@ -75,13 +77,17 @@ async function bootstrap() {
             });
         });
 
-        // 2) Verify completo Nodemailer (TCP + TLS + AUTH)
-        const smtpStart = Date.now();
-        try {
-            await transporter.verify();
-            result.smtpVerify = { ok: true, ms: Date.now() - smtpStart };
-        } catch (err: any) {
-            result.smtpVerify = { ok: false, error: err?.code || err?.message, ms: Date.now() - smtpStart };
+        // 2) Verify completo Nodemailer (TCP + TLS + AUTH), solo se non sono stati passati host/port
+        // custom (altrimenti le credenziali in env non sono valide per l'host di test).
+        if (!req.query.host) {
+            const { transporter } = await import('./services/email.service.js');
+            const smtpStart = Date.now();
+            try {
+                await transporter.verify();
+                result.smtpVerify = { ok: true, ms: Date.now() - smtpStart };
+            } catch (err: any) {
+                result.smtpVerify = { ok: false, error: err?.code || err?.message, ms: Date.now() - smtpStart };
+            }
         }
 
         res.json(result);
