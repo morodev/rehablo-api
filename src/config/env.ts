@@ -39,6 +39,12 @@ export const env = {
     emailUser: process.env.EMAIL_AUTH_USER || '',
     emailPass: process.env.EMAIL_AUTH_PASS || '',
 
-    corsOrigin: process.env.CORS_ORIGIN || '*'
+    // CORS_ORIGIN: uno o più origin (dominio, senza path) separati da virgola, es.
+    // "https://rehablo.it,https://www.rehablo.it". Eventuali slash finali vengono rimossi
+    // automaticamente perché l'header Origin del browser non lo include mai (confronto esatto).
+    corsOrigin: (process.env.CORS_ORIGIN || '*')
+        .split(',')
+        .map((origin) => origin.trim().replace(/\/+$/, ''))
+        .filter(Boolean)
 };
 

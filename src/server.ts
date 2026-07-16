@@ -30,7 +30,21 @@ async function bootstrap() {
     const app = express();
 
     app.use(helmet());
-    app.use(cors({ origin: env.corsOrigin }));
+    app.use(
+        cors({
+            origin(requestOrigin, callback) {
+                // Nessun header Origin (curl, health check, richieste server-to-server): consenti.
+                if (!requestOrigin) return callback(null, true);
+
+                if (env.corsOrigin.includes('*') || env.corsOrigin.includes(requestOrigin)) {
+                    return callback(null, true);
+                }
+
+                console.warn(`[cors] origin rifiutato: "${requestOrigin}" (consentiti: ${env.corsOrigin.join(', ')})`);
+                return callback(new Error(`Origin "${requestOrigin}" non consentito da CORS`));
+            }
+        })
+    );
     app.use(morgan(env.isProduction ? 'combined' : 'dev'));
     app.use(bodyParser.urlencoded({ extended: false }));
     app.use(bodyParser.json());
