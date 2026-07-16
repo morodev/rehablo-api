@@ -1,3 +1,10 @@
+databases:
+  - name: rehablo-db
+    plan: free
+    region: frankfurt
+    databaseName: rehablo
+    user: rehablo
+
 services:
   - type: web
     name: rehablo-api
@@ -10,4 +17,36 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20.14.0
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: rehablo-db
+          property: connectionString
+      - key: DB_SSL
+        value: "false"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 7d
+      - key: DEVICE_CREDENTIALS_SECRET
+        generateValue: true
+      - key: RAW_FILE_STORAGE_DIR
+        value: ./storage/raw-files
+      - key: MAX_UPLOAD_SIZE_MB
+        value: "20"
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: EMAIL_HOST
+        sync: false
+      - key: EMAIL_PORT
+        value: "465"
+      - key: EMAIL_SECURE
+        value: "true"
+      - key: EMAIL_AUTH_USER
+        sync: false
+      - key: EMAIL_AUTH_PASS
+        sync: false
 

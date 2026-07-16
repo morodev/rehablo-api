@@ -99,7 +99,12 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
 
     const patient: any = agendaEvent.get('patient');
     if (patient?.emails?.length > 0 && patient.emails[0]?.email) {
-        await sendNewEventMail(agendaEvent.get({ plain: true }));
+        // Fire-and-forget: un SMTP non configurato/irraggiungibile non deve far fallire la
+        // creazione dell'appuntamento (già salvato correttamente a DB), stessa logica usata
+        // per signup/forgot-password in email.service.ts.
+        sendNewEventMail(agendaEvent.get({ plain: true })).catch((err) => {
+            console.error('[saveAgendaEvent] notification email could not be sent:', err);
+        });
     }
 
     return sendSuccessResponse(res, 201, agendaEvent, 'Agenda event created');
