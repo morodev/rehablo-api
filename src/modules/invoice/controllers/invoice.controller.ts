@@ -11,6 +11,7 @@ import Product from '../../products-services/models/product.model.js';
 import Service from '../../products-services/models/service.model.js';
 import Patient from '../../patients/models/patient.model.js';
 import Tenant from '../../auth/models/tenant.model.js';
+import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import { evalTotals } from '../utils/evalTotals.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
 
@@ -114,7 +115,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const { InvoiceScoped, ProductScoped, ServiceScoped, InvoiceProductScoped, InvoiceServiceScoped } =
         getScopedModels(schema);
 
-    const { products: requestedProducts = [], services: requestedServices = [], ...invoiceFields } = req.body;
+    const { products: requestedProducts = [], services: requestedServices = [], agendaEventId, ...invoiceFields } = req.body;
 
     const [{ lines: productLines, missingId: missingProductId }, { lines: serviceLines, missingId: missingServiceId }] =
         await Promise.all([
@@ -216,6 +217,16 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                 )
             )
         ]);
+
+        // Fattura emessa a partire da un appuntamento: il collegamento va scritto nella STESSA
+        // transazione, altrimenti un errore qui lascerebbe una fattura senza appuntamento
+        // collegato e la dashboard mostrerebbe di nuovo "da emettere" per una seduta già fatturata.
+        if (agendaEventId) {
+            await AgendaEvent.schema(schema).update(
+                { invoiceId },
+                { where: { id: agendaEventId }, transaction: t }
+            );
+        }
 
         return createdInvoice;
     });
@@ -432,7 +443,10 @@ export const deleteInvoice = asyncHandler(async (req: Request, res: Response) =>
 
     await Promise.all([
         InvoiceProductScoped.destroy({ where: { InvoiceId: id } }),
-        InvoiceServiceScoped.destroy({ where: { InvoiceId: id } })
+        InvoiceServiceScoped.destroy({ where: { InvoiceId: id } }),
+        // L'appuntamento eventualmente collegato torna "da fatturare": senza questo resterebbe
+        // puntato a una fattura inesistente e la dashboard lo darebbe per emesso.
+        AgendaEvent.schema(schema).update({ invoiceId: null }, { where: { invoiceId: id } })
     ]);
     await InvoiceScoped.destroy({ where: { id } });
 

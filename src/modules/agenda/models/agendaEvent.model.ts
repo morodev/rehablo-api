@@ -20,6 +20,14 @@ export interface AgendaEventAttributes {
     status?: string | null;
     erasable?: boolean | null;
     eventTypeId?: string | null;
+    /**
+     * Fattura emessa per questo appuntamento (1 fattura ↔ 1 appuntamento).
+     *
+     * È l'unica fonte di verità per le colonne "documento fiscale" e "stato pagamento"
+     * della dashboard: se valorizzato il documento è emesso e lo stato del pagamento è
+     * quello della fattura collegata. Nessuno stato di pagamento viene duplicato qui.
+     */
+    invoiceId?: string | null;
 }
 
 export type AgendaEventCreationAttributes = Optional<AgendaEventAttributes, 'id'>;
@@ -44,6 +52,7 @@ export class AgendaEvent
     declare status: string | null;
     declare erasable: boolean | null;
     declare eventTypeId: string | null;
+    declare invoiceId: string | null;
 }
 
 AgendaEvent.init(
@@ -63,7 +72,8 @@ AgendaEvent.init(
         duration: DataTypes.STRING,
         status: DataTypes.STRING,
         erasable: { type: DataTypes.BOOLEAN, defaultValue: true },
-        eventTypeId: { type: DataTypes.UUID, allowNull: true }
+        eventTypeId: { type: DataTypes.UUID, allowNull: true },
+        invoiceId: { type: DataTypes.UUID, allowNull: true }
     },
     { sequelize, modelName: 'agendaEvent', tableName: 'agenda_events' }
 );

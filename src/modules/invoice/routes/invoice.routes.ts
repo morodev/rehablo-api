@@ -3,10 +3,15 @@ import { requireAuth } from '../../../middleware/auth.js';
 import { requirePermission } from '../../../middleware/rbac.js';
 import { resolveTenantSchema } from '../../../middleware/tenantSchema.js';
 import invoiceController from '../controllers/invoice.controller.js';
+import reportsController from '../controllers/reports.controller.js';
 
 const router = Router();
 
 router.use(requireAuth, resolveTenantSchema);
+
+// Aggregazioni economiche per la dashboard di direzione. Dichiarata PRIMA di `/invoice/:invoiceId`
+// per non farla intercettare come id di fattura.
+router.get('/reports/overview', requirePermission('invoice', 'read'), reportsController.getOverview);
 
 router.post('/invoice', requirePermission('invoice', 'create'), invoiceController.saveInvoice);
 router.get('/invoice', requirePermission('invoice', 'read'), invoiceController.findAllInvoices);
