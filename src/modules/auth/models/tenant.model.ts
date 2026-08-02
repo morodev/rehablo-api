@@ -25,6 +25,8 @@ export interface TenantAttributes {
     city?: string | null;
     province?: string | null;
     zipCode?: string | null;
+    email?: string | null;
+    phone?: string | null;
     /** Progressivo dell'ultimo numero fattura/ricevuta emesso per anno fiscale: { "2026": 42 }. */
     lastDocumentNumberByYear: Record<string, number>;
 }
@@ -54,6 +56,8 @@ export class Tenant extends Model<TenantAttributes, TenantCreationAttributes> im
     declare city: string | null;
     declare province: string | null;
     declare zipCode: string | null;
+    declare email: string | null;
+    declare phone: string | null;
     declare lastDocumentNumberByYear: Record<string, number>;
 }
 
@@ -78,6 +82,8 @@ Tenant.init(
         city: { type: DataTypes.STRING, allowNull: true },
         province: { type: DataTypes.STRING(2), allowNull: true },
         zipCode: { type: DataTypes.STRING(10), allowNull: true },
+        email: { type: DataTypes.STRING, allowNull: true },
+        phone: { type: DataTypes.STRING, allowNull: true },
         lastDocumentNumberByYear: { type: DataTypes.JSONB, defaultValue: {} }
     },
     { sequelize, modelName: 'tenant', tableName: 'tenants' }

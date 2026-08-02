@@ -16,6 +16,10 @@ export interface StructureAttributes {
     region?: string | null;
     /** Codice struttura sanitaria (es. codice STS2 se accreditata SSN, o codice interno). */
     structureCode?: string | null;
+    // --- Dati di contatto opzionali per la sede (differenti dall'account principale) ---
+    phone?: string | null;
+    phone2?: string | null;
+    email?: string | null;
 }
 
 export type StructureCreationAttributes = Optional<StructureAttributes, 'id'>;
@@ -30,6 +34,9 @@ export class Structure extends Model<StructureAttributes, StructureCreationAttri
     declare zipCode: string | null;
     declare region: string | null;
     declare structureCode: string | null;
+    declare phone: string | null;
+    declare phone2: string | null;
+    declare email: string | null;
 }
 
 Structure.init(
@@ -42,7 +49,10 @@ Structure.init(
         province: { type: DataTypes.STRING(2), allowNull: true },
         zipCode: { type: DataTypes.STRING(10), allowNull: true },
         region: { type: DataTypes.STRING, allowNull: true },
-        structureCode: { type: DataTypes.STRING, allowNull: true }
+        structureCode: { type: DataTypes.STRING, allowNull: true },
+        phone: { type: DataTypes.STRING, allowNull: true },
+        phone2: { type: DataTypes.STRING, allowNull: true },
+        email: { type: DataTypes.STRING, allowNull: true }
     },
     { sequelize, modelName: 'structure', tableName: 'structures' }
 );

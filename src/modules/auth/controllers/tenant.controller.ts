@@ -127,11 +127,29 @@ export const updateTenant = asyncHandler(async (req: Request, res: Response) => 
 
 export const findTenantById = asyncHandler(async (req: Request, res: Response) => {
     const id = req.params.tenantId;
-    const tenant = await Tenant.findByPk(id);
-    if (!tenant) {
-        return sendErrorResponse(res, 404, `Tenant with id: ${id} not found`);
+    console.log('=== findTenantById called ===');
+    console.log('Requested tenant ID:', id);
+    console.log('User from JWT:', req.user);
+    
+    let tenant = await Tenant.findByPk(id);
+    console.log('Tenant found:', !!tenant);
+    
+    if (tenant) {
+        console.log('Tenant data:', { id: tenant.id, businessName: tenant.businessName });
+        return sendSuccessResponse(res, 200, tenant, `Tenant with id: ${id} found`);
     }
-    return sendSuccessResponse(res, 200, tenant, `Tenant with id: ${id} found`);
+    
+    // If not found, log all tenants to debug
+    console.warn(`Tenant ${id} not found. Checking all tenants in database...`);
+    const allTenants = await Tenant.findAll();
+    console.log('All tenants in DB:', allTenants.map(t => ({ id: t.id, businessName: t.businessName })));
+    
+    // Check if user has a tenant association
+    if (req.user?.tenants && req.user.tenants.length > 0) {
+        console.log('User tenants from JWT:', req.user.tenants);
+    }
+    
+    return sendErrorResponse(res, 404, `Tenant with id: ${id} not found`);
 });
 
 export default { createTenant, updateTenant, findTenantById };
