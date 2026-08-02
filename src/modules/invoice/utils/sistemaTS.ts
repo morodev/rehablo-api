@@ -29,9 +29,13 @@ import { TenantAttributes } from '../../auth/models/tenant.model.js';
 export interface SistemaTSRecordInput {
     invoice: Pick<
         InvoiceAttributes,
-        'id' | 'documentNumber' | 'documentYear' | 'emissionDate' | 'invoiceTotal' | 'stsExpenseTypeCode'
+        'id' | 'documentNumber' | 'documentYear' | 'emissionDate' | 'invoiceTotal' | 'stsExpenseTypeCode' | 'issuer'
     >;
     patient: Pick<PatientAttributes, 'name' | 'surname' | 'fiscalCode' | 'stsOppositionToDataSending'>;
+    /**
+     * Dati correnti dello studio, usati SOLO come ripiego per i documenti emessi prima
+     * dell'introduzione dello snapshot `invoice.issuer`.
+     */
     tenant: Pick<TenantAttributes, 'VATNumber' | 'taxCode' | 'businessName'>;
 }
 
@@ -54,12 +58,26 @@ export function buildSistemaTSRecord({ invoice, patient, tenant }: SistemaTSReco
     if (!patient.fiscalCode) {
         throw new Error('Impossibile generare il record Sistema TS: codice fiscale paziente mancante');
     }
-    if (!tenant.VATNumber && !tenant.taxCode) {
+
+    // L'identificativo dell'erogatore va preso dallo SNAPSHOT della fattura, non dai dati
+    // correnti dello studio: se la partita IVA cambia, un nuovo invio (o un reinvio) di
+    // annualità passate deve continuare a riportare quella in vigore alla data del documento,
+    // altrimenti i dati trasmessi non corrisponderebbero ai documenti consegnati al paziente.
+    //
+    // La scelta della FONTE avviene una volta sola: se lo snapshot esiste è autoritativo in
+    // blocco. Leggere i due campi con fallback indipendenti mischierebbe le epoche, ad esempio
+    // usando la partita IVA di oggi per uno studio che alla data del documento operava con il
+    // solo codice fiscale.
+    const issuer = invoice.issuer
+        ? { vatNumber: invoice.issuer.vatNumber, taxCode: invoice.issuer.taxCode }
+        : { vatNumber: tenant.VATNumber, taxCode: tenant.taxCode };
+
+    if (!issuer.vatNumber && !issuer.taxCode) {
         throw new Error('Impossibile generare il record Sistema TS: dati fiscali dello studio/professionista mancanti');
     }
 
     return {
-        partitaIvaErogatore: tenant.VATNumber || tenant.taxCode || '',
+        partitaIvaErogatore: issuer.vatNumber || issuer.taxCode || '',
         codiceFiscalePaziente: patient.fiscalCode.toUpperCase(),
         dataDocumento: invoice.emissionDate ? new Date(invoice.emissionDate).toISOString().slice(0, 10) : '',
         numeroDocumento: `${invoice.documentNumber ?? ''}`,

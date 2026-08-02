@@ -41,6 +41,33 @@ export interface InvoiceAttributes {
     stsExcluded: boolean;
     stsSent: boolean;
     stsSentAt?: Date | null;
+    /**
+     * Snapshot dei dati del CEDENTE/PRESTATORE al momento dell'emissione.
+     *
+     * Obbligatori sul documento per l'art. 21 DPR 633/72 (ditta/denominazione, residenza o
+     * domicilio, partita IVA del soggetto che effettua la prestazione).
+     *
+     * Sono copiati qui e non letti dal tenant in fase di stampa per lo stesso motivo per cui
+     * `productName`/`productVat` sono copiati sulle righe: se lo studio cambia sede, ragione
+     * sociale o partita IVA, i documenti già emessi devono continuare a riportare i dati
+     * validi alla data di emissione. Ristampare una fattura del 2024 con l'indirizzo del 2026
+     * la renderebbe difforme dall'originale consegnato al paziente.
+     */
+    issuer?: InvoiceIssuerSnapshot | null;
+}
+
+/** Dati del soggetto emittente congelati sul documento. */
+export interface InvoiceIssuerSnapshot {
+    businessName: string | null;
+    vatNumber: string | null;
+    taxCode: string | null;
+    address: string | null;
+    city: string | null;
+    province: string | null;
+    zipCode: string | null;
+    pec: string | null;
+    email: string | null;
+    phone: string | null;
 }
 
 export type InvoiceCreationAttributes = Optional<
@@ -86,6 +113,7 @@ export class Invoice extends Model<InvoiceAttributes, InvoiceCreationAttributes>
     declare stsExcluded: boolean;
     declare stsSent: boolean;
     declare stsSentAt: Date | null;
+    declare issuer: InvoiceIssuerSnapshot | null;
 }
 
 Invoice.init(
@@ -118,7 +146,8 @@ Invoice.init(
         stsExpenseTypeCode: DataTypes.STRING,
         stsExcluded: { type: DataTypes.BOOLEAN, defaultValue: false },
         stsSent: { type: DataTypes.BOOLEAN, defaultValue: false },
-        stsSentAt: DataTypes.DATE
+        stsSentAt: DataTypes.DATE,
+        issuer: { type: DataTypes.JSONB, allowNull: true }
     },
     { sequelize, modelName: 'invoice', tableName: 'invoices' }
 );

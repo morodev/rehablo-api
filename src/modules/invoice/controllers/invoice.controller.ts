@@ -13,6 +13,7 @@ import Patient from '../../patients/models/patient.model.js';
 import Tenant from '../../auth/models/tenant.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import { evalTotals } from '../utils/evalTotals.js';
+import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
 
 /**
@@ -162,6 +163,22 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         }
     }
 
+    // --- Dati del cedente/prestatore: senza non si emette. ---
+    // Il controllo sta QUI e non solo nella UI perché è un requisito di validità del documento
+    // (art. 21 DPR 633/72): un client che chiamasse direttamente l'API produrrebbe altrimenti
+    // fatture prive dei dati obbligatori, già numerate e quindi non eliminabili senza buchi.
+    const issuerTenant = await Tenant.findByPk(tenantId);
+    const missingIssuerFields = getMissingIssuerFields(issuerTenant?.get({ plain: true }) as any);
+    if (missingIssuerFields.length > 0) {
+        return sendErrorResponse(
+            res,
+            422,
+            `Dati di fatturazione dello studio incompleti: ${missingIssuerFields.join(', ')}. ` +
+                'Completali in Impostazioni → Dati aziendali prima di emettere il documento.'
+        );
+    }
+    const issuer = buildIssuerSnapshot(issuerTenant!.get({ plain: true }) as any);
+
     // Numerazione progressiva + creazione fattura + creazione righe in un'UNICA transazione:
     // se una qualsiasi parte fallisce, non deve restare un numero "bruciato" senza fattura, né
     // una fattura senza le sue righe.
@@ -178,7 +195,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         await tenant.update({ lastDocumentNumberByYear: counters }, { transaction: t });
 
         const createdInvoice = await InvoiceScoped.create(
-            { ...invoiceFields, ...totals, documentNumber: nextNumber, documentYear: fiscalYear, stsExcluded },
+            { ...invoiceFields, ...totals, documentNumber: nextNumber, documentYear: fiscalYear, stsExcluded, issuer },
             { transaction: t }
         );
         const invoiceId = createdInvoice.get('id') as string;
@@ -309,7 +326,17 @@ export const findOneInvoice = asyncHandler(async (req: Request, res: Response) =
         return sendErrorResponse(res, 404, 'Fattura non trovata');
     }
 
-    return sendSuccessResponse(res, 200, { invoice }, 'Fattura caricata correttamente');
+    // Fatture create prima dell'introduzione dello snapshot: si ripiega sui dati correnti
+    // dello studio, così la stampa resta completa. Il documento NON viene modificato: il
+    // ripiego vale solo per la risposta.
+    const plainInvoice = invoice.get({ plain: true }) as unknown as Record<string, unknown>;
+    if (!plainInvoice.issuer) {
+        const tenant = await Tenant.findByPk(req.user!.tenants[0].id);
+        plainInvoice.issuer = tenant ? buildIssuerSnapshot(tenant.get({ plain: true }) as any) : null;
+        plainInvoice.issuerIsFallback = true;
+    }
+
+    return sendSuccessResponse(res, 200, { invoice: plainInvoice }, 'Fattura caricata correttamente');
 });
 
 /**
@@ -468,6 +495,8 @@ export const exportSistemaTS = asyncHandler(async (req: Request, res: Response) 
     const markAsSent = req.query.markAsSent === 'true';
     const tenantId = req.user!.tenants[0].id;
 
+    // Serve solo come ripiego per i documenti emessi prima dell'introduzione di `invoice.issuer`:
+    // per tutti gli altri l'identificativo dell'erogatore viene letto dallo snapshot del documento.
     const tenant = await Tenant.findByPk(tenantId);
     if (!tenant) {
         return sendErrorResponse(res, 404, 'Struttura/tenant non trovato');

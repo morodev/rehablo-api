@@ -106,20 +106,34 @@
    assegnato automaticamente e in modo atomico in `invoice.controller.ts`), `documentType`,
    `vatNature` (es. `N4` per operazioni esenti art. 10 DPR 633/72), `stsExpenseTypeCode`,
    `stsExcluded` (calcolato automaticamente se il paziente si è opposto), `stsSent`, `stsSentAt`.
-6. **`modules/invoice/utils/sistemaTS.ts`**: costruzione dei record e generazione di un file
+6. **`Invoice.issuer`** (JSONB): snapshot dei dati del cedente/prestatore (ragione sociale,
+   P.IVA, codice fiscale, indirizzo completo, PEC, email, telefono) congelato all'emissione.
+   Obbligatori sul documento per l'art. 21 comma 2 DPR 633/72. Sono copiati e non letti dal
+   tenant in fase di stampa/export perché, se lo studio cambia sede o partita IVA, i documenti
+   già emessi devono continuare a riportare i dati validi alla data di emissione — stesso
+   principio già applicato a `productName`/`productVat` sulle righe.
+   - `POST /invoice` rifiuta con **422** se i dati obbligatori dello studio sono incompleti
+     (vedi `modules/invoice/utils/issuer.ts`): il controllo è lato server perché una fattura
+     priva dei dati obbligatori sarebbe comunque già numerata, e i buchi nella numerazione
+     non si sanano cancellando il documento.
+   - `GET /reports/issuer-status` espone alla UI l'elenco dei dati mancanti, per avvisare
+     prima della compilazione.
+   - `buildSistemaTSRecord()` legge l'identificativo dell'erogatore dallo snapshot; i documenti
+     anteriori all'introduzione del campo ricadono sui dati correnti del tenant.
+7. **`modules/invoice/utils/sistemaTS.ts`**: costruzione dei record e generazione di un file
    XML "best effort" con i dati da trasmettere al Sistema TS (da validare con il tracciato
    ufficiale prima di un invio reale).
-7. **`GET /invoice/export/sistema-ts?year=YYYY&markAsSent=true`**: nuovo endpoint che genera
+8. **`GET /invoice/export/sistema-ts?year=YYYY&markAsSent=true`**: nuovo endpoint che genera
    il file di export per l'anno richiesto, escludendo automaticamente le fatture con paziente
    opposto o già inviate.
-8. **`modules/compliance/fse/`**: interfaccia `FseAdapter` + implementazione di default
+9. **`modules/compliance/fse/`**: interfaccia `FseAdapter` + implementazione di default
    `NullFseAdapter` (non effettua alcun invio reale, logga chiaramente che l'integrazione va
    completata con un connettore regionale specifico) — predisposizione per la Fase 3.
-9. **`Evaluation.structureId`** (+ fallback su `Patient.structureId`) e
-   **`regionResolver.ts`/`getFseAdapter(regionCode)`**: correzione di un gap di modellazione —
-   un tenant può avere più `Structure` in Regioni diverse, quindi l'adapter FSE va scelto per
-   ogni singolo documento in base alla Regione della struttura in cui è stato erogato, non una
-   sola volta per tenant (dettagli in `modules/compliance/fse/README.md`, sezione 6).
+10. **`Evaluation.structureId`** (+ fallback su `Patient.structureId`) e
+    **`regionResolver.ts`/`getFseAdapter(regionCode)`**: correzione di un gap di modellazione —
+    un tenant può avere più `Structure` in Regioni diverse, quindi l'adapter FSE va scelto per
+    ogni singolo documento in base alla Regione della struttura in cui è stato erogato, non una
+    sola volta per tenant (dettagli in `modules/compliance/fse/README.md`, sezione 6).
 
 
 > Le colonne sopra vengono create automaticamente al riavvio del backend grazie a

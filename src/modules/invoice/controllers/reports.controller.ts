@@ -4,6 +4,8 @@ import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendSuccessResponse } from '../../../utils/response.js';
 import { patientScopeWhere } from '../../../middleware/rbac.js';
 import Invoice from '../models/invoice.model.js';
+import Tenant from '../../auth/models/tenant.model.js';
+import { getMissingIssuerFields } from '../utils/issuer.js';
 
 /**
  * Aggregazioni economiche per la dashboard di direzione.
@@ -135,6 +137,26 @@ export const getOverview = asyncHandler(async (req: Request, res: Response) => {
     );
 });
 
-export default { getOverview };
+/**
+ * GET /reports/issuer-status
+ *
+ * Dice se lo studio è in regola per emettere documenti fiscali e, in caso contrario,
+ * quali dati mancano. Serve alla UI per avvisare PRIMA che l'utente compili una fattura
+ * intera, invece di farlo fallire al salvataggio.
+ */
+export const getIssuerStatus = asyncHandler(async (req: Request, res: Response) => {
+    const tenantId = req.user!.tenants[0].id;
+    const tenant = await Tenant.findByPk(tenantId);
+    const missing = getMissingIssuerFields(tenant?.get({ plain: true }) as any);
+
+    return sendSuccessResponse(
+        res,
+        200,
+        { ready: missing.length === 0, missing },
+        'Stato dati di fatturazione'
+    );
+});
+
+export default { getOverview, getIssuerStatus };
 
 
