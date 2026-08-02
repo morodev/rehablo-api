@@ -3,11 +3,23 @@ import { Op, fn, col } from 'sequelize';
 import moment from 'moment';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
+import { scopeWhere } from '../../../middleware/rbac.js';
 import { sendNewEventMail } from '../../../services/email.service.js';
 import AgendaEvent from '../models/agendaEvent.model.js';
 import AgendaEventException from '../models/agendaEventException.model.js';
 import EventType from '../models/eventType.model.js';
 import Patient from '../../patients/models/patient.model.js';
+
+/**
+ * Campi per il filtro row-level RBAC.
+ * `calendarId` è l'id dell'utente proprietario del calendario: è l'owner dell'appuntamento.
+ * `structureId` è nullable sugli eventi storici, quindi restano visibili a scope struttura.
+ */
+const AGENDA_SCOPE_FIELDS = {
+    ownerField: 'calendarId',
+    structureField: 'structureId',
+    includeUnassigned: true
+};
 
 // Simple RFC-4122 UUID matcher used to reject malformed ids (e.g. a stray numeric
 // placeholder like `1`) with a clean 400 instead of letting Postgres blow up with
@@ -21,7 +33,7 @@ export const eventDashboardWithFilter = asyncHandler(async (req: Request, res: R
     const endDate = new Date(req.query.endDate as string);
 
     const agendaEvents = await AgendaEvent.schema(schema).findAll({
-        where: { start: { [Op.between]: [startDate, endDate] } },
+        where: { start: { [Op.between]: [startDate, endDate] }, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) },
         attributes: [
             'calendarId',
             [fn('DATE_TRUNC', 'month', fn('TO_DATE', col('start'), 'YYYY-MM-DD')), 'month_start'],
@@ -39,10 +51,8 @@ export const findAllAgendaEvents = asyncHandler(async (req: Request, res: Respon
     const endDate = new Date(req.query.end as string).toISOString();
 
     const agendaEvents = await AgendaEvent.schema(schema).findAll({
-        where: { start: { [Op.between]: [startDate, endDate] } }
+        where: { start: { [Op.between]: [startDate, endDate] }, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
     });
-
-    console.log(agendaEvents);
 
     return sendSuccessResponse(res, 200, { agendaEvents }, 'Agenda events loaded');
 });
@@ -51,8 +61,9 @@ export const findAgendaEventsByUsers = asyncHandler(async (req: Request, res: Re
     const schema = req.tenantSchema!;
     const calendarIds = ((req.query.calendarIds as string) || '').split(',').filter(Boolean);
 
+    // I calendari richiesti vengono comunque intersecati con quelli visibili allo scope.
     const agendaEvents = await AgendaEvent.schema(schema).findAll({
-        where: { calendarId: { [Op.or]: calendarIds } }
+        where: { calendarId: { [Op.or]: calendarIds }, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
     });
 
     return sendSuccessResponse(res, 200, { agendaEvents }, 'Agenda events loaded');
@@ -71,13 +82,19 @@ export const findAppointmentsForPatientById = asyncHandler(async (req: Request, 
         return sendErrorResponse(res, 400, 'Invalid or missing patientId');
     }
 
-    const patient = await Patient.schema(schema).findByPk(patientId);
+    // Il paziente deve rientrare nello scope: altrimenti si rivelerebbe la sua esistenza.
+    const patient = await Patient.schema(schema).findOne({
+        where: {
+            id: patientId,
+            ...scopeWhere(req, { ownerField: 'userId', structureField: 'structureId', includeUnassigned: true })
+        }
+    });
     if (!patient) {
         return sendErrorResponse(res, 404, 'Patient not found');
     }
 
     const agendaEvents = await AgendaEvent.schema(schema).findAll({
-        where: { patient: { id: patientId } as any }
+        where: { patient: { id: patientId } as any, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
     });
 
     return sendSuccessResponse(res, 200, { agendaEvents }, 'Agenda events loaded');
@@ -87,7 +104,12 @@ export const findAllHolidays = asyncHandler(async (req: Request, res: Response) 
     const schema = req.tenantSchema!;
 
     const agendaEvents = await AgendaEvent.schema(schema).findAll({
-        where: { [Op.or]: [{ title: 'Ferie' }, { title: 'Permesso' }] }
+        where: {
+            [Op.and]: [
+                { [Op.or]: [{ title: 'Ferie' }, { title: 'Permesso' }] },
+                scopeWhere(req, AGENDA_SCOPE_FIELDS)
+            ]
+        }
     });
 
     return sendSuccessResponse(res, 200, { agendaEvents }, 'Holidays loaded');
@@ -95,7 +117,19 @@ export const findAllHolidays = asyncHandler(async (req: Request, res: Response) 
 
 export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const agendaEvent = await AgendaEvent.schema(schema).create(req.body.agendaEvent);
+    const payload = { ...req.body.agendaEvent };
+
+    // Chi gestisce solo la propria agenda non può creare eventi nel calendario di altri.
+    if (req.access?.scope === 'own') {
+        payload.calendarId = req.access.userId;
+    }
+    // Traccia la struttura in cui si svolge l'appuntamento: senza, lo scope `structure`
+    // non potrebbe distinguere le sedi.
+    if (!payload.structureId && req.access?.structureId) {
+        payload.structureId = req.access.structureId;
+    }
+
+    const agendaEvent = await AgendaEvent.schema(schema).create(payload);
 
     const patient: any = agendaEvent.get('patient');
     if (patient?.emails?.length > 0 && patient.emails[0]?.email) {
@@ -119,7 +153,9 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
         event.title = event.title?.title;
     }
 
-    const [rowsUpdated] = await AgendaEvent.schema(schema).update(event, { where: { id } });
+    const [rowsUpdated] = await AgendaEvent.schema(schema).update(event, {
+        where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
+    });
     if (rowsUpdated === 0) {
         return sendErrorResponse(res, 404, `Error updating agendaEvent with id=${id}`);
     }
@@ -132,7 +168,9 @@ export const deleteAgendaEvent = asyncHandler(async (req: Request, res: Response
     const schema = req.tenantSchema!;
     const id = req.query.id as string;
 
-    const removed = await AgendaEvent.schema(schema).destroy({ where: { id } });
+    const removed = await AgendaEvent.schema(schema).destroy({
+        where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
+    });
     return sendSuccessResponse(res, 200, { removed }, 'Evento eliminato correttamente');
 });
 
@@ -161,7 +199,11 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
     const schema = req.tenantSchema!;
     const { event, originalEvent, mode } = req.body;
 
-    const recurringEvent = await AgendaEvent.schema(schema).findByPk(event.recurringEventId);
+    // Gate di accesso: se la serie non rientra nello scope, l'operazione si ferma qui.
+    // Le modifiche successive agiscono tutte sullo stesso `recurringEventId`.
+    const recurringEvent = await AgendaEvent.schema(schema).findOne({
+        where: { id: event.recurringEventId, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
+    });
     if (!recurringEvent) {
         return sendErrorResponse(res, 404, 'Recurring event not found');
     }
@@ -213,6 +255,15 @@ export const deleteRecurringEvent = asyncHandler(async (req: Request, res: Respo
     const event = JSON.parse((req.query.event as string) ?? '{}');
     const mode = req.query.mode as string;
 
+    // Gate di accesso valido per tutti i mode: anche la cancellazione di una singola
+    // occorrenza (che crea solo un'eccezione) deve agire su una serie visibile.
+    const series = await AgendaEvent.schema(schema).findOne({
+        where: { id: event.recurringEventId, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
+    });
+    if (!series) {
+        return sendErrorResponse(res, 404, 'Recurring event not found');
+    }
+
     if (mode === 'single') {
         await AgendaEventException.schema(schema).create({
             eventId: event.recurringEventId,
@@ -222,12 +273,7 @@ export const deleteRecurringEvent = asyncHandler(async (req: Request, res: Respo
     }
 
     if (mode === 'future') {
-        const recurringEvent = await AgendaEvent.schema(schema).findByPk(event.recurringEventId);
-        if (!recurringEvent) {
-            return sendErrorResponse(res, 404, 'Recurring event not found');
-        }
-
-        const eventFound: any = recurringEvent.get({ plain: true });
+        const eventFound: any = series.get({ plain: true });
         eventFound.end = moment(event.start).subtract(1, 'day').endOf('day').toISOString();
 
         const parsedRules = parseRecurrenceRules(eventFound.recurrence);

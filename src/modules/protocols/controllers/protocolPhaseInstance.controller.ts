@@ -1,13 +1,39 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
-import { ProtocolPhaseInstance } from '../models/index.js';
+import { patientScopeWhere } from '../../../middleware/rbac.js';
+import { ProtocolInstance, ProtocolPhaseInstance } from '../models/index.js';
 import { ProtocolPhaseTemplate } from '../models/catalog/index.js';
+
+/**
+ * Le fasi non hanno un legame diretto con il paziente: l'unico riferimento è
+ * `protocolInstanceId`. La verifica di accesso passa quindi dal protocollo padre,
+ * che eredita l'ampiezza dai pazienti visibili.
+ */
+async function canAccessPhase(req: Request, phaseInstanceId: string): Promise<boolean> {
+    const schema = req.tenantSchema!;
+
+    const phase = await ProtocolPhaseInstance.schema(schema).findByPk(phaseInstanceId);
+    if (!phase) return false;
+
+    const parent = await ProtocolInstance.schema(schema).findOne({
+        where: {
+            id: phase.get('protocolInstanceId') as string,
+            ...patientScopeWhere(req, schema)
+        }
+    });
+
+    return !!parent;
+}
 
 /** Manual update of a phase instance (e.g. adding progression notes, forcing a status). */
 export const updateProtocolPhaseInstance = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const id = req.params.protocolPhaseInstanceId;
+
+    if (!(await canAccessPhase(req, id))) {
+        return sendErrorResponse(res, 404, 'Impossibile aggiornare la fase del protocollo');
+    }
 
     const [rowsUpdated] = await ProtocolPhaseInstance.schema(schema).update(req.body, { where: { id } });
     if (rowsUpdated === 0) {
@@ -25,6 +51,10 @@ export const updateProtocolPhaseInstance = asyncHandler(async (req: Request, res
 export const advanceProtocolPhase = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const id = req.params.protocolPhaseInstanceId;
+
+    if (!(await canAccessPhase(req, id))) {
+        return sendErrorResponse(res, 404, 'Fase del protocollo non trovata');
+    }
 
     const currentPhase = await ProtocolPhaseInstance.schema(schema).findByPk(id, {
         include: [{ model: ProtocolPhaseTemplate }]

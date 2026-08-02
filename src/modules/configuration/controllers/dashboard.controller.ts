@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
+import { getUserId } from '../../../middleware/rbac.js';
 import Dashboard from '../models/dashboard.model.js';
 import Widget from '../models/widget.model.js';
 
@@ -56,7 +57,11 @@ export const updateDashboard = asyncHandler(async (req: Request, res: Response) 
     const { DashboardScoped, WidgetScoped } = getScopedModels(schema);
     const id = req.params.dashboardId;
 
-    const [rowsUpdated] = await DashboardScoped.update(req.body, { where: { id } });
+    // La dashboard è una configurazione PERSONALE: si modifica solo la propria,
+    // a prescindere dallo scope del ruolo (nemmeno il titolare tocca quelle altrui).
+    const [rowsUpdated] = await DashboardScoped.update(req.body, {
+        where: { id, userId: getUserId(req) }
+    });
     if (rowsUpdated === 0) {
         return sendErrorResponse(res, 404, 'Impossibile aggiornare la dashboard');
     }
@@ -70,7 +75,9 @@ export const deleteDashboard = asyncHandler(async (req: Request, res: Response) 
     const { DashboardScoped } = getScopedModels(schema);
     const id = req.params.dashboardId;
 
-    const removedDashboard = await DashboardScoped.destroy({ where: { id } });
+    const removedDashboard = await DashboardScoped.destroy({
+        where: { id, userId: getUserId(req) }
+    });
     return sendSuccessResponse(res, 200, { removedDashboard }, 'Dashboard eliminata correttamente');
 });
 

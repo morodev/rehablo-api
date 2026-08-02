@@ -5,6 +5,7 @@ import StructureAvailability from './structureAvailability.model.js';
 import UserAvailability from './userAvailability.model.js';
 import TenantUser from './tenantUser.model.js';
 import StructureUser from './structureUser.model.js';
+import RefreshToken from './refreshToken.model.js';
 
 /** Centralised associations for the auth/tenant domain (mirrors former rehab-authentication.js). */
 export function registerAuthAssociations(): void {
@@ -32,7 +33,8 @@ export async function syncAuthModels(): Promise<void> {
     await StructureAvailability.sync({ alter: true });
     await TenantUser.sync({ alter: true });
     await StructureUser.sync({ alter: true });
+    await RefreshToken.sync({ alter: true });
 }
 
-export { Tenant, User, Structure, StructureAvailability, UserAvailability, TenantUser, StructureUser };
+export { Tenant, User, Structure, StructureAvailability, UserAvailability, TenantUser, StructureUser, RefreshToken };
 

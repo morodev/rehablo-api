@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
+import { patientScopeWhere } from '../../../middleware/rbac.js';
 import { sendSuccessResponse } from '../../../utils/response.js';
 import HumanBodyQuestionnaireInstance from '../models/humanBodyQuestionnaireInstance.model.js';
 import HumanBodyAnswerInstance from '../models/humanBodyAnswerInstance.model.js';
@@ -62,7 +63,7 @@ export const getQuestionnaireInstances = asyncHandler(async (req: Request, res: 
     const schema = req.tenantSchema!;
     const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
 
-    const where: Record<string, unknown> = {};
+    const where: Record<string, unknown> = { ...patientScopeWhere(req, schema) };
     if (patientId) where.patientId = patientId;
     if (evaluationId) where.evaluationId = evaluationId;
 
@@ -109,7 +110,7 @@ export const getQuestionnaireInstancesByPoint = asyncHandler(async (req: Request
     const humanBodyPointId = req.query.humanBodyPointId as string;
 
     const instances = await HumanBodyQuestionnaireInstance.schema(schema).findAll({
-        where: { humanBodyPointId },
+        where: { humanBodyPointId, ...patientScopeWhere(req, schema) },
         include: [
             { model: HumanBodyQuestionnaire.schema(schema), attributes: ['title', 'description'] },
             {

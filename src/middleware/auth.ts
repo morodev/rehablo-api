@@ -19,6 +19,20 @@ export interface AuthTokenPayload {
     tenants: TenantRef[];
     selectedPremise?: { id: string } | null;
 
+    // --- Claim RBAC (vedi docs/RBAC_DESIGN.md) ---
+    /** Id utente (claim standard). Alias di `id` durante la migrazione. */
+    sub?: string;
+    /** Tipo di principal: staff interno oppure paziente del portale. */
+    actor?: 'staff' | 'patient';
+    /** Tenant attivo per la sessione corrente. */
+    tid?: string;
+    /** Struttura (premise) selezionata: determina lo scope `structure`. */
+    sid?: string | null;
+    /** Ruolo effettivo = override di struttura ?? ruolo del tenant. */
+    role?: string | null;
+    /** Permessi effettivi nel formato `resource:action:scope`. */
+    perms?: string[];
+
     [key: string]: unknown;
 }
 

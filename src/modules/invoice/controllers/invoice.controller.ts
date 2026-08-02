@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
+import { patientScopeWhere } from '../../../middleware/rbac.js';
 import { sequelize } from '../../../config/database.js';
 import Invoice from '../models/invoice.model.js';
 import InvoiceProduct from '../models/invoiceProduct.model.js';
@@ -148,8 +149,14 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
 
     let stsExcluded = Boolean(invoiceFields.stsExcluded);
     if (invoiceFields.patientID) {
-        const patient = await Patient.schema(schema).findByPk(invoiceFields.patientID);
-        if (patient?.get('stsOppositionToDataSending')) {
+        // Si può fatturare solo a un paziente che si ha il diritto di vedere.
+        const patient = await Patient.schema(schema).findOne({
+            where: { id: invoiceFields.patientID, ...patientScopeWhere(req, schema, 'id') }
+        });
+        if (!patient) {
+            return sendErrorResponse(res, 404, 'Paziente non trovato');
+        }
+        if (patient.get('stsOppositionToDataSending')) {
             stsExcluded = true;
         }
     }
@@ -231,6 +238,8 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
     const size = parseInt((req.query.size as string) ?? '10', 10);
 
     const { count, rows } = await InvoiceScoped.findAndCountAll({
+        // Le fatture non hanno un proprietario: l'ampiezza si eredita dai pazienti visibili.
+        where: patientScopeWhere(req, schema, 'patientID'),
         include: [
             { model: InvoiceProductScoped, as: 'products' },
             { model: InvoiceServiceScoped, as: 'services' }
@@ -258,9 +267,14 @@ export const searchInvoices = asyncHandler(async (req: Request, res: Response) =
 
     const invoices = await InvoiceScoped.findAll({
         where: {
-            [Op.or]: [
-                sequelizeWhere(fn('LOWER', col('status')), 'LIKE', `%${query.toLowerCase()}%`),
-                sequelizeWhere(fn('LOWER', col('paymentMethod')), 'LIKE', `%${query.toLowerCase()}%`)
+            [Op.and]: [
+                patientScopeWhere(req, schema, 'patientID'),
+                {
+                    [Op.or]: [
+                        sequelizeWhere(fn('LOWER', col('status')), 'LIKE', `%${query.toLowerCase()}%`),
+                        sequelizeWhere(fn('LOWER', col('paymentMethod')), 'LIKE', `%${query.toLowerCase()}%`)
+                    ]
+                }
             ]
         }
     });
@@ -272,7 +286,8 @@ export const findOneInvoice = asyncHandler(async (req: Request, res: Response) =
     const schema = req.tenantSchema!;
     const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped } = getScopedModels(schema);
 
-    const invoice = await InvoiceScoped.findByPk(req.params.invoiceId, {
+    const invoice = await InvoiceScoped.findOne({
+        where: { id: req.params.invoiceId, ...patientScopeWhere(req, schema, 'patientID') },
         include: [
             { model: InvoiceProductScoped, as: 'products' },
             { model: InvoiceServiceScoped, as: 'services' }
@@ -298,7 +313,9 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
         getScopedModels(schema);
     const id = req.params.invoiceId;
 
-    const existingInvoice = await InvoiceScoped.findByPk(id);
+    const existingInvoice = await InvoiceScoped.findOne({
+        where: { id, ...patientScopeWhere(req, schema, 'patientID') }
+    });
     if (!existingInvoice) {
         return sendErrorResponse(res, 404, 'Fattura non trovata');
     }
@@ -406,7 +423,9 @@ export const deleteInvoice = asyncHandler(async (req: Request, res: Response) =>
     const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped } = getScopedModels(schema);
     const id = req.params.invoiceId;
 
-    const removedInvoice = await InvoiceScoped.findByPk(id);
+    const removedInvoice = await InvoiceScoped.findOne({
+        where: { id, ...patientScopeWhere(req, schema, 'patientID') }
+    });
     if (!removedInvoice) {
         return sendErrorResponse(res, 404, 'Fattura non trovata');
     }
@@ -441,7 +460,12 @@ export const exportSistemaTS = asyncHandler(async (req: Request, res: Response) 
     }
 
     const invoices = await InvoiceScoped.findAll({
-        where: { documentYear: year, stsExcluded: false, stsSent: false }
+        where: {
+            documentYear: year,
+            stsExcluded: false,
+            stsSent: false,
+            ...patientScopeWhere(req, schema, 'patientID')
+        }
     });
 
     const records: SistemaTSRecord[] = [];

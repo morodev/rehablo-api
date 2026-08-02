@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
+import { scopeWhere } from '../../../middleware/rbac.js';
 import Patient from '../../patients/models/patient.model.js';
 import Observation from '../../measurements/models/observation.model.js';
 import { assertEvaluationEditable, assertNotFutureDate } from '../services/evaluationGuard.js';
@@ -26,6 +27,16 @@ import {
 } from '../models/index.js';
 
 /**
+ * Campi per il filtro row-level RBAC: `userId` è il professionista autore della valutazione,
+ * `structureId` la sede in cui è stata prodotta (nullable finché non si fa il backfill).
+ */
+const EVALUATION_SCOPE_FIELDS = {
+    ownerField: 'userId',
+    structureField: 'structureId',
+    includeUnassigned: true
+};
+
+/**
  * Creates a new evaluation ("valutazione") for a patient. Symptoms, questionnaires, scales and
  * tests are added afterwards by their own endpoints, passing back this evaluation's `id` as
  * `evaluationId`.
@@ -48,13 +59,20 @@ export const createEvaluation = asyncHandler(async (req: Request, res: Response)
     // FASE E: la data della valutazione non può essere futura (solo oggi o nel passato).
     assertNotFutureDate(date);
 
+    // Si può creare una valutazione solo su un paziente che si ha il diritto di vedere.
+    const patient = await Patient.schema(schema).findOne({
+        where: { id: patientId, ...scopeWhere(req, EVALUATION_SCOPE_FIELDS) }
+    });
+    if (!patient) {
+        return sendErrorResponse(res, 404, 'Paziente non trovato');
+    }
+
     // Se la struttura non è indicata esplicitamente per questa valutazione, si ricade sulla
     // struttura di riferimento anagrafico del paziente (necessaria per instradare correttamente
     // un futuro invio al FSE regionale in base alla Regione della struttura).
     let resolvedStructureId = structureId ?? null;
     if (!resolvedStructureId) {
-        const patient = await Patient.schema(schema).findByPk(patientId);
-        resolvedStructureId = (patient?.get('structureId') as string | undefined) ?? null;
+        resolvedStructureId = (patient.get('structureId') as string | undefined) ?? null;
     }
 
     const evaluation = await Evaluation.schema(schema).create({
@@ -78,7 +96,10 @@ export const getEvaluations = asyncHandler(async (req: Request, res: Response) =
     const { patientId } = req.query as { patientId?: string };
 
     const evaluations = await Evaluation.schema(schema).findAll({
-        where: patientId ? { patientId } : undefined,
+        where: {
+            ...(patientId ? { patientId } : {}),
+            ...scopeWhere(req, EVALUATION_SCOPE_FIELDS)
+        },
         order: [['date', 'DESC']]
     });
 
@@ -90,7 +111,8 @@ export const getEvaluationById = asyncHandler(async (req: Request, res: Response
     const schema = req.tenantSchema!;
     const { evaluationId } = req.params;
 
-    const evaluation = await Evaluation.schema(schema).findByPk(evaluationId, {
+    const evaluation = await Evaluation.schema(schema).findOne({
+        where: { id: evaluationId, ...scopeWhere(req, EVALUATION_SCOPE_FIELDS) },
         include: [
             { model: HumanBodyPoint.schema(schema) },
             { model: HumanBodySymptom.schema(schema) },
@@ -153,7 +175,9 @@ export const updateEvaluation = asyncHandler(async (req: Request, res: Response)
     await assertEvaluationEditable(schema, id);
     assertNotFutureDate(req.body?.date);
 
-    const [rowsUpdated] = await Evaluation.schema(schema).update(req.body, { where: { id } });
+    const [rowsUpdated] = await Evaluation.schema(schema).update(req.body, {
+        where: { id, ...scopeWhere(req, EVALUATION_SCOPE_FIELDS) }
+    });
     if (rowsUpdated === 0) {
         return sendErrorResponse(res, 404, 'Valutazione non trovata');
     }
@@ -171,6 +195,14 @@ export const cloneEvaluationHandler = asyncHandler(async (req: Request, res: Res
     const schema = req.tenantSchema!;
     const sourceId = req.params.evaluationId;
 
+    // Si può duplicare solo una valutazione che si ha il diritto di vedere.
+    const source = await Evaluation.schema(schema).findOne({
+        where: { id: sourceId, ...scopeWhere(req, EVALUATION_SCOPE_FIELDS) }
+    });
+    if (!source) {
+        return sendErrorResponse(res, 404, 'Valutazione non trovata');
+    }
+
     const created = await cloneEvaluation(schema, sourceId, { userId: req.user!.id });
     return sendSuccessResponse(res, 201, created, 'Valutazione duplicata correttamente');
 });
@@ -178,7 +210,9 @@ export const cloneEvaluationHandler = asyncHandler(async (req: Request, res: Res
 /** Deleting an evaluation cascades to every symptom/articularity/strength/questionnaire/scale/test attached to it. */
 export const deleteEvaluation = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const removed = await Evaluation.schema(schema).destroy({ where: { id: req.params.evaluationId } });
+    const removed = await Evaluation.schema(schema).destroy({
+        where: { id: req.params.evaluationId, ...scopeWhere(req, EVALUATION_SCOPE_FIELDS) }
+    });
     if (removed === 0) {
         return sendErrorResponse(res, 404, 'Valutazione non trovata');
     }

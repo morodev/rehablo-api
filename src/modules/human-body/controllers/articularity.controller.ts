@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
+import { patientScopeWhere } from '../../../middleware/rbac.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import HumanBodyArticularity from '../models/humanBodyArticularity.model.js';
 import { resolveHumanBodyPointId } from './humanBodyPoint.helper.js';
@@ -28,7 +29,7 @@ export const saveArticularity = asyncHandler(async (req: Request, res: Response)
 export const getAllArticularityByPoint = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const articularity = await HumanBodyArticularity.schema(schema).findAll({
-        where: { humanBodyPointId: req.query.humanBodyPointId as string }
+        where: { humanBodyPointId: req.query.humanBodyPointId as string, ...patientScopeWhere(req, schema) }
     });
     return sendSuccessResponse(res, 200, { articularity }, 'Human body articularity loaded');
 });
@@ -36,7 +37,7 @@ export const getAllArticularityByPoint = asyncHandler(async (req: Request, res: 
 /** Was previously an empty stub. Completed here. */
 export const getArticularityById = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const articularity = await HumanBodyArticularity.schema(schema).findByPk(req.params.articularityId);
+    const articularity = await HumanBodyArticularity.schema(schema).findOne({ where: { id: req.params.articularityId, ...patientScopeWhere(req, schema) } });
     if (!articularity) {
         return sendErrorResponse(res, 404, 'Human body articularity not found');
     }
@@ -62,7 +63,7 @@ export const updateArticularity = asyncHandler(async (req: Request, res: Respons
 /** Was previously an empty stub. Completed here as a real delete. */
 export const deleteArticularity = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const removed = await HumanBodyArticularity.schema(schema).destroy({ where: { id: req.params.articularityId } });
+    const removed = await HumanBodyArticularity.schema(schema).destroy({ where: { id: req.params.articularityId, ...patientScopeWhere(req, schema) } });
     if (removed === 0) {
         return sendErrorResponse(res, 404, 'Human body articularity not found');
     }
@@ -74,7 +75,7 @@ export const getArticularityByBodyPart = asyncHandler(async (req: Request, res: 
     const schema = req.tenantSchema!;
     const { bodyPart, bodySubPart, patientId, evaluationId } = req.query;
 
-    const where: Record<string, unknown> = {};
+    const where: Record<string, unknown> = { ...patientScopeWhere(req, schema) };
     if (bodyPart) where.bodyPart = sequelizeWhere(fn('LOWER', col('bodyPart')), 'LIKE', `%${String(bodyPart).toLowerCase()}%`);
     if (bodySubPart) where.bodySubPart = sequelizeWhere(fn('LOWER', col('bodySubPart')), 'LIKE', `%${String(bodySubPart).toLowerCase()}%`);
     if (patientId) where.patientId = patientId;

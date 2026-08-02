@@ -4,6 +4,9 @@ import bcrypt from 'bcryptjs';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
+import { getGrantedPermissions } from '../../../middleware/rbac.js';
+import { hasPermission } from '../rbac/permissions.js';
+import { DEFAULT_ROLE, isRoleCode } from '../rbac/roles.js';
 import { sendForgotPasswordMail, signUpSendMail } from '../../../services/email.service.js';
 import { licenseSecret } from './tenant.controller.js';
 import { Tenant, User, Structure, UserAvailability } from '../models/index.js';
@@ -17,13 +20,34 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 404, 'Tenant not found');
     }
 
+    // Il ruolo non è una colonna di `users`: vive sulla membership `tenant_users`.
+    const requestedRole = newUser.role;
+    delete newUser.role;
+    if (requestedRole !== undefined && !isRoleCode(requestedRole)) {
+        return sendErrorResponse(res, 400, 'Ruolo non valido');
+    }
+    const role = isRoleCode(requestedRole) ? requestedRole : DEFAULT_ROLE;
+
+    // Strutture in cui l'utente può operare. Se non specificate, viene assegnato a tutte
+    // quelle del tenant (comportamento storico). Va estratto PRIMA della create:
+    // non è una colonna di `users`.
+    const requestedStructureIds: string[] | undefined = Array.isArray(newUser.structureIds)
+        ? newUser.structureIds
+        : undefined;
+    delete newUser.structureIds;
+
     newUser.password = await bcrypt.hash(newUser.password, 12);
 
     const user: any = await User.create(newUser, { include: UserAvailability as any });
 
     const structures = await tenant.getStructures();
-    await Promise.all(structures.map((structure: any) => structure.addUser(user)));
-    await tenant.addUser(user);
+    const targetStructures = requestedStructureIds
+        ? structures.filter((structure: any) => requestedStructureIds.includes(structure.id))
+        : structures;
+
+    // Nessun ruolo sulla struttura: `null` significa "eredita quello del tenant".
+    await Promise.all(targetStructures.map((structure: any) => structure.addUser(user)));
+    await tenant.addUser(user, { through: { role } });
 
     const verificationToken = jwt.sign({ email: user.get('email') }, licenseSecret, { expiresIn: '12h' });
 
@@ -44,7 +68,13 @@ export const findAllUsersTenantByTenantId = asyncHandler(async (req: Request, re
     const tenant: any = await Tenant.findByPk(tenantId, {
         include: [
             { model: Structure },
-            { model: User, attributes: { exclude: ['password'] }, include: [{ model: UserAvailability }] }
+            {
+                model: User,
+                attributes: { exclude: ['password'] },
+                // Le strutture assegnate servono alla UI di gestione team per mostrare
+                // e modificare dove ciascun utente può operare.
+                include: [{ model: UserAvailability }, { model: Structure }]
+            }
         ],
         order: [[User, UserAvailability, 'day', 'ASC']]
     });
@@ -53,7 +83,15 @@ export const findAllUsersTenantByTenantId = asyncHandler(async (req: Request, re
         return sendErrorResponse(res, 404, 'Tenant not found');
     }
 
-    return sendSuccessResponse(res, 200, tenant.users, 'All users found');
+    // Il ruolo vive sulla join `tenant_users`: lo si espone anche in forma piatta come
+    // `role`, così la UI di gestione utenti non deve conoscere la struttura della join.
+    const users = (tenant.users ?? []).map((user: any) => ({
+        ...user.get({ plain: true }),
+        role: user.tenantUser?.role ?? null,
+        structureIds: (user.structures ?? []).map((structure: any) => structure.id)
+    }));
+
+    return sendSuccessResponse(res, 200, users, 'All users found');
 });
 
 export const updateUser = asyncHandler(async (req: Request, res: Response) => {
@@ -81,8 +119,22 @@ export const updateUser = asyncHandler(async (req: Request, res: Response) => {
     return sendSuccessResponse(res, 200, updatedUser, 'User updated');
 });
 
+/**
+ * Le preferenze di calendario sono self-service: ognuno modifica le proprie.
+ * Modificare quelle di un altro utente richiede il permesso `user:update`.
+ */
+function canEditUserPreferences(req: Request, targetUserId: string): boolean {
+    const currentUserId = (req.user?.sub as string) ?? (req.user?.id as string);
+    if (currentUserId === targetUserId) return true;
+    if (req.user?.isSuperAdmin) return true;
+    return hasPermission(getGrantedPermissions(req), 'user', 'update');
+}
+
 export const updateUserCalendarVisibility = asyncHandler(async (req: Request, res: Response) => {
     const userId = req.params.userId;
+    if (!canEditUserPreferences(req, userId)) {
+        return sendErrorResponse(res, 403, 'forbidden');
+    }
     await User.update({ calendarVisible: req.body.calendarVisible }, { where: { id: userId } });
     const updatedUser = await User.findByPk(userId, { attributes: { exclude: ['password'] } });
     return sendSuccessResponse(res, 200, updatedUser, 'User updated');
@@ -90,6 +142,9 @@ export const updateUserCalendarVisibility = asyncHandler(async (req: Request, re
 
 export const updateUserCalendarColor = asyncHandler(async (req: Request, res: Response) => {
     const userId = req.params.userId;
+    if (!canEditUserPreferences(req, userId)) {
+        return sendErrorResponse(res, 403, 'forbidden');
+    }
     await User.update({ calendarColor: req.body.calendarColor }, { where: { id: userId } });
     const updatedUser = await User.findByPk(userId, { attributes: { exclude: ['password'] } });
     return sendSuccessResponse(res, 200, updatedUser, 'User updated');

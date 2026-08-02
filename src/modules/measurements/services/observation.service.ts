@@ -124,11 +124,16 @@ export interface ListObservationsFilter {
     metricCode?: string;
     humanBodyPointId?: string;
     evaluationId?: string;
+    /**
+     * Filtro RBAC aggiuntivo (vedi `patientScopeWhere`): restringe le misure ai soli
+     * pazienti visibili all'utente. Passato dal controller, che ha accesso a `req`.
+     */
+    scope?: Record<string, unknown>;
 }
 
 /** Lettura delle Observation di un paziente (o filtrate per metrica/punto/valutazione). */
 export async function listObservations(schema: string, filter: ListObservationsFilter): Promise<Observation[]> {
-    const where: Record<string, unknown> = {};
+    const where: Record<string, unknown> = { ...(filter.scope ?? {}) };
     if (filter.patientId) where.patientId = filter.patientId;
     if (filter.metricCode) where.metricCode = filter.metricCode;
     if (filter.humanBodyPointId) where.humanBodyPointId = filter.humanBodyPointId;

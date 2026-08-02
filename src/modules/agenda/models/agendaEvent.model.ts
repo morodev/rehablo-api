@@ -3,7 +3,10 @@ import { sequelize } from '../../../config/database.js';
 
 export interface AgendaEventAttributes {
     id: string;
+    /** Id dell'utente proprietario del calendario: è l'owner del record ai fini RBAC. */
     calendarId?: string | null;
+    /** Struttura in cui si svolge l'appuntamento: abilita lo scope `structure`. */
+    structureId?: string | null;
     recurringEventId?: string | null;
     isFirstInstance?: boolean | null;
     title?: string | null;
@@ -27,6 +30,7 @@ export class AgendaEvent
     implements AgendaEventAttributes {
     declare id: string;
     declare calendarId: string | null;
+    declare structureId: string | null;
     declare recurringEventId: string | null;
     declare isFirstInstance: boolean | null;
     declare title: string | null;
@@ -46,6 +50,7 @@ AgendaEvent.init(
     {
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
         calendarId: DataTypes.STRING,
+        structureId: { type: DataTypes.UUID, allowNull: true },
         recurringEventId: { type: DataTypes.STRING, allowNull: true },
         isFirstInstance: DataTypes.BOOLEAN,
         title: DataTypes.STRING,

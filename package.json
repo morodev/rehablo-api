@@ -13,6 +13,8 @@
     "copy-assets": "node -e \"require('fs').cpSync('src/assets','dist/assets',{recursive:true})\"",
     "start": "node dist/server.js",
     "lint": "tsc --noEmit",
+    "audit:rbac": "node scripts/audit-rbac.mjs",
+    "backfill:structure": "tsx src/scripts/backfillStructureId.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "Luca Moro",

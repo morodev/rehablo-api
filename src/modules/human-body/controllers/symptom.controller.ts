@@ -2,9 +2,13 @@ import { Request, Response } from 'express';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
+import { patientScopeWhere } from '../../../middleware/rbac.js';
 import HumanBodySymptom from '../models/humanBodySymptom.model.js';
 import { resolveHumanBodyPointId } from './humanBodyPoint.helper.js';
 import { assertEvaluationEditable } from '../../evaluations/services/evaluationGuard.js';
+
+// NOTA RBAC: i sintomi sono dati clinici del PAZIENTE (vedi point.controller.ts):
+// l'ampiezza si eredita dai pazienti visibili, non dall'operatore che li ha registrati.
 
 export const saveSymptom = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
@@ -22,7 +26,10 @@ export const saveSymptom = asyncHandler(async (req: Request, res: Response) => {
 export const getAllSymptomByPoint = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const symptoms = await HumanBodySymptom.schema(schema).findAll({
-        where: { humanBodyPointId: req.query.humanBodyPointId as string }
+        where: {
+            humanBodyPointId: req.query.humanBodyPointId as string,
+            ...patientScopeWhere(req, schema)
+        }
     });
     return sendSuccessResponse(res, 200, symptoms, 'Human body symptoms loaded');
 });
@@ -42,7 +49,7 @@ export const getSymptomById = asyncHandler(async (req: Request, res: Response) =
     }
 
     const symptoms = await HumanBodySymptom.schema(schema).findAll({
-        where: { humanBodyPointId },
+        where: { humanBodyPointId, ...patientScopeWhere(req, schema) },
         order: [['date', 'DESC']]
     });
 
@@ -57,7 +64,9 @@ export const updateSymptom = asyncHandler(async (req: Request, res: Response) =>
     const schema = req.tenantSchema!;
     const id = req.params.symptomId;
 
-    const [rowsUpdated] = await HumanBodySymptom.schema(schema).update(req.body.symptom ?? req.body, { where: { id } });
+    const [rowsUpdated] = await HumanBodySymptom.schema(schema).update(req.body.symptom ?? req.body, {
+        where: { id, ...patientScopeWhere(req, schema) }
+    });
     if (rowsUpdated === 0) {
         return sendErrorResponse(res, 404, 'Human body symptom not found');
     }
@@ -69,7 +78,9 @@ export const updateSymptom = asyncHandler(async (req: Request, res: Response) =>
 /** Was previously an empty stub. Completed here as a real delete. */
 export const deleteSymptom = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const removed = await HumanBodySymptom.schema(schema).destroy({ where: { id: req.params.symptomId } });
+    const removed = await HumanBodySymptom.schema(schema).destroy({
+        where: { id: req.params.symptomId, ...patientScopeWhere(req, schema) }
+    });
     if (removed === 0) {
         return sendErrorResponse(res, 404, 'Human body symptom not found');
     }
@@ -81,7 +92,7 @@ export const getSymptomsByBodyPart = asyncHandler(async (req: Request, res: Resp
     const schema = req.tenantSchema!;
     const { bodyPart, bodySubPart, patientId, evaluationId } = req.query;
 
-    const where: Record<string, unknown> = {};
+    const where: Record<string, unknown> = { ...patientScopeWhere(req, schema) };
     if (bodyPart) where.bodyPart = sequelizeWhere(fn('LOWER', col('bodyPart')), 'LIKE', `%${String(bodyPart).toLowerCase()}%`);
     if (bodySubPart) where.bodySubPart = sequelizeWhere(fn('LOWER', col('bodySubPart')), 'LIKE', `%${String(bodySubPart).toLowerCase()}%`);
     if (patientId) where.patientId = patientId;

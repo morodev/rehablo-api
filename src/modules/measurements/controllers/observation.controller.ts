@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
+import { patientScopeWhere } from '../../../middleware/rbac.js';
 import {
     ingestObservations,
     listObservations,
@@ -93,7 +94,14 @@ export const list = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 400, 'Almeno uno tra patientId, humanBodyPointId o evaluationId è obbligatorio');
     }
 
-    const observations = await listObservations(schema, { patientId, metricCode, humanBodyPointId, evaluationId });
+    const observations = await listObservations(schema, {
+        patientId,
+        metricCode,
+        humanBodyPointId,
+        evaluationId,
+        // Le misure appartengono al paziente: l'ampiezza si eredita da quella sui pazienti.
+        scope: patientScopeWhere(req, schema)
+    });
     return sendSuccessResponse(res, 200, observations, 'Misure caricate');
 });
 

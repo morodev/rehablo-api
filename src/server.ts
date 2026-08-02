@@ -9,6 +9,9 @@ import { connectDatabase } from './config/database.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
 
 import { registerAuthAssociations, syncAuthModels } from './modules/auth/models/index.js';
+import { assignBootstrapRoles } from './modules/auth/rbac/bootstrap.js';
+import { purgeExpiredRefreshTokens } from './modules/auth/services/refreshToken.service.js';
+import { runStructureBackfill } from './modules/auth/services/structureBackfill.service.js';
 import { registerTenantModels } from './tenantModelsRegistry.js';
 import { registerCatalogAssociations, syncCatalogModels, seedCatalogData } from './modules/human-body/models/catalog/index.js';
 import { registerProtocolCatalogAssociations, syncProtocolCatalogModels } from './modules/protocols/models/catalog/index.js';
@@ -73,6 +76,46 @@ async function bootstrap() {
     // Public-schema models (tenants/users/structures/availabilities)
     registerAuthAssociations();
     await syncAuthModels();
+
+    // RBAC: allinea i ruoli delle membership preesistenti (vedi docs/RBAC_DESIGN.md)
+    await assignBootstrapRoles();
+
+    // RBAC: assegna la sede ai record che ne sono privi, così lo scope `structure` può
+    // diventare stretto. Idempotente e non distruttivo (tocca solo `structureId IS NULL`),
+    // quindi può girare a ogni avvio senza bisogno di interventi manuali sul server.
+    try {
+        const backfill = await runStructureBackfill({ apply: true });
+        const updated = Object.entries(backfill.updated);
+        if (updated.length > 0) {
+            const detail = updated.map(([table, count]) => `${table}=${count}`).join(', ');
+            console.log(`[rbac] backfill structureId completato: ${detail}`);
+        }
+        const ambiguous = Object.entries(backfill.ambiguous);
+        if (ambiguous.length > 0) {
+            const detail = ambiguous.map(([table, count]) => `${table}=${count}`).join(', ');
+            console.warn(
+                `[rbac] backfill structureId: record senza sede non assegnabili automaticamente (${detail}). ` +
+                    'Finché esistono, mantenere `includeUnassigned` nei controller.'
+            );
+        }
+    } catch (err) {
+        // Un problema qui non deve impedire l'avvio: il flag `includeUnassigned` garantisce
+        // comunque che i dati restino visibili.
+        console.error('[rbac] backfill structureId fallito', err);
+    }
+
+    // Con un refresh a ogni 15 minuti di utilizzo la tabella cresce in fretta: si ripulisce
+    // all'avvio e poi una volta al giorno. `unref()` evita che il timer tenga vivo il processo.
+    const purge = async () => {
+        try {
+            const removed = await purgeExpiredRefreshTokens();
+            if (removed > 0) console.log(`[auth] rimossi ${removed} refresh token scaduti`);
+        } catch (err) {
+            console.error('[auth] purge dei refresh token fallita', err);
+        }
+    };
+    await purge();
+    setInterval(purge, 24 * 60 * 60 * 1000).unref();
 
     // Public-schema human-body catalog (standardized scales/tests, shared by every tenant).
     // Seeded exactly once at boot here, instead of on every single GET request like the legacy

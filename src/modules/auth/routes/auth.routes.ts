@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { requireAuth } from '../../../middleware/auth.js';
+import { requireAnyPermission, requirePermission } from '../../../middleware/rbac.js';
 import authController from '../controllers/auth.controller.js';
+import rbacController from '../controllers/rbac.controller.js';
 import tenantController from '../controllers/tenant.controller.js';
 import userController from '../controllers/user.controller.js';
 import structureController from '../controllers/structure.controller.js';
@@ -9,14 +11,27 @@ const router = Router();
 
 // --- Authentication ---
 router.post('/auth/login', authController.login);
+// Refresh e logout si autenticano con il refresh token nel body, non con l'access token:
+// devono funzionare anche quando quest'ultimo è già scaduto (dura pochi minuti).
+router.post('/auth/refresh', authController.refresh);
+router.delete('/auth/logout', authController.logout);
 router.post('/auth/login-premise/:premiseId', requireAuth, authController.loginPremise);
-router.delete('/auth/logout', requireAuth, authController.logout);
 router.post('/auth/login-token', authController.loginWithToken);
+
+// --- RBAC ---
+router.get('/auth/me', requireAuth, rbacController.me);
+router.get('/auth/me/permissions', requireAuth, rbacController.myPermissions);
+router.get('/auth/roles', requireAuth, requirePermission('user', 'read'), rbacController.listRoles);
+// Assegnazione ruoli: il ruolo base vive sulla membership del tenant, l'override sulla struttura.
+router.patch('/user/:userId/role', requireAuth, requirePermission('user', 'update', 'tenant'), rbacController.updateUserRole);
+router.patch('/user/:userId/structure-role', requireAuth, requirePermission('user', 'update', 'tenant'), rbacController.updateUserStructureRole);
+router.put('/user/:userId/structures', requireAuth, requirePermission('user', 'update', 'tenant'), rbacController.updateUserStructures);
 
 // --- Tenant (registration / subscription owner) ---
 router.post('/tenant', tenantController.createTenant);
-router.put('/tenant/:tenantId', requireAuth, tenantController.updateTenant);
-router.get('/tenant/:tenantId', requireAuth, tenantController.findTenantById);
+router.put('/tenant/:tenantId', requireAuth, requirePermission('tenant', 'update'), tenantController.updateTenant);
+// I dati dell'azienda servono anche in intestazione documenti/UI: basta poter leggere le strutture.
+router.get('/tenant/:tenantId', requireAuth, requireAnyPermission(['tenant', 'read'], ['structure', 'read']), tenantController.findTenantById);
 
 // --- Public account flows (no auth required: token-in-url based) ---
 router.put('/user/verify/:verificationToken', userController.verificationAccount);
@@ -25,17 +40,20 @@ router.get('/user/forgot-password', userController.forgotPassword);
 router.put('/user/reset-password/:resetPasswordToken', userController.resetPassword);
 
 // --- Users (requires auth) ---
-router.post('/user', requireAuth, userController.createUser);
-router.get('/user', requireAuth, userController.findAllUsersTenantByTenantId);
-router.patch('/user/:userId', requireAuth, userController.updateUser);
+router.post('/user', requireAuth, requirePermission('user', 'create'), userController.createUser);
+router.get('/user', requireAuth, requirePermission('user', 'read'), userController.findAllUsersTenantByTenantId);
+router.patch('/user/:userId', requireAuth, requirePermission('user', 'update'), userController.updateUser);
+// SELF-SERVICE: preferenze personali di calendario, modificabili da qualunque utente autenticato.
+// TODO(RBAC): il controller deve verificare che `userId` coincida con `req.user.sub`,
+// oppure che il chiamante abbia `user:update`.
 router.patch('/user/:userId/calendar-visibility', requireAuth, userController.updateUserCalendarVisibility);
 router.patch('/user/:userId/calendar-color', requireAuth, userController.updateUserCalendarColor);
-router.delete('/user/:userId', requireAuth, userController.deleteUser);
+router.delete('/user/:userId', requireAuth, requirePermission('user', 'delete'), userController.deleteUser);
 
 // --- Structures (premises) ---
-router.post('/structure', requireAuth, structureController.saveStructureForTenant);
-router.put('/structure/:structureId', requireAuth, structureController.updateStructureForTenant);
-router.get('/structure', requireAuth, structureController.findAllStructuresForTenant);
+router.post('/structure', requireAuth, requirePermission('structure', 'create'), structureController.saveStructureForTenant);
+router.put('/structure/:structureId', requireAuth, requirePermission('structure', 'update'), structureController.updateStructureForTenant);
+router.get('/structure', requireAuth, requirePermission('structure', 'read'), structureController.findAllStructuresForTenant);
 
 export default router;
 

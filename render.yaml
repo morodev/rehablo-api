@@ -27,8 +27,12 @@ services:
         value: "false"
       - key: JWT_SECRET
         generateValue: true
+      # Access token a vita breve: i permessi RBAC viaggiano nei claim, quindi un token
+      # longevo terrebbe in vita permessi già revocati. La sessione è garantita dal refresh.
       - key: JWT_EXPIRES_IN
-        value: 7d
+        value: 15m
+      - key: REFRESH_TOKEN_TTL_DAYS
+        value: "30"
       - key: DEVICE_CREDENTIALS_SECRET
         generateValue: true
       - key: RAW_FILE_STORAGE_DIR

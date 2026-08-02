@@ -35,7 +35,15 @@ export const env = {
     dbSsl: process.env.DB_SSL === 'true',
 
     jwtSecret: required('JWT_SECRET', 'change-me-please-use-a-long-random-string'),
-    jwtExpiresIn: normalizeExpiresIn(process.env.JWT_EXPIRES_IN || '7d'),
+    /**
+     * Durata dell'ACCESS token. Volutamente breve: i permessi RBAC viaggiano nei claim,
+     * quindi un token longevo terrebbe in vita permessi già revocati (vedi docs/RBAC_DESIGN.md).
+     * La sessione lunga è garantita dal refresh token.
+     */
+    jwtExpiresIn: normalizeExpiresIn(process.env.JWT_EXPIRES_IN || '15m'),
+
+    /** Durata del REFRESH token, in giorni. Ruotato a ogni utilizzo. */
+    refreshTokenTtlDays: parseInt(process.env.REFRESH_TOKEN_TTL_DAYS || '30', 10),
 
     // Segreto per cifrare le credenziali dei dispositivi (API key dei vendor salvate per tenant).
     // In produzione impostare DEVICE_CREDENTIALS_SECRET a una stringa lunga e casuale.
