@@ -85,7 +85,7 @@ soddisfa anche una richiesta di `patient:read:own`.
 | Protocolli | tenant | nessuno | own CRUD | structure R / own CRU | own R | tenant R | own R |
 | Agenda | tenant CRUD | structure CRUD | structure R / own CRUD | structure R / own CRUD | own CRU | tenant R | own R |
 | Fatturazione | tenant CRUD | structure CRU | nessuno | nessuno | nessuno | tenant R | own R |
-| Listino prodotti/servizi | tenant CRUD | tenant R | tenant R | tenant R | — | tenant R | — |
+| Listino prodotti/servizi | tenant CRUD | tenant CRU | tenant R | tenant R | — | tenant R | — |
 | Utenti e strutture | tenant manage | structure R | structure R | structure R | — | tenant R | — |
 | Dati azienda / billing | tenant manage | — | — | — | — | — | — |
 

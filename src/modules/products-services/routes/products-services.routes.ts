@@ -22,6 +22,8 @@ router.put('/product/:productId', requirePermission('product', 'update'), produc
 router.delete('/product/:productId', requirePermission('product', 'delete'), productController.deleteProduct);
 
 // Services
+// NB: la resource RBAC è `product` anche qui: prodotti e servizi sono lo stesso listino
+// (vedi RESOURCES in auth/rbac/permissions.ts). Non esiste un permesso `service:*`.
 router.post('/service', requirePermission('product', 'create'), serviceController.saveService);
 router.get('/service', requirePermission('product', 'read'), serviceController.findAllServices);
 router.get('/service/search', requirePermission('product', 'read'), serviceController.searchServices);

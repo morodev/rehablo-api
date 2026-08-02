@@ -5,6 +5,7 @@ import {
     Action,
     PermissionScope,
     Resource,
+    RESOURCE_LABELS,
     resolveGrantedScope,
     SCOPE_RANK
 } from '../modules/auth/rbac/permissions.js';
@@ -85,7 +86,11 @@ export function requirePermission(
         const scope = resolveGrantedScope(getGrantedPermissions(req), resource, action);
 
         if (scope === null || (minimumScope && SCOPE_RANK[scope] < SCOPE_RANK[minimumScope])) {
-            return sendErrorResponse(res, 403, `forbidden: missing ${resource}:${action}`);
+            return sendErrorResponse(
+                res,
+                403,
+                `forbidden: missing ${resource}:${action} (${RESOURCE_LABELS[resource]})`
+            );
         }
 
         req.access = {

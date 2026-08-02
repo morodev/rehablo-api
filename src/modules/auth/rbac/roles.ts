@@ -106,7 +106,10 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             // NESSUN permesso su evaluation / protocol / bodymap / measurement
             ...crud('agenda', 'structure'),
             ...perms('invoice', ['read', 'create', 'update', 'export'], 'structure'),
-            perm('product', 'read', 'tenant'),
+            // Il front-office gestisce il listino perché è ciò che alimenta fatture e tipi
+            // appuntamento. La cancellazione resta all'OWNER: una voce eliminata per errore
+            // romperebbe lo storico delle fatture che la referenziano.
+            ...perms('product', ['read', 'create', 'update'], 'tenant'),
             perm('user', 'read', 'structure'),
             perm('structure', 'read', 'structure'),
             perm('dashboard', 'read', 'structure')

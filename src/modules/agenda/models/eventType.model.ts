@@ -11,6 +11,7 @@ export interface EventTypeAttributes {
     color: string;
     erasable: boolean;
     editable: boolean;
+    linkedServiceId?: string | null;
 }
 
 export type EventTypeCreationAttributes = Optional<
@@ -29,6 +30,7 @@ export class EventType extends Model<EventTypeAttributes, EventTypeCreationAttri
     declare color: string;
     declare erasable: boolean;
     declare editable: boolean;
+    declare linkedServiceId: string | null;
 }
 
 EventType.init(
@@ -41,7 +43,8 @@ EventType.init(
         duration: { type: DataTypes.INTEGER, defaultValue: 60, allowNull: false },
         color: { type: DataTypes.STRING, defaultValue: 'text-green-500' },
         erasable: { type: DataTypes.BOOLEAN, defaultValue: true },
-        editable: { type: DataTypes.BOOLEAN, defaultValue: true }
+        editable: { type: DataTypes.BOOLEAN, defaultValue: true },
+        linkedServiceId: { type: DataTypes.UUID, allowNull: true }
     },
     { sequelize, modelName: 'eventType', tableName: 'event_types' }
 );

@@ -32,6 +32,29 @@ export const RESOURCES = [
 
 export type Resource = (typeof RESOURCES)[number];
 
+/**
+ * Etichette leggibili delle resource, usate nei messaggi di errore.
+ *
+ * Serve soprattutto dove il nome tecnico della resource non coincide con l'entità
+ * dell'endpoint: es. `POST /service` è governato da `product` perché prodotti e servizi
+ * condividono lo stesso listino.
+ */
+export const RESOURCE_LABELS: Record<Resource, string> = {
+    patient: 'anagrafica pazienti',
+    evaluation: 'valutazioni',
+    protocol: 'protocolli',
+    bodymap: 'mappa corporea',
+    measurement: 'misurazioni',
+    agenda: 'agenda',
+    invoice: 'fatturazione',
+    product: 'listino prodotti e servizi',
+    dashboard: 'dashboard',
+    user: 'utenti',
+    structure: 'strutture',
+    tenant: 'dati azienda',
+    maintenance: 'manutenzione piattaforma'
+};
+
 export const ACTIONS = ['read', 'create', 'update', 'delete', 'export', 'manage'] as const;
 export type Action = (typeof ACTIONS)[number];
 
