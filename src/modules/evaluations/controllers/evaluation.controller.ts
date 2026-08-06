@@ -93,14 +93,16 @@ export const createEvaluation = asyncHandler(async (req: Request, res: Response)
 /** Lists the evaluations of a patient (or of the whole tenant if `patientId` is omitted), most recent first. */
 export const getEvaluations = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { patientId } = req.query as { patientId?: string };
+    const { patientId, status } = req.query as { patientId?: string; status?: string };
 
     const evaluations = await Evaluation.schema(schema).findAll({
         where: {
             ...(patientId ? { patientId } : {}),
+            ...(status ? { status } : {}),
             ...scopeWhere(req, EVALUATION_SCOPE_FIELDS)
         },
-        order: [['date', 'DESC']]
+        order: [['date', 'DESC']],
+        limit: 1000
     });
 
     return sendSuccessResponse(res, 200, evaluations, 'Valutazioni caricate correttamente');
