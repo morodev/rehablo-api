@@ -8,11 +8,23 @@ export interface UserAttributes {
     email: string;
     password: string;
     calendarVisible: boolean;
-    calendarColor: string;
+    /** `true` una volta verificato l'indirizzo email. NON indica la sospensione dell'account. */
     isActive: boolean;
+    calendarColor: string;
     isSuperAdmin: boolean;
+    /**
+     * Titolare dello studio: è l'utente nato dalla registrazione, quello che ha creato il tenant.
+     * Ne esiste esattamente uno per tenant, non è eliminabile e il suo ruolo resta `OWNER`.
+     */
     isTenant: boolean;
     isPremium: boolean;
+    /**
+     * Sospensione dell'account: valorizzata quando un amministratore disattiva l'utente.
+     * È volutamente distinta da `isActive` (che indica la verifica dell'email), così la UI
+     * può differenziare "in attesa di verifica" da "disattivato" e la riattivazione non
+     * richiede un nuovo giro di verifica dell'indirizzo.
+     */
+    deactivatedAt?: Date | null;
     // --- Dati identificativi del professionista sanitario, richiesti per il tracciato Sistema
     // Tessera Sanitaria (identificazione dell'erogatore) e per i metadati FSE/CDA2 (autore del
     // documento clinico). Il fisioterapista è "professione sanitaria riabilitativa" ex L. 3/2018,
@@ -24,7 +36,14 @@ export interface UserAttributes {
 
 export type UserCreationAttributes = Optional<
     UserAttributes,
-    'id' | 'calendarVisible' | 'calendarColor' | 'isActive' | 'isSuperAdmin' | 'isTenant' | 'isPremium'
+    | 'id'
+    | 'calendarVisible'
+    | 'calendarColor'
+    | 'isActive'
+    | 'isSuperAdmin'
+    | 'isTenant'
+    | 'isPremium'
+    | 'deactivatedAt'
 >;
 
 export class User extends Model<UserAttributes, UserCreationAttributes> implements UserAttributes {
@@ -39,6 +58,7 @@ export class User extends Model<UserAttributes, UserCreationAttributes> implemen
     declare isSuperAdmin: boolean;
     declare isTenant: boolean;
     declare isPremium: boolean;
+    declare deactivatedAt: Date | null;
     declare taxCode: string | null;
     declare professionalRegisterNumber: string | null;
     declare professionalRegisterProvince: string | null;
@@ -57,6 +77,7 @@ User.init(
         isSuperAdmin: { type: DataTypes.BOOLEAN, defaultValue: false },
         isTenant: { type: DataTypes.BOOLEAN, defaultValue: false },
         isPremium: { type: DataTypes.BOOLEAN, defaultValue: false },
+        deactivatedAt: { type: DataTypes.DATE, allowNull: true, defaultValue: null },
         taxCode: { type: DataTypes.STRING(16), allowNull: true },
         professionalRegisterNumber: { type: DataTypes.STRING, allowNull: true },
         professionalRegisterProvince: { type: DataTypes.STRING(2), allowNull: true }

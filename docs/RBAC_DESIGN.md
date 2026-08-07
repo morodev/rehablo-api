@@ -395,20 +395,51 @@ sul proprio utente, salvo possedere `user:update`.
 | `GET /auth/me` | solo auth | profilo + ruolo e permessi **riletti dal DB** |
 | `GET /auth/me/permissions` | solo auth | ruolo e permessi come stanno nel token |
 | `GET /user` | `user:read` | espone `role` in forma piatta per ogni utente |
+| `PATCH /user/:userId/status` | `user:update:tenant` | attiva/sospende l'account (`{ active: boolean }`) |
+| `DELETE /user/:userId` | `user:delete` | elimina un utente; **mai** il titolare dello studio |
 
 **Vincoli applicati al cambio ruolo** (`validateRoleChange`):
 1. il ruolo deve esistere ed essere `assignable` (`PATIENT` è escluso: nasce dal portale, non dalla UI staff);
 2. **nessuno può modificare il proprio ruolo** — impedisce sia l'auto-esclusione sia l'auto-promozione di chi possiede `user:update`;
 3. l'utente deve appartenere al tenant di chi effettua la modifica;
 4. non si può declassare **l'ultimo `OWNER`** dello studio (409), altrimenti nessuno potrebbe più gestire utenti e fatturazione;
-5. per l'override di struttura, la struttura deve appartenere al tenant e l'utente esservi assegnato.
+5. **il titolare (`users.isTenant = true`) resta sempre `OWNER`** (409): è l'intestatario dell'abbonamento e il riferimento amministrativo del tenant;
+6. per l'override di struttura, la struttura deve appartenere al tenant e l'utente esservi assegnato.
 
 `GET /auth/me` rilegge ruolo e permessi dal database e restituisce `roleChanged: true` quando
 il token in mano al client è disallineato: il frontend può così aggiornare i permessi
 (`PermissionsService.loadFromProfile()`) senza attendere la scadenza del JWT.
 
+### Il titolare dello studio (`isTenant`)
+
+Chi arriva dalla **registrazione** (`POST /tenant`) è per definizione il titolare: ha creato
+lui il tenant. `createTenant` lo marca quindi con `users.isTenant = true` e ne crea la
+membership con `through: { role: TENANT_OWNER_ROLE }` (cioè `OWNER`). Senza quel `through`
+la join `tenant_users` ricadrebbe sul default `THERAPIST`, e il titolare si ritroverebbe
+senza accesso a fatturazione, gestione utenti e dati azienda.
+
+Il titolare **non è eliminabile da nessuno, nemmeno da sé stesso**: `DELETE /user/:userId`
+risponde 409. L'unico modo per revocargli l'accesso è la **disattivazione**
+(`PATCH /user/:userId/status` con `{ active: false }`), che valorizza `users.deactivatedAt`,
+blocca login e refresh e revoca le sessioni aperte, preservando però lo storico clinico e
+amministrativo che gli fa riferimento (valutazioni, appuntamenti, fatture).
+
+`deactivatedAt` è volutamente distinto da `isActive`: quest'ultimo indica solo l'avvenuta
+verifica dell'email, così la UI può differenziare *"in attesa di verifica"* da *"disattivato"*
+e la riattivazione non richiede un nuovo giro di verifica dell'indirizzo.
+
+Vincoli sulla disattivazione:
+- nessuno può disattivare sé stesso (si chiuderebbe fuori dall'applicazione);
+- l'utente deve appartenere al tenant di chi effettua la richiesta;
+- lo studio deve conservare **almeno un `OWNER` attivo** (409).
+
+Un utente creato da `POST /user` non è mai titolare né super admin: i campi `isTenant`,
+`isSuperAdmin`, `isActive`, `isPremium`, `deactivatedAt` sono rimossi dal payload in ingresso
+sia in creazione sia in aggiornamento (`stripProtectedFields`).
+
 ### Assegnazione del ruolo
 - `assignBootstrapRoles()` (chiamata all'avvio) promuove a `OWNER` le membership degli utenti con `isTenant = true`, altrimenti tutti resterebbero `THERAPIST` dopo la creazione della colonna.
+- Sempre all'avvio, `markMissingTenantOwners()` individua il titolare degli studi che ne sono privi — effetto del bug per cui `createTenant` non valorizzava `isTenant` — riconoscendolo nel **primo utente entrato nel tenant**. È idempotente: gli studi che hanno già un titolare vengono ignorati.
 
 ### Audit automatico (deny-by-default)
 

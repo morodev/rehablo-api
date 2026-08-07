@@ -8,6 +8,7 @@ import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.
 import { env } from '../../../config/env.js';
 import { signUpSendMail } from '../../../services/email.service.js';
 import { sequelize } from '../../../config/database.js';
+import { TENANT_OWNER_ROLE } from '../rbac/roles.js';
 import { Tenant, User, Structure, StructureAvailability, UserAvailability } from '../models/index.js';
 
 export const stripe = env.stripeSecretKey ? new Stripe(env.stripeSecretKey) : (null as unknown as Stripe);
@@ -72,12 +73,19 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
                 ...users[0],
                 password: hashedPassword,
                 isActive: false,
-                isSuperAdmin: true
+                isSuperAdmin: true,
+                // Chi arriva dalla registrazione È il tenant: ha creato lui lo studio.
+                // Il flag lo distingue dagli utenti invitati successivamente e lo rende
+                // non eliminabile (vedi `deleteUser`).
+                isTenant: true
             },
             { transaction }
         );
 
-        await tenant.addUser(createdUser, { transaction });
+        // Il ruolo NON è una colonna di `users`: vive sulla membership `tenant_users`, che
+        // senza questo `through` ricadrebbe sul default (`THERAPIST`). Il titolare si sarebbe
+        // così ritrovato senza accesso a fatturazione, gestione utenti e dati azienda.
+        await tenant.addUser(createdUser, { through: { role: TENANT_OWNER_ROLE }, transaction });
 
         const newStructure = await Structure.create(
             { tenantId: tenant.id, name: `Studio di ${createdUser.get('email')}` },

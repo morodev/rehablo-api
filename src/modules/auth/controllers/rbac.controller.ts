@@ -131,6 +131,14 @@ async function validateRoleChange(
         return { status: 404, message: 'Utente non trovato in questo studio' };
     }
 
+    // Il titolare dello studio resta OWNER: è l'intestatario dell'abbonamento e il
+    // riferimento amministrativo del tenant. Declassarlo lo priverebbe dell'accesso ai
+    // propri dati aziendali senza che nessuno possa più ripristinarlo.
+    const targetUser = await User.findByPk(targetUserId, { attributes: ['isTenant'] });
+    if (targetUser?.get('isTenant') && role !== RoleCode.OWNER) {
+        return { status: 409, message: 'Il ruolo del titolare dello studio non può essere modificato' };
+    }
+
     return null;
 }
 

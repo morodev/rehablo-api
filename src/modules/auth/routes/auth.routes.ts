@@ -48,6 +48,9 @@ router.patch('/user/:userId', requireAuth, requirePermission('user', 'update'), 
 // oppure che il chiamante abbia `user:update`.
 router.patch('/user/:userId/calendar-visibility', requireAuth, userController.updateUserCalendarVisibility);
 router.patch('/user/:userId/calendar-color', requireAuth, userController.updateUserCalendarColor);
+// Attivazione/sospensione dell'account: è l'alternativa alla cancellazione per il titolare
+// dello studio, che non è eliminabile. Riservata a chi amministra l'intero tenant.
+router.patch('/user/:userId/status', requireAuth, requirePermission('user', 'update', 'tenant'), userController.setUserActive);
 router.delete('/user/:userId', requireAuth, requirePermission('user', 'delete'), userController.deleteUser);
 
 // --- Structures (premises) ---

@@ -86,6 +86,12 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 403, 'User not active!');
     }
 
+    // Account sospeso da un amministratore: distinto dalla mancata verifica dell'email,
+    // così il messaggio è comprensibile e reinviare la verifica non riapre l'accesso.
+    if (user.get('deactivatedAt')) {
+        return sendErrorResponse(res, 403, 'Account disattivato. Contatta il titolare dello studio.');
+    }
+
     const payload = buildTokenPayload(user);
     const tenantId = payload.tenants?.[0]?.id ?? null;
     Object.assign(payload, await buildRbacClaims(payload.id, tenantId, null));
@@ -144,6 +150,12 @@ export const refresh = asyncHandler(async (req: Request, res: Response) => {
         // Utente disattivato mentre la sessione era attiva: la catena va chiusa subito.
         await revokeFamily(result.familyId, 'user_inactive');
         return sendErrorResponse(res, 403, 'User not active!');
+    }
+
+    if (user.get('deactivatedAt')) {
+        // Sospensione decisa dopo il login: la sessione non deve poter essere rinnovata.
+        await revokeFamily(result.familyId, 'user_deactivated');
+        return sendErrorResponse(res, 403, 'Account disattivato. Contatta il titolare dello studio.');
     }
 
     const payload = buildTokenPayload(user);

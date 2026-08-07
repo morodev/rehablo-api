@@ -1,19 +1,60 @@
 import { Request, Response } from 'express';
+import { Op } from 'sequelize';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
-import { getGrantedPermissions } from '../../../middleware/rbac.js';
+import { getGrantedPermissions, getUserId } from '../../../middleware/rbac.js';
 import { hasPermission } from '../rbac/permissions.js';
-import { DEFAULT_ROLE, isRoleCode } from '../rbac/roles.js';
+import { DEFAULT_ROLE, isRoleCode, RoleCode } from '../rbac/roles.js';
 import { sendForgotPasswordMail, signUpSendMail } from '../../../services/email.service.js';
 import { licenseSecret } from './tenant.controller.js';
-import { Tenant, User, Structure, UserAvailability } from '../models/index.js';
+import { revokeAllForUser } from '../services/refreshToken.service.js';
+import { Tenant, TenantUser, User, Structure, UserAvailability } from '../models/index.js';
+
+/**
+ * Campi che non possono MAI arrivare dal client: determinano privilegi (super admin,
+ * titolarità dello studio) o stato dell'account (verifica email, sospensione), e vanno
+ * modificati solo dai flussi dedicati.
+ */
+const PROTECTED_USER_FIELDS = [
+    'id',
+    'isSuperAdmin',
+    'isTenant',
+    'isActive',
+    'isPremium',
+    'deactivatedAt',
+    'createdAt',
+    'updatedAt'
+] as const;
+
+function stripProtectedFields<T extends Record<string, any>>(payload: T): T {
+    const sanitized = { ...payload };
+    for (const field of PROTECTED_USER_FIELDS) {
+        delete sanitized[field];
+    }
+    return sanitized;
+}
+
+/**
+ * Carica l'utente bersaglio verificando che appartenga allo studio di chi effettua la
+ * richiesta: senza questo controllo un amministratore potrebbe agire, conoscendone l'id,
+ * su utenti di altri tenant.
+ */
+async function findTenantMember(req: Request, targetUserId: string) {
+    const tenantId = getCurrentTenantId(req);
+    const membership = await TenantUser.findOne({ where: { tenantId, userId: targetUserId } });
+    if (!membership) return { tenantId, membership: null, user: null };
+
+    const user = await User.findByPk(targetUserId, { attributes: { exclude: ['password'] } });
+    return { tenantId, membership, user };
+}
+
 
 export const createUser = asyncHandler(async (req: Request, res: Response) => {
     const tenantId = getCurrentTenantId(req);
-    const newUser = req.body;
+    const newUser = { ...req.body };
 
     const tenant: any = await Tenant.findByPk(tenantId, { include: Structure });
     if (!tenant) {
@@ -36,9 +77,15 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
         : undefined;
     delete newUser.structureIds;
 
-    newUser.password = await bcrypt.hash(newUser.password, 12);
+    // Un utente invitato non è mai il titolare dello studio né un super admin: il titolare
+    // nasce esclusivamente dalla registrazione (vedi `createTenant`).
+    const userToCreate = stripProtectedFields(newUser);
+    userToCreate.password = await bcrypt.hash(newUser.password, 12);
+    userToCreate.isTenant = false;
+    userToCreate.isSuperAdmin = false;
+    userToCreate.isActive = false;
 
-    const user: any = await User.create(newUser, { include: UserAvailability as any });
+    const user: any = await User.create(userToCreate, { include: UserAvailability as any });
 
     const structures = await tenant.getStructures();
     const targetStructures = requestedStructureIds
@@ -96,8 +143,13 @@ export const findAllUsersTenantByTenantId = asyncHandler(async (req: Request, re
 
 export const updateUser = asyncHandler(async (req: Request, res: Response) => {
     const userId = req.params.userId;
-    const userToUpdate = { ...req.body.user };
+    const userToUpdate = stripProtectedFields({ ...req.body.user });
     delete userToUpdate.password;
+
+    const { membership } = await findTenantMember(req, userId);
+    if (!membership) {
+        return sendErrorResponse(res, 404, 'Utente non trovato in questo studio');
+    }
 
     const [rowsUpdated] = await User.update(userToUpdate, { where: { id: userId } });
     if (rowsUpdated === 0) {
@@ -150,9 +202,93 @@ export const updateUserCalendarColor = asyncHandler(async (req: Request, res: Re
     return sendSuccessResponse(res, 200, updatedUser, 'User updated');
 });
 
+/**
+ * Attiva / disattiva un utente.
+ *
+ * È l'alternativa alla cancellazione per il titolare dello studio, che non è eliminabile:
+ * disattivarlo ne blocca l'accesso preservando lo storico clinico e amministrativo
+ * (valutazioni, appuntamenti e fatture restano riferiti al loro autore).
+ */
+export const setUserActive = asyncHandler(async (req: Request, res: Response) => {
+    const targetUserId = req.params.userId;
+    const { active } = req.body as { active?: boolean };
+
+    if (typeof active !== 'boolean') {
+        return sendErrorResponse(res, 400, 'Il campo `active` è obbligatorio (boolean)');
+    }
+
+    // Nessuno può disattivare sé stesso: si chiuderebbe fuori dall'applicazione.
+    if (targetUserId === getUserId(req)) {
+        return sendErrorResponse(res, 403, 'Non puoi disattivare il tuo account');
+    }
+
+    const { tenantId, membership, user } = await findTenantMember(req, targetUserId);
+    if (!membership || !user) {
+        return sendErrorResponse(res, 404, 'Utente non trovato in questo studio');
+    }
+
+    // Lo studio deve conservare almeno un titolare operativo, altrimenti nessuno potrebbe
+    // più gestire utenti, fatturazione e dati azienda.
+    if (!active && membership.get('role') === RoleCode.OWNER) {
+        const ownerMemberships = await TenantUser.findAll({
+            where: { tenantId, role: RoleCode.OWNER },
+            attributes: ['userId']
+        });
+        const ownerIds = ownerMemberships.map((row) => row.get('userId') as string);
+        const activeOwners = await User.count({
+            where: { id: { [Op.in]: ownerIds }, deactivatedAt: null }
+        });
+        if (activeOwners <= 1) {
+            return sendErrorResponse(res, 409, 'Lo studio deve avere almeno un titolare attivo');
+        }
+    }
+
+    await User.update({ deactivatedAt: active ? null : new Date() }, { where: { id: targetUserId } });
+
+    // Le sessioni aperte sopravvivrebbero fino alla scadenza dell'access token: revocando
+    // i refresh token la disattivazione diventa effettiva entro pochi minuti.
+    if (!active) {
+        await revokeAllForUser(targetUserId, 'user_deactivated');
+    }
+
+    const updatedUser = await User.findByPk(targetUserId, { attributes: { exclude: ['password'] } });
+
+    return sendSuccessResponse(
+        res,
+        200,
+        updatedUser,
+        active ? 'Utente riattivato' : 'Utente disattivato'
+    );
+});
+
 export const deleteUser = asyncHandler(async (req: Request, res: Response) => {
     const userId = req.params.userId;
+
+    const { membership, user } = await findTenantMember(req, userId);
+    if (!membership || !user) {
+        return sendErrorResponse(res, 404, 'Utente non trovato in questo studio');
+    }
+
+    // Il titolare dello studio non è eliminabile da nessuno, nemmeno da sé stesso:
+    // è l'intestatario dell'abbonamento e il riferimento amministrativo del tenant.
+    // Per revocarne l'accesso si usa la disattivazione (`PATCH /user/:userId/status`).
+    if (user.get('isTenant')) {
+        return sendErrorResponse(
+            res,
+            409,
+            'Il titolare dello studio non può essere eliminato. Puoi disattivarlo.'
+        );
+    }
+
+    // Cancellare il proprio account dalla gestione team è quasi sempre un errore:
+    // lascerebbe lo studio senza l'amministratore che ha avviato l'operazione.
+    if (userId === getUserId(req)) {
+        return sendErrorResponse(res, 403, 'Non puoi eliminare il tuo account');
+    }
+
     const deleted = await User.destroy({ where: { id: userId } });
+    await revokeAllForUser(userId, 'user_deleted');
+
     return sendSuccessResponse(res, 200, { deleted }, 'User removed');
 });
 
@@ -235,6 +371,7 @@ export default {
     updateUser,
     updateUserCalendarVisibility,
     updateUserCalendarColor,
+    setUserActive,
     deleteUser,
     resetPassword,
     verificationAccount,
