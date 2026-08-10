@@ -66,6 +66,20 @@ export const env = {
      */
     refreshTokenTtlDays: positiveInt('REFRESH_TOKEN_TTL_DAYS', 30),
 
+    /**
+     * Finestra di tolleranza (SECONDI) entro cui un refresh token appena ruotato può essere
+     * ripresentato senza far scattare la reuse detection.
+     *
+     * La rotazione invalida il vecchio token PRIMA che il client abbia salvato il nuovo: se la
+     * risposta si perde (F5 durante la chiamata, rete instabile, due tab che rinnovano insieme)
+     * il client resta con un token già revocato e, senza questa finestra, il tentativo successivo
+     * verrebbe scambiato per un furto e revocherebbe l'intera famiglia — cioè un logout definitivo
+     * a fronte di un evento del tutto normale.
+     *
+     * Va tenuta corta: è il tempo in cui un token rubato resta spendibile.
+     */
+    refreshTokenGraceSeconds: positiveInt('REFRESH_TOKEN_GRACE_SECONDS', 60),
+
     // Segreto per cifrare le credenziali dei dispositivi (API key dei vendor salvate per tenant).
     // In produzione impostare DEVICE_CREDENTIALS_SECRET a una stringa lunga e casuale.
     deviceCredentialsSecret: required('DEVICE_CREDENTIALS_SECRET', 'change-me-device-credentials-secret'),

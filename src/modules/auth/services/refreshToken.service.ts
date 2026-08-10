@@ -105,6 +105,14 @@ export interface RotationError {
  * Il vecchio token viene invalidato subito: se qualcuno lo ripresenta (perché lo ha copiato),
  * il tentativo cade nel ramo `reused` e l'intera famiglia viene revocata — il legittimo
  * proprietario dovrà rifare il login, ma l'attaccante resta tagliato fuori.
+ *
+ * ECCEZIONE (finestra di tolleranza, `REFRESH_TOKEN_GRACE_SECONDS`): la rotazione revoca il
+ * token PRIMA che il client possa aver salvato il successore. Se la risposta non arriva a
+ * destinazione — F5 durante la chiamata, connessione che cade, due tab che rinnovano nello
+ * stesso istante — il client resta legittimamente in mano un token già `rotated`. Trattarlo
+ * come furto significa revocare la famiglia e sbattere l'utente sulla pagina di login senza
+ * possibilità di rientrare: era esattamente il sintomo "il refresh non rientra più".
+ * Dentro la finestra, quindi, si riemette semplicemente un token nella stessa famiglia.
  */
 export async function rotateRefreshToken(
     req: Request,
@@ -121,9 +129,24 @@ export async function rotateRefreshToken(
     }
 
     const familyId = record.get('familyId') as string;
+    const userId = record.get('userId') as string;
+    const tenantId = (record.get('tenantId') as string) ?? null;
+    const structureId = (record.get('structureId') as string) ?? null;
 
-    // Token già ruotato o revocato: chi lo presenta ora non dovrebbe più averlo.
-    if (record.get('revokedAt')) {
+    const revokedAt = record.get('revokedAt') as Date | null;
+
+    if (revokedAt) {
+        const revokedReason = (record.get('revokedReason') as string) ?? null;
+        const elapsedMs = Date.now() - new Date(revokedAt).getTime();
+        const withinGrace = elapsedMs <= env.refreshTokenGraceSeconds * 1000;
+
+        // Solo una ROTAZIONE recente è compatibile con una risposta persa. Logout, cambio sede
+        // e reuse detection sono revoche volontarie: lì il rifiuto deve restare secco.
+        if (revokedReason === 'rotated' && withinGrace) {
+            const refresh = await issueRefreshToken(req, userId, { tenantId, structureId }, familyId);
+            return { ok: true, userId, familyId, tenantId, structureId, refresh };
+        }
+
         await revokeFamily(familyId, 'reuse_detected');
         return { ok: false, reason: 'reused' };
     }
@@ -132,9 +155,6 @@ export async function rotateRefreshToken(
         return { ok: false, reason: 'expired' };
     }
 
-    const userId = record.get('userId') as string;
-    const tenantId = (record.get('tenantId') as string) ?? null;
-    const structureId = (record.get('structureId') as string) ?? null;
 
     // Rotazione: prima invalido il token presentato, poi ne emetto uno nuovo nella stessa famiglia.
     await record.update({ revokedAt: new Date(), revokedReason: 'rotated' });
