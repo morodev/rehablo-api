@@ -238,6 +238,11 @@ export const loginPremise = asyncHandler(async (req: Request, res: Response) => 
     // così anche i rinnovi successivi restano coerenti con il premise scelto.
     const refresh = await issueRefreshToken(req, payload.id, { tenantId, structureId });
 
+    // Il client sostituisce il refresh token con quello appena emesso: quello precedente
+    // resterebbe altrimenti valido per giorni senza che nessuno lo usi più. Revocato DOPO
+    // l'emissione del nuovo, così un errore qui non lascia mai il client senza sessione.
+    await revokeRefreshToken(req.body?.refreshToken, 'premise_switch');
+
     return sendSuccessResponse(
         res,
         200,

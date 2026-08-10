@@ -26,6 +26,24 @@ function normalizeExpiresIn(value: string): string {
     return value;
 }
 
+/**
+ * Legge un intero positivo da env. A differenza di JWT_EXPIRES_IN, questi valori NON sono
+ * stringhe con unità (`ms`): sono numeri puri. Un valore malformato produrrebbe NaN e, in
+ * casi come il TTL del refresh token, una `Invalid Date` con sessioni non rinnovabili.
+ */
+function positiveInt(name: string, fallback: number): number {
+    const raw = process.env[name];
+    if (raw === undefined || raw.trim() === '') {
+        return fallback;
+    }
+    const parsed = parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        console.warn(`[env] ${name}="${raw}" non è un intero positivo. Uso il default ${fallback}.`);
+        return fallback;
+    }
+    return parsed;
+}
+
 export const env = {
     nodeEnv: process.env.NODE_ENV || 'development',
     isProduction: process.env.NODE_ENV === 'production',
@@ -42,8 +60,11 @@ export const env = {
      */
     jwtExpiresIn: normalizeExpiresIn(process.env.JWT_EXPIRES_IN || '15m'),
 
-    /** Durata del REFRESH token, in giorni. Ruotato a ogni utilizzo. */
-    refreshTokenTtlDays: parseInt(process.env.REFRESH_TOKEN_TTL_DAYS || '30', 10),
+    /**
+     * Durata del REFRESH token, in GIORNI (numero puro, senza unità: `30`, non `30d`).
+     * A differenza di JWT_EXPIRES_IN non passa da `ms`. Ruotato a ogni utilizzo.
+     */
+    refreshTokenTtlDays: positiveInt('REFRESH_TOKEN_TTL_DAYS', 30),
 
     // Segreto per cifrare le credenziali dei dispositivi (API key dei vendor salvate per tenant).
     // In produzione impostare DEVICE_CREDENTIALS_SECRET a una stringa lunga e casuale.
