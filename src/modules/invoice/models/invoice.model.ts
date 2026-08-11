@@ -18,6 +18,14 @@ export interface InvoiceAttributes {
     taxWithholding?: number | null;
     isStamp: boolean;
     stampAmount?: number | null;
+    /**
+     * true se la marca da bollo è RIADDEBITATA al paziente e quindi sommata al totale a pagare.
+     *
+     * Il bollo è dovuto dall'emittente; il riaddebito è facoltativo ed è escluso dalla base
+     * imponibile IVA (art. 15, c. 1, n. 3, DPR 633/72). Va congelato sul documento perché
+     * cambiare l'impostazione dello studio non deve alterare i totali di fatture già emesse.
+     */
+    stampChargedToPatient: boolean;
     paymentMethod?: string | null;
     discountType?: string | null;
     discountAmount?: number | null;
@@ -54,6 +62,12 @@ export interface InvoiceAttributes {
      * la renderebbe difforme dall'originale consegnato al paziente.
      */
     issuer?: InvoiceIssuerSnapshot | null;
+    /**
+     * Diciture obbligatorie congelate all'emissione (regime forfettario, esenzione art. 10 n. 18,
+     * assolvimento del bollo...). Stesso motivo di `issuer`: una fattura emessa in forfettario deve
+     * continuare a riportare le diciture del forfettario anche dopo il passaggio al regime ordinario.
+     */
+    fiscalNotes?: string[] | null;
 }
 
 /** Dati del soggetto emittente congelati sul documento. */
@@ -68,11 +82,21 @@ export interface InvoiceIssuerSnapshot {
     pec: string | null;
     email: string | null;
     phone: string | null;
+    /** Codice regime fiscale (RF01-RF19) valido alla data di emissione. */
+    taxRegime: string | null;
 }
 
 export type InvoiceCreationAttributes = Optional<
     InvoiceAttributes,
-    'id' | 'isCashPro' | 'isRivals' | 'isTaxWithholding' | 'isStamp' | 'documentType' | 'stsExcluded' | 'stsSent'
+    | 'id'
+    | 'isCashPro'
+    | 'isRivals'
+    | 'isTaxWithholding'
+    | 'isStamp'
+    | 'stampChargedToPatient'
+    | 'documentType'
+    | 'stsExcluded'
+    | 'stsSent'
 >;
 
 /**
@@ -100,6 +124,7 @@ export class Invoice extends Model<InvoiceAttributes, InvoiceCreationAttributes>
     declare taxWithholding: number | null;
     declare isStamp: boolean;
     declare stampAmount: number | null;
+    declare stampChargedToPatient: boolean;
     declare paymentMethod: string | null;
     declare discountType: string | null;
     declare discountAmount: number | null;
@@ -114,6 +139,7 @@ export class Invoice extends Model<InvoiceAttributes, InvoiceCreationAttributes>
     declare stsSent: boolean;
     declare stsSentAt: Date | null;
     declare issuer: InvoiceIssuerSnapshot | null;
+    declare fiscalNotes: string[] | null;
 }
 
 Invoice.init(
@@ -134,6 +160,7 @@ Invoice.init(
         taxWithholding: DataTypes.INTEGER,
         isStamp: { type: DataTypes.BOOLEAN, defaultValue: false },
         stampAmount: DataTypes.DECIMAL(10, 2),
+        stampChargedToPatient: { type: DataTypes.BOOLEAN, defaultValue: false },
         paymentMethod: DataTypes.STRING,
         discountType: DataTypes.STRING,
         discountAmount: DataTypes.DECIMAL(10, 2),
@@ -147,7 +174,8 @@ Invoice.init(
         stsExcluded: { type: DataTypes.BOOLEAN, defaultValue: false },
         stsSent: { type: DataTypes.BOOLEAN, defaultValue: false },
         stsSentAt: DataTypes.DATE,
-        issuer: { type: DataTypes.JSONB, allowNull: true }
+        issuer: { type: DataTypes.JSONB, allowNull: true },
+        fiscalNotes: { type: DataTypes.JSONB, allowNull: true }
     },
     { sequelize, modelName: 'invoice', tableName: 'invoices' }
 );

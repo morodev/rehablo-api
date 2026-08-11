@@ -1,5 +1,6 @@
 import { TenantAttributes } from '../../auth/models/tenant.model.js';
 import { InvoiceIssuerSnapshot } from '../models/invoice.model.js';
+import { getTaxRegime } from './fiscalRegime.js';
 
 /**
  * Dati del CEDENTE/PRESTATORE richiesti per emettere un documento fiscale valido.
@@ -65,7 +66,11 @@ export function buildIssuerSnapshot(tenant: TenantLike): InvoiceIssuerSnapshot {
         zipCode: asString(tenant.zipCode),
         pec: asString(tenant.pec),
         email: asString(tenant.email),
-        phone: asString(tenant.phone)
+        phone: asString(tenant.phone),
+        // Il regime è risolto (non copiato grezzo) così un valore assente o sporco diventa
+        // comunque un codice valido: sulle vecchie fatture ricadrebbe altrimenti a `null`,
+        // rendendo impossibile ristampare le diciture corrette.
+        taxRegime: getTaxRegime(tenant.taxRegime as string | null | undefined).code
     };
 }
 

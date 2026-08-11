@@ -12,8 +12,9 @@ import Service from '../../products-services/models/service.model.js';
 import Patient from '../../patients/models/patient.model.js';
 import Tenant from '../../auth/models/tenant.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
-import { evalTotals } from '../utils/evalTotals.js';
+import { evalTotals, EvalTotalsResult, toPersistedTotals } from '../utils/evalTotals.js';
 import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
+import { buildFiscalNotes, FiscalProfile, isStampDutyDue, resolveFiscalProfile } from '../utils/fiscalRegime.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
 
 /**
@@ -111,6 +112,91 @@ const toEvalLine = (line: ResolvedInvoiceLine) => ({
     productVat: line.vat
 });
 
+/** Esito dell'applicazione del regime fiscale al documento in corso di emissione. */
+interface FiscalOutcome {
+    /** Campi fiscali normalizzati da persistere (sovrascrivono quanto arrivato dal client). */
+    fields: {
+        vatNature: string;
+        isTaxWithholding: boolean;
+        taxWithholding: number | null;
+        isStamp: boolean;
+        stampAmount: number | null;
+        stampChargedToPatient: boolean;
+    };
+    totals: EvalTotalsResult;
+    fiscalNotes: string[];
+}
+
+/**
+ * Applica il REGIME FISCALE dello studio al documento e ricalcola i totali di conseguenza.
+ *
+ * Il controllo sta qui e non (solo) nella UI perché è una regola di validità del documento: un
+ * forfettario che riuscisse a emettere una fattura con IVA e ritenuta produrrebbe un documento
+ * fiscalmente errato, già numerato e quindi non eliminabile senza lasciare buchi nella numerazione.
+ *
+ * La marca da bollo richiede due passate: la soglia di 77,47 € si valuta sull'imponibile delle
+ * sole righe SENZA IVA, che è a sua volta un risultato del calcolo. Si calcola quindi una prima
+ * volta senza bollo per conoscere quella quota, poi si ricalcola includendolo se dovuto.
+ */
+function applyFiscalRules(params: {
+    profile: FiscalProfile;
+    invoiceFields: Record<string, any>;
+    evalLines: { products: ReturnType<typeof toEvalLine>[]; services: ReturnType<typeof toEvalLine>[] };
+}): FiscalOutcome {
+    const { profile, invoiceFields, evalLines } = params;
+
+    // Il regime può imporre la natura IVA (forfettario: N2.2 "non soggetta", che assorbe anche
+    // l'esenzione sanitaria art. 10 n. 18 e quindi NON va indicata come N4).
+    const vatNature = profile.forcedVatNature ?? invoiceFields.vatNature ?? profile.defaultVatNature;
+
+    // Regimi forfettario/minimi: il committente non opera alcuna ritenuta (art. 1 c. 67 L. 190/2014).
+    const isTaxWithholding = profile.allowsWithholding && Boolean(invoiceFields.isTaxWithholding);
+    const taxWithholding = isTaxWithholding
+        ? Number(invoiceFields.taxWithholding ?? profile.withholdingRate)
+        : null;
+
+    const baseInput = {
+        products: evalLines.products,
+        services: evalLines.services,
+        discountType: invoiceFields.discountType,
+        discountAmount: invoiceFields.discountAmount,
+        isRivals: invoiceFields.isRivals,
+        rivals: invoiceFields.rivals,
+        isCashPro: invoiceFields.isCashPro,
+        isTaxWithholding,
+        taxWithholding: taxWithholding ?? 0,
+        appliesVat: profile.appliesVat
+    };
+
+    const stampDue = isStampDutyDue(evalTotals(baseInput).vatFreeAmount, profile);
+
+    // Se il client si esprime esplicitamente sul bollo la sua scelta viene rispettata (esistono
+    // casi limite legittimi); se tace, si applica la regola di legge.
+    const isStamp = invoiceFields.isStamp === undefined ? stampDue : Boolean(invoiceFields.isStamp);
+    const stampAmount = isStamp ? Number(invoiceFields.stampAmount ?? profile.stampDutyAmount) : null;
+    const stampChargedToPatient =
+        invoiceFields.stampChargedToPatient === undefined
+            ? profile.stampChargedToPatient
+            : Boolean(invoiceFields.stampChargedToPatient);
+
+    const totals = evalTotals({
+        ...baseInput,
+        isStamp,
+        stampAmount: stampAmount ?? 0,
+        stampChargedToPatient
+    });
+
+    return {
+        fields: { vatNature, isTaxWithholding, taxWithholding, isStamp, stampAmount, stampChargedToPatient },
+        totals,
+        fiscalNotes: buildFiscalNotes({
+            profile,
+            hasVatFreeLines: totals.vatFreeAmount > 0,
+            hasStampDuty: isStamp
+        })
+    };
+}
+
 export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const { InvoiceScoped, ProductScoped, ServiceScoped, InvoiceProductScoped, InvoiceServiceScoped } =
@@ -131,21 +217,35 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 400, `Servizio non trovato nel catalogo: ${missingServiceId}`);
     }
 
-    const totals = evalTotals({
-        products: productLines.map(toEvalLine),
-        services: serviceLines.map(toEvalLine),
-        discountType: invoiceFields.discountType,
-        discountAmount: invoiceFields.discountAmount,
-        isRivals: invoiceFields.isRivals,
-        rivals: invoiceFields.rivals,
-        isCashPro: invoiceFields.isCashPro,
-        isTaxWithholding: invoiceFields.isTaxWithholding,
-        taxWithholding: invoiceFields.taxWithholding
+    // --- Dati del cedente/prestatore: senza non si emette. ---
+    // Il controllo sta QUI e non solo nella UI perché è un requisito di validità del documento
+    // (art. 21 DPR 633/72): un client che chiamasse direttamente l'API produrrebbe altrimenti
+    // fatture prive dei dati obbligatori, già numerate e quindi non eliminabili senza buchi.
+    const tenantId = req.user!.tenants[0].id;
+    const issuerTenant = await Tenant.findByPk(tenantId);
+    const missingIssuerFields = getMissingIssuerFields(issuerTenant?.get({ plain: true }) as any);
+    if (missingIssuerFields.length > 0) {
+        return sendErrorResponse(
+            res,
+            422,
+            `Dati di fatturazione dello studio incompleti: ${missingIssuerFields.join(', ')}. ` +
+                'Completali in Impostazioni → Dati aziendali prima di emettere il documento.'
+        );
+    }
+    const issuerData = issuerTenant!.get({ plain: true }) as any;
+    const issuer = buildIssuerSnapshot(issuerData);
+
+    // Il regime fiscale dello studio decide IVA, natura, ritenuta e bollo: va applicato PRIMA di
+    // calcolare i totali, non dopo (vedi docs/REGIME_FISCALE_IT.md).
+    const fiscalProfile = resolveFiscalProfile(issuerData);
+    const fiscal = applyFiscalRules({
+        profile: fiscalProfile,
+        invoiceFields,
+        evalLines: { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) }
     });
 
     // --- Adempimenti fiscali: numerazione progressiva senza "buchi" per anno fiscale, e
     // verifica automatica dell'eventuale opposizione del paziente all'invio Sistema TS. ---
-    const tenantId = req.user!.tenants[0].id;
     const fiscalYear =
         invoiceFields.documentYear ?? new Date(invoiceFields.emissionDate ?? Date.now()).getFullYear();
 
@@ -163,22 +263,6 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         }
     }
 
-    // --- Dati del cedente/prestatore: senza non si emette. ---
-    // Il controllo sta QUI e non solo nella UI perché è un requisito di validità del documento
-    // (art. 21 DPR 633/72): un client che chiamasse direttamente l'API produrrebbe altrimenti
-    // fatture prive dei dati obbligatori, già numerate e quindi non eliminabili senza buchi.
-    const issuerTenant = await Tenant.findByPk(tenantId);
-    const missingIssuerFields = getMissingIssuerFields(issuerTenant?.get({ plain: true }) as any);
-    if (missingIssuerFields.length > 0) {
-        return sendErrorResponse(
-            res,
-            422,
-            `Dati di fatturazione dello studio incompleti: ${missingIssuerFields.join(', ')}. ` +
-                'Completali in Impostazioni → Dati aziendali prima di emettere il documento.'
-        );
-    }
-    const issuer = buildIssuerSnapshot(issuerTenant!.get({ plain: true }) as any);
-
     // Numerazione progressiva + creazione fattura + creazione righe in un'UNICA transazione:
     // se una qualsiasi parte fallisce, non deve restare un numero "bruciato" senza fattura, né
     // una fattura senza le sue righe.
@@ -195,7 +279,16 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         await tenant.update({ lastDocumentNumberByYear: counters }, { transaction: t });
 
         const createdInvoice = await InvoiceScoped.create(
-            { ...invoiceFields, ...totals, documentNumber: nextNumber, documentYear: fiscalYear, stsExcluded, issuer },
+            {
+                ...invoiceFields,
+                ...fiscal.fields,
+                ...toPersistedTotals(fiscal.totals),
+                fiscalNotes: fiscal.fiscalNotes,
+                documentNumber: nextNumber,
+                documentYear: fiscalYear,
+                stsExcluded,
+                issuer
+            },
             { transaction: t }
         );
         const invoiceId = createdInvoice.get('id') as string;
@@ -380,19 +473,42 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
             return sendErrorResponse(res, 400, `Servizio non trovato nel catalogo: ${missingServiceId}`);
         }
 
-        const totals = evalTotals({
-            products: productLines.map(toEvalLine),
-            services: serviceLines.map(toEvalLine),
-            discountType: invoiceFields.discountType ?? existingInvoice.get('discountType'),
-            discountAmount: invoiceFields.discountAmount ?? existingInvoice.get('discountAmount'),
-            isRivals: invoiceFields.isRivals ?? existingInvoice.get('isRivals'),
-            rivals: invoiceFields.rivals ?? existingInvoice.get('rivals'),
-            isCashPro: invoiceFields.isCashPro ?? existingInvoice.get('isCashPro'),
-            isTaxWithholding: invoiceFields.isTaxWithholding ?? existingInvoice.get('isTaxWithholding'),
-            taxWithholding: invoiceFields.taxWithholding ?? existingInvoice.get('taxWithholding')
+        // Il regime da applicare è quello congelato sul documento (`issuer.taxRegime`), non quello
+        // corrente dello studio: correggere una fattura del 2025 emessa in forfettario non deve
+        // trasformarla in una fattura con IVA solo perché nel frattempo si è passati all'ordinario.
+        // Le altre impostazioni (importo bollo, aliquote proposte) restano quelle attuali del tenant.
+        const issuerSnapshot = existingInvoice.get('issuer') as { taxRegime?: string | null } | null;
+        const issuerTenant = await Tenant.findByPk(req.user!.tenants[0].id);
+        const profile = resolveFiscalProfile({
+            ...((issuerTenant?.get({ plain: true }) as any) ?? {}),
+            taxRegime: issuerSnapshot?.taxRegime ?? (issuerTenant?.get('taxRegime') as string | null)
         });
 
-        updateData = { ...updateData, ...totals };
+        const fiscal = applyFiscalRules({
+            profile,
+            invoiceFields: {
+                discountType: invoiceFields.discountType ?? existingInvoice.get('discountType'),
+                discountAmount: invoiceFields.discountAmount ?? existingInvoice.get('discountAmount'),
+                isRivals: invoiceFields.isRivals ?? existingInvoice.get('isRivals'),
+                rivals: invoiceFields.rivals ?? existingInvoice.get('rivals'),
+                isCashPro: invoiceFields.isCashPro ?? existingInvoice.get('isCashPro'),
+                isTaxWithholding: invoiceFields.isTaxWithholding ?? existingInvoice.get('isTaxWithholding'),
+                taxWithholding: invoiceFields.taxWithholding ?? existingInvoice.get('taxWithholding'),
+                vatNature: invoiceFields.vatNature ?? existingInvoice.get('vatNature'),
+                isStamp: invoiceFields.isStamp ?? existingInvoice.get('isStamp'),
+                stampAmount: invoiceFields.stampAmount ?? existingInvoice.get('stampAmount'),
+                stampChargedToPatient:
+                    invoiceFields.stampChargedToPatient ?? existingInvoice.get('stampChargedToPatient')
+            },
+            evalLines: { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) }
+        });
+
+        updateData = {
+            ...updateData,
+            ...fiscal.fields,
+            ...toPersistedTotals(fiscal.totals),
+            fiscalNotes: fiscal.fiscalNotes
+        };
 
         await sequelize.transaction(async (t) => {
             await InvoiceScoped.update(updateData, { where: { id }, transaction: t });

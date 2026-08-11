@@ -9,6 +9,7 @@ import { env } from '../../../config/env.js';
 import { signUpSendMail } from '../../../services/email.service.js';
 import { sequelize } from '../../../config/database.js';
 import { TENANT_OWNER_ROLE } from '../rbac/roles.js';
+import { isTaxRegimeCode } from '../../invoice/utils/fiscalRegime.js';
 import { Tenant, User, Structure, StructureAvailability, UserAvailability } from '../models/index.js';
 
 export const stripe = env.stripeSecretKey ? new Stripe(env.stripeSecretKey) : (null as unknown as Stripe);
@@ -129,6 +130,18 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
 
 export const updateTenant = asyncHandler(async (req: Request, res: Response) => {
     const id = req.params.tenantId;
+
+    // Il regime fiscale pilota IVA, ritenuta, natura e diciture di OGNI documento emesso: un codice
+    // inventato produrrebbe fatture sbagliate a catena. Si accettano solo i codici della tabella
+    // `RegimeFiscale` della FatturaPA (vedi src/modules/invoice/utils/fiscalRegime.ts).
+    if (req.body?.taxRegime !== undefined && req.body.taxRegime !== null && req.body.taxRegime !== '') {
+        const normalized = `${req.body.taxRegime}`.trim().toUpperCase();
+        if (!isTaxRegimeCode(normalized)) {
+            return sendErrorResponse(res, 422, `Regime fiscale non valido: ${req.body.taxRegime}`);
+        }
+        req.body.taxRegime = normalized;
+    }
+
     const [, updated] = await Tenant.update(req.body, { where: { id }, returning: true });
     return sendSuccessResponse(res, 200, updated, 'Tenant updated');
 });

@@ -6,6 +6,7 @@ import { patientScopeWhere } from '../../../middleware/rbac.js';
 import Invoice from '../models/invoice.model.js';
 import Tenant from '../../auth/models/tenant.model.js';
 import { getMissingIssuerFields } from '../utils/issuer.js';
+import { resolveFiscalProfile } from '../utils/fiscalRegime.js';
 
 /**
  * Aggregazioni economiche per la dashboard di direzione.
@@ -143,16 +144,26 @@ export const getOverview = asyncHandler(async (req: Request, res: Response) => {
  * Dice se lo studio è in regola per emettere documenti fiscali e, in caso contrario,
  * quali dati mancano. Serve alla UI per avvisare PRIMA che l'utente compili una fattura
  * intera, invece di farlo fallire al salvataggio.
+ *
+ * Restituisce anche il PROFILO FISCALE risolto (regime, IVA applicabile, natura imposta,
+ * ritenuta ammessa, parametri del bollo): il form fattura lo usa per proporre i valori corretti
+ * e disabilitare le opzioni che il regime esclude, invece di lasciare all'utente la possibilità
+ * di comporre un documento che il backend rifiuterà o correggerà silenziosamente.
  */
 export const getIssuerStatus = asyncHandler(async (req: Request, res: Response) => {
     const tenantId = req.user!.tenants[0].id;
     const tenant = await Tenant.findByPk(tenantId);
-    const missing = getMissingIssuerFields(tenant?.get({ plain: true }) as any);
+    const tenantData = tenant?.get({ plain: true }) as any;
+    const missing = getMissingIssuerFields(tenantData);
 
     return sendSuccessResponse(
         res,
         200,
-        { ready: missing.length === 0, missing },
+        {
+            ready: missing.length === 0,
+            missing,
+            fiscalProfile: resolveFiscalProfile(tenantData)
+        },
         'Stato dati di fatturazione'
     );
 });

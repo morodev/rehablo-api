@@ -28,6 +28,7 @@ router.get('/event-type', requirePermission('agenda', 'read'), eventTypeControll
 router.get('/event-type/:eventTypeId', requirePermission('agenda', 'read'), eventTypeController.findEventById);
 router.post('/event-type', requirePermission('agenda', 'create', 'structure'), eventTypeController.createEventType);
 router.put('/event-type/:eventTypeId', requirePermission('agenda', 'update', 'structure'), eventTypeController.updateEventType);
+router.patch('/event-type/:eventTypeId/default', requirePermission('agenda', 'update', 'structure'), eventTypeController.setDefaultEventType);
 router.delete('/event-type/:eventTypeId', requirePermission('agenda', 'delete', 'structure'), eventTypeController.deleteEventType);
 router.get('/event-type/search/event', requirePermission('agenda', 'read'), eventTypeController.searchEventType);
 

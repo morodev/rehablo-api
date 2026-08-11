@@ -27,13 +27,42 @@ export interface TenantAttributes {
     zipCode?: string | null;
     email?: string | null;
     phone?: string | null;
+    // --- Regime fiscale e opzioni di fatturazione (Italia). ---
+    // Il regime determina se in fattura si espone l'IVA, quale natura indicare al suo posto, se è
+    // ammessa la ritenuta d'acconto e quali diciture sono obbligatorie sul documento: senza questo
+    // dato il software può solo indovinare. Vedi docs/REGIME_FISCALE_IT.md e
+    // src/modules/invoice/utils/fiscalRegime.ts.
+    /** Codice tabella `RegimeFiscale` FatturaPA (RF01-RF19). Default: RF01 ordinario. */
+    taxRegime?: string | null;
+    /** Cassa previdenziale: 'NONE' | 'INPS_GS' (rivalsa 4%) | 'CASSA' (contributo integrativo). */
+    socialSecurityFund?: string | null;
+    /** Aliquota del contributo previdenziale proposta in fattura (es. 4 per la Gestione Separata). */
+    socialSecurityRate?: number | null;
+    /** Aliquota ritenuta d'acconto proposta in fattura (art. 25 DPR 600/73: 20%). */
+    withholdingRate?: number | null;
+    /** Importo dell'imposta di bollo (DPR 642/72: 2,00 €, storicamente variato). */
+    stampDutyAmount?: number | null;
+    /** Se il bollo va riaddebitato al paziente e quindi sommato al totale (art. 15 DPR 633/72). */
+    stampChargedToPatient?: boolean | null;
     /** Progressivo dell'ultimo numero fattura/ricevuta emesso per anno fiscale: { "2026": 42 }. */
     lastDocumentNumberByYear: Record<string, number>;
 }
 
 export type TenantCreationAttributes = Optional<
     TenantAttributes,
-    'id' | 'isActive' | 'isPremium' | 'userQuantity' | 'structureQuantity' | 'MBQuantity' | 'lastDocumentNumberByYear'
+    | 'id'
+    | 'isActive'
+    | 'isPremium'
+    | 'userQuantity'
+    | 'structureQuantity'
+    | 'MBQuantity'
+    | 'lastDocumentNumberByYear'
+    | 'taxRegime'
+    | 'socialSecurityFund'
+    | 'socialSecurityRate'
+    | 'withholdingRate'
+    | 'stampDutyAmount'
+    | 'stampChargedToPatient'
 >;
 
 export class Tenant extends Model<TenantAttributes, TenantCreationAttributes> implements TenantAttributes {
@@ -58,6 +87,12 @@ export class Tenant extends Model<TenantAttributes, TenantCreationAttributes> im
     declare zipCode: string | null;
     declare email: string | null;
     declare phone: string | null;
+    declare taxRegime: string | null;
+    declare socialSecurityFund: string | null;
+    declare socialSecurityRate: number | null;
+    declare withholdingRate: number | null;
+    declare stampDutyAmount: number | null;
+    declare stampChargedToPatient: boolean | null;
     declare lastDocumentNumberByYear: Record<string, number>;
 }
 
@@ -84,6 +119,14 @@ Tenant.init(
         zipCode: { type: DataTypes.STRING(10), allowNull: true },
         email: { type: DataTypes.STRING, allowNull: true },
         phone: { type: DataTypes.STRING, allowNull: true },
+        // Il default RF01 (ordinario) è la scelta prudente: applica l'IVA di riga e ammette la
+        // ritenuta, quindi non "nasconde" imposte a chi non ha ancora configurato il regime.
+        taxRegime: { type: DataTypes.STRING(4), allowNull: true, defaultValue: 'RF01' },
+        socialSecurityFund: { type: DataTypes.STRING(16), allowNull: true, defaultValue: 'NONE' },
+        socialSecurityRate: { type: DataTypes.DECIMAL(5, 2), allowNull: true, defaultValue: 4 },
+        withholdingRate: { type: DataTypes.DECIMAL(5, 2), allowNull: true, defaultValue: 20 },
+        stampDutyAmount: { type: DataTypes.DECIMAL(10, 2), allowNull: true, defaultValue: 2 },
+        stampChargedToPatient: { type: DataTypes.BOOLEAN, allowNull: true, defaultValue: true },
         lastDocumentNumberByYear: { type: DataTypes.JSONB, defaultValue: {} }
     },
     { sequelize, modelName: 'tenant', tableName: 'tenants' }

@@ -12,11 +12,19 @@ export interface EventTypeAttributes {
     erasable: boolean;
     editable: boolean;
     linkedServiceId?: string | null;
+    /**
+     * Tipo proposto automaticamente quando si crea un appuntamento in agenda.
+     *
+     * Al massimo UNO per tenant: l'unicità è garantita lato server (vedi
+     * `eventType.controller.ts`), non dal client, perché farla con più chiamate HTTP
+     * significherebbe restare con due predefiniti se una delle due fallisse.
+     */
+    isDefault: boolean;
 }
 
 export type EventTypeCreationAttributes = Optional<
     EventTypeAttributes,
-    'id' | 'icon' | 'duration' | 'color' | 'erasable' | 'editable'
+    'id' | 'icon' | 'duration' | 'color' | 'erasable' | 'editable' | 'isDefault'
 >;
 
 /** Tenant-scoped model: always access through `EventType.schema(req.tenantSchema)`. */
@@ -31,6 +39,7 @@ export class EventType extends Model<EventTypeAttributes, EventTypeCreationAttri
     declare erasable: boolean;
     declare editable: boolean;
     declare linkedServiceId: string | null;
+    declare isDefault: boolean;
 }
 
 EventType.init(
@@ -44,7 +53,8 @@ EventType.init(
         color: { type: DataTypes.STRING, defaultValue: 'text-green-500' },
         erasable: { type: DataTypes.BOOLEAN, defaultValue: true },
         editable: { type: DataTypes.BOOLEAN, defaultValue: true },
-        linkedServiceId: { type: DataTypes.UUID, allowNull: true }
+        linkedServiceId: { type: DataTypes.UUID, allowNull: true },
+        isDefault: { type: DataTypes.BOOLEAN, defaultValue: false, allowNull: false }
     },
     { sequelize, modelName: 'eventType', tableName: 'event_types' }
 );

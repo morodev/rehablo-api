@@ -39,6 +39,16 @@ export interface EvalTotalsInput {
     isCashPro?: boolean;
     isTaxWithholding?: boolean;
     taxWithholding?: number;
+    /**
+     * false quando il REGIME dell'emittente esclude l'IVA (forfettario RF19, minimi RF02):
+     * in quel caso nessuna riga espone IVA, nemmeno la vendita di un prodotto con aliquota 22%
+     * a catalogo. Vedi utils/fiscalRegime.ts. Default: true (regime ordinario).
+     */
+    appliesVat?: boolean;
+    isStamp?: boolean;
+    stampAmount?: number;
+    /** true se il bollo è riaddebitato al paziente e quindi sommato al totale (art. 15 DPR 633/72). */
+    stampChargedToPatient?: boolean;
 }
 
 export interface EvalTotalsResult {
@@ -47,6 +57,22 @@ export interface EvalTotalsResult {
     discSellingPrice: number;
     invoiceNet: number;
     invoiceVAT: number;
+    /**
+     * Imponibile delle sole righe SENZA IVA (esenti/non soggette), già scontato.
+     * È la base su cui si verifica la soglia di 77,47 € della marca da bollo: su una fattura mista
+     * il bollo dipende da questa quota, non dal totale del documento.
+     */
+    vatFreeAmount: number;
+    /** Contributo previdenziale addebitato (rivalsa INPS o contributo integrativo cassa). */
+    rivalsAmount: number;
+    /** Ritenuta d'acconto trattenuta dal committente. */
+    taxWithholdingAmount: number;
+    /**
+     * Bollo effettivamente sommato al totale (0 se non applicato o non riaddebitato).
+     * Deliberatamente NON si chiama `stampAmount`: quello è il campo del documento (l'importo del
+     * tributo, es. 2,00 €) e non deve essere sovrascritto dal risultato del calcolo.
+     */
+    stampChargedAmount: number;
 }
 
 /** Normalizza un codice IVA in una delle chiavi note ('4'|'5'|'10'|'22'|'ESENTE'). Codici non
@@ -80,12 +106,15 @@ function evalVat(isRivals: boolean, rivals: number, vatRate: number, sellingPric
 export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
     const rivals = invoiceFields.rivals || 0;
     const isRivals = !!invoiceFields.isRivals;
+    // Il regime dell'emittente ha la precedenza sull'aliquota di catalogo: un forfettario non
+    // addebita IVA nemmeno vendendo un prodotto con aliquota 22% censita a catalogo.
+    const appliesVat = invoiceFields.appliesVat !== false;
 
     // Unifica prodotti e servizi in un'unica lista di righe, applicando la quantità al prezzo
     // unitario (fix del bug "quantity ignorata").
     const lines = [...(invoiceFields.products ?? []), ...(invoiceFields.services ?? [])].map((line) => ({
         totalLinePrice: line.sellingPrice * (line.quantity ?? 1),
-        vatKey: normalizeVatRateKey(line.productVat)
+        vatKey: appliesVat ? normalizeVatRateKey(line.productVat) : 'ESENTE'
     }));
 
     let totalSellingPrice = 0;
@@ -97,6 +126,7 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
     const totalDiscSellingPrice = totalSellingPrice - applyDiscount(discount, totalSellingPrice);
 
     let totalRivals = 0;
+    let vatFreeAmount = 0;
     const vatBuckets: Record<string, number> = { '4': 0, '5': 0, '10': 0, '22': 0, ESENTE: 0 };
 
     lines.forEach((line) => {
@@ -105,13 +135,20 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
 
         if (line.vatKey === 'ESENTE') {
             vatBuckets.ESENTE += 0; // operazione esente/non imponibile: nessuna IVA dovuta.
+            vatFreeAmount += discountedPrice; // ...ma concorre alla soglia della marca da bollo.
         } else {
             vatBuckets[line.vatKey] += evalVat(isRivals, rivals, Number(line.vatKey), discountedPrice);
         }
     });
 
     const totalProductVat = vatBuckets['4'] + vatBuckets['5'] + vatBuckets['10'] + vatBuckets['22'] + vatBuckets.ESENTE;
-    const invoiceTotal = totalDiscSellingPrice + totalRivals + totalProductVat;
+
+    // Marca da bollo: il tributo è dovuto dall'emittente, ma entra nel totale a pagare SOLO se
+    // riaddebitato al cliente (art. 15, c. 1, n. 3, DPR 633/72, che lo esclude dalla base imponibile).
+    const stampChargedAmount =
+        invoiceFields.isStamp && invoiceFields.stampChargedToPatient ? invoiceFields.stampAmount || 0 : 0;
+
+    const invoiceTotal = totalDiscSellingPrice + totalRivals + totalProductVat + stampChargedAmount;
 
     let taxWithholdingValue = 0;
     if (invoiceFields.isTaxWithholding) {
@@ -128,7 +165,28 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
         sellingPrice: totalSellingPrice,
         discSellingPrice: totalDiscSellingPrice,
         invoiceNet: netAmountDue,
-        invoiceVAT: totalProductVat
+        invoiceVAT: totalProductVat,
+        vatFreeAmount,
+        rivalsAmount: totalRivals,
+        taxWithholdingAmount: taxWithholdingValue,
+        stampChargedAmount
+    };
+}
+
+/**
+ * Sottoinsieme dei totali che corrisponde a colonne di `invoices`.
+ *
+ * Serve a poter fare `create({ ...invoiceFields, ...toPersistedTotals(totals) })` senza che i
+ * valori di supporto (soglia bollo, importi di dettaglio) finiscano per collidere con campi
+ * omonimi del documento.
+ */
+export function toPersistedTotals(totals: EvalTotalsResult) {
+    return {
+        invoiceTotal: totals.invoiceTotal,
+        sellingPrice: totals.sellingPrice,
+        discSellingPrice: totals.discSellingPrice,
+        invoiceNet: totals.invoiceNet,
+        invoiceVAT: totals.invoiceVAT
     };
 }
 

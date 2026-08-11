@@ -134,10 +134,37 @@
     un tenant può avere più `Structure` in Regioni diverse, quindi l'adapter FSE va scelto per
     ogni singolo documento in base alla Regione della struttura in cui è stato erogato, non una
     sola volta per tenant (dettagli in `modules/compliance/fse/README.md`, sezione 6).
+11. **Regime fiscale** (`Tenant.taxRegime` + `modules/invoice/utils/fiscalRegime.ts`):
+    il codice della tabella `RegimeFiscale` FatturaPA (RF01-RF19) determina in modo deterministico
+    come viene costruito ogni documento — se si espone l'IVA, quale natura indicare al suo posto
+    (`N4` esente art. 10 vs `N2.2` non soggetta per i forfettari), se è ammessa la ritenuta
+    d'acconto (esclusa dall'art. 1, c. 67, L. 190/2014) e quali diciture sono obbligatorie.
+    Insieme al regime sono stati aggiunti `socialSecurityFund`/`socialSecurityRate` (rivalsa INPS
+    4% vs contributo integrativo di cassa, che si comportano diversamente rispetto alla ritenuta),
+    `withholdingRate`, `stampDutyAmount` e `stampChargedToPatient`.
+    - `resolveFiscalProfile()` traduce i dati aziendali in regole applicabili; `applyFiscalRules()`
+      in `invoice.controller.ts` le impone **lato server**, come già per i dati dell'emittente.
+    - La **marca da bollo** (2,00 € oltre 77,47 €, DPR 642/72) viene applicata automaticamente
+      valutando la soglia sull'imponibile delle sole righe **senza IVA**: su una fattura mista
+      (prestazione esente + vendita di un prodotto con IVA) è quella la base di legge. Il tributo
+      concorre al totale **solo se riaddebitato** al paziente (art. 15, c. 1, n. 3, DPR 633/72):
+      in precedenza il backend non lo sommava mai e il frontend sempre, con totali divergenti.
+    - `Invoice.fiscalNotes` (JSONB) congela le **diciture obbligatorie** all'emissione e
+      `issuer.taxRegime` il regime vigente in quella data, con lo stesso principio dello snapshot
+      dell'emittente: una fattura emessa in forfettario resta tale anche dopo il passaggio
+      all'ordinario.
+    - `GET /reports/issuer-status` restituisce anche il `fiscalProfile` risolto, così il form
+      fattura propone i valori corretti invece di lasciar comporre documenti che il server
+      dovrebbe poi correggere in silenzio.
+    - Riferimento normativo di dettaglio: **`docs/REGIME_FISCALE_IT.md`**.
 
 
 > Le colonne sopra vengono create automaticamente al riavvio del backend grazie a
 > `sync({ alter: true })` (sia per i modelli globali sia per gli schemi dinamici per-tenant).
+>
+> **Eccezione**: `public.tenants` non è tenant-scoped e non viene toccata dal sync. Le colonne del
+> regime fiscale vanno applicate con la migration
+> `migrations/20260811-add-tax-regime-to-tenant.js`.
 
 ## 4. Roadmap consigliata (fasi successive)
 
