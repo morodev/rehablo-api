@@ -47,7 +47,7 @@ export interface RoleDefinition {
 // ---------------------------------------------------------------------------
 
 /** Risorse cliniche: tutto ciò che costituisce cartella clinica del paziente. */
-const CLINICAL_RESOURCES = ['evaluation', 'protocol', 'bodymap', 'measurement'] as const;
+const CLINICAL_RESOURCES = ['evaluation', 'protocol', 'note', 'bodymap', 'measurement'] as const;
 
 const clinicalCrud = (scope: 'own' | 'structure' | 'tenant'): Permission[] =>
     CLINICAL_RESOURCES.flatMap((resource) => crud(resource, scope));
@@ -63,6 +63,8 @@ const physicianPermissions = (): Permission[] => [
     // legge tutta la clinica della struttura, scrive solo la propria
     ...clinicalRead('structure'),
     ...CLINICAL_RESOURCES.flatMap((resource) => perms(resource, ['create', 'update'], 'own')),
+    perm('reminder', 'read', 'structure'),
+    ...crud('reminder', 'own'),
     perm('agenda', 'read', 'structure'),
     ...crud('agenda', 'own'),
     perm('product', 'read', 'tenant'),
@@ -85,6 +87,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
         permissions: [
             perm('patient', 'manage', 'tenant'),
             ...CLINICAL_RESOURCES.map((resource) => perm(resource, 'manage', 'tenant')),
+            perm('reminder', 'manage', 'tenant'),
             perm('agenda', 'manage', 'tenant'),
             perm('invoice', 'manage', 'tenant'),
             perm('product', 'manage', 'tenant'),
@@ -104,6 +107,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             // anagrafica sì, cancellazione no
             ...perms('patient', ['read', 'create', 'update'], 'structure'),
             // NESSUN permesso su evaluation / protocol / bodymap / measurement
+            ...crud('reminder', 'structure'),
             ...crud('agenda', 'structure'),
             ...perms('invoice', ['read', 'create', 'update', 'export'], 'structure'),
             // Il front-office gestisce il listino perché è ciò che alimenta fatture e tipi
@@ -126,6 +130,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             perm('patient', 'update', 'own'),
             perm('patient', 'create', 'structure'),
             ...clinicalCrud('own'),
+            ...crud('reminder', 'own'),
             // vede l'agenda della struttura (disponibilità) ma gestisce solo la propria
             perm('agenda', 'read', 'structure'),
             ...crud('agenda', 'own'),
@@ -163,6 +168,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             ...CLINICAL_RESOURCES.flatMap((resource) =>
                 perms(resource, ['read', 'create', 'update'], 'own')
             ),
+            ...perms('reminder', ['read', 'create', 'update'], 'own'),
             ...perms('agenda', ['read', 'create', 'update'], 'own'),
             perm('product', 'read', 'tenant'),
             // Serve almeno la propria dashboard: è la pagina su cui atterra dopo il login.
@@ -179,6 +185,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
         permissions: [
             perm('patient', 'read', 'tenant'),
             ...clinicalRead('tenant'),
+            perm('reminder', 'read', 'tenant'),
             perm('agenda', 'read', 'tenant'),
             perm('invoice', 'read', 'tenant'),
             perm('product', 'read', 'tenant'),

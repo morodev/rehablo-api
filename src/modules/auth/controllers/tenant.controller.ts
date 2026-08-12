@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import multer from 'multer';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import Stripe from 'stripe';
@@ -11,11 +12,19 @@ import { sequelize } from '../../../config/database.js';
 import { TENANT_OWNER_ROLE } from '../rbac/roles.js';
 import { isTaxRegimeCode } from '../../invoice/utils/fiscalRegime.js';
 import { Tenant, User, Structure, StructureAvailability, UserAvailability } from '../models/index.js';
+import { localStorageAdapter } from '../../measurements/storage/localStorageAdapter.js';
 
 export const stripe = env.stripeSecretKey ? new Stripe(env.stripeSecretKey) : (null as unknown as Stripe);
 
 /** Secret used for short-lived tokens (license/verification/reset), separate from the main session JWT secret. */
 export const licenseSecret = env.jwtSecret + '::license';
+
+const ALLOWED_LOGO_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/svg+xml', 'image/webp']);
+
+export const logoUploadMiddleware = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 2 * 1024 * 1024 }
+}).single('file');
 
 export const createTenant = asyncHandler(async (req: Request, res: Response) => {
     req.body = {
@@ -131,6 +140,11 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
 export const updateTenant = asyncHandler(async (req: Request, res: Response) => {
     const id = req.params.tenantId;
 
+    delete req.body.logoStoragePath;
+    delete req.body.logoMimeType;
+    delete req.body.logoOriginalName;
+    delete req.body.logoSizeBytes;
+
     // Il regime fiscale pilota IVA, ritenuta, natura e diciture di OGNI documento emesso: un codice
     // inventato produrrebbe fatture sbagliate a catena. Si accettano solo i codici della tabella
     // `RegimeFiscale` della FatturaPA (vedi src/modules/invoice/utils/fiscalRegime.ts).
@@ -144,6 +158,82 @@ export const updateTenant = asyncHandler(async (req: Request, res: Response) => 
 
     const [, updated] = await Tenant.update(req.body, { where: { id }, returning: true });
     return sendSuccessResponse(res, 200, updated, 'Tenant updated');
+});
+
+function canAccessTenant(req: Request, tenantId: string): boolean {
+    return req.user?.tenants?.some((tenant) => tenant.id === tenantId) ?? false;
+}
+
+export const uploadTenantLogo = asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params.tenantId;
+
+    if (!canAccessTenant(req, id)) {
+        return sendErrorResponse(res, 403, 'Tenant non accessibile');
+    }
+
+    if (!req.file) {
+        return sendErrorResponse(res, 400, 'Il campo "file" (multipart/form-data) Ã¨ obbligatorio');
+    }
+
+    if (!ALLOWED_LOGO_MIME_TYPES.has(req.file.mimetype)) {
+        return sendErrorResponse(res, 422, 'Formato logo non supportato. Usa PNG, JPG, SVG o WebP.');
+    }
+
+    const tenant = await Tenant.findByPk(id);
+    if (!tenant) {
+        return sendErrorResponse(res, 404, `Tenant with id: ${id} not found`);
+    }
+
+    const saved = await localStorageAdapter.save(id, req.file.buffer, req.file.originalname);
+    await tenant.update({
+        logoStoragePath: saved.storagePath,
+        logoMimeType: req.file.mimetype,
+        logoOriginalName: req.file.originalname,
+        logoSizeBytes: saved.sizeBytes
+    });
+
+    return sendSuccessResponse(res, 200, tenant, 'Logo aziendale caricato');
+});
+
+export const getTenantLogo = asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params.tenantId;
+
+    if (!canAccessTenant(req, id)) {
+        return sendErrorResponse(res, 403, 'Tenant non accessibile');
+    }
+
+    const tenant = await Tenant.findByPk(id);
+    if (!tenant?.logoStoragePath) {
+        return sendErrorResponse(res, 404, 'Logo aziendale non presente');
+    }
+
+    const buffer = await localStorageAdapter.read(tenant.logoStoragePath);
+    res.setHeader('Content-Type', tenant.logoMimeType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename="${tenant.logoOriginalName || 'logo'}"`);
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    return res.send(buffer);
+});
+
+export const removeTenantLogo = asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params.tenantId;
+
+    if (!canAccessTenant(req, id)) {
+        return sendErrorResponse(res, 403, 'Tenant non accessibile');
+    }
+
+    const tenant = await Tenant.findByPk(id);
+    if (!tenant) {
+        return sendErrorResponse(res, 404, `Tenant with id: ${id} not found`);
+    }
+
+    await tenant.update({
+        logoStoragePath: null,
+        logoMimeType: null,
+        logoOriginalName: null,
+        logoSizeBytes: null
+    });
+
+    return sendSuccessResponse(res, 200, tenant, 'Logo aziendale rimosso');
 });
 
 export const findTenantById = asyncHandler(async (req: Request, res: Response) => {
@@ -173,6 +263,14 @@ export const findTenantById = asyncHandler(async (req: Request, res: Response) =
     return sendErrorResponse(res, 404, `Tenant with id: ${id} not found`);
 });
 
-export default { createTenant, updateTenant, findTenantById };
+export default {
+    createTenant,
+    updateTenant,
+    uploadTenantLogo,
+    getTenantLogo,
+    removeTenantLogo,
+    findTenantById,
+    logoUploadMiddleware
+};
 
 

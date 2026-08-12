@@ -27,6 +27,7 @@ import humanBodyRoutes from './modules/human-body/routes/human-body.routes.js';
 import protocolRoutes from './modules/protocols/routes/protocol.routes.js';
 import evaluationRoutes from './modules/evaluations/routes/evaluation.routes.js';
 import measurementsRoutes from './modules/measurements/routes/measurements.routes.js';
+import noteRoutes from './modules/notes/routes/note.routes.js';
 import maintenanceRoutes from './modules/maintenance/routes/maintenance.routes.js';
 
 async function bootstrap() {
@@ -66,6 +67,7 @@ async function bootstrap() {
     app.use(protocolRoutes);
     app.use(evaluationRoutes);
     app.use(measurementsRoutes);
+    app.use(noteRoutes);
     app.use(maintenanceRoutes);
 
     app.use(notFoundHandler);

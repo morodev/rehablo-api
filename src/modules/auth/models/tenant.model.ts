@@ -44,6 +44,11 @@ export interface TenantAttributes {
     stampDutyAmount?: number | null;
     /** Se il bollo va riaddebitato al paziente e quindi sommato al totale (art. 15 DPR 633/72). */
     stampChargedToPatient?: boolean | null;
+    /** Logo aziendale usato nella stampa dei documenti fiscali. */
+    logoStoragePath?: string | null;
+    logoMimeType?: string | null;
+    logoOriginalName?: string | null;
+    logoSizeBytes?: number | null;
     /** Progressivo dell'ultimo numero fattura/ricevuta emesso per anno fiscale: { "2026": 42 }. */
     lastDocumentNumberByYear: Record<string, number>;
 }
@@ -63,6 +68,10 @@ export type TenantCreationAttributes = Optional<
     | 'withholdingRate'
     | 'stampDutyAmount'
     | 'stampChargedToPatient'
+    | 'logoStoragePath'
+    | 'logoMimeType'
+    | 'logoOriginalName'
+    | 'logoSizeBytes'
 >;
 
 export class Tenant extends Model<TenantAttributes, TenantCreationAttributes> implements TenantAttributes {
@@ -93,6 +102,10 @@ export class Tenant extends Model<TenantAttributes, TenantCreationAttributes> im
     declare withholdingRate: number | null;
     declare stampDutyAmount: number | null;
     declare stampChargedToPatient: boolean | null;
+    declare logoStoragePath: string | null;
+    declare logoMimeType: string | null;
+    declare logoOriginalName: string | null;
+    declare logoSizeBytes: number | null;
     declare lastDocumentNumberByYear: Record<string, number>;
 }
 
@@ -127,6 +140,10 @@ Tenant.init(
         withholdingRate: { type: DataTypes.DECIMAL(5, 2), allowNull: true, defaultValue: 20 },
         stampDutyAmount: { type: DataTypes.DECIMAL(10, 2), allowNull: true, defaultValue: 2 },
         stampChargedToPatient: { type: DataTypes.BOOLEAN, allowNull: true, defaultValue: true },
+        logoStoragePath: { type: DataTypes.STRING, allowNull: true },
+        logoMimeType: { type: DataTypes.STRING(80), allowNull: true },
+        logoOriginalName: { type: DataTypes.STRING, allowNull: true },
+        logoSizeBytes: { type: DataTypes.INTEGER, allowNull: true },
         lastDocumentNumberByYear: { type: DataTypes.JSONB, defaultValue: {} }
     },
     { sequelize, modelName: 'tenant', tableName: 'tenants' }

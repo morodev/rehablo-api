@@ -82,6 +82,10 @@ export interface InvoiceIssuerSnapshot {
     pec: string | null;
     email: string | null;
     phone: string | null;
+    logoStoragePath?: string | null;
+    logoMimeType?: string | null;
+    logoOriginalName?: string | null;
+    logoSizeBytes?: number | null;
     /** Codice regime fiscale (RF01-RF19) valido alla data di emissione. */
     taxRegime: string | null;
 }

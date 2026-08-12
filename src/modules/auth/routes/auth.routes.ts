@@ -30,6 +30,9 @@ router.put('/user/:userId/structures', requireAuth, requirePermission('user', 'u
 // --- Tenant (registration / subscription owner) ---
 router.post('/tenant', tenantController.createTenant);
 router.put('/tenant/:tenantId', requireAuth, requirePermission('tenant', 'update'), tenantController.updateTenant);
+router.post('/tenant/:tenantId/logo', requireAuth, requirePermission('tenant', 'update'), tenantController.logoUploadMiddleware, tenantController.uploadTenantLogo);
+router.get('/tenant/:tenantId/logo', requireAuth, requireAnyPermission(['tenant', 'read'], ['structure', 'read']), tenantController.getTenantLogo);
+router.delete('/tenant/:tenantId/logo', requireAuth, requirePermission('tenant', 'update'), tenantController.removeTenantLogo);
 // I dati dell'azienda servono anche in intestazione documenti/UI: basta poter leggere le strutture.
 router.get('/tenant/:tenantId', requireAuth, requireAnyPermission(['tenant', 'read'], ['structure', 'read']), tenantController.findTenantById);
 

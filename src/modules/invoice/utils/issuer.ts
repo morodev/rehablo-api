@@ -55,6 +55,10 @@ export function canIssueInvoice(tenant: TenantLike | null | undefined): boolean 
 export function buildIssuerSnapshot(tenant: TenantLike): InvoiceIssuerSnapshot {
     const asString = (value: unknown): string | null =>
         typeof value === 'string' && value.trim() ? value.trim() : null;
+    const asNumber = (value: unknown): number | null => {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    };
 
     return {
         businessName: asString(tenant.businessName),
@@ -67,6 +71,10 @@ export function buildIssuerSnapshot(tenant: TenantLike): InvoiceIssuerSnapshot {
         pec: asString(tenant.pec),
         email: asString(tenant.email),
         phone: asString(tenant.phone),
+        logoStoragePath: asString(tenant.logoStoragePath),
+        logoMimeType: asString(tenant.logoMimeType),
+        logoOriginalName: asString(tenant.logoOriginalName),
+        logoSizeBytes: asNumber(tenant.logoSizeBytes),
         // Il regime è risolto (non copiato grezzo) così un valore assente o sporco diventa
         // comunque un codice valido: sulle vecchie fatture ricadrebbe altrimenti a `null`,
         // rendendo impossibile ristampare le diciture corrette.

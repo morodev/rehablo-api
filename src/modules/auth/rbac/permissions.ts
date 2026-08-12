@@ -18,6 +18,8 @@ export const RESOURCES = [
     'patient',      // anagrafica pazienti
     'evaluation',   // valutazioni, scale, test
     'protocol',     // protocolli riabilitativi
+    'note',         // note cliniche/operative
+    'reminder',     // promemoria e attivitÃ  assegnate
     'bodymap',      // human-body: aree, sintomi, questionari
     'measurement',  // device, raw files, misurazioni strumentali
     'agenda',       // appuntamenti ed event types
@@ -43,6 +45,8 @@ export const RESOURCE_LABELS: Record<Resource, string> = {
     patient: 'anagrafica pazienti',
     evaluation: 'valutazioni',
     protocol: 'protocolli',
+    note: 'note',
+    reminder: 'promemoria',
     bodymap: 'mappa corporea',
     measurement: 'misurazioni',
     agenda: 'agenda',
