@@ -30,6 +30,8 @@ export interface PatientAttributes {
     phoneNumbers: Record<string, unknown>[];
     background: string;
     notes?: string | null;
+    deactivatedAt?: Date | null;
+    anonymizedAt?: Date | null;
     // --- Adempimenti privacy/GDPR (art. 9 GDPR, dati sanitari) ---
     /** Consenso esplicito al trattamento dei dati sanitari (obbligatorio prima di qualunque prestazione). */
     privacyConsent: boolean;
@@ -81,6 +83,8 @@ export class Patient extends Model<PatientAttributes, PatientCreationAttributes>
     declare phoneNumbers: Record<string, unknown>[];
     declare background: string;
     declare notes: string | null;
+    declare deactivatedAt: Date | null;
+    declare anonymizedAt: Date | null;
     declare privacyConsent: boolean;
     declare privacyConsentDate: Date | null;
     declare privacyPolicyVersion: string | null;
@@ -114,6 +118,8 @@ Patient.init(
         phoneNumbers: { type: DataTypes.ARRAY(DataTypes.JSON), defaultValue: [] },
         background: { type: DataTypes.STRING, defaultValue: 'assets/images/cards/17-640x480.jpg' },
         notes: DataTypes.TEXT,
+        deactivatedAt: DataTypes.DATE,
+        anonymizedAt: DataTypes.DATE,
         privacyConsent: { type: DataTypes.BOOLEAN, defaultValue: false },
         privacyConsentDate: DataTypes.DATE,
         privacyPolicyVersion: DataTypes.STRING,

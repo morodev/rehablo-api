@@ -4,7 +4,7 @@ import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { patientScopeWhere } from '../../../middleware/rbac.js';
 import { sequelize } from '../../../config/database.js';
-import Invoice from '../models/invoice.model.js';
+import Invoice, { InvoiceRecipientSnapshot } from '../models/invoice.model.js';
 import InvoiceProduct from '../models/invoiceProduct.model.js';
 import InvoiceService from '../models/invoiceService.model.js';
 import Product from '../../products-services/models/product.model.js';
@@ -16,6 +16,7 @@ import { evalTotals, EvalTotalsResult, toPersistedTotals } from '../utils/evalTo
 import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
 import { buildFiscalNotes, FiscalProfile, isStampDutyDue, resolveFiscalProfile } from '../utils/fiscalRegime.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
+import { recordAuditEvent } from '../../compliance/audit/audit.service.js';
 
 /**
  * NOTA SULL'INTEGRITÀ REFERENZIALE: in questa architettura multi-tenant, `Invoice`/`InvoiceProduct`/
@@ -197,6 +198,110 @@ function applyFiscalRules(params: {
     };
 }
 
+const INVOICE_STATUS = {
+    DRAFT: 'draft',
+    ISSUED: 'issued',
+    PAID: 'paid',
+    VOID: 'void',
+    CREDITED: 'credited'
+} as const;
+
+const IMMUTABLE_STATUSES = new Set<string>([
+    INVOICE_STATUS.ISSUED,
+    INVOICE_STATUS.PAID,
+    INVOICE_STATUS.VOID,
+    INVOICE_STATUS.CREDITED
+]);
+
+const PAYMENT_UPDATE_FIELDS = new Set(['status', 'paymentMethod', 'paymentTerms']);
+
+function normalizeStatus(value: unknown): string {
+    const status = `${value ?? ''}`.trim().toLowerCase();
+    return status || INVOICE_STATUS.ISSUED;
+}
+
+function getInvoiceStatus(invoice: Invoice): string {
+    const status = normalizeStatus(invoice.get('status'));
+    if (status === INVOICE_STATUS.ISSUED && !invoice.get('documentNumber')) {
+        return INVOICE_STATUS.DRAFT;
+    }
+    return status;
+}
+
+function isImmutableInvoice(invoice: Invoice): boolean {
+    return Boolean(invoice.get('documentNumber')) || IMMUTABLE_STATUSES.has(getInvoiceStatus(invoice));
+}
+
+function validateImmutableUpdate(
+    invoice: Invoice,
+    updateData: Record<string, unknown>,
+    shouldReplaceLines: boolean
+): string | null {
+    if (!isImmutableInvoice(invoice)) return null;
+
+    const status = getInvoiceStatus(invoice);
+    if (status === INVOICE_STATUS.VOID || status === INVOICE_STATUS.CREDITED) {
+        return 'Documento fiscale gia stornato/accreditato: non e modificabile.';
+    }
+
+    if (shouldReplaceLines) {
+        return 'Documento fiscale gia emesso: le righe non sono modificabili. Usa una nota di credito/storno.';
+    }
+
+    const changedFields = Object.keys(updateData).filter((key) => updateData[key] !== undefined);
+    const forbidden = changedFields.filter((key) => !PAYMENT_UPDATE_FIELDS.has(key));
+    if (forbidden.length > 0) {
+        return `Documento fiscale gia emesso: campi non modificabili (${forbidden.join(', ')}).`;
+    }
+
+    if (
+        updateData.status !== undefined &&
+        ![INVOICE_STATUS.ISSUED, INVOICE_STATUS.PAID].includes(normalizeStatus(updateData.status) as any)
+    ) {
+        return 'Lo stato fiscale void/credited va gestito dagli endpoint dedicati, non da update generico.';
+    }
+
+    return null;
+}
+
+async function recordInvoiceAudit(
+    req: Request,
+    schema: string,
+    action: string,
+    invoice: Invoice | Record<string, unknown>,
+    metadata?: Record<string, unknown>
+): Promise<void> {
+    const read = (key: string) =>
+        typeof (invoice as any).get === 'function' ? (invoice as any).get(key) : (invoice as any)[key];
+
+    await recordAuditEvent({
+        schema,
+        tenantId: req.user!.tenants[0].id,
+        actorId: req.user!.id,
+        action,
+        resource: 'invoice',
+        resourceId: (read('id') as string | undefined) ?? null,
+        patientId: (read('patientID') as string | undefined) ?? null,
+        metadata,
+        req
+    });
+}
+
+function buildRecipientSnapshot(patient: Record<string, unknown>): InvoiceRecipientSnapshot {
+    const asString = (value: unknown): string | null =>
+        typeof value === 'string' && value.trim() ? value.trim() : null;
+    const birthday = patient.birthday ? new Date(patient.birthday as Date).toISOString().slice(0, 10) : null;
+
+    return {
+        name: asString(patient.name),
+        surname: asString(patient.surname),
+        fiscalCode: asString(patient.fiscalCode),
+        address: asString(patient.address),
+        birthday,
+        placeBirth: asString(patient.placeBirth)
+    };
+}
+
 export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const { InvoiceScoped, ProductScoped, ServiceScoped, InvoiceProductScoped, InvoiceServiceScoped } =
@@ -223,8 +328,19 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     // fatture prive dei dati obbligatori, già numerate e quindi non eliminabili senza buchi.
     const tenantId = req.user!.tenants[0].id;
     const issuerTenant = await Tenant.findByPk(tenantId);
-    const missingIssuerFields = getMissingIssuerFields(issuerTenant?.get({ plain: true }) as any);
-    if (missingIssuerFields.length > 0) {
+    if (!issuerTenant) {
+        return sendErrorResponse(res, 404, 'Struttura/tenant non trovato');
+    }
+    const issuerData = issuerTenant.get({ plain: true }) as any;
+    const requestedStatus = normalizeStatus(invoiceFields.status);
+    const isDraft = requestedStatus === INVOICE_STATUS.DRAFT;
+    const initialStatus = isDraft
+        ? INVOICE_STATUS.DRAFT
+        : requestedStatus === INVOICE_STATUS.PAID
+          ? INVOICE_STATUS.PAID
+          : INVOICE_STATUS.ISSUED;
+    const missingIssuerFields = getMissingIssuerFields(issuerData);
+    if (!isDraft && missingIssuerFields.length > 0) {
         return sendErrorResponse(
             res,
             422,
@@ -232,8 +348,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                 'Completali in Impostazioni → Dati aziendali prima di emettere il documento.'
         );
     }
-    const issuerData = issuerTenant!.get({ plain: true }) as any;
-    const issuer = buildIssuerSnapshot(issuerData);
+    const issuer = isDraft ? null : buildIssuerSnapshot(issuerData);
 
     // Il regime fiscale dello studio decide IVA, natura, ritenuta e bollo: va applicato PRIMA di
     // calcolare i totali, non dopo (vedi docs/REGIME_FISCALE_IT.md).
@@ -250,6 +365,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         invoiceFields.documentYear ?? new Date(invoiceFields.emissionDate ?? Date.now()).getFullYear();
 
     let stsExcluded = Boolean(invoiceFields.stsExcluded);
+    let recipient: InvoiceRecipientSnapshot | null = null;
     if (invoiceFields.patientID) {
         // Si può fatturare solo a un paziente che si ha il diritto di vedere.
         const patient = await Patient.schema(schema).findOne({
@@ -261,22 +377,26 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         if (patient.get('stsOppositionToDataSending')) {
             stsExcluded = true;
         }
+        recipient = buildRecipientSnapshot(patient.get({ plain: true }) as unknown as Record<string, unknown>);
     }
 
     // Numerazione progressiva + creazione fattura + creazione righe in un'UNICA transazione:
     // se una qualsiasi parte fallisce, non deve restare un numero "bruciato" senza fattura, né
     // una fattura senza le sue righe.
     const invoice = await sequelize.transaction(async (t) => {
-        const tenant = await Tenant.findByPk(tenantId, { transaction: t, lock: t.LOCK.UPDATE });
-        if (!tenant) {
-            throw new Error('Tenant non trovato: impossibile assegnare il numero progressivo del documento');
+        let nextNumber: number | null = null;
+        if (!isDraft) {
+            const tenant = await Tenant.findByPk(tenantId, { transaction: t, lock: t.LOCK.UPDATE });
+            if (!tenant) {
+                throw new Error('Tenant non trovato: impossibile assegnare il numero progressivo del documento');
+            }
+            const counters: Record<string, number> = {
+                ...(tenant.get('lastDocumentNumberByYear') as Record<string, number>)
+            };
+            nextNumber = (counters[fiscalYear] || 0) + 1;
+            counters[fiscalYear] = nextNumber;
+            await tenant.update({ lastDocumentNumberByYear: counters }, { transaction: t });
         }
-        const counters: Record<string, number> = {
-            ...(tenant.get('lastDocumentNumberByYear') as Record<string, number>)
-        };
-        const nextNumber = (counters[fiscalYear] || 0) + 1;
-        counters[fiscalYear] = nextNumber;
-        await tenant.update({ lastDocumentNumberByYear: counters }, { transaction: t });
 
         const createdInvoice = await InvoiceScoped.create(
             {
@@ -285,8 +405,11 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                 ...toPersistedTotals(fiscal.totals),
                 fiscalNotes: fiscal.fiscalNotes,
                 documentNumber: nextNumber,
-                documentYear: fiscalYear,
+                documentYear: isDraft ? null : fiscalYear,
+                status: initialStatus,
+                issuedAt: isDraft ? null : new Date(),
                 stsExcluded,
+                recipient,
                 issuer
             },
             { transaction: t }
@@ -331,7 +454,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         // Fattura emessa a partire da un appuntamento: il collegamento va scritto nella STESSA
         // transazione, altrimenti un errore qui lascerebbe una fattura senza appuntamento
         // collegato e la dashboard mostrerebbe di nuovo "da emettere" per una seduta già fatturata.
-        if (agendaEventId) {
+        if (agendaEventId && !isDraft) {
             await AgendaEvent.schema(schema).update(
                 { invoiceId },
                 { where: { id: agendaEventId }, transaction: t }
@@ -347,6 +470,16 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             { model: InvoiceServiceScoped, as: 'services' }
         ]
     });
+
+    if (invoiceWithLines) {
+        await recordInvoiceAudit(
+            req,
+            schema,
+            isDraft ? 'invoice.draft_created' : 'invoice.issued',
+            invoiceWithLines,
+            { status: initialStatus, documentNumber: invoiceWithLines.get('documentNumber') }
+        );
+    }
 
     return sendSuccessResponse(res, 201, invoiceWithLines, 'Invoice Created');
 });
@@ -428,6 +561,13 @@ export const findOneInvoice = asyncHandler(async (req: Request, res: Response) =
         plainInvoice.issuer = tenant ? buildIssuerSnapshot(tenant.get({ plain: true }) as any) : null;
         plainInvoice.issuerIsFallback = true;
     }
+    if (!plainInvoice.recipient && plainInvoice.patientID) {
+        const patient = await Patient.schema(schema).findByPk(plainInvoice.patientID as string);
+        plainInvoice.recipient = patient
+            ? buildRecipientSnapshot(patient.get({ plain: true }) as unknown as Record<string, unknown>)
+            : null;
+        plainInvoice.recipientIsFallback = true;
+    }
 
     return sendSuccessResponse(res, 200, { invoice: plainInvoice }, 'Fattura caricata correttamente');
 });
@@ -456,6 +596,17 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
     const shouldReplaceLines = Array.isArray(requestedProducts) || Array.isArray(requestedServices);
 
     let updateData: Record<string, unknown> = { ...invoiceFields };
+    const immutableUpdateError = validateImmutableUpdate(existingInvoice, updateData, shouldReplaceLines);
+    if (immutableUpdateError) {
+        return sendErrorResponse(res, 409, immutableUpdateError);
+    }
+    if (
+        !isImmutableInvoice(existingInvoice) &&
+        updateData.status !== undefined &&
+        normalizeStatus(updateData.status) !== INVOICE_STATUS.DRAFT
+    ) {
+        return sendErrorResponse(res, 409, 'Per emettere una bozza usa POST /invoice/:invoiceId/issue');
+    }
 
     if (shouldReplaceLines) {
         const [
@@ -563,6 +714,12 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
             { model: InvoiceServiceScoped, as: 'services' }
         ]
     });
+    if (updatedInvoice) {
+        await recordInvoiceAudit(req, schema, 'invoice.updated', updatedInvoice, {
+            fields: Object.keys(updateData),
+            replacedLines: shouldReplaceLines
+        });
+    }
     return sendSuccessResponse(res, 200, updatedInvoice, 'Fattura aggiornata correttamente');
 });
 
@@ -583,6 +740,13 @@ export const deleteInvoice = asyncHandler(async (req: Request, res: Response) =>
     if (!removedInvoice) {
         return sendErrorResponse(res, 404, 'Fattura non trovata');
     }
+    if (isImmutableInvoice(removedInvoice)) {
+        return sendErrorResponse(
+            res,
+            409,
+            'Documento fiscale gia emesso: non puo essere cancellato fisicamente. Usa storno o nota di credito.'
+        );
+    }
 
     await Promise.all([
         InvoiceProductScoped.destroy({ where: { InvoiceId: id } }),
@@ -592,8 +756,300 @@ export const deleteInvoice = asyncHandler(async (req: Request, res: Response) =>
         AgendaEvent.schema(schema).update({ invoiceId: null }, { where: { invoiceId: id } })
     ]);
     await InvoiceScoped.destroy({ where: { id } });
+    await recordInvoiceAudit(req, schema, 'invoice.draft_deleted', removedInvoice);
 
     return sendSuccessResponse(res, 200, { removedInvoice }, 'Fattura eliminata correttamente');
+});
+
+export const issueInvoice = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped } = getScopedModels(schema);
+    const id = req.params.invoiceId;
+    const tenantId = req.user!.tenants[0].id;
+
+    const invoice = await InvoiceScoped.findOne({
+        where: { id, ...patientScopeWhere(req, schema, 'patientID') },
+        include: [
+            { model: InvoiceProductScoped, as: 'products' },
+            { model: InvoiceServiceScoped, as: 'services' }
+        ]
+    });
+    if (!invoice) {
+        return sendErrorResponse(res, 404, 'Fattura non trovata');
+    }
+    if (isImmutableInvoice(invoice)) {
+        return sendErrorResponse(res, 409, 'Documento gia emesso');
+    }
+
+    const issuerTenant = await Tenant.findByPk(tenantId);
+    const issuerData = issuerTenant?.get({ plain: true }) as any;
+    const missingIssuerFields = getMissingIssuerFields(issuerData);
+    if (missingIssuerFields.length > 0) {
+        return sendErrorResponse(
+            res,
+            422,
+            `Dati di fatturazione dello studio incompleti: ${missingIssuerFields.join(', ')}.`
+        );
+    }
+
+    const plain = invoice.get({ plain: true }) as any;
+    const products = (plain.products ?? []).map((line: any) => ({
+        sellingPrice: Number(line.productPrice) || 0,
+        quantity: Number(line.quantity) || 1,
+        productVat: line.productVat ?? null
+    }));
+    const services = (plain.services ?? []).map((line: any) => ({
+        sellingPrice: Number(line.servicePrice) || 0,
+        quantity: Number(line.quantity) || 1,
+        productVat: line.serviceVat ?? null
+    }));
+
+    const profile = resolveFiscalProfile(issuerData);
+    const fiscal = applyFiscalRules({
+        profile,
+        invoiceFields: plain,
+        evalLines: { products, services }
+    });
+    const fiscalYear = plain.documentYear ?? new Date(plain.emissionDate ?? Date.now()).getFullYear();
+    const issuer = buildIssuerSnapshot(issuerData);
+    let stsExcluded = Boolean(plain.stsExcluded);
+    let recipient = (plain.recipient as InvoiceRecipientSnapshot | null) ?? null;
+
+    if (plain.patientID) {
+        const patient = await Patient.schema(schema).findByPk(plain.patientID);
+        if (patient?.get('stsOppositionToDataSending')) {
+            stsExcluded = true;
+        }
+        if (patient) {
+            recipient = buildRecipientSnapshot(patient.get({ plain: true }) as unknown as Record<string, unknown>);
+        }
+    }
+
+    await sequelize.transaction(async (t) => {
+        const tenant = await Tenant.findByPk(tenantId, { transaction: t, lock: t.LOCK.UPDATE });
+        if (!tenant) {
+            throw new Error('Tenant non trovato: impossibile assegnare il numero progressivo del documento');
+        }
+        const counters: Record<string, number> = {
+            ...(tenant.get('lastDocumentNumberByYear') as Record<string, number>)
+        };
+        const nextNumber = (counters[fiscalYear] || 0) + 1;
+        counters[fiscalYear] = nextNumber;
+        await tenant.update({ lastDocumentNumberByYear: counters }, { transaction: t });
+
+        await invoice.update(
+            {
+                ...fiscal.fields,
+                ...toPersistedTotals(fiscal.totals),
+                fiscalNotes: fiscal.fiscalNotes,
+                documentNumber: nextNumber,
+                documentYear: fiscalYear,
+                status: INVOICE_STATUS.ISSUED,
+                issuedAt: new Date(),
+                issuer,
+                stsExcluded,
+                recipient
+            },
+            { transaction: t }
+        );
+    });
+
+    const issued = await InvoiceScoped.findByPk(id, {
+        include: [
+            { model: InvoiceProductScoped, as: 'products' },
+            { model: InvoiceServiceScoped, as: 'services' }
+        ]
+    });
+    if (issued) {
+        await recordInvoiceAudit(req, schema, 'invoice.issued', issued, {
+            documentNumber: issued.get('documentNumber')
+        });
+    }
+
+    return sendSuccessResponse(res, 200, issued, 'Fattura emessa correttamente');
+});
+
+export const voidInvoice = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const { InvoiceScoped } = getScopedModels(schema);
+    const id = req.params.invoiceId;
+    const reason = `${req.body?.reason ?? ''}`.trim();
+
+    const invoice = await InvoiceScoped.findOne({
+        where: { id, ...patientScopeWhere(req, schema, 'patientID') }
+    });
+    if (!invoice) {
+        return sendErrorResponse(res, 404, 'Fattura non trovata');
+    }
+    if (!isImmutableInvoice(invoice)) {
+        return sendErrorResponse(res, 409, 'Una bozza non va stornata: puo essere cancellata.');
+    }
+    if ([INVOICE_STATUS.VOID, INVOICE_STATUS.CREDITED].includes(getInvoiceStatus(invoice) as any)) {
+        return sendErrorResponse(res, 409, 'Documento gia stornato/accreditato');
+    }
+
+    await invoice.update({
+        status: INVOICE_STATUS.VOID,
+        voidedAt: new Date(),
+        voidedBy: req.user!.id,
+        voidReason: reason || null
+    });
+    await recordInvoiceAudit(req, schema, 'invoice.voided', invoice, {
+        reason: reason || null,
+        stsSent: invoice.get('stsSent')
+    });
+
+    return sendSuccessResponse(res, 200, invoice, 'Fattura stornata correttamente');
+});
+
+export const createCreditNote = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped } = getScopedModels(schema);
+    const sourceId = req.params.invoiceId;
+    const tenantId = req.user!.tenants[0].id;
+
+    const source = await InvoiceScoped.findOne({
+        where: { id: sourceId, ...patientScopeWhere(req, schema, 'patientID') },
+        include: [
+            { model: InvoiceProductScoped, as: 'products' },
+            { model: InvoiceServiceScoped, as: 'services' }
+        ]
+    });
+    if (!source) {
+        return sendErrorResponse(res, 404, 'Fattura non trovata');
+    }
+    if (!isImmutableInvoice(source)) {
+        return sendErrorResponse(res, 409, 'La nota di credito richiede una fattura emessa.');
+    }
+    if ([INVOICE_STATUS.VOID, INVOICE_STATUS.CREDITED].includes(getInvoiceStatus(source) as any)) {
+        return sendErrorResponse(res, 409, 'Documento gia stornato/accreditato');
+    }
+    if ((source.get('documentType') as string | null) === 'nota_di_credito') {
+        return sendErrorResponse(res, 409, 'Non si crea una nota di credito da una nota di credito.');
+    }
+
+    const negate = (value: unknown): number | null => {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? -Math.abs(parsed) : null;
+    };
+    const fiscalYear = new Date().getFullYear();
+    const sourcePlain = source.get({ plain: true }) as any;
+
+    const creditNote = await sequelize.transaction(async (t) => {
+        const tenant = await Tenant.findByPk(tenantId, { transaction: t, lock: t.LOCK.UPDATE });
+        if (!tenant) {
+            throw new Error('Tenant non trovato: impossibile assegnare il numero progressivo del documento');
+        }
+        const counters: Record<string, number> = {
+            ...(tenant.get('lastDocumentNumberByYear') as Record<string, number>)
+        };
+        const nextNumber = (counters[fiscalYear] || 0) + 1;
+        counters[fiscalYear] = nextNumber;
+        await tenant.update({ lastDocumentNumberByYear: counters }, { transaction: t });
+
+        const created = await InvoiceScoped.create(
+            {
+                emissionDate: new Date(),
+                invoiceNet: negate(source.get('invoiceNet')),
+                invoiceTotal: negate(source.get('invoiceTotal')),
+                sellingPrice: negate(source.get('sellingPrice')),
+                discSellingPrice: negate(source.get('discSellingPrice')),
+                invoiceVAT: negate(source.get('invoiceVAT')),
+                patientID: source.get('patientID'),
+                isCashPro: source.get('isCashPro'),
+                cashPro: source.get('cashPro'),
+                isRivals: source.get('isRivals'),
+                rivals: source.get('rivals'),
+                isTaxWithholding: source.get('isTaxWithholding'),
+                taxWithholding: source.get('taxWithholding'),
+                isStamp: false,
+                stampAmount: null,
+                stampChargedToPatient: false,
+                paymentMethod: source.get('paymentMethod'),
+                discountType: source.get('discountType'),
+                discountAmount: source.get('discountAmount'),
+                status: INVOICE_STATUS.ISSUED,
+                documentNumber: nextNumber,
+                documentYear: fiscalYear,
+                documentType: 'nota_di_credito',
+                vatNature: source.get('vatNature'),
+                stsExpenseTypeCode: source.get('stsExpenseTypeCode'),
+                stsExcluded: true,
+                stsSent: false,
+                issuedAt: new Date(),
+                sourceInvoiceId: sourceId,
+                recipient: source.get('recipient'),
+                issuer: source.get('issuer'),
+                fiscalNotes: [
+                    ...(((source.get('fiscalNotes') as string[] | null) ?? [])),
+                    `Nota di credito riferita al documento ${source.get('documentNumber')}/${source.get('documentYear')}`
+                ]
+            },
+            { transaction: t }
+        );
+
+        const creditId = created.get('id') as string;
+        await Promise.all([
+            ...(sourcePlain.products ?? []).map((line: any) =>
+                InvoiceProductScoped.create(
+                    {
+                        InvoiceId: creditId,
+                        ProductId: line.ProductId,
+                        quantity: line.quantity,
+                        productPrice: negate(line.productPrice),
+                        totalPrice: negate(line.totalPrice),
+                        percentageDiscount: line.percentageDiscount,
+                        discountAmount: line.discountAmount,
+                        productName: line.productName,
+                        productVat: line.productVat
+                    },
+                    { transaction: t }
+                )
+            ),
+            ...(sourcePlain.services ?? []).map((line: any) =>
+                InvoiceServiceScoped.create(
+                    {
+                        InvoiceId: creditId,
+                        ServiceId: line.ServiceId,
+                        quantity: line.quantity,
+                        servicePrice: negate(line.servicePrice),
+                        totalPrice: negate(line.totalPrice),
+                        percentageDiscount: line.percentageDiscount,
+                        discountAmount: line.discountAmount,
+                        serviceName: line.serviceName,
+                        serviceVat: line.serviceVat
+                    },
+                    { transaction: t }
+                )
+            ),
+            source.update(
+                {
+                    status: INVOICE_STATUS.CREDITED,
+                    creditedAt: new Date(),
+                    creditedBy: req.user!.id
+                },
+                { transaction: t }
+            )
+        ]);
+
+        return created;
+    });
+
+    await recordInvoiceAudit(req, schema, 'invoice.credit_note_created', creditNote, {
+        sourceInvoiceId: sourceId
+    });
+    await recordInvoiceAudit(req, schema, 'invoice.credited', source, {
+        creditNoteId: creditNote.get('id')
+    });
+
+    const payload = await InvoiceScoped.findByPk(creditNote.get('id') as string, {
+        include: [
+            { model: InvoiceProductScoped, as: 'products' },
+            { model: InvoiceServiceScoped, as: 'services' }
+        ]
+    });
+
+    return sendSuccessResponse(res, 201, payload, 'Nota di credito creata correttamente');
 });
 
 /**
@@ -623,6 +1079,10 @@ export const exportSistemaTS = asyncHandler(async (req: Request, res: Response) 
             documentYear: year,
             stsExcluded: false,
             stsSent: false,
+            [Op.or]: [
+                { status: { [Op.in]: [INVOICE_STATUS.ISSUED, INVOICE_STATUS.PAID] } },
+                { status: { [Op.is]: null } }
+            ],
             ...patientScopeWhere(req, schema, 'patientID')
         }
     });
@@ -658,6 +1118,15 @@ export const exportSistemaTS = asyncHandler(async (req: Request, res: Response) 
             { stsSent: true, stsSentAt: new Date() },
             { where: { id: { [Op.in]: includedInvoiceIds } } }
         );
+        await recordAuditEvent({
+            schema,
+            tenantId,
+            actorId: req.user!.id,
+            action: 'sts.export.marked_sent',
+            resource: 'sts',
+            metadata: { year, invoiceIds: includedInvoiceIds },
+            req
+        });
     }
 
     res.setHeader('Content-Type', 'application/xml; charset=utf-8');
@@ -672,6 +1141,9 @@ export default {
     findOneInvoice,
     updateInvoice,
     deleteInvoice,
+    issueInvoice,
+    voidInvoice,
+    createCreditNote,
     exportSistemaTS
 };
 

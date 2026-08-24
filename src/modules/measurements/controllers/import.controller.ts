@@ -1,11 +1,14 @@
 import { Request, Response } from 'express';
+import { Op } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
+import { patientScopeWhere } from '../../../middleware/rbac.js';
 import { listDeviceSources } from '../mapping/deviceMappings.js';
 import { applyMapping, inspectCsv } from '../mapping/mappingEngine.js';
 import { resolveDeviceMapping } from '../mapping/mappingResolver.js';
 import { ingestObservations, loadMetricInfo, type ObservationInput } from '../services/observation.service.js';
 import { assertEvaluationEditable } from '../../evaluations/services/evaluationGuard.js';
+import Patient from '../../patients/models/patient.model.js';
 
 /**
  * Elenco delle sorgenti/dispositivi disponibili per l'import (alimenta il menù a tendina del frontend,
@@ -49,6 +52,15 @@ export const importCsv = asyncHandler(async (req: Request, res: Response) => {
 
     if (!sourceId || !patientId || !csv) {
         return sendErrorResponse(res, 400, 'sourceId, patientId e csv sono obbligatori');
+    }
+    const patientInScope = await Patient.schema(schema).count({
+        where: {
+            id: { [Op.in]: [patientId] },
+            ...patientScopeWhere(req, schema, 'id')
+        }
+    });
+    if (patientInScope !== 1) {
+        return sendErrorResponse(res, 403, 'Paziente non accessibile per la scrittura delle misure');
     }
 
     // FASE E: se l'import è agganciato a una valutazione, questa deve essere ancora modificabile.

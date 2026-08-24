@@ -13,6 +13,7 @@ router.use(requireAuth, resolveTenantSchema);
 router.post('/patient', requirePermission('patient', 'create'), patientController.savePatient);
 router.get('/patient/search', requirePermission('patient', 'read'), patientController.searchPatients);
 router.get('/patient', requirePermission('patient', 'read'), patientController.findAndCountAll);
+router.get('/patient/:patientId/consents', requirePermission('patient', 'read'), patientController.getConsentHistory);
 router.get('/patient/:patientId', requirePermission('patient', 'read'), patientController.findOne);
 router.put('/patient/:patientId', requirePermission('patient', 'update'), patientController.update);
 router.delete('/patient/:patientId', requirePermission('patient', 'delete'), patientController.deletePatient);

@@ -18,6 +18,9 @@ router.post('/invoice', requirePermission('invoice', 'create'), invoiceControlle
 router.get('/invoice', requirePermission('invoice', 'read'), invoiceController.findAllInvoices);
 router.get('/invoice/search', requirePermission('invoice', 'read'), invoiceController.searchInvoices);
 router.get('/invoice/export/sistema-ts', requirePermission('invoice', 'export'), invoiceController.exportSistemaTS);
+router.post('/invoice/:invoiceId/issue', requirePermission('invoice', 'update'), invoiceController.issueInvoice);
+router.post('/invoice/:invoiceId/void', requirePermission('invoice', 'update'), invoiceController.voidInvoice);
+router.post('/invoice/:invoiceId/credit', requirePermission('invoice', 'create'), invoiceController.createCreditNote);
 router.get('/invoice/:invoiceId', requirePermission('invoice', 'read'), invoiceController.findOneInvoice);
 router.put('/invoice/:invoiceId', requirePermission('invoice', 'update'), invoiceController.updateInvoice);
 router.delete('/invoice/:invoiceId', requirePermission('invoice', 'delete'), invoiceController.deleteInvoice);

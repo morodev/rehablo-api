@@ -28,6 +28,8 @@ import {
 import { registerEvaluationAssociations, Evaluation } from './modules/evaluations/models/index.js';
 import { registerMeasurementAssociations, Observation, DeviceConnection, RawFile } from './modules/measurements/models/index.js';
 import { Note, Reminder } from './modules/notes/models/index.js';
+import AuditLog from './modules/compliance/audit/auditLog.model.js';
+import ConsentEvent from './modules/compliance/consent/consentEvent.model.js';
 
 /**
  * Registers every tenant-scoped model (i.e. living in the dynamic "rehablo_<tenantId>" schema)
@@ -56,6 +58,8 @@ export function registerTenantModels(): void {
     // RawFile (F0.1): file grezzo originale di un import/upload. `Observation.rawFileId` lo referenzia
     // in modo logico; nessun vincolo di ordine di sync richiesto (nessuna FK cross-tabella reale).
     registerTenantScopedModel(RawFile);
+    registerTenantScopedModel(AuditLog);
+    registerTenantScopedModel(ConsentEvent);
     registerTenantScopedModel(Note);
     registerTenantScopedModel(Reminder);
     registerTenantScopedModel(Category);

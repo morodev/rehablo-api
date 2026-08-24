@@ -1,7 +1,9 @@
 import { Request, Response } from 'express';
+import { Op } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { patientScopeWhere } from '../../../middleware/rbac.js';
+import Patient from '../../patients/models/patient.model.js';
 import {
     ingestObservations,
     listObservations,
@@ -32,6 +34,20 @@ async function assertInputsEditable(schema: string, inputs: ObservationInput[]):
     }
 }
 
+async function areInputPatientsInScope(req: Request, schema: string, inputs: ObservationInput[]): Promise<boolean> {
+    const patientIds = Array.from(new Set(inputs.map((i) => i.patientId).filter(Boolean)));
+    if (patientIds.length === 0) return false;
+
+    const count = await Patient.schema(schema).count({
+        where: {
+            id: { [Op.in]: patientIds },
+            ...patientScopeWhere(req, schema, 'id')
+        }
+    });
+
+    return count === patientIds.length;
+}
+
 /**
  * Canale ④ MANUALE: l'operatore inserisce una o più misure già canoniche.
  * Body: una Observation o { observations: [...] } con { patientId, metricCode, value, side?, ... }.
@@ -42,6 +58,9 @@ export const saveManual = asyncHandler(async (req: Request, res: Response) => {
 
     if (!inputs.length || !inputs[0]?.patientId) {
         return sendErrorResponse(res, 400, 'patientId e almeno una misura sono obbligatori');
+    }
+    if (!(await areInputPatientsInScope(req, schema, inputs))) {
+        return sendErrorResponse(res, 403, 'Paziente non accessibile per la scrittura delle misure');
     }
 
     await assertInputsEditable(schema, inputs);
@@ -65,6 +84,9 @@ export const ingestApi = asyncHandler(async (req: Request, res: Response) => {
 
     if (!inputs.length || !inputs[0]?.patientId) {
         return sendErrorResponse(res, 400, 'patientId e almeno una misura sono obbligatori');
+    }
+    if (!(await areInputPatientsInScope(req, schema, inputs))) {
+        return sendErrorResponse(res, 403, 'Paziente non accessibile per la scrittura delle misure');
     }
 
     await assertInputsEditable(schema, inputs);

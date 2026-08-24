@@ -157,23 +157,70 @@
       fattura propone i valori corretti invece di lasciar comporre documenti che il server
       dovrebbe poi correggere in silenzio.
     - Riferimento normativo di dettaglio: **`docs/REGIME_FISCALE_IT.md`**.
+12. **Ciclo documentale e audit (aggiornamento 2026-08-24)**:
+    - `Invoice.status` viene usato come stato documentale/pagamento (`draft`, `issued`, `paid`,
+      `void`, `credited`) e sono stati aggiunti `issuedAt`, `sourceInvoiceId`, `voidedAt`,
+      `voidedBy`, `voidReason`, `creditedAt`, `creditedBy`.
+    - `POST /invoice` puo' creare una bozza (`status: draft`) senza bruciare numerazione; la
+      numerazione progressiva e lo snapshot emittente vengono assegnati solo all'emissione.
+    - `POST /invoice/:invoiceId/issue` emette una bozza numerandola in transazione.
+    - `POST /invoice/:invoiceId/void` storna un documento emesso senza cancellarlo fisicamente.
+    - `POST /invoice/:invoiceId/credit` crea una nota di credito numerata e collega il documento
+      sorgente tramite `sourceInvoiceId`.
+    - `Invoice.recipient` congela i dati principali del paziente intestatario sul documento
+      fiscale, prerequisito per ristampe corrette e futura anonimizzazione dell'anagrafica.
+    - `PUT /invoice/:invoiceId` blocca modifiche distruttive su documenti gia' emessi: restano
+      ammessi solo aggiornamenti non fiscali limitati allo stato pagamento e ai dati pagamento.
+    - `DELETE /invoice/:invoiceId` cancella fisicamente solo bozze non numerate; per documenti
+      emessi risponde 409 e richiede storno/nota di credito.
+    - `AuditLog` tenant-scoped e `recordAuditEvent()` registrano gli eventi documento principali
+      (bozza, emissione, update, storno, nota di credito, export STS marcato inviato).
+    - `ConsentEvent` tenant-scoped registra lo storico dei consensi privacy/STS/FSE; e'
+      disponibile `GET /patient/:patientId/consents`.
+    - `DELETE /patient/:patientId` non effettua hard delete se esistono fatture, valutazioni o
+      misurazioni collegate: il paziente viene marcato con `deactivatedAt` per retention.
+    - La scrittura di misurazioni manuali/API/import CSV verifica ora che il `patientId` sia
+      nello scope RBAC dell'utente, non solo la lettura.
 
 
-> Le colonne sopra vengono create automaticamente al riavvio del backend grazie a
-> `sync({ alter: true })` (sia per i modelli globali sia per gli schemi dinamici per-tenant).
+> Le colonne tenant-scoped vengono create automaticamente al primo accesso allo schema del tenant
+> tramite `TENANT_SCHEMA_SYNC=additive` (`alter: { drop: false }`), quindi senza rimuovere colonne
+> esistenti.
 >
 > **Eccezione**: `public.tenants` non è tenant-scoped e non viene toccata dal sync. Le colonne del
 > regime fiscale vanno applicate con la migration
 > `migrations/20260811-add-tax-regime-to-tenant.js`.
 
-## 4. Roadmap consigliata (fasi successive)
+## 4. Matrice operativa aggiornata (2026-08-24)
+
+Questa matrice separa quello che e' gia' stato portato a codice da quello che resta da
+implementare e da cio' che richiede input esterni del cliente/provider. Serve come riferimento
+prima di aprire nuove iterazioni tecniche.
+
+| Area | Gia' presente nel backend | Da implementare nel backend | Dipendenze esterne |
+|---|---|---|---|
+| Sistema TS | Opposizione paziente, `stsExcluded`, export XML best-effort, audit export | `StsSubmission`/`StsSubmissionItem`, validazione tracciato/XSD, codici spesa versionati, pagamento tracciato/non tracciato, rimborsi/rettifiche/annullamenti/reinvii, ricevute/esiti | Credenziali STS nominali o intermediario; tracciati e tabelle ufficiali dell'anno fiscale; scelta canale web service/upload/provider |
+| FSE | Consensi FSE paziente, storico `ConsentEvent`, `Structure.region`, `FseAdapter`/`NullFseAdapter`, risoluzione Regione per valutazione | `ClinicalDocument`, `FseSubmission`, generazione documento da valutazione chiusa, CDA2/PDF firmato, metadati XDS/FHIR dove richiesti, adapter regionale/provider, ricevute/retry/audit FSE | Accreditamento Regione/ASL, endpoint, certificati, ambiente test, manuale interoperabilita' regionale o provider autorizzato |
+| SDI e conservazione | Dati fiscali tenant, PEC/codice SDI, regime fiscale, snapshot emittente/destinatario, ciclo documento non distruttivo | Separazione canale extra-SDI sanitario vs FatturaPA B2B/PA/non sanitario, XML FatturaPA, invio provider/canale, ricevute/scarti, pacchetti conservazione | Provider SDI/conservazione o canale accreditato; policy fiscale/commercialista |
+| GDPR/dati sanitari | `AuditLog`, `ConsentEvent`, audit principali, deactivation paziente con record collegati, RBAC su scrittura misure | Audit sistematico su tutti gli accessi clinici, retention configurabile, export dati paziente, anonimizzazione/pseudonimizzazione, cifratura file/storage, rimozione log sensibili, rate limit | Policy privacy approvata: tempi retention, base giuridica, informative, DPO se dovuto |
+
+Nota tecnica: STS production, FSE reale e SDI/conservazione non possono essere chiusi solo con
+codice locale. Il backend puo' pero' implementare gia' i modelli, gli stati, le validazioni, gli
+adapter e i workflow di preparazione; l'invio reale va attivato quando sono disponibili credenziali,
+certificati, endpoint e provider.
+
+## 5. Roadmap consigliata (fasi successive)
 
 **Fase 2 — Sistema TS "production ready"**
-- UI per raccogliere i dati fiscali mancanti (CF struttura/professionista, iscrizione Albo).
-- UI paziente per raccogliere/gestire il consenso privacy e l'opposizione Sistema TS
-  (con data e traccia storica, non solo booleano).
+- Introdurre i modelli `StsSubmission` e `StsSubmissionItem`, con stato, payload hash,
+  progressivo invio, ricevuta, errori e utente operatore.
+- Rendere l'export STS riproducibile: simulazione, generazione file, conferma invio, ricevuta.
+- Aggiungere sui documenti fiscali la modalita' pagamento tracciato/non tracciato e usarla nel
+  record STS.
 - Validare `sistemaTS.ts` contro l'ultimo tracciato/XSD ufficiale e la tabella "Tipologia di
   spesa" in vigore per l'anno fiscale corrente.
+- Gestire rimborsi, rettifiche, annullamenti e reinvii senza alterare i documenti fiscali
+  originari.
 - Invio via web service SOAP del Sistema TS (attualmente l'endpoint genera solo il file da
   caricare manualmente sul portale) previa registrazione delle credenziali del cliente.
 - Template di stampa fattura/ricevuta con dicitura di esenzione SDI e natura IVA esente.
@@ -182,16 +229,29 @@
 - Determinare, per ciascun tenant, la Regione di competenza (`Structure.region`) e verificare
   i requisiti/tempistiche di obbligo per la propria categoria.
 - Supportare il cliente nell'accreditamento regionale (fuori dal perimetro del solo software).
-- Implementare un adapter concreto per Regione (a partire da `FseAdapter`), generazione CDA2
-  dei referti/valutazioni prodotti dal modulo `evaluations`, firma digitale dei documenti.
-- Raccolta strutturata dei consensi FSE con audit trail.
+- Introdurre `ClinicalDocument` e `FseSubmission` per tracciare documenti clinici, payload,
+  metadati, esiti, errori, retry e repository id.
+- Generare il documento candidato alla chiusura di una valutazione/referto.
+- Implementare CDA2 reale, PDF firmato dove necessario, metadati XDS/FHIR richiesti e adapter
+  concreto per Regione o provider/intermediario.
+- Mantenere audit trail specifico sugli accessi e sulle operazioni FSE.
 
-**Fase 4 — GDPR/conservazione**
-- Registro dei trattamenti e audit trail accessi alla cartella clinica digitale.
-- Conservazione sostitutiva a norma (marcatura temporale) di fatture e documentazione clinica.
+**Fase 4 — GDPR, retention e sicurezza dati**
+- Audit trail sistematico su accessi a valutazioni, fatture sanitarie, misure, documenti clinici
+  e file grezzi.
+- Export dati paziente e workflow revisionabile di anonimizzazione/pseudonimizzazione.
 - Policy di retention/anonimizzazione conformi ai tempi minimi di conservazione sanitaria.
+- Cifratura applicativa o storage sicuro per file grezzi sanitari.
+- Rimozione log debug con payload utente/tenant e rate limit su auth/ingestion.
 
-## 5. Avvertenza
+**Fase 5 — SDI e conservazione**
+- Mantenere fuori SDI le prestazioni sanitarie rese a persone fisiche quando rientrano nel divieto
+  di fatturazione elettronica sanitaria.
+- Generare FatturaPA XML per B2B/PA/non sanitario.
+- Integrare provider/canale SDI con ricevute, scarti e retry.
+- Integrare conservazione sostitutiva a norma tramite provider o processo accreditato.
+
+## 6. Avvertenza
 
 Le integrazioni con Sistema TS e FSE prevedono **credenziali di accreditamento nominali**
 (P.IVA/CF del professionista o della struttura) e, per il FSE, un accordo con l'infrastruttura

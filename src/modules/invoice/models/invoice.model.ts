@@ -29,6 +29,7 @@ export interface InvoiceAttributes {
     paymentMethod?: string | null;
     discountType?: string | null;
     discountAmount?: number | null;
+    /** Stato documentale/pagamento: draft, issued, paid, void, credited. */
     status?: string | null;
     paymentTerms?: Date | null;
     // --- Adempimenti fiscali per prestazioni sanitarie (fisioterapista libero professionista) ---
@@ -49,6 +50,14 @@ export interface InvoiceAttributes {
     stsExcluded: boolean;
     stsSent: boolean;
     stsSentAt?: Date | null;
+    issuedAt?: Date | null;
+    sourceInvoiceId?: string | null;
+    voidedAt?: Date | null;
+    voidedBy?: string | null;
+    voidReason?: string | null;
+    creditedAt?: Date | null;
+    creditedBy?: string | null;
+    recipient?: InvoiceRecipientSnapshot | null;
     /**
      * Snapshot dei dati del CEDENTE/PRESTATORE al momento dell'emissione.
      *
@@ -88,6 +97,16 @@ export interface InvoiceIssuerSnapshot {
     logoSizeBytes?: number | null;
     /** Codice regime fiscale (RF01-RF19) valido alla data di emissione. */
     taxRegime: string | null;
+}
+
+/** Dati del paziente/cessionario congelati sul documento. */
+export interface InvoiceRecipientSnapshot {
+    name: string | null;
+    surname: string | null;
+    fiscalCode: string | null;
+    address: string | null;
+    birthday?: string | null;
+    placeBirth?: string | null;
 }
 
 export type InvoiceCreationAttributes = Optional<
@@ -142,6 +161,14 @@ export class Invoice extends Model<InvoiceAttributes, InvoiceCreationAttributes>
     declare stsExcluded: boolean;
     declare stsSent: boolean;
     declare stsSentAt: Date | null;
+    declare issuedAt: Date | null;
+    declare sourceInvoiceId: string | null;
+    declare voidedAt: Date | null;
+    declare voidedBy: string | null;
+    declare voidReason: string | null;
+    declare creditedAt: Date | null;
+    declare creditedBy: string | null;
+    declare recipient: InvoiceRecipientSnapshot | null;
     declare issuer: InvoiceIssuerSnapshot | null;
     declare fiscalNotes: string[] | null;
 }
@@ -178,6 +205,14 @@ Invoice.init(
         stsExcluded: { type: DataTypes.BOOLEAN, defaultValue: false },
         stsSent: { type: DataTypes.BOOLEAN, defaultValue: false },
         stsSentAt: DataTypes.DATE,
+        issuedAt: DataTypes.DATE,
+        sourceInvoiceId: DataTypes.UUID,
+        voidedAt: DataTypes.DATE,
+        voidedBy: DataTypes.UUID,
+        voidReason: DataTypes.TEXT,
+        creditedAt: DataTypes.DATE,
+        creditedBy: DataTypes.UUID,
+        recipient: { type: DataTypes.JSONB, allowNull: true },
         issuer: { type: DataTypes.JSONB, allowNull: true },
         fiscalNotes: { type: DataTypes.JSONB, allowNull: true }
     },
