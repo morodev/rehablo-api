@@ -15,6 +15,30 @@ import {
 import { Structure, StructureUser, TenantUser, User } from '../models/index.js';
 import { revokeAllForUser } from '../services/refreshToken.service.js';
 
+/** Garantisce che un OWNER sia assegnato a tutte le sedi del proprio tenant. */
+async function assignOwnerToAllStructures(tenantId: string, userId: string): Promise<void> {
+    const structures = await Structure.findAll({ where: { tenantId }, attributes: ['id'] });
+    if (!structures.length) return;
+
+    const structureIds = structures.map((structure) => structure.get('id') as string);
+
+    await StructureUser.bulkCreate(
+        structureIds.map((structureId) => ({
+            structureId,
+            userId,
+            role: null
+        })),
+        { ignoreDuplicates: true }
+    );
+
+    // Un OWNER non può diventare localmente un ruolo meno privilegiato: il ruolo
+    // proprietario è tenant-wide e deve restare effettivo in ogni sede.
+    await StructureUser.update(
+        { role: null },
+        { where: { userId, structureId: { [Op.in]: structureIds } } }
+    );
+}
+
 /**
  * Catalogo dei ruoli assegnabili + relativi permessi.
  * Serve alla UI di gestione utenti per popolare la select del ruolo e mostrare
@@ -168,6 +192,10 @@ export const updateUserRole = asyncHandler(async (req: Request, res: Response) =
 
     await TenantUser.update({ role }, { where: { tenantId, userId: targetUserId } });
 
+    if (role === RoleCode.OWNER) {
+        await assignOwnerToAllStructures(tenantId, targetUserId);
+    }
+
     // I permessi viaggiano nell'access token: senza revocare le sessioni, il vecchio ruolo
     // resterebbe valido fino alla scadenza. Così il cambio è effettivo al primo refresh.
     await revokeAllForUser(targetUserId, 'role_changed');
@@ -219,6 +247,17 @@ export const updateUserStructureRole = asyncHandler(async (req: Request, res: Re
         );
     }
 
+    const membership = await TenantUser.findOne({ where: { tenantId, userId: targetUserId } });
+    if (membership?.get('role') === RoleCode.OWNER) {
+        return sendErrorResponse(res, 409, 'Il ruolo proprietario vale in tutte le sedi e non ammette override');
+    }
+
+    // OWNER è un ruolo del tenant e implica l'accesso a tutte le sedi: non può essere
+    // usato come override locale su una singola struttura.
+    if (role === RoleCode.OWNER) {
+        return sendErrorResponse(res, 400, 'Il ruolo proprietario può essere assegnato solo a livello di studio');
+    }
+
     const error = await validateRoleChange(req, targetUserId, role);
     if (error) {
         return sendErrorResponse(res, error.status, error.message);
@@ -259,10 +298,18 @@ export const updateUserStructures = asyncHandler(async (req: Request, res: Respo
     // Si possono assegnare solo strutture del proprio tenant.
     const tenantStructures = await Structure.findAll({ where: { tenantId } });
     const allowedIds = tenantStructures.map((structure) => structure.get('id') as string);
-    const requested = structureIds.filter((id) => allowedIds.includes(id));
+    const requested = [...new Set(structureIds)].filter((id) => allowedIds.includes(id));
 
-    if (requested.length !== structureIds.length) {
+    if (requested.length !== new Set(structureIds).size) {
         return sendErrorResponse(res, 400, 'Una o più strutture non appartengono allo studio');
+    }
+
+    if (membership.get('role') === RoleCode.OWNER) {
+        const ownsEveryStructure = requested.length === allowedIds.length
+            && allowedIds.every((id) => requested.includes(id));
+        if (!ownsEveryStructure) {
+            return sendErrorResponse(res, 409, 'Un proprietario deve essere abilitato a tutte le sedi');
+        }
     }
 
     const current = await StructureUser.findAll({ where: { userId: targetUserId } });

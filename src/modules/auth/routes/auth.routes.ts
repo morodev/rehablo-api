@@ -59,7 +59,8 @@ router.delete('/user/:userId', requireAuth, requirePermission('user', 'delete'),
 // --- Structures (premises) ---
 router.post('/structure', requireAuth, requirePermission('structure', 'create'), structureController.saveStructureForTenant);
 router.put('/structure/:structureId', requireAuth, requirePermission('structure', 'update'), structureController.updateStructureForTenant);
-router.get('/structure', requireAuth, requirePermission('structure', 'read'), structureController.findAllStructuresForTenant);
+router.get('/structure/accessible', requireAuth, requirePermission('structure', 'read'), structureController.findAccessibleStructures);
+router.get('/structure', requireAuth, requirePermission('structure', 'manage', 'tenant'), structureController.findAllStructuresForTenant);
 
 export default router;
 

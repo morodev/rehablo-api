@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { requireAuth } from '../../../middleware/auth.js';
-import { requirePermission } from '../../../middleware/rbac.js';
+import { requireAnyPermission, requirePermission } from '../../../middleware/rbac.js';
 import { resolveTenantSchema } from '../../../middleware/tenantSchema.js';
 
 import pointController from '../controllers/point.controller.js';
@@ -59,27 +59,27 @@ router.delete('/human-body-strength/:strengthId', requirePermission('bodymap', '
 
 // Custom (per-tenant) questionnaires: la definizione del questionario è configurazione
 // condivisa del tenant, la compilazione (instance) è un atto clinico sul paziente.
-router.post('/questionnaire', requirePermission('bodymap', 'create', 'structure'), questionnaireController.saveQuestionnaire);
-router.get('/questionnaires', requirePermission('bodymap', 'read'), questionnaireController.getAllQuestionnaires);
-router.get('/questionnaires/search', requirePermission('bodymap', 'read'), questionnaireController.searchQuestionnaires);
-router.put('/questionnaire/:questionnaireId', requirePermission('bodymap', 'update', 'structure'), questionnaireController.updateQuestionnaireById);
-router.delete('/questionnaire/:questionnaireId', requirePermission('bodymap', 'delete', 'structure'), questionnaireController.deleteQuestionnaireById);
-router.get('/questionnaire/:questionnaireId', requirePermission('bodymap', 'read'), questionnaireController.getQuestionnaireById);
+router.post('/questionnaire', requirePermission('clinical_content', 'create', 'tenant'), questionnaireController.saveQuestionnaire);
+router.get('/questionnaires', requireAnyPermission(['clinical_content', 'read'], ['bodymap', 'read']), questionnaireController.getAllQuestionnaires);
+router.get('/questionnaires/search', requireAnyPermission(['clinical_content', 'read'], ['bodymap', 'read']), questionnaireController.searchQuestionnaires);
+router.put('/questionnaire/:questionnaireId', requirePermission('clinical_content', 'update', 'tenant'), questionnaireController.updateQuestionnaireById);
+router.delete('/questionnaire/:questionnaireId', requirePermission('clinical_content', 'delete', 'tenant'), questionnaireController.deleteQuestionnaireById);
+router.get('/questionnaire/:questionnaireId', requireAnyPermission(['clinical_content', 'read'], ['bodymap', 'read']), questionnaireController.getQuestionnaireById);
 router.post('/questionnaire-instance', requirePermission('bodymap', 'create'), questionnaireInstanceController.saveQuestionnaireInstance);
 router.get('/questionnaire-instance', requirePermission('bodymap', 'read'), questionnaireInstanceController.getQuestionnaireInstances);
 router.get('/questionnaire-instance-by-point', requirePermission('bodymap', 'read'), questionnaireInstanceController.getQuestionnaireInstancesByPoint);
 
 // Standardized scales catalog (public schema) + per-tenant compiled instances
-router.get('/scales', requirePermission('evaluation', 'read'), scaleController.getAllScales);
-router.get('/scales/search', requirePermission('evaluation', 'read'), scaleController.searchScales);
+router.get('/scales', requireAnyPermission(['clinical_content', 'read'], ['evaluation', 'read']), scaleController.getAllScales);
+router.get('/scales/search', requireAnyPermission(['clinical_content', 'read'], ['evaluation', 'read']), scaleController.searchScales);
 router.post('/scales-instance', requirePermission('evaluation', 'create'), scaleInstanceController.saveScale);
 router.get('/scales-instance', requirePermission('evaluation', 'read'), scaleInstanceController.getUserScaleInstances);
 
 // Standardized clinical/orthopedic tests catalog (public schema) + per-tenant compiled instances
-router.get('/tests', requirePermission('evaluation', 'read'), testController.getAllTests);
-router.get('/tests-orthopedic', requirePermission('evaluation', 'read'), testController.getAllOrthopedicTests);
-router.get('/tests-clinic', requirePermission('evaluation', 'read'), testController.getAllClinicTests);
-router.get('/tests/search', requirePermission('evaluation', 'read'), testController.searchTests);
+router.get('/tests', requireAnyPermission(['clinical_content', 'read'], ['evaluation', 'read']), testController.getAllTests);
+router.get('/tests-orthopedic', requireAnyPermission(['clinical_content', 'read'], ['evaluation', 'read']), testController.getAllOrthopedicTests);
+router.get('/tests-clinic', requireAnyPermission(['clinical_content', 'read'], ['evaluation', 'read']), testController.getAllClinicTests);
+router.get('/tests/search', requireAnyPermission(['clinical_content', 'read'], ['evaluation', 'read']), testController.searchTests);
 router.post('/tests-instance', requirePermission('evaluation', 'create'), testInstanceController.saveTest);
 router.get('/tests-instance', requirePermission('evaluation', 'read'), testInstanceController.getUserTestInstances);
 

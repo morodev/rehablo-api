@@ -7,7 +7,7 @@ import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.
 import { getCurrentTenantId } from '../../../middleware/auth.js';
 import { getGrantedPermissions, getUserId } from '../../../middleware/rbac.js';
 import { hasPermission } from '../rbac/permissions.js';
-import { DEFAULT_ROLE, isRoleCode, RoleCode } from '../rbac/roles.js';
+import { DEFAULT_ROLE, isRoleCode, RoleCode, ROLE_DEFINITIONS } from '../rbac/roles.js';
 import { sendForgotPasswordMail, signUpSendMail } from '../../../services/email.service.js';
 import { licenseSecret } from './tenant.controller.js';
 import { revokeAllForUser } from '../services/refreshToken.service.js';
@@ -68,6 +68,9 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 400, 'Ruolo non valido');
     }
     const role = isRoleCode(requestedRole) ? requestedRole : DEFAULT_ROLE;
+    if (!ROLE_DEFINITIONS[role].assignable) {
+        return sendErrorResponse(res, 400, 'Ruolo non assegnabile');
+    }
 
     // Strutture in cui l'utente può operare. Se non specificate, viene assegnato a tutte
     // quelle del tenant (comportamento storico). Va estratto PRIMA della create:
@@ -85,12 +88,20 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
     userToCreate.isSuperAdmin = false;
     userToCreate.isActive = false;
 
+    const structures = await tenant.getStructures();
+    const allowedStructureIds = structures.map((structure: any) => structure.id as string);
+    const uniqueRequestedIds = requestedStructureIds ? [...new Set(requestedStructureIds)] : undefined;
+    if (uniqueRequestedIds?.some((id) => !allowedStructureIds.includes(id))) {
+        return sendErrorResponse(res, 400, 'Una o più strutture non appartengono allo studio');
+    }
+
     const user: any = await User.create(userToCreate, { include: UserAvailability as any });
 
-    const structures = await tenant.getStructures();
-    const targetStructures = requestedStructureIds
-        ? structures.filter((structure: any) => requestedStructureIds.includes(structure.id))
-        : structures;
+    const targetStructures = role === RoleCode.OWNER
+        ? structures
+        : uniqueRequestedIds
+          ? structures.filter((structure: any) => uniqueRequestedIds.includes(structure.id))
+          : structures;
 
     // Nessun ruolo sulla struttura: `null` significa "eredita quello del tenant".
     await Promise.all(targetStructures.map((structure: any) => structure.addUser(user)));

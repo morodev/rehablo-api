@@ -44,6 +44,54 @@ async function markMissingTenantOwners(): Promise<number> {
 }
 
 /**
+ * Ripristina l'invariant OWNER -> tutte le sedi per i dati creati prima della regola.
+ * L'INSERT è idempotente e non modifica eventuali override già presenti.
+ */
+async function assignOwnersToAllStructures(): Promise<number> {
+    const inserted = await sequelize.query<{ inserted: number }>(
+        `INSERT INTO structure_users ("structureId", "userId", role, "createdAt", "updatedAt")
+         SELECT s.id, tu."userId", NULL, NOW(), NOW()
+           FROM tenant_users tu
+           JOIN structures s ON s."tenantId" = tu."tenantId"
+           LEFT JOIN structure_users su
+             ON su."structureId" = s.id
+            AND su."userId" = tu."userId"
+          WHERE tu.role = :ownerRole
+            AND su."userId" IS NULL
+         ON CONFLICT ("structureId", "userId") DO NOTHING
+         RETURNING 1 AS inserted`,
+        {
+            replacements: { ownerRole: RoleCode.OWNER },
+            type: QueryTypes.SELECT
+        }
+    );
+
+    return inserted.length;
+}
+
+/** Rimuove vecchi override locali: OWNER deve essere effettivo in ogni sede. */
+async function clearOwnerStructureOverrides(): Promise<number> {
+    const result = await sequelize.query(
+        `UPDATE structure_users su
+            SET role = NULL,
+                "updatedAt" = NOW()
+           FROM tenant_users tu,
+                structures s
+          WHERE tu.role = :ownerRole
+            AND s."tenantId" = tu."tenantId"
+            AND su."userId" = tu."userId"
+            AND su."structureId" = s.id
+            AND su.role IS NOT NULL`,
+        {
+            replacements: { ownerRole: RoleCode.OWNER },
+            type: QueryTypes.UPDATE
+        }
+    );
+
+    return affectedRows(result);
+}
+
+/**
  * Bootstrap dei ruoli sulle membership già esistenti.
  *
  * Quando la colonna `tenant_users.role` viene creata, Postgres assegna a tutte le righe
@@ -80,6 +128,16 @@ export async function assignBootstrapRoles(): Promise<void> {
     const updated = affectedRows(result);
     if (updated > 0) {
         console.log(`[rbac] assegnato il ruolo OWNER a ${updated} membership di tenant`);
+    }
+
+    const assignedStructures = await assignOwnersToAllStructures();
+    if (assignedStructures > 0) {
+        console.log(`[rbac] assegnate ${assignedStructures} sedi mancanti ai proprietari`);
+    }
+
+    const clearedOverrides = await clearOwnerStructureOverrides();
+    if (clearedOverrides > 0) {
+        console.log(`[rbac] rimossi ${clearedOverrides} override locali dai proprietari`);
     }
 }
 

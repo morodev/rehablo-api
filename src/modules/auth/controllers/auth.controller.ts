@@ -202,6 +202,14 @@ export const loginPremise = asyncHandler(async (req: Request, res: Response) => 
     const structureId = req.params.premiseId;
     const tenantId = req.user!.tenants[0].id;
     const email = req.user!.email;
+    const userId = (req.user?.sub as string | undefined) ?? req.user!.id;
+
+    // La conoscenza dell'id di una sede non autorizza a lavorarci: l'assegnazione
+    // StructureUser è la fonte di verità per ogni ruolo, OWNER compreso.
+    const assignment = await StructureUser.findOne({ where: { structureId, userId } });
+    if (!assignment) {
+        return sendErrorResponse(res, 403, 'Non sei abilitato a questa sede');
+    }
 
     const premise = await Structure.findOne({
         where: { id: structureId, tenantId },
@@ -272,6 +280,9 @@ export const loginWithToken = asyncHandler(async (req: Request, res: Response) =
         isSuperAdmin: decoded.isSuperAdmin,
         role: decoded.role ?? null,
         perms: decoded.perms ?? [],
+        // Necessario per ripristinare il selettore sedi anche con F5 mentre
+        // l'access token è ancora valido (quindi senza passare dal refresh).
+        structures: Array.isArray(decoded.structures) ? decoded.structures : [],
         data: decoded
     };
 

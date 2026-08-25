@@ -48,7 +48,7 @@ ruoloEffettivo = structure_users.role (se valorizzato per il premise selezionato
 
 ### Resources (1:1 con i moduli API)
 `patient`, `evaluation`, `protocol`, `bodymap`, `measurement`, `agenda`,
-`invoice`, `product`, `dashboard`, `user`, `structure`, `tenant`, `maintenance`
+`invoice`, `product`, `dashboard`, `user`, `structure`, `tenant`, `clinical_content`, `maintenance`
 
 ### Actions
 `read`, `create`, `update`, `delete`, `export`, `manage`
@@ -82,12 +82,13 @@ soddisfa anche una richiesta di `patient:read:own`.
 |---|---|---|---|---|---|---|---|
 | Anagrafica pazienti | tenant CRUD | structure CRU | own RU + create | structure R | own R | tenant R | own R |
 | Dati clinici (valutazioni, bodymap, misurazioni) | tenant | **nessuno** | own CRUD | structure R / own CRU | own CRU | tenant R | own R |
+| Questionari e test (cataloghi) | tenant manage | tenant manage | uso clinico | uso clinico | uso clinico | uso clinico R | uso clinico R |
 | Protocolli | tenant | nessuno | own CRUD | structure R / own CRU | own R | tenant R | own R |
 | Agenda | tenant CRUD | structure CRUD | structure R / own CRUD | structure R / own CRUD | own CRU | tenant R | own R |
 | Fatturazione | tenant CRUD | structure CRU | nessuno | nessuno | nessuno | tenant R | own R |
-| Listino prodotti/servizi | tenant CRUD | tenant CRU | tenant R | tenant R | — | tenant R | — |
-| Utenti e strutture | tenant manage | structure R | structure R | structure R | — | tenant R | — |
-| Dati azienda / billing | tenant manage | — | — | — | — | — | — |
+| Listino prodotti/servizi | tenant manage | tenant manage | tenant R | tenant R | — | tenant R | — |
+| Utenti e strutture | tenant manage | tenant manage | structure R | structure R | — | tenant R | — |
+| Dati azienda / billing | tenant manage | tenant RU | — | — | — | — | — |
 
 > La matrice autoritativa è il codice: `src/modules/auth/rbac/roles.ts`.
 > `SUPER_ADMIN` non è un ruolo di tenant: è il flag `users.isSuperAdmin` e **bypassa** ogni check.
@@ -231,6 +232,19 @@ payload, perché l'API crea utente, membership e assegnazioni insieme.
 `updateUserStructures` esegue un diff invece di cancellare e ricreare: riscrivere tutto
 perderebbe gli override di ruolo per struttura.
 
+### Sedi amministrative e sedi operative
+
+Le due liste non sono intercambiabili:
+
+- `GET /structure` è amministrativo, richiede `structure:manage:tenant` e restituisce tutte le sedi dello studio;
+- `GET /structure/accessible` restituisce soltanto le righe collegate all'utente in `structure_users` ed è l'unica fonte per scelta e cambio sede;
+- `POST /auth/login-premise/:id` verifica sempre l'assegnazione, quindi conoscere l'id di una sede non consente di accedervi;
+- ogni `OWNER` è assegnato a tutte le sedi, non può rimuoverne alcuna e non ammette override locali di ruolo;
+- alla creazione di una sede vengono assegnati automaticamente solo gli `OWNER`; gli altri membri vengono abilitati esplicitamente dalla pagina Team.
+
+Il bootstrap RBAC ripara in modo idempotente i proprietari storici con sedi mancanti e
+rimuove eventuali override locali incompatibili con questo invariant.
+
 ### Bug corretti strada facendo
 Il frontend chiamava due endpoint inesistenti — modifica ed eliminazione utente
 rispondevano 404:
@@ -314,7 +328,7 @@ Ogni rotta che tocca dati dichiara il permesso richiesto **e** filtra i record p
 | evaluations | `evaluation` | ✅ | ✅ | `scopeWhere` su `userId` / `structureId` |
 | agenda | `agenda` | ✅ | ✅ | `scopeWhere` su `calendarId` / `structureId` |
 | invoice | `invoice` | ✅ | ✅ | `patientScopeWhere` su `patientID` |
-| human-body | `bodymap` / `evaluation` | ✅ | ✅ | `patientScopeWhere` su `patientId` |
+| human-body | `bodymap` / `evaluation` / `clinical_content` | ✅ | ✅ | dati clinici scoped; cataloghi amministrativi tenant-wide |
 | protocols (istanze) | `protocol` | ✅ | ✅ | `patientScopeWhere`; le fasi via protocollo padre |
 | measurements | `measurement` | ✅ | ✅ | `patientScopeWhere` su `patientId` |
 | configuration | `dashboard` | ✅ | ✅ | ownership stretta (`userId`), widget via dashboard |
@@ -374,7 +388,7 @@ Alcune rotte richiedono uno scope minimo perché toccano configurazione condivis
 |---|---|---|
 | `POST/PUT/DELETE /event-type` | `agenda:*:structure` | tipi di appuntamento della sede, non agenda personale |
 | `POST/PUT/DELETE /exercises`, `/protocol-templates` | `protocol:*:tenant` | cataloghi nello schema **public**: la scrittura impatta tutti i tenant |
-| `POST /questionnaire` e affini | `bodymap:*:structure` | definizione del questionario = configurazione |
+| `POST/PUT/DELETE /questionnaire` | `clinical_content:*:tenant` | gestione del catalogo separata dai dati clinici del paziente |
 | `POST /import-profiles`, `POST /device-catalog` | `measurement:update:tenant` | configurazione di integrazione del tenant |
 
 ### Rotte volutamente senza permesso

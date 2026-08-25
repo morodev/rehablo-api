@@ -29,6 +29,7 @@ export const RESOURCES = [
     'user',         // utenti del tenant
     'structure',    // strutture / premise
     'tenant',       // dati azienda, licenza, billing
+    'clinical_content', // cataloghi configurabili: questionari, test e scale
     'maintenance'   // operazioni di piattaforma
 ] as const;
 
@@ -56,6 +57,7 @@ export const RESOURCE_LABELS: Record<Resource, string> = {
     user: 'utenti',
     structure: 'strutture',
     tenant: 'dati azienda',
+    clinical_content: 'questionari e test',
     maintenance: 'manutenzione piattaforma'
 };
 

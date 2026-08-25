@@ -94,7 +94,8 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             perm('dashboard', 'manage', 'tenant'),
             perm('user', 'manage', 'tenant'),
             perm('structure', 'manage', 'tenant'),
-            perm('tenant', 'manage', 'tenant')
+            perm('tenant', 'manage', 'tenant'),
+            perm('clinical_content', 'manage', 'tenant')
         ]
     },
 
@@ -110,12 +111,14 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             ...crud('reminder', 'structure'),
             ...crud('agenda', 'structure'),
             ...perms('invoice', ['read', 'create', 'update', 'export'], 'structure'),
-            // Il front-office gestisce il listino perché è ciò che alimenta fatture e tipi
-            // appuntamento. La cancellazione resta all'OWNER: una voce eliminata per errore
-            // romperebbe lo storico delle fatture che la referenziano.
-            ...perms('product', ['read', 'create', 'update'], 'tenant'),
-            perm('user', 'read', 'structure'),
-            perm('structure', 'read', 'structure'),
+            // Il front-office gestisce il listino che alimenta fatture e tipi appuntamento.
+            perm('product', 'manage', 'tenant'),
+            // Le impostazioni amministrative sono gestibili dal titolare e dalla
+            // segreteria. Gli altri ruoli conservano soltanto le letture operative.
+            perm('user', 'manage', 'tenant'),
+            perm('structure', 'manage', 'tenant'),
+            ...perms('tenant', ['read', 'update'], 'tenant'),
+            perm('clinical_content', 'manage', 'tenant'),
             perm('dashboard', 'read', 'structure')
         ]
     },
