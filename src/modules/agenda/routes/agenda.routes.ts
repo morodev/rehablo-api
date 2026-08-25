@@ -4,6 +4,7 @@ import { requirePermission } from '../../../middleware/rbac.js';
 import { resolveTenantSchema } from '../../../middleware/tenantSchema.js';
 import agendaController from '../controllers/agenda.controller.js';
 import eventTypeController from '../controllers/eventType.controller.js';
+import timeOffController from '../controllers/timeOff.controller.js';
 
 const router = Router();
 
@@ -21,6 +22,17 @@ router.delete('/agenda-event', requirePermission('agenda', 'delete'), agendaCont
 router.get('/agenda-event-exceptions', requirePermission('agenda', 'read'), agendaController.getAllEventExceptions);
 router.patch('/recurring-event', requirePermission('agenda', 'update'), agendaController.updateRecurringEvent);
 router.delete('/recurring-event', requirePermission('agenda', 'delete'), agendaController.deleteRecurringEvent);
+
+// Ferie e permessi: dominio separato dagli appuntamenti con paziente.
+router.get('/time-off-requests', requirePermission('agenda', 'read'), timeOffController.getTimeOffRequests);
+router.post('/time-off-requests', requirePermission('agenda', 'create'), timeOffController.createTimeOffRequest);
+router.get('/time-off-requests/:timeOffRequestId', requirePermission('agenda', 'read'), timeOffController.getTimeOffRequestById);
+router.get('/time-off-requests/:timeOffRequestId/history', requirePermission('agenda', 'read'), timeOffController.getTimeOffRequestHistory);
+router.patch('/time-off-requests/:timeOffRequestId', requirePermission('agenda', 'update'), timeOffController.updateTimeOffRequest);
+router.patch('/time-off-requests/:timeOffRequestId/approve', requirePermission('agenda', 'update', 'structure'), timeOffController.approveTimeOffRequest);
+router.patch('/time-off-requests/:timeOffRequestId/reject', requirePermission('agenda', 'update', 'structure'), timeOffController.rejectTimeOffRequest);
+router.patch('/time-off-requests/:timeOffRequestId/cancel', requirePermission('agenda', 'update'), timeOffController.cancelTimeOffRequest);
+router.patch('/time-off-requests/:timeOffRequestId/revoke', requirePermission('agenda', 'update', 'structure'), timeOffController.revokeTimeOffRequest);
 
 // Event types: sono configurazione condivisa della struttura, non dati del singolo
 // professionista. Lo scope minimo `structure` esclude chi gestisce solo la propria agenda.

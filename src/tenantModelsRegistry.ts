@@ -6,6 +6,8 @@ import { registerInvoiceAssociations, Invoice, InvoiceProduct, InvoiceService } 
 import EventType from './modules/agenda/models/eventType.model.js';
 import AgendaEvent from './modules/agenda/models/agendaEvent.model.js';
 import AgendaEventException from './modules/agenda/models/agendaEventException.model.js';
+import TimeOffRequest from './modules/agenda/models/timeOffRequest.model.js';
+import TimeOffStatusHistory from './modules/agenda/models/timeOffStatusHistory.model.js';
 import { registerConfigurationAssociations, Dashboard, Widget } from './modules/configuration/models/index.js';
 import { registerProtocolAssociations, ProtocolInstance, ProtocolPhaseInstance, ProtocolExerciseLog } from './modules/protocols/models/index.js';
 import {
@@ -67,6 +69,8 @@ export function registerTenantModels(): void {
     registerTenantScopedModel(EventType);
     registerTenantScopedModel(AgendaEvent);
     registerTenantScopedModel(AgendaEventException);
+    registerTenantScopedModel(TimeOffRequest);
+    registerTenantScopedModel(TimeOffStatusHistory);
     registerTenantScopedModel(Dashboard);
     registerTenantScopedModel(Widget);
 

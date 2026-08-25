@@ -9,6 +9,7 @@ import AgendaEvent from '../models/agendaEvent.model.js';
 import AgendaEventException from '../models/agendaEventException.model.js';
 import EventType from '../models/eventType.model.js';
 import Patient from '../../patients/models/patient.model.js';
+import TimeOffRequest from '../models/timeOffRequest.model.js';
 
 /**
  * Campi per il filtro row-level RBAC.
@@ -26,6 +27,99 @@ const AGENDA_SCOPE_FIELDS = {
 // "invalid input syntax for type uuid" (which the generic error handler turns into
 // an opaque 500).
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Restituisce l'intervallo della singola occorrenza che si sta salvando.
+ * Negli eventi ricorrenti `end` indica la fine della serie, quindi l'estremo
+ * dell'occorrenza va ricavato da `duration`.
+ */
+function agendaOccurrenceInterval(event: Record<string, any>): { start: Date; end: Date } | null {
+    const start = new Date(event.start);
+    if (Number.isNaN(start.getTime())) return null;
+
+    const duration = Number(event.duration);
+    const end = event.recurrence && Number.isFinite(duration) && duration > 0
+        ? new Date(start.getTime() + duration * 60_000)
+        : new Date(event.end);
+
+    if (Number.isNaN(end.getTime()) || end.getTime() <= start.getTime()) return null;
+    return { start, end };
+}
+
+function isLegacyTimeOffEvent(event: Record<string, any>): boolean {
+    const title = typeof event.title === 'string' ? event.title : event.title?.title;
+    const patient = event.patient;
+    const hasPatient = !!patient &&
+        (typeof patient !== 'object' || Object.keys(patient).length > 0);
+    return !hasPatient && (title === 'Ferie' || title === 'Permesso');
+}
+
+async function validateAndNormalizeEventType(
+    schema: string,
+    event: Record<string, any>
+): Promise<string | null> {
+    if (isLegacyTimeOffEvent(event) || event.eventTypeId === undefined || event.eventTypeId === null) {
+        return null;
+    }
+    if (!UUID_REGEX.test(event.eventTypeId)) {
+        return 'Tipo appuntamento non valido';
+    }
+
+    const eventType = await EventType.schema(schema).findByPk(event.eventTypeId);
+    if (!eventType) {
+        return 'Tipo appuntamento non trovato';
+    }
+
+    // Il titolo resta denormalizzato per la leggibilità dello storico, ma quando
+    // esiste un id il valore autorevole è il tipo salvato nel tenant.
+    event.title = eventType.title;
+    return null;
+}
+
+async function findApprovedTimeOffConflict(
+    schema: string,
+    event: Record<string, any>,
+    agendaEventId?: string
+): Promise<TimeOffRequest | null> {
+    // Compatibilita' con i vecchi client durante il rollout: gli AgendaEvent
+    // Ferie/Permesso sono migrati nello stesso intervallo e non sono appuntamenti.
+    if (isLegacyTimeOffEvent(event) || !event.calendarId) return null;
+
+    const interval = agendaOccurrenceInterval(event);
+    if (!interval) return null;
+
+    const where: Record<string | symbol, any> = {
+        userId: event.calendarId,
+        status: 'APPROVED',
+        start: { [Op.lt]: interval.end },
+        end: { [Op.gt]: interval.start }
+    };
+    if (agendaEventId) {
+        where[Op.or] = [
+            { legacyAgendaEventId: null },
+            { legacyAgendaEventId: { [Op.ne]: agendaEventId } }
+        ];
+    }
+
+    return TimeOffRequest.schema(schema).findOne({ where });
+}
+
+async function rejectApprovedTimeOffConflict(
+    res: Response,
+    schema: string,
+    event: Record<string, any>,
+    agendaEventId?: string
+): Promise<boolean> {
+    const conflict = await findApprovedTimeOffConflict(schema, event, agendaEventId);
+    if (!conflict) return false;
+
+    sendErrorResponse(
+        res,
+        409,
+        `L'operatore ha un'assenza approvata dal ${moment(conflict.start).format('DD/MM/YYYY HH:mm')} al ${moment(conflict.end).format('DD/MM/YYYY HH:mm')}`
+    );
+    return true;
+}
 
 export const eventDashboardWithFilter = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
@@ -129,6 +223,11 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
         payload.structureId = req.access.structureId;
     }
 
+    const eventTypeError = await validateAndNormalizeEventType(schema, payload);
+    if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
+
+    if (await rejectApprovedTimeOffConflict(res, schema, payload)) return;
+
     const agendaEvent = await AgendaEvent.schema(schema).create(payload);
 
     const patient: any = agendaEvent.get('patient');
@@ -149,8 +248,29 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     const id = req.body.id;
     const event = req.body.event;
 
-    if (typeof event.title !== 'string') {
+    const current = await AgendaEvent.schema(schema).findOne({
+        where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
+    });
+    if (!current) {
+        return sendErrorResponse(res, 404, `Error updating agendaEvent with id=${id}`);
+    }
+
+    if (typeof event.title !== 'string' && event.title !== undefined) {
         event.title = event.title?.title;
+    }
+
+    if (req.access?.scope === 'own') {
+        event.calendarId = req.access.userId;
+    }
+
+    const eventTypeError = await validateAndNormalizeEventType(schema, event);
+    if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
+
+    const scheduleChanged = ['calendarId', 'start', 'end', 'duration', 'recurrence']
+        .some((field) => Object.prototype.hasOwnProperty.call(event, field));
+    if (scheduleChanged) {
+        const candidate = { ...current.get({ plain: true }), ...event };
+        if (await rejectApprovedTimeOffConflict(res, schema, candidate, id)) return;
     }
 
     const [rowsUpdated] = await AgendaEvent.schema(schema).update(event, {
@@ -208,12 +328,17 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
         return sendErrorResponse(res, 404, 'Recurring event not found');
     }
 
+    const eventTypeError = await validateAndNormalizeEventType(schema, event);
+    if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
+
     if (mode === 'single') {
         const { range, recurringEventId, ...newEvent } = event;
         newEvent.id = undefined;
         newEvent.end = moment(newEvent.start).add(newEvent.duration, 'minutes').toISOString();
         newEvent.duration = null;
         newEvent.recurrence = null;
+
+        if (await rejectApprovedTimeOffConflict(res, schema, newEvent)) return;
 
         await AgendaEvent.schema(schema).create(newEvent);
         await AgendaEventException.schema(schema).create({
@@ -225,6 +350,8 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
     }
 
     if (mode === 'future') {
+        if (await rejectApprovedTimeOffConflict(res, schema, event, recurringEvent.id)) return;
+
         const eventFound: any = recurringEvent.get({ plain: true });
         eventFound.end = moment(originalEvent.start).subtract(1, 'day').endOf('day').toISOString();
 
@@ -242,6 +369,9 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
     }
 
     if (mode === 'all') {
+        const candidate = { ...recurringEvent.get({ plain: true }), ...event };
+        if (await rejectApprovedTimeOffConflict(res, schema, candidate, recurringEvent.id)) return;
+
         const { id, recurringEventId, range, ...updateAll } = event;
         await AgendaEvent.schema(schema).update(updateAll, { where: { id: event.recurringEventId } });
         return sendSuccessResponse(res, 201, true, 'Recurring event updated (all)');

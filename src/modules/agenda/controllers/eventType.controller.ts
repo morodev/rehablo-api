@@ -27,8 +27,21 @@ function wantsDefault(payload: Record<string, unknown>): boolean {
     return payload?.isDefault === true || payload?.isDefault === 'true';
 }
 
+function isReservedTimeOffTitle(value: unknown): boolean {
+    const title = `${value ?? ''}`.trim().toLocaleLowerCase('it');
+    return title === 'ferie' || title === 'permesso';
+}
+
 export const createEventType = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
+
+    if (isReservedTimeOffTitle(req.body?.title)) {
+        return sendErrorResponse(
+            res,
+            409,
+            'Ferie e Permesso sono tipi di assenza gestiti dalla sezione dedicata'
+        );
+    }
 
     const eventType = await sequelize.transaction(async (transaction) => {
         const created = await EventType.schema(schema).create(req.body, { transaction });
@@ -70,6 +83,14 @@ export const updateEventType = asyncHandler(async (req: Request, res: Response) 
     const schema = req.tenantSchema!;
     const id = req.params.eventTypeId;
     const payload = req.body.eventType ?? req.body;
+
+    if (Object.prototype.hasOwnProperty.call(payload, 'title') && isReservedTimeOffTitle(payload.title)) {
+        return sendErrorResponse(
+            res,
+            409,
+            'Ferie e Permesso sono tipi di assenza gestiti dalla sezione dedicata'
+        );
+    }
 
     const rowsUpdated = await sequelize.transaction(async (transaction) => {
         const [count] = await EventType.schema(schema).update(payload, { where: { id }, transaction });
