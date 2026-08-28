@@ -2,24 +2,28 @@ import { Request, Response } from 'express';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
-import { patientScopeWhere } from '../../../middleware/rbac.js';
+import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
 import HumanBodySymptom from '../models/humanBodySymptom.model.js';
 import { resolveHumanBodyPointId } from './humanBodyPoint.helper.js';
 import { assertEvaluationEditable } from '../../evaluations/services/evaluationGuard.js';
 
-// NOTA RBAC: i sintomi sono dati clinici del PAZIENTE (vedi point.controller.ts):
-// l'ampiezza si eredita dai pazienti visibili, non dall'operatore che li ha registrati.
+// NOTA RBAC: lo scope `own` segue l'autore del sintomo; gli scope più ampi
+// ereditano la visibilità dalla sede del paziente (vedi point.controller.ts).
 
 export const saveSymptom = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    await assertEvaluationEditable(schema, req.body?.evaluationId);
-    const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body);
+    await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined);
+    const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId);
 
     if (!humanBodyPointId) {
         return sendErrorResponse(res, 400, 'humanBodyPointId or pointToCreate is required');
     }
 
-    const symptom = await HumanBodySymptom.schema(schema).create({ ...req.body, humanBodyPointId });
+    const symptom = await HumanBodySymptom.schema(schema).create({
+        ...req.body,
+        humanBodyPointId,
+        userId: req.access!.userId
+    });
     return sendSuccessResponse(res, 201, symptom, 'Human body symptom created');
 });
 
@@ -28,7 +32,7 @@ export const getAllSymptomByPoint = asyncHandler(async (req: Request, res: Respo
     const symptoms = await HumanBodySymptom.schema(schema).findAll({
         where: {
             humanBodyPointId: req.query.humanBodyPointId as string,
-            ...patientScopeWhere(req, schema)
+            ...patientResourceScopeWhere(req, schema)
         }
     });
     return sendSuccessResponse(res, 200, symptoms, 'Human body symptoms loaded');
@@ -49,7 +53,7 @@ export const getSymptomById = asyncHandler(async (req: Request, res: Response) =
     }
 
     const symptoms = await HumanBodySymptom.schema(schema).findAll({
-        where: { humanBodyPointId, ...patientScopeWhere(req, schema) },
+        where: { humanBodyPointId, ...patientResourceScopeWhere(req, schema) },
         order: [['date', 'DESC']]
     });
 
@@ -65,7 +69,7 @@ export const updateSymptom = asyncHandler(async (req: Request, res: Response) =>
     const id = req.params.symptomId;
 
     const [rowsUpdated] = await HumanBodySymptom.schema(schema).update(req.body.symptom ?? req.body, {
-        where: { id, ...patientScopeWhere(req, schema) }
+        where: { id, ...patientResourceScopeWhere(req, schema) }
     });
     if (rowsUpdated === 0) {
         return sendErrorResponse(res, 404, 'Human body symptom not found');
@@ -79,7 +83,7 @@ export const updateSymptom = asyncHandler(async (req: Request, res: Response) =>
 export const deleteSymptom = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const removed = await HumanBodySymptom.schema(schema).destroy({
-        where: { id: req.params.symptomId, ...patientScopeWhere(req, schema) }
+        where: { id: req.params.symptomId, ...patientResourceScopeWhere(req, schema) }
     });
     if (removed === 0) {
         return sendErrorResponse(res, 404, 'Human body symptom not found');
@@ -92,7 +96,7 @@ export const getSymptomsByBodyPart = asyncHandler(async (req: Request, res: Resp
     const schema = req.tenantSchema!;
     const { bodyPart, bodySubPart, patientId, evaluationId } = req.query;
 
-    const where: Record<string, unknown> = { ...patientScopeWhere(req, schema) };
+    const where: Record<string, unknown> = { ...patientResourceScopeWhere(req, schema) };
     if (bodyPart) where.bodyPart = sequelizeWhere(fn('LOWER', col('bodyPart')), 'LIKE', `%${String(bodyPart).toLowerCase()}%`);
     if (bodySubPart) where.bodySubPart = sequelizeWhere(fn('LOWER', col('bodySubPart')), 'LIKE', `%${String(bodySubPart).toLowerCase()}%`);
     if (patientId) where.patientId = patientId;

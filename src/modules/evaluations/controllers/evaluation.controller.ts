@@ -33,7 +33,7 @@ import {
 const EVALUATION_SCOPE_FIELDS = {
     ownerField: 'userId',
     structureField: 'structureId',
-    includeUnassigned: true
+    includeUnassigned: false
 };
 
 /**
@@ -61,7 +61,11 @@ export const createEvaluation = asyncHandler(async (req: Request, res: Response)
 
     // Si può creare una valutazione solo su un paziente che si ha il diritto di vedere.
     const patient = await Patient.schema(schema).findOne({
-        where: { id: patientId, ...scopeWhere(req, EVALUATION_SCOPE_FIELDS) }
+        where: {
+            id: patientId,
+            structureId: req.access?.structureId ?? null,
+            archivedAt: null
+        }
     });
     if (!patient) {
         return sendErrorResponse(res, 404, 'Paziente non trovato');
@@ -70,10 +74,7 @@ export const createEvaluation = asyncHandler(async (req: Request, res: Response)
     // Se la struttura non è indicata esplicitamente per questa valutazione, si ricade sulla
     // struttura di riferimento anagrafico del paziente (necessaria per instradare correttamente
     // un futuro invio al FSE regionale in base alla Regione della struttura).
-    let resolvedStructureId = structureId ?? null;
-    if (!resolvedStructureId) {
-        resolvedStructureId = (patient.get('structureId') as string | undefined) ?? null;
-    }
+    const resolvedStructureId = patient.get('structureId') as string;
 
     const evaluation = await Evaluation.schema(schema).create({
         patientId,
@@ -174,10 +175,23 @@ export const updateEvaluation = asyncHandler(async (req: Request, res: Response)
     // Guard immutabilità (FASE E): si può aggiornare solo una valutazione ancora editabile (DRAFT di
     // oggi). Questo consente la transizione di chiusura (DRAFT→COMPLETED) e blocca ogni modifica a una
     // valutazione già chiusa. La data, se presente, non può essere futura.
-    await assertEvaluationEditable(schema, id);
+    await assertEvaluationEditable(
+        schema,
+        id,
+        req.access?.scope === 'own' ? req.access.userId : undefined
+    );
     assertNotFutureDate(req.body?.date);
 
-    const [rowsUpdated] = await Evaluation.schema(schema).update(req.body, {
+    const payload = Object.fromEntries(
+        ['date', 'title', 'notes', 'status']
+            .filter((field) => Object.prototype.hasOwnProperty.call(req.body ?? {}, field))
+            .map((field) => [field, req.body[field]])
+    );
+    if (Object.keys(payload).length === 0) {
+        return sendErrorResponse(res, 400, 'Nessun campo aggiornabile ricevuto');
+    }
+
+    const [rowsUpdated] = await Evaluation.schema(schema).update(payload, {
         where: { id, ...scopeWhere(req, EVALUATION_SCOPE_FIELDS) }
     });
     if (rowsUpdated === 0) {

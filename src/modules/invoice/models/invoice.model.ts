@@ -10,6 +10,8 @@ export interface InvoiceAttributes {
     discSellingPrice?: number | null;
     invoiceVAT?: number | null;
     patientID?: string | null;
+    /** Appuntamento da cui nasce il documento. NULL per le fatture create manualmente. */
+    agendaEventId?: string | null;
     isCashPro: boolean;
     cashPro?: string | null;
     isRivals: boolean;
@@ -120,6 +122,7 @@ export class Invoice extends Model<InvoiceAttributes, InvoiceCreationAttributes>
     declare discSellingPrice: number | null;
     declare invoiceVAT: number | null;
     declare patientID: string | null;
+    declare agendaEventId: string | null;
     declare isCashPro: boolean;
     declare cashPro: string | null;
     declare isRivals: boolean;
@@ -156,6 +159,13 @@ Invoice.init(
         discSellingPrice: DataTypes.DECIMAL(10, 2),
         invoiceVAT: DataTypes.DECIMAL(10, 2),
         patientID: DataTypes.UUID,
+        // Un appuntamento non puo' generare piu' documenti. PostgreSQL consente invece
+        // piu' valori NULL, quindi le fatture create manualmente restano ammesse.
+        agendaEventId: {
+            type: DataTypes.UUID,
+            allowNull: true,
+            unique: 'invoices_agenda_event_id_unique'
+        },
         isCashPro: { type: DataTypes.BOOLEAN, defaultValue: false },
         cashPro: DataTypes.STRING,
         isRivals: { type: DataTypes.BOOLEAN, defaultValue: false },

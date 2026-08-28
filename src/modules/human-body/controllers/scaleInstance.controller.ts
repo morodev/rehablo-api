@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
-import { patientScopeWhere } from '../../../middleware/rbac.js';
+import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
 import { sendSuccessResponse } from '../../../utils/response.js';
 import { Scale, QuestionScale, AnswerScale } from '../models/catalog/index.js';
 import UserScaleInstance from '../models/userScaleInstance.model.js';
@@ -23,10 +23,10 @@ export const saveScale = asyncHandler(async (req: Request, res: Response) => {
         questions: ScaleAnswerInput[];
     };
 
-    await assertEvaluationEditable(schema, body.evaluationId);
+    await assertEvaluationEditable(schema, body.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined);
 
     const newScaleInstance = await UserScaleInstance.schema(schema).create({
-        userId: body.userId,
+        userId: req.access!.userId,
         patientId: body.patientId,
         evaluationId: body.evaluationId ?? null,
         scaleId: body.scaleId
@@ -50,7 +50,7 @@ export const getUserScaleInstances = asyncHandler(async (req: Request, res: Resp
     const schema = req.tenantSchema!;
     const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
 
-    const where: Record<string, unknown> = { ...patientScopeWhere(req, schema) };
+    const where: Record<string, unknown> = { ...patientResourceScopeWhere(req, schema) };
     if (patientId) where.patientId = patientId;
     if (evaluationId) where.evaluationId = evaluationId;
 

@@ -73,7 +73,11 @@ AgendaEvent.init(
         status: DataTypes.STRING,
         erasable: { type: DataTypes.BOOLEAN, defaultValue: true },
         eventTypeId: { type: DataTypes.UUID, allowNull: true },
-        invoiceId: { type: DataTypes.UUID, allowNull: true }
+        invoiceId: {
+            type: DataTypes.UUID,
+            allowNull: true,
+            unique: 'agenda_events_invoice_id_unique'
+        }
     },
     { sequelize, modelName: 'agendaEvent', tableName: 'agenda_events' }
 );

@@ -177,7 +177,7 @@ export function scopeWhere(req: Request, fields: ScopeFields): Record<string, un
         if (!fields.structureField) return {};
         if (!access.structureId) {
             // Nessun premise selezionato: nessun dato visibile a scope struttura.
-            return { [fields.structureField]: null };
+            return { [Op.and]: literal('1=0') } as Record<string, unknown>;
         }
         if (fields.includeUnassigned) {
             return {
@@ -288,14 +288,14 @@ export function patientScopeWhere(
     } else {
         if (!access.structureId) {
             // Nessuna struttura selezionata: nessun paziente visibile.
-            return { [patientField]: null };
+            return { [Op.and]: literal('1=0') } as Record<string, unknown>;
         }
         if (!UUID_REGEX.test(access.structureId)) {
             throw new Error('patientScopeWhere(): structureId non valido');
         }
-        // `structureId IS NULL` copre i pazienti non ancora assegnati a una sede
-        // (coerente con ScopeFields.includeUnassigned usato su Patient).
-        condition = `("structureId" = '${access.structureId}' OR "structureId" IS NULL)`;
+        // I record legacy senza sede non devono diventare visibili in piÃ¹ strutture.
+        // Il backfill li assegna solo quando la sede Ã¨ deducibile senza ambiguitÃ .
+        condition = `"structureId" = '${access.structureId}'`;
     }
 
     return {
@@ -303,5 +303,25 @@ export function patientScopeWhere(
             [Op.in]: literal(`(SELECT "id" FROM "${schema}"."patients" WHERE ${condition})`)
         }
     };
+}
+
+/**
+ * Scope per record clinici che hanno sia un autore proprio (`userId`) sia un
+ * collegamento al paziente. Con scope `own` filtra l'autore del dato clinico, non
+ * chi aveva creato l'anagrafica; per structure/tenant eredita invece la sede del paziente.
+ */
+export function patientResourceScopeWhere(
+    req: Request,
+    schema: string,
+    patientField = 'patientId',
+    ownerField = 'userId'
+): Record<string, unknown> {
+    if (!req.access) {
+        throw new Error('patientResourceScopeWhere() richiede requirePermission() sulla rotta');
+    }
+    if (req.access.scope === 'own') {
+        return { [ownerField]: req.access.userId };
+    }
+    return patientScopeWhere(req, schema, patientField);
 }
 

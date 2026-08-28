@@ -85,7 +85,9 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
         actor: 'staff',
         assignable: true,
         permissions: [
-            perm('patient', 'manage', 'tenant'),
+            // L'anagrafica operativa segue sempre la sede selezionata. Le viste
+            // aggregate multi-sede devono usare endpoint amministrativi espliciti.
+            perm('patient', 'manage', 'structure'),
             ...CLINICAL_RESOURCES.map((resource) => perm(resource, 'manage', 'tenant')),
             perm('reminder', 'manage', 'tenant'),
             perm('agenda', 'manage', 'tenant'),
@@ -129,9 +131,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
         actor: 'staff',
         assignable: true,
         permissions: [
-            perm('patient', 'read', 'own'),
-            perm('patient', 'update', 'own'),
-            perm('patient', 'create', 'structure'),
+            ...perms('patient', ['read', 'create', 'update'], 'structure'),
             ...clinicalCrud('own'),
             ...crud('reminder', 'own'),
             // vede l'agenda della struttura (disponibilità) ma gestisce solo la propria
@@ -167,7 +167,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
         actor: 'staff',
         assignable: true,
         permissions: [
-            perm('patient', 'read', 'own'),
+            ...perms('patient', ['read', 'create', 'update'], 'structure'),
             ...CLINICAL_RESOURCES.flatMap((resource) =>
                 perms(resource, ['read', 'create', 'update'], 'own')
             ),
@@ -186,7 +186,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
         actor: 'staff',
         assignable: true,
         permissions: [
-            perm('patient', 'read', 'tenant'),
+            perm('patient', 'read', 'structure'),
             ...clinicalRead('tenant'),
             perm('reminder', 'read', 'tenant'),
             perm('agenda', 'read', 'tenant'),

@@ -1,6 +1,9 @@
 import { DataTypes, Model, Optional } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 
+export const USER_AVAILABILITY_MODES = ['INHERIT_STRUCTURE', 'CUSTOM'] as const;
+export type UserAvailabilityMode = (typeof USER_AVAILABILITY_MODES)[number];
+
 export interface UserAttributes {
     id: string;
     name?: string | null;
@@ -11,6 +14,7 @@ export interface UserAttributes {
     /** `true` una volta verificato l'indirizzo email. NON indica la sospensione dell'account. */
     isActive: boolean;
     calendarColor: string;
+    availabilityMode: UserAvailabilityMode;
     isSuperAdmin: boolean;
     /**
      * Titolare dello studio: è l'utente nato dalla registrazione, quello che ha creato il tenant.
@@ -39,6 +43,7 @@ export type UserCreationAttributes = Optional<
     | 'id'
     | 'calendarVisible'
     | 'calendarColor'
+    | 'availabilityMode'
     | 'isActive'
     | 'isSuperAdmin'
     | 'isTenant'
@@ -54,6 +59,7 @@ export class User extends Model<UserAttributes, UserCreationAttributes> implemen
     declare password: string;
     declare calendarVisible: boolean;
     declare calendarColor: string;
+    declare availabilityMode: UserAvailabilityMode;
     declare isActive: boolean;
     declare isSuperAdmin: boolean;
     declare isTenant: boolean;
@@ -73,6 +79,12 @@ User.init(
         password: { type: DataTypes.STRING, allowNull: false },
         calendarVisible: { type: DataTypes.BOOLEAN, defaultValue: true },
         calendarColor: { type: DataTypes.STRING, allowNull: false, defaultValue: 'bg-primary' },
+        availabilityMode: {
+            type: DataTypes.STRING(32),
+            allowNull: false,
+            defaultValue: 'INHERIT_STRUCTURE',
+            validate: { isIn: [[...USER_AVAILABILITY_MODES]] }
+        },
         isActive: { type: DataTypes.BOOLEAN, defaultValue: false },
         isSuperAdmin: { type: DataTypes.BOOLEAN, defaultValue: false },
         isTenant: { type: DataTypes.BOOLEAN, defaultValue: false },

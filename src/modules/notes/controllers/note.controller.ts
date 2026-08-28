@@ -9,13 +9,7 @@ import Note, { NoteType } from '../models/note.model.js';
 const NOTE_SCOPE_FIELDS = {
     ownerField: 'ownerUserId',
     structureField: 'structureId',
-    includeUnassigned: true
-};
-
-const PATIENT_SCOPE_FIELDS = {
-    ownerField: 'userId',
-    structureField: 'structureId',
-    includeUnassigned: true
+    includeUnassigned: false
 };
 
 const NOTE_TYPES: NoteType[] = ['CLINICAL', 'ADMIN', 'INTERNAL'];
@@ -27,11 +21,8 @@ function parseBool(value: unknown): boolean | undefined {
     return undefined;
 }
 
-function resolveWritableStructureId(req: Request, requested?: string | null): string | null {
-    if (req.access?.scope === 'tenant') {
-        return requested ?? req.access.structureId ?? null;
-    }
-    return req.access?.structureId ?? requested ?? null;
+function resolveWritableStructureId(req: Request): string | null {
+    return req.access?.structureId ?? null;
 }
 
 async function assertPatientVisible(req: Request, res: Response, patientId?: string | null): Promise<boolean> {
@@ -40,7 +31,8 @@ async function assertPatientVisible(req: Request, res: Response, patientId?: str
     const patient = await Patient.schema(req.tenantSchema!).findOne({
         where: {
             id: patientId,
-            ...scopeWhere(req, PATIENT_SCOPE_FIELDS)
+            structureId: req.access?.structureId ?? null,
+            archivedAt: null
         }
     });
 
@@ -60,6 +52,10 @@ export const createNote = asyncHandler(async (req: Request, res: Response) => {
 
     const type = NOTE_TYPES.includes(body.type) ? body.type : 'CLINICAL';
     const patientId = body.patientId ?? null;
+    const structureId = resolveWritableStructureId(req);
+    if (!structureId) {
+        return sendErrorResponse(res, 400, 'Seleziona una sede prima di creare la nota');
+    }
 
     if (!(await assertPatientVisible(req, res, patientId))) {
         return;
@@ -79,7 +75,7 @@ export const createNote = asyncHandler(async (req: Request, res: Response) => {
         agendaEventId: body.agendaEventId ?? null,
         evaluationId: body.evaluationId ?? null,
         ownerUserId,
-        structureId: resolveWritableStructureId(req, body.structureId),
+        structureId,
         createdByUserId: req.user!.id,
         pinned: !!body.pinned,
         archived: !!body.archived

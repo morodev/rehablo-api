@@ -4,6 +4,7 @@ import { sequelize } from '../../../config/database.js';
 export interface PatientAttributes {
     id: string;
     tenantId: string;
+    /** Utente che ha creato l'anagrafica. È un dato di audit, non determina la visibilità. */
     userId: string;
     // --- Multi-struttura/multi-regione: un tenant può avere più Structure (sedi), anche in
     // Regioni diverse. `structureId` indica la struttura di riferimento anagrafico del
@@ -11,7 +12,7 @@ export interface PatientAttributes {
     // FSE regionale quando il singolo atto clinico (Evaluation) non specifica una struttura
     // propria. Non è una FK cross-schema (Structure vive nello schema "public"), stesso
     // pattern già usato per `tenantId`/`userId`. ---
-    structureId?: string | null;
+    structureId: string | null;
     isShared: boolean;
     sharedWith: number[];
     name: string;
@@ -30,6 +31,8 @@ export interface PatientAttributes {
     phoneNumbers: Record<string, unknown>[];
     background: string;
     notes?: string | null;
+    /** Archiviazione logica: preserva cartella clinica, appuntamenti e documenti collegati. */
+    archivedAt?: Date | null;
     // --- Adempimenti privacy/GDPR (art. 9 GDPR, dati sanitari) ---
     /** Consenso esplicito al trattamento dei dati sanitari (obbligatorio prima di qualunque prestazione). */
     privacyConsent: boolean;
@@ -50,7 +53,7 @@ export interface PatientAttributes {
 
 export type PatientCreationAttributes = Optional<
     PatientAttributes,
-    'id' | 'isShared' | 'sharedWith' | 'emails' | 'tags' | 'phoneNumbers' | 'background' | 'name' | 'privacyConsent' | 'stsOppositionToDataSending'
+    'id' | 'isShared' | 'sharedWith' | 'emails' | 'tags' | 'phoneNumbers' | 'background' | 'name' | 'archivedAt' | 'privacyConsent' | 'stsOppositionToDataSending'
 >;
 
 /**
@@ -81,6 +84,7 @@ export class Patient extends Model<PatientAttributes, PatientCreationAttributes>
     declare phoneNumbers: Record<string, unknown>[];
     declare background: string;
     declare notes: string | null;
+    declare archivedAt: Date | null;
     declare privacyConsent: boolean;
     declare privacyConsentDate: Date | null;
     declare privacyPolicyVersion: string | null;
@@ -95,7 +99,9 @@ Patient.init(
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
         tenantId: { type: DataTypes.STRING, allowNull: false },
         userId: { type: DataTypes.STRING, allowNull: false },
-        structureId: { type: DataTypes.UUID, allowNull: true },
+        // `allowNull: false` vale per tutti i nuovi record. Gli schemi legacy vengono
+        // prima riallineati dal backfill; il sync additive non forza il vincolo sui dati storici.
+        structureId: { type: DataTypes.UUID, allowNull: false },
         isShared: { type: DataTypes.BOOLEAN, defaultValue: false },
         sharedWith: { type: DataTypes.ARRAY(DataTypes.INTEGER), defaultValue: [] },
         name: { type: DataTypes.STRING, defaultValue: '' },
@@ -114,6 +120,7 @@ Patient.init(
         phoneNumbers: { type: DataTypes.ARRAY(DataTypes.JSON), defaultValue: [] },
         background: { type: DataTypes.STRING, defaultValue: 'assets/images/cards/17-640x480.jpg' },
         notes: DataTypes.TEXT,
+        archivedAt: { type: DataTypes.DATE, allowNull: true, defaultValue: null },
         privacyConsent: { type: DataTypes.BOOLEAN, defaultValue: false },
         privacyConsentDate: DataTypes.DATE,
         privacyPolicyVersion: DataTypes.STRING,
@@ -122,7 +129,15 @@ Patient.init(
         fseConsentViewing: { type: DataTypes.BOOLEAN, allowNull: true, defaultValue: null },
         fseConsentDate: DataTypes.DATE
     },
-    { sequelize, modelName: 'patient', tableName: 'patients' }
+    {
+        sequelize,
+        modelName: 'patient',
+        tableName: 'patients',
+        indexes: [
+            { name: 'patients_structure_archived_idx', fields: ['structureId', 'archivedAt'] },
+            { name: 'patients_fiscal_code_idx', fields: ['fiscalCode'] }
+        ]
+    }
 );
 
 export default Patient;

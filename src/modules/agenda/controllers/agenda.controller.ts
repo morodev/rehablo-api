@@ -9,7 +9,9 @@ import AgendaEvent from '../models/agendaEvent.model.js';
 import AgendaEventException from '../models/agendaEventException.model.js';
 import EventType from '../models/eventType.model.js';
 import Patient from '../../patients/models/patient.model.js';
+import Invoice from '../../invoice/models/invoice.model.js';
 import TimeOffRequest from '../models/timeOffRequest.model.js';
+import { StructureUser } from '../../auth/models/index.js';
 
 /**
  * Campi per il filtro row-level RBAC.
@@ -19,7 +21,7 @@ import TimeOffRequest from '../models/timeOffRequest.model.js';
 const AGENDA_SCOPE_FIELDS = {
     ownerField: 'calendarId',
     structureField: 'structureId',
-    includeUnassigned: true
+    includeUnassigned: false
 };
 
 // Simple RFC-4122 UUID matcher used to reject malformed ids (e.g. a stray numeric
@@ -27,6 +29,46 @@ const AGENDA_SCOPE_FIELDS = {
 // "invalid input syntax for type uuid" (which the generic error handler turns into
 // an opaque 500).
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Aggiunge al feed dell'agenda soltanto lo stato necessario alla UI.
+ * Le fatture vengono lette in blocco: una query per il feed, mai una query per appuntamento.
+ */
+async function withInvoiceStatus(
+    schema: string,
+    agendaEvents: AgendaEvent[]
+): Promise<Record<string, any>[]> {
+    const plainEvents = agendaEvents.map((event) =>
+        event.get({ plain: true }) as Record<string, any>
+    );
+    const invoiceIds = Array.from(new Set(
+        plainEvents
+            .map((event) => event.invoiceId as string | null | undefined)
+            .filter((invoiceId): invoiceId is string => !!invoiceId)
+    ));
+
+    if (invoiceIds.length === 0) {
+        return plainEvents;
+    }
+
+    const invoices = await Invoice.schema(schema).findAll({
+        where: { id: { [Op.in]: invoiceIds } },
+        attributes: ['id', 'status']
+    });
+    const statusByInvoiceId = new Map(
+        invoices.map((invoice) => [
+            invoice.get('id') as string,
+            invoice.get('status') as string | null
+        ])
+    );
+
+    return plainEvents.map((event) => ({
+        ...event,
+        invoiceStatus: event.invoiceId
+            ? statusByInvoiceId.get(event.invoiceId) ?? null
+            : null
+    }));
+}
 
 /**
  * Restituisce l'intervallo della singola occorrenza che si sta salvando.
@@ -52,6 +94,68 @@ function isLegacyTimeOffEvent(event: Record<string, any>): boolean {
     const hasPatient = !!patient &&
         (typeof patient !== 'object' || Object.keys(patient).length > 0);
     return !hasPatient && (title === 'Ferie' || title === 'Permesso');
+}
+
+/**
+ * Verifica che l'appuntamento punti a un paziente attivo della stessa sede e sostituisce
+ * l'oggetto ricevuto dal client con uno snapshot minimo letto dal database.
+ */
+async function rejectInvalidPatient(
+    res: Response,
+    schema: string,
+    event: Record<string, any>
+): Promise<boolean> {
+    if (isLegacyTimeOffEvent(event)) return false;
+
+    const patientId = event.patient && typeof event.patient === 'object' ? event.patient.id : null;
+    const structureId = event.structureId;
+    if (!patientId || !structureId || !UUID_REGEX.test(patientId) || !UUID_REGEX.test(structureId)) {
+        sendErrorResponse(res, 400, 'Paziente e sede sono obbligatori per un appuntamento');
+        return true;
+    }
+
+    const patient = await Patient.schema(schema).findOne({
+        where: { id: patientId, structureId, archivedAt: null }
+    });
+    if (!patient) {
+        sendErrorResponse(res, 409, 'Il paziente non appartiene alla sede selezionata o è archiviato');
+        return true;
+    }
+
+    const plain = patient.get({ plain: true });
+    event.patient = {
+        id: plain.id,
+        name: plain.name,
+        surname: plain.surname,
+        fiscalCode: plain.fiscalCode,
+        emails: plain.emails,
+        phoneNumbers: plain.phoneNumbers
+    };
+    return false;
+}
+
+async function rejectOperatorOutsideStructure(
+    res: Response,
+    event: Record<string, any>
+): Promise<boolean> {
+    if (isLegacyTimeOffEvent(event)) return false;
+
+    const calendarId = event.calendarId;
+    const structureId = event.structureId;
+    if (!calendarId || !structureId) {
+        sendErrorResponse(res, 400, 'Operatore e sede sono obbligatori per un appuntamento');
+        return true;
+    }
+    if (!UUID_REGEX.test(calendarId) || !UUID_REGEX.test(structureId)) {
+        sendErrorResponse(res, 400, 'Operatore o sede non validi');
+        return true;
+    }
+
+    const assignment = await StructureUser.findOne({ where: { userId: calendarId, structureId } });
+    if (assignment) return false;
+
+    sendErrorResponse(res, 409, 'L\'operatore non è assegnato alla sede selezionata');
+    return true;
 }
 
 async function validateAndNormalizeEventType(
@@ -148,7 +252,12 @@ export const findAllAgendaEvents = asyncHandler(async (req: Request, res: Respon
         where: { start: { [Op.between]: [startDate, endDate] }, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
     });
 
-    return sendSuccessResponse(res, 200, { agendaEvents }, 'Agenda events loaded');
+    return sendSuccessResponse(
+        res,
+        200,
+        { agendaEvents: await withInvoiceStatus(schema, agendaEvents) },
+        'Agenda events loaded'
+    );
 });
 
 export const findAgendaEventsByUsers = asyncHandler(async (req: Request, res: Response) => {
@@ -160,7 +269,12 @@ export const findAgendaEventsByUsers = asyncHandler(async (req: Request, res: Re
         where: { calendarId: { [Op.or]: calendarIds }, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
     });
 
-    return sendSuccessResponse(res, 200, { agendaEvents }, 'Agenda events loaded');
+    return sendSuccessResponse(
+        res,
+        200,
+        { agendaEvents: await withInvoiceStatus(schema, agendaEvents) },
+        'Agenda events loaded'
+    );
 });
 
 /**
@@ -180,7 +294,8 @@ export const findAppointmentsForPatientById = asyncHandler(async (req: Request, 
     const patient = await Patient.schema(schema).findOne({
         where: {
             id: patientId,
-            ...scopeWhere(req, { ownerField: 'userId', structureField: 'structureId', includeUnassigned: true })
+            structureId: req.access?.structureId ?? null,
+            archivedAt: null
         }
     });
     if (!patient) {
@@ -191,7 +306,12 @@ export const findAppointmentsForPatientById = asyncHandler(async (req: Request, 
         where: { patient: { id: patientId } as any, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
     });
 
-    return sendSuccessResponse(res, 200, { agendaEvents }, 'Agenda events loaded');
+    return sendSuccessResponse(
+        res,
+        200,
+        { agendaEvents: await withInvoiceStatus(schema, agendaEvents) },
+        'Agenda events loaded'
+    );
 });
 
 export const findAllHolidays = asyncHandler(async (req: Request, res: Response) => {
@@ -213,15 +333,20 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
     const schema = req.tenantSchema!;
     const payload = { ...req.body.agendaEvent };
 
+    // Il collegamento fiscale e' server-managed dal controller fatture. In particolare,
+    // copia/incolla di un appuntamento gia' fatturato non deve duplicarne invoiceId.
+    delete payload.invoiceId;
+
     // Chi gestisce solo la propria agenda non può creare eventi nel calendario di altri.
     if (req.access?.scope === 'own') {
         payload.calendarId = req.access.userId;
     }
     // Traccia la struttura in cui si svolge l'appuntamento: senza, lo scope `structure`
     // non potrebbe distinguere le sedi.
-    if (!payload.structureId && req.access?.structureId) {
-        payload.structureId = req.access.structureId;
-    }
+    payload.structureId = req.access?.structureId ?? null;
+
+    if (await rejectOperatorOutsideStructure(res, payload)) return;
+    if (await rejectInvalidPatient(res, schema, payload)) return;
 
     const eventTypeError = await validateAndNormalizeEventType(schema, payload);
     if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
@@ -246,13 +371,22 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
 export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const id = req.body.id;
-    const event = req.body.event;
+    const event = { ...req.body.event };
+    delete event.invoiceId;
 
     const current = await AgendaEvent.schema(schema).findOne({
         where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
     });
     if (!current) {
         return sendErrorResponse(res, 404, `Error updating agendaEvent with id=${id}`);
+    }
+    if (current.get('invoiceId')) {
+        return sendErrorResponse(
+            res,
+            409,
+            'Appuntamento fatturato: modifica e cambio stato non sono consentiti',
+            { invoiceId: current.get('invoiceId') }
+        );
     }
 
     if (typeof event.title !== 'string' && event.title !== undefined) {
@@ -262,14 +396,19 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     if (req.access?.scope === 'own') {
         event.calendarId = req.access.userId;
     }
+    event.structureId = req.access?.structureId ?? current.get('structureId');
 
     const eventTypeError = await validateAndNormalizeEventType(schema, event);
     if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
 
-    const scheduleChanged = ['calendarId', 'start', 'end', 'duration', 'recurrence']
+    const candidate = { ...current.get({ plain: true }), ...event };
+    if (await rejectInvalidPatient(res, schema, candidate)) return;
+    event.patient = candidate.patient;
+
+    const scheduleChanged = ['calendarId', 'structureId', 'start', 'end', 'duration', 'recurrence']
         .some((field) => Object.prototype.hasOwnProperty.call(event, field));
     if (scheduleChanged) {
-        const candidate = { ...current.get({ plain: true }), ...event };
+        if (await rejectOperatorOutsideStructure(res, candidate)) return;
         if (await rejectApprovedTimeOffConflict(res, schema, candidate, id)) return;
     }
 
@@ -288,10 +427,23 @@ export const deleteAgendaEvent = asyncHandler(async (req: Request, res: Response
     const schema = req.tenantSchema!;
     const id = req.query.id as string;
 
-    const removed = await AgendaEvent.schema(schema).destroy({
+    const current = await AgendaEvent.schema(schema).findOne({
         where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
     });
-    return sendSuccessResponse(res, 200, { removed }, 'Evento eliminato correttamente');
+    if (!current) {
+        return sendErrorResponse(res, 404, 'Appuntamento non trovato');
+    }
+    if (current.get('invoiceId')) {
+        return sendErrorResponse(
+            res,
+            409,
+            'Appuntamento fatturato: eliminazione non consentita',
+            { invoiceId: current.get('invoiceId') }
+        );
+    }
+
+    await current.destroy();
+    return sendSuccessResponse(res, 200, { removed: 1 }, 'Evento eliminato correttamente');
 });
 
 export const getAllEventExceptions = asyncHandler(async (req: Request, res: Response) => {
@@ -317,7 +469,9 @@ function stringifyRecurrenceRules(rules: Record<string, string>): string {
 
 export const updateRecurringEvent = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { event, originalEvent, mode } = req.body;
+    const { event: requestedEvent, originalEvent, mode } = req.body;
+    const event = { ...requestedEvent };
+    delete event.invoiceId;
 
     // Gate di accesso: se la serie non rientra nello scope, l'operazione si ferma qui.
     // Le modifiche successive agiscono tutte sullo stesso `recurringEventId`.
@@ -327,9 +481,21 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
     if (!recurringEvent) {
         return sendErrorResponse(res, 404, 'Recurring event not found');
     }
+    if (recurringEvent.get('invoiceId')) {
+        return sendErrorResponse(res, 409, 'Serie fatturata: modifica non consentita');
+    }
 
     const eventTypeError = await validateAndNormalizeEventType(schema, event);
     if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
+
+    const recurringCandidate = { ...recurringEvent.get({ plain: true }), ...event };
+    recurringCandidate.structureId = req.access?.structureId ?? recurringCandidate.structureId;
+    if (req.access?.scope === 'own') recurringCandidate.calendarId = req.access.userId;
+    if (await rejectOperatorOutsideStructure(res, recurringCandidate)) return;
+    if (await rejectInvalidPatient(res, schema, recurringCandidate)) return;
+    event.structureId = recurringCandidate.structureId;
+    event.calendarId = recurringCandidate.calendarId;
+    event.patient = recurringCandidate.patient;
 
     if (mode === 'single') {
         const { range, recurringEventId, ...newEvent } = event;
@@ -392,6 +558,9 @@ export const deleteRecurringEvent = asyncHandler(async (req: Request, res: Respo
     });
     if (!series) {
         return sendErrorResponse(res, 404, 'Recurring event not found');
+    }
+    if (series.get('invoiceId')) {
+        return sendErrorResponse(res, 409, 'Serie fatturata: eliminazione non consentita');
     }
 
     if (mode === 'single') {

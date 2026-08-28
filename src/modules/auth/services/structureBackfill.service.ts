@@ -6,9 +6,9 @@ import { getTenantSchemaName } from '../../../utils/tenantSchema.js';
  * Backfill di `structureId` sui record tenant-scoped.
  *
  * Lo scope RBAC `structure` filtra con `WHERE "structureId" = <sede>`. I record creati prima
- * dell'introduzione della colonna hanno `NULL` e, per non farli sparire dalla UI, `scopeWhere()`
- * usa `includeUnassigned: true` (`... OR "structureId" IS NULL`). Quel flag però rende i record
- * senza sede visibili a TUTTE le sedi: qui si assegna la sede mancante per poterlo rimuovere.
+ * dell'introduzione della colonna hanno `NULL`. Quei record non vengono esposti dalle API,
+ * perché mostrarli in tutte le sedi causerebbe una fuga di dati: qui si assegna la sede
+ * mancante solo quando può essere dedotta senza ambiguità.
  *
  * Sicuro da eseguire a ogni avvio:
  * - tocca SOLO le righe con `structureId IS NULL` (non riscrive mai un valore esistente);
@@ -28,7 +28,7 @@ interface TenantRow {
     businessName: string | null;
 }
 
-const TABLES = ['patients', 'evaluations', 'agenda_events'] as const;
+const TABLES = ['patients', 'evaluations', 'agenda_events', 'notes', 'reminders', 'time_off_requests'] as const;
 
 async function schemaExists(schema: string): Promise<boolean> {
     const rows = await sequelize.query<{ exists: boolean }>(
@@ -112,7 +112,55 @@ async function backfillTenant(
 
     // --- Pazienti ---
     if (await tableExists(schema, 'patients')) {
-        const updated = single
+        let updated = 0;
+
+        if (!single) {
+            // Prima del creatore usiamo le evidenze operative: una valutazione o un
+            // appuntamento gia assegnati a una sede sono piu affidabili, soprattutto
+            // per OWNER e segreterie che lavorano su piu strutture.
+            const evidenceSources: string[] = [];
+            if (await tableExists(schema, 'evaluations')) {
+                evidenceSources.push(
+                    `SELECT e."patientId"::text AS patient_id, e."structureId" AS structure_id
+                       FROM "${schema}"."evaluations" e
+                      WHERE e."structureId" IS NOT NULL`
+                );
+            }
+            if (await tableExists(schema, 'agenda_events')) {
+                evidenceSources.push(
+                    `SELECT a."patient"->>'id' AS patient_id, a."structureId" AS structure_id
+                       FROM "${schema}"."agenda_events" a
+                      WHERE a."structureId" IS NOT NULL
+                        AND a."patient"->>'id' IS NOT NULL`
+                );
+            }
+
+            if (evidenceSources.length > 0) {
+                const uniqueEvidence = `
+                    SELECT evidence.patient_id,
+                           MIN(evidence.structure_id::text)::uuid AS structure_id
+                      FROM (${evidenceSources.join(' UNION ALL ')}) evidence
+                     WHERE evidence.patient_id IS NOT NULL
+                  GROUP BY evidence.patient_id
+                    HAVING COUNT(DISTINCT evidence.structure_id) = 1
+                `;
+                updated += await execute(
+                    apply,
+                    `UPDATE "${schema}"."patients" p
+                        SET "structureId" = evidence.structure_id
+                       FROM (${uniqueEvidence}) evidence
+                      WHERE p."structureId" IS NULL
+                        AND p.id::text = evidence.patient_id`,
+                    `SELECT COUNT(*) AS count
+                       FROM "${schema}"."patients" p
+                       JOIN (${uniqueEvidence}) evidence ON p.id::text = evidence.patient_id
+                      WHERE p."structureId" IS NULL`,
+                    {}
+                );
+            }
+        }
+
+        updated += single
             ? await execute(
                   apply,
                   `UPDATE "${schema}"."patients" SET "structureId" = :structureId WHERE "structureId" IS NULL`,
@@ -123,11 +171,11 @@ async function backfillTenant(
                   apply,
                   `UPDATE "${schema}"."patients" p
                       SET "structureId" = sub.structure_id
-                     FROM (${singleStructurePerUser('')}) sub
+                     FROM (${singleStructurePerUser('::text')}) sub
                     WHERE p."structureId" IS NULL AND p."userId" = sub.user_id`,
                   `SELECT COUNT(*) AS count
                      FROM "${schema}"."patients" p
-                     JOIN (${singleStructurePerUser('')}) sub ON sub.user_id = p."userId"
+                     JOIN (${singleStructurePerUser('::text')}) sub ON sub.user_id = p."userId"
                     WHERE p."structureId" IS NULL`,
                   { tenantId: tenant.id }
               );
@@ -151,6 +199,77 @@ async function backfillTenant(
             {}
         );
         add('evaluations', updated);
+    }
+
+    // --- Note e promemoria: prima sede del paziente, poi sede univoca dell'assegnatario ---
+    for (const linked of [
+        { table: 'notes', userField: 'ownerUserId' },
+        { table: 'reminders', userField: 'assigneeUserId' }
+    ]) {
+        if (!(await tableExists(schema, linked.table))) continue;
+
+        let updated = 0;
+        if (await tableExists(schema, 'patients')) {
+            updated += await execute(
+                apply,
+                `UPDATE "${schema}"."${linked.table}" item
+                    SET "structureId" = p."structureId"
+                   FROM "${schema}"."patients" p
+                  WHERE item."structureId" IS NULL
+                    AND item."patientId" = p.id
+                    AND p."structureId" IS NOT NULL`,
+                `SELECT COUNT(*) AS count
+                   FROM "${schema}"."${linked.table}" item
+                   JOIN "${schema}"."patients" p ON p.id = item."patientId"
+                  WHERE item."structureId" IS NULL AND p."structureId" IS NOT NULL`,
+                {}
+            );
+        }
+
+        updated += single
+            ? await execute(
+                  apply,
+                  `UPDATE "${schema}"."${linked.table}" SET "structureId" = :structureId WHERE "structureId" IS NULL`,
+                  `SELECT COUNT(*) AS count FROM "${schema}"."${linked.table}" WHERE "structureId" IS NULL`,
+                  { structureId: single }
+              )
+            : await execute(
+                  apply,
+                  `UPDATE "${schema}"."${linked.table}" item
+                      SET "structureId" = sub.structure_id
+                     FROM (${singleStructurePerUser('')}) sub
+                    WHERE item."structureId" IS NULL AND item."${linked.userField}" = sub.user_id`,
+                  `SELECT COUNT(*) AS count
+                     FROM "${schema}"."${linked.table}" item
+                     JOIN (${singleStructurePerUser('')}) sub ON sub.user_id = item."${linked.userField}"
+                    WHERE item."structureId" IS NULL`,
+                  { tenantId: tenant.id }
+              );
+        add(linked.table, updated);
+    }
+
+    // --- Ferie/permessi: sede univoca del professionista ---
+    if (await tableExists(schema, 'time_off_requests')) {
+        const updated = single
+            ? await execute(
+                  apply,
+                  `UPDATE "${schema}"."time_off_requests" SET "structureId" = :structureId WHERE "structureId" IS NULL`,
+                  `SELECT COUNT(*) AS count FROM "${schema}"."time_off_requests" WHERE "structureId" IS NULL`,
+                  { structureId: single }
+              )
+            : await execute(
+                  apply,
+                  `UPDATE "${schema}"."time_off_requests" item
+                      SET "structureId" = sub.structure_id
+                     FROM (${singleStructurePerUser('')}) sub
+                    WHERE item."structureId" IS NULL AND item."userId" = sub.user_id`,
+                  `SELECT COUNT(*) AS count
+                     FROM "${schema}"."time_off_requests" item
+                     JOIN (${singleStructurePerUser('')}) sub ON sub.user_id = item."userId"
+                    WHERE item."structureId" IS NULL`,
+                  { tenantId: tenant.id }
+              );
+        add('time_off_requests', updated);
     }
 
     // --- Appuntamenti: sede del professionista titolare del calendario ---

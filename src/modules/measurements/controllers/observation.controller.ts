@@ -25,10 +25,14 @@ function collectInputs(body: any, provenance: ObservationProvenance): Observatio
 }
 
 /** Guardia immutabilità (FASE E): rifiuta la scrittura su valutazioni chiuse referenziate dagli input. */
-async function assertInputsEditable(schema: string, inputs: ObservationInput[]): Promise<void> {
+async function assertInputsEditable(
+    schema: string,
+    inputs: ObservationInput[],
+    ownerUserId?: string
+): Promise<void> {
     const evaluationIds = Array.from(new Set(inputs.map((i) => i.evaluationId).filter(Boolean)));
     for (const evaluationId of evaluationIds) {
-        await assertEvaluationEditable(schema, evaluationId as string);
+        await assertEvaluationEditable(schema, evaluationId as string, ownerUserId);
     }
 }
 
@@ -44,7 +48,11 @@ export const saveManual = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 400, 'patientId e almeno una misura sono obbligatori');
     }
 
-    await assertInputsEditable(schema, inputs);
+    await assertInputsEditable(
+        schema,
+        inputs,
+        req.access?.scope === 'own' ? req.access.userId : undefined
+    );
 
     const result = await ingestObservations(schema, inputs, { tenantId, operatorId });
     return sendSuccessResponse(
@@ -67,7 +75,11 @@ export const ingestApi = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 400, 'patientId e almeno una misura sono obbligatori');
     }
 
-    await assertInputsEditable(schema, inputs);
+    await assertInputsEditable(
+        schema,
+        inputs,
+        req.access?.scope === 'own' ? req.access.userId : undefined
+    );
 
     const result = await ingestObservations(schema, inputs, { tenantId, operatorId });
     return sendSuccessResponse(

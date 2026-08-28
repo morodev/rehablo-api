@@ -12,6 +12,8 @@ import { sendForgotPasswordMail, signUpSendMail } from '../../../services/email.
 import { licenseSecret } from './tenant.controller.js';
 import { revokeAllForUser } from '../services/refreshToken.service.js';
 import { Tenant, TenantUser, User, Structure, UserAvailability } from '../models/index.js';
+import { USER_AVAILABILITY_MODES } from '../models/user.model.js';
+import { validateUserStructureSelection } from '../services/userStructurePolicy.service.js';
 
 /**
  * Campi che non possono MAI arrivare dal client: determinano privilegi (super admin,
@@ -35,6 +37,11 @@ function stripProtectedFields<T extends Record<string, any>>(payload: T): T {
         delete sanitized[field];
     }
     return sanitized;
+}
+
+function isAvailabilityMode(value: unknown): boolean {
+    return typeof value === 'string'
+        && (USER_AVAILABILITY_MODES as readonly string[]).includes(value);
 }
 
 /**
@@ -83,6 +90,9 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
     // Un utente invitato non è mai il titolare dello studio né un super admin: il titolare
     // nasce esclusivamente dalla registrazione (vedi `createTenant`).
     const userToCreate = stripProtectedFields(newUser);
+    if (userToCreate.availabilityMode !== undefined && !isAvailabilityMode(userToCreate.availabilityMode)) {
+        return sendErrorResponse(res, 400, 'Modalità disponibilità non valida');
+    }
     userToCreate.password = await bcrypt.hash(newUser.password, 12);
     userToCreate.isTenant = false;
     userToCreate.isSuperAdmin = false;
@@ -91,17 +101,26 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
     const structures = await tenant.getStructures();
     const allowedStructureIds = structures.map((structure: any) => structure.id as string);
     const uniqueRequestedIds = requestedStructureIds ? [...new Set(requestedStructureIds)] : undefined;
-    if (uniqueRequestedIds?.some((id) => !allowedStructureIds.includes(id))) {
-        return sendErrorResponse(res, 400, 'Una o più strutture non appartengono allo studio');
+    const selectedStructureIds = role === RoleCode.OWNER
+        ? allowedStructureIds
+        : uniqueRequestedIds
+          ?? (role === RoleCode.SECRETARY || allowedStructureIds.length === 1
+              ? allowedStructureIds
+              : []);
+    const structureSelectionError = validateUserStructureSelection(
+        role,
+        selectedStructureIds,
+        allowedStructureIds
+    );
+    if (structureSelectionError) {
+        return sendErrorResponse(res, 400, structureSelectionError);
     }
 
     const user: any = await User.create(userToCreate, { include: UserAvailability as any });
 
     const targetStructures = role === RoleCode.OWNER
         ? structures
-        : uniqueRequestedIds
-          ? structures.filter((structure: any) => uniqueRequestedIds.includes(structure.id))
-          : structures;
+        : structures.filter((structure: any) => selectedStructureIds.includes(structure.id));
 
     // Nessun ruolo sulla struttura: `null` significa "eredita quello del tenant".
     await Promise.all(targetStructures.map((structure: any) => structure.addUser(user)));
@@ -155,7 +174,15 @@ export const findAllUsersTenantByTenantId = asyncHandler(async (req: Request, re
 export const updateUser = asyncHandler(async (req: Request, res: Response) => {
     const userId = req.params.userId;
     const userToUpdate = stripProtectedFields({ ...req.body.user });
+    const userAvailabilities = Array.isArray(userToUpdate.userAvailabilities)
+        ? userToUpdate.userAvailabilities
+        : null;
+    delete userToUpdate.userAvailabilities;
     delete userToUpdate.password;
+
+    if (userToUpdate.availabilityMode !== undefined && !isAvailabilityMode(userToUpdate.availabilityMode)) {
+        return sendErrorResponse(res, 400, 'Modalità disponibilità non valida');
+    }
 
     const { membership } = await findTenantMember(req, userId);
     if (!membership) {
@@ -169,12 +196,13 @@ export const updateUser = asyncHandler(async (req: Request, res: Response) => {
 
     const updatedUser = await User.findByPk(userId, { attributes: { exclude: ['password'] } });
 
-    if (Array.isArray(userToUpdate.userAvailabilities)) {
-        for (const availability of userToUpdate.userAvailabilities) {
-            if (availability.id) {
-                await UserAvailability.update(availability, { where: { id: availability.id } });
+    if (userAvailabilities) {
+        for (const availability of userAvailabilities) {
+            const { id, userId: _ignoredUserId, ...availabilityValues } = availability;
+            if (id) {
+                await UserAvailability.update(availabilityValues, { where: { id, userId } });
             } else {
-                await UserAvailability.create({ ...availability, userId });
+                await UserAvailability.create({ ...availabilityValues, userId });
             }
         }
     }

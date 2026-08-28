@@ -32,10 +32,17 @@ export function isEvaluationEditable(evaluation: Evaluation): boolean {
  * non è più modificabile risponde `409`. Se `evaluationId` è assente (flusso legacy senza valutazione)
  * non blocca nulla, per retrocompatibilità.
  */
-export async function assertEvaluationEditable(schema: string, evaluationId?: string | null): Promise<void> {
+export async function assertEvaluationEditable(
+    schema: string,
+    evaluationId?: string | null,
+    ownerUserId?: string
+): Promise<void> {
     if (!evaluationId) return;
     const evaluation = await Evaluation.schema(schema).findByPk(evaluationId);
     if (!evaluation) {
+        throw httpError(404, 'Valutazione non trovata');
+    }
+    if (ownerUserId && evaluation.get('userId') !== ownerUserId) {
         throw httpError(404, 'Valutazione non trovata');
     }
     if (!isEvaluationEditable(evaluation)) {

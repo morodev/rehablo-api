@@ -1,17 +1,15 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
-import { getUserId, patientScopeWhere, scopeWhere } from '../../../middleware/rbac.js';
+import { getUserId, patientScopeWhere } from '../../../middleware/rbac.js';
 import { ProtocolInstance, ProtocolPhaseInstance } from '../models/index.js';
 import Patient from '../../patients/models/patient.model.js';
 import { ProtocolTemplate, ProtocolPhaseTemplate, ProtocolTemplateExercise, Exercise } from '../models/catalog/index.js';
 
-/** Stessi campi usati dal modulo pazienti: il protocollo eredita l'ampiezza dal paziente. */
-const PATIENT_SCOPE_FIELDS = {
-    ownerField: 'userId',
-    structureField: 'structureId',
-    includeUnassigned: true
-};
+function protocolScopeWhere(req: Request, schema: string): Record<string, unknown> {
+    if (req.access?.scope === 'own') return { userId: getUserId(req) };
+    return patientScopeWhere(req, schema);
+}
 
 /**
  * Assigns a `ProtocolTemplate` (public catalog) to a patient: creates the `ProtocolInstance` plus
@@ -20,11 +18,15 @@ const PATIENT_SCOPE_FIELDS = {
  */
 export const assignProtocol = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { protocolTemplateId, patientId, userId, startDate, notes } = req.body;
+    const { protocolTemplateId, patientId, startDate, notes } = req.body;
 
     // Si può assegnare un protocollo solo a un paziente che si ha il diritto di vedere.
     const patient = await Patient.schema(schema).findOne({
-        where: { id: patientId, ...scopeWhere(req, PATIENT_SCOPE_FIELDS) }
+        where: {
+            id: patientId,
+            structureId: req.access?.structureId ?? null,
+            archivedAt: null
+        }
     });
     if (!patient) {
         return sendErrorResponse(res, 404, 'Paziente non trovato');
@@ -43,7 +45,7 @@ export const assignProtocol = asyncHandler(async (req: Request, res: Response) =
         patientId,
         // Se non indicato, il protocollo appartiene a chi lo assegna: senza owner
         // lo scope `own` non potrebbe mai ritrovarlo.
-        userId: userId ?? getUserId(req),
+        userId: getUserId(req),
         protocolTemplateId,
         startDate: startDate ?? new Date(),
         notes
@@ -75,7 +77,7 @@ export const findAllProtocolInstances = asyncHandler(async (req: Request, res: R
         where: {
             ...(patientId ? { patientId: patientId as string } : {}),
             ...(status ? { status: status as string } : {}),
-            ...patientScopeWhere(req, schema)
+            ...protocolScopeWhere(req, schema)
         },
         include: [{ model: ProtocolTemplate, required: false }],
         order: [['startDate', 'DESC']]
@@ -88,7 +90,7 @@ export const findOneProtocolInstance = asyncHandler(async (req: Request, res: Re
     const schema = req.tenantSchema!;
 
     const instance = await ProtocolInstance.schema(schema).findOne({
-        where: { id: req.params.protocolInstanceId, ...patientScopeWhere(req, schema) },
+        where: { id: req.params.protocolInstanceId, ...protocolScopeWhere(req, schema) },
         include: [
             { model: ProtocolTemplate, required: false },
             {
@@ -109,8 +111,17 @@ export const updateProtocolInstance = asyncHandler(async (req: Request, res: Res
     const schema = req.tenantSchema!;
     const id = req.params.protocolInstanceId;
 
-    const [rowsUpdated] = await ProtocolInstance.schema(schema).update(req.body, {
-        where: { id, ...patientScopeWhere(req, schema) }
+    const payload = Object.fromEntries(
+        ['startDate', 'endDate', 'status', 'notes']
+            .filter((field) => Object.prototype.hasOwnProperty.call(req.body ?? {}, field))
+            .map((field) => [field, req.body[field]])
+    );
+    if (Object.keys(payload).length === 0) {
+        return sendErrorResponse(res, 400, 'Nessun campo aggiornabile ricevuto');
+    }
+
+    const [rowsUpdated] = await ProtocolInstance.schema(schema).update(payload, {
+        where: { id, ...protocolScopeWhere(req, schema) }
     });
     if (rowsUpdated === 0) {
         return sendErrorResponse(res, 404, 'Impossibile aggiornare il protocollo assegnato');
@@ -123,7 +134,7 @@ export const updateProtocolInstance = asyncHandler(async (req: Request, res: Res
 export const deleteProtocolInstance = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const id = req.params.protocolInstanceId;
-    const scope = patientScopeWhere(req, schema);
+    const scope = protocolScopeWhere(req, schema);
 
     const removed = await ProtocolInstance.schema(schema).findOne({ where: { id, ...scope } });
     if (!removed) {

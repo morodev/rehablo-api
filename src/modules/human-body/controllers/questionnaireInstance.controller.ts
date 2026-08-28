@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
-import { patientScopeWhere } from '../../../middleware/rbac.js';
+import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
 import { sendSuccessResponse } from '../../../utils/response.js';
 import HumanBodyQuestionnaireInstance from '../models/humanBodyQuestionnaireInstance.model.js';
 import HumanBodyAnswerInstance from '../models/humanBodyAnswerInstance.model.js';
@@ -26,16 +26,16 @@ export const saveQuestionnaireInstance = asyncHandler(async (req: Request, res: 
         questions: AnswerInstanceInput[];
     };
 
-    await assertEvaluationEditable(schema, body.evaluationId);
+    await assertEvaluationEditable(schema, body.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined);
 
     // Same pattern as saveSymptom/saveArticularity: attach the compiled questionnaire to
     // an existing point (`humanBodyPointId`) or create one on the fly (`pointToCreate`),
     // so it can be tracked/drawn on the body diagram exactly like symptoms and
     // articularity already are.
-    const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body);
+    const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId);
 
     const instance = await HumanBodyQuestionnaireInstance.schema(schema).create({
-        userId: body.userId,
+        userId: req.access!.userId,
         patientId: body.patientId,
         evaluationId: body.evaluationId ?? null,
         humanBodyPointId,
@@ -63,7 +63,7 @@ export const getQuestionnaireInstances = asyncHandler(async (req: Request, res: 
     const schema = req.tenantSchema!;
     const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
 
-    const where: Record<string, unknown> = { ...patientScopeWhere(req, schema) };
+    const where: Record<string, unknown> = { ...patientResourceScopeWhere(req, schema) };
     if (patientId) where.patientId = patientId;
     if (evaluationId) where.evaluationId = evaluationId;
 
@@ -110,7 +110,7 @@ export const getQuestionnaireInstancesByPoint = asyncHandler(async (req: Request
     const humanBodyPointId = req.query.humanBodyPointId as string;
 
     const instances = await HumanBodyQuestionnaireInstance.schema(schema).findAll({
-        where: { humanBodyPointId, ...patientScopeWhere(req, schema) },
+        where: { humanBodyPointId, ...patientResourceScopeWhere(req, schema) },
         include: [
             { model: HumanBodyQuestionnaire.schema(schema), attributes: ['title', 'description'] },
             {

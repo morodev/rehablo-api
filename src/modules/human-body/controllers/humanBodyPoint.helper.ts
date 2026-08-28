@@ -5,11 +5,17 @@ import HumanBodyPoint from '../models/humanBodyPoint.model.js';
  * existing point (`humanBodyPointId`) or create a brand new one on the fly (`pointToCreate`),
  * exactly like the legacy microservice did inline in every controller.
  */
-export async function resolveHumanBodyPointId(schema: string, body: Record<string, unknown>): Promise<string | null> {
+export async function resolveHumanBodyPointId(
+    schema: string,
+    body: Record<string, unknown>,
+    userId: string
+): Promise<string | null> {
     const humanBodyPointId = body.humanBodyPointId as string | undefined;
 
     if (humanBodyPointId) {
-        const point = await HumanBodyPoint.schema(schema).findByPk(humanBodyPointId);
+        const point = await HumanBodyPoint.schema(schema).findOne({
+            where: { id: humanBodyPointId, userId }
+        });
         return point ? (point.get('id') as string) : null;
     }
 
@@ -18,7 +24,7 @@ export async function resolveHumanBodyPointId(schema: string, body: Record<strin
         return null;
     }
 
-    const point = await HumanBodyPoint.schema(schema).create(pointToCreate as any);
+    const point = await HumanBodyPoint.schema(schema).create({ ...pointToCreate, userId } as any);
     return point.get('id') as string;
 }
 

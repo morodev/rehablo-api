@@ -52,7 +52,7 @@ export const importCsv = asyncHandler(async (req: Request, res: Response) => {
     }
 
     // FASE E: se l'import è agganciato a una valutazione, questa deve essere ancora modificabile.
-    await assertEvaluationEditable(schema, evaluationId);
+    await assertEvaluationEditable(schema, evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined);
 
     const mapping = await resolveDeviceMapping(sourceId);
     if (!mapping) {

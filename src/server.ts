@@ -97,12 +97,12 @@ async function bootstrap() {
             const detail = ambiguous.map(([table, count]) => `${table}=${count}`).join(', ');
             console.warn(
                 `[rbac] backfill structureId: record senza sede non assegnabili automaticamente (${detail}). ` +
-                    'Finché esistono, mantenere `includeUnassigned` nei controller.'
+                    'Restano esclusi dalle API operative finche non viene assegnata manualmente una sede.'
             );
         }
     } catch (err) {
-        // Un problema qui non deve impedire l'avvio: il flag `includeUnassigned` garantisce
-        // comunque che i dati restino visibili.
+        // Un problema qui non deve impedire l'avvio. Per sicurezza i record senza sede
+        // restano esclusi dalle API operative, evitando visibilita cross-sede.
         console.error('[rbac] backfill structureId fallito', err);
     }
 

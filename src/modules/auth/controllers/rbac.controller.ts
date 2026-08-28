@@ -14,29 +14,34 @@ import {
 } from '../rbac/roles.js';
 import { Structure, StructureUser, TenantUser, User } from '../models/index.js';
 import { revokeAllForUser } from '../services/refreshToken.service.js';
+import { validateUserStructureSelection } from '../services/userStructurePolicy.service.js';
 
-/** Garantisce che un OWNER sia assegnato a tutte le sedi del proprio tenant. */
-async function assignOwnerToAllStructures(tenantId: string, userId: string): Promise<void> {
-    const structures = await Structure.findAll({ where: { tenantId }, attributes: ['id'] });
-    if (!structures.length) return;
+async function syncUserStructureAssignments(
+    userId: string,
+    tenantStructureIds: readonly string[],
+    requestedStructureIds: readonly string[]
+): Promise<{ added: number; removed: number }> {
+    const requested = [...new Set(requestedStructureIds)];
+    const current = await StructureUser.findAll({ where: { userId } });
+    const currentIds = current
+        .map((row) => row.get('structureId') as string)
+        .filter((id) => tenantStructureIds.includes(id));
 
-    const structureIds = structures.map((structure) => structure.get('id') as string);
+    const toAdd = requested.filter((id) => !currentIds.includes(id));
+    const toRemove = currentIds.filter((id) => !requested.includes(id));
 
-    await StructureUser.bulkCreate(
-        structureIds.map((structureId) => ({
-            structureId,
-            userId,
-            role: null
-        })),
-        { ignoreDuplicates: true }
-    );
+    if (toAdd.length > 0) {
+        await StructureUser.bulkCreate(
+            toAdd.map((structureId) => ({ structureId, userId, role: null }))
+        );
+    }
+    if (toRemove.length > 0) {
+        await StructureUser.destroy({
+            where: { userId, structureId: { [Op.in]: toRemove } }
+        });
+    }
 
-    // Un OWNER non può diventare localmente un ruolo meno privilegiato: il ruolo
-    // proprietario è tenant-wide e deve restare effettivo in ogni sede.
-    await StructureUser.update(
-        { role: null },
-        { where: { userId, structureId: { [Op.in]: structureIds } } }
-    );
+    return { added: toAdd.length, removed: toRemove.length };
 }
 
 /**
@@ -169,7 +174,7 @@ async function validateRoleChange(
 /** Ruolo BASE dell'utente nel tenant corrente. */
 export const updateUserRole = asyncHandler(async (req: Request, res: Response) => {
     const targetUserId = req.params.userId;
-    const { role } = req.body as { role?: string };
+    const { role, structureIds } = req.body as { role?: string; structureIds?: string[] };
 
     const error = await validateRoleChange(req, targetUserId, role);
     if (error) {
@@ -177,6 +182,25 @@ export const updateUserRole = asyncHandler(async (req: Request, res: Response) =
     }
 
     const tenantId = getCurrentTenantId(req);
+    const tenantStructures = await Structure.findAll({ where: { tenantId }, attributes: ['id'] });
+    const allowedIds = tenantStructures.map((structure) => structure.get('id') as string);
+    const currentAssignments = await StructureUser.findAll({ where: { userId: targetUserId } });
+    const currentIds = currentAssignments
+        .map((assignment) => assignment.get('structureId') as string)
+        .filter((id) => allowedIds.includes(id));
+    const requested = role === RoleCode.OWNER
+        ? allowedIds
+        : Array.isArray(structureIds)
+          ? [...new Set(structureIds)]
+          : currentIds;
+    const structureSelectionError = validateUserStructureSelection(
+        role as RoleCode,
+        requested,
+        allowedIds
+    );
+    if (structureSelectionError) {
+        return sendErrorResponse(res, 400, structureSelectionError);
+    }
 
     // Uno studio deve sempre avere almeno un titolare, altrimenti nessuno potrebbe più
     // gestire utenti, fatturazione e dati azienda.
@@ -191,9 +215,13 @@ export const updateUserRole = asyncHandler(async (req: Request, res: Response) =
     }
 
     await TenantUser.update({ role }, { where: { tenantId, userId: targetUserId } });
+    await syncUserStructureAssignments(targetUserId, allowedIds, requested);
 
     if (role === RoleCode.OWNER) {
-        await assignOwnerToAllStructures(tenantId, targetUserId);
+        await StructureUser.update(
+            { role: null },
+            { where: { userId: targetUserId, structureId: { [Op.in]: allowedIds } } }
+        );
     }
 
     // I permessi viaggiano nell'access token: senza revocare le sessioni, il vecchio ruolo
@@ -203,7 +231,7 @@ export const updateUserRole = asyncHandler(async (req: Request, res: Response) =
     return sendSuccessResponse(
         res,
         200,
-        { userId: targetUserId, tenantId, role },
+        { userId: targetUserId, tenantId, role, structureIds: requested },
         'Ruolo aggiornato correttamente'
     );
 });
@@ -298,49 +326,31 @@ export const updateUserStructures = asyncHandler(async (req: Request, res: Respo
     // Si possono assegnare solo strutture del proprio tenant.
     const tenantStructures = await Structure.findAll({ where: { tenantId } });
     const allowedIds = tenantStructures.map((structure) => structure.get('id') as string);
-    const requested = [...new Set(structureIds)].filter((id) => allowedIds.includes(id));
-
-    if (requested.length !== new Set(structureIds).size) {
-        return sendErrorResponse(res, 400, 'Una o più strutture non appartengono allo studio');
+    const requested = [...new Set(structureIds)];
+    const structureSelectionError = validateUserStructureSelection(
+        membership.get('role') as RoleCode,
+        requested,
+        allowedIds
+    );
+    if (structureSelectionError) {
+        return sendErrorResponse(res, 400, structureSelectionError);
     }
 
-    if (membership.get('role') === RoleCode.OWNER) {
-        const ownsEveryStructure = requested.length === allowedIds.length
-            && allowedIds.every((id) => requested.includes(id));
-        if (!ownsEveryStructure) {
-            return sendErrorResponse(res, 409, 'Un proprietario deve essere abilitato a tutte le sedi');
-        }
-    }
-
-    const current = await StructureUser.findAll({ where: { userId: targetUserId } });
-    const currentIds = current
-        .map((row) => row.get('structureId') as string)
-        .filter((id) => allowedIds.includes(id));
-
-    const toAdd = requested.filter((id) => !currentIds.includes(id));
-    const toRemove = currentIds.filter((id) => !requested.includes(id));
-
-    if (toAdd.length > 0) {
-        await StructureUser.bulkCreate(
-            toAdd.map((structureId) => ({ structureId, userId: targetUserId, role: null }))
-        );
-    }
-
-    if (toRemove.length > 0) {
-        await StructureUser.destroy({
-            where: { userId: targetUserId, structureId: { [Op.in]: toRemove } }
-        });
-    }
+    const { added, removed } = await syncUserStructureAssignments(
+        targetUserId,
+        allowedIds,
+        requested
+    );
 
     // Le strutture determinano cosa l'utente può vedere: la sessione va riallineata.
-    if (toAdd.length > 0 || toRemove.length > 0) {
+    if (added > 0 || removed > 0) {
         await revokeAllForUser(targetUserId, 'structures_changed');
     }
 
     return sendSuccessResponse(
         res,
         200,
-        { userId: targetUserId, structureIds: requested, added: toAdd.length, removed: toRemove.length },
+        { userId: targetUserId, structureIds: requested, added, removed },
         'Strutture aggiornate correttamente'
     );
 });

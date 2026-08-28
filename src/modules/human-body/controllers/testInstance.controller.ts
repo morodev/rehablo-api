@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
-import { patientScopeWhere } from '../../../middleware/rbac.js';
+import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
 import { sendSuccessResponse } from '../../../utils/response.js';
 import { Test } from '../models/catalog/index.js';
 import TestInstance from '../models/testInstance.model.js';
@@ -8,8 +8,11 @@ import { assertEvaluationEditable } from '../../evaluations/services/evaluationG
 
 export const saveTest = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    await assertEvaluationEditable(schema, req.body?.evaluationId);
-    const testInstance = await TestInstance.schema(schema).create(req.body);
+    await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined);
+    const testInstance = await TestInstance.schema(schema).create({
+        ...req.body,
+        userId: req.access!.userId
+    });
     return sendSuccessResponse(res, 201, testInstance, 'Test instance saved');
 });
 
@@ -17,7 +20,7 @@ export const getUserTestInstances = asyncHandler(async (req: Request, res: Respo
     const schema = req.tenantSchema!;
     const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
 
-    const where: Record<string, unknown> = { ...patientScopeWhere(req, schema) };
+    const where: Record<string, unknown> = { ...patientResourceScopeWhere(req, schema) };
     if (patientId) where.patientId = patientId;
     if (evaluationId) where.evaluationId = evaluationId;
 

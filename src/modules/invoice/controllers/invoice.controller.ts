@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
-import { patientScopeWhere } from '../../../middleware/rbac.js';
+import { patientScopeWhere, scopeWhere } from '../../../middleware/rbac.js';
 import { sequelize } from '../../../config/database.js';
 import Invoice from '../models/invoice.model.js';
 import InvoiceProduct from '../models/invoiceProduct.model.js';
@@ -16,6 +16,13 @@ import { evalTotals, EvalTotalsResult, toPersistedTotals } from '../utils/evalTo
 import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
 import { buildFiscalNotes, FiscalProfile, isStampDutyDue, resolveFiscalProfile } from '../utils/fiscalRegime.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const AGENDA_SCOPE_FIELDS = {
+    ownerField: 'calendarId',
+    structureField: 'structureId',
+    includeUnassigned: false
+};
 
 /**
  * NOTA SULL'INTEGRITÀ REFERENZIALE: in questa architettura multi-tenant, `Invoice`/`InvoiceProduct`/
@@ -204,6 +211,10 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
 
     const { products: requestedProducts = [], services: requestedServices = [], agendaEventId, ...invoiceFields } = req.body;
 
+    if (agendaEventId != null && (typeof agendaEventId !== 'string' || !UUID_REGEX.test(agendaEventId))) {
+        return sendErrorResponse(res, 400, 'Identificativo appuntamento non valido');
+    }
+
     const [{ lines: productLines, missingId: missingProductId }, { lines: serviceLines, missingId: missingServiceId }] =
         await Promise.all([
             resolveCatalogLines(requestedProducts, ProductScoped),
@@ -266,7 +277,76 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     // Numerazione progressiva + creazione fattura + creazione righe in un'UNICA transazione:
     // se una qualsiasi parte fallisce, non deve restare un numero "bruciato" senza fattura, né
     // una fattura senza le sue righe.
-    const invoice = await sequelize.transaction(async (t) => {
+    const transactionResult = await sequelize.transaction(async (t) => {
+        let agendaEvent: AgendaEvent | null = null;
+
+        if (agendaEventId) {
+            // Il lock rende atomico il controllo "non ancora fatturato": una seconda richiesta
+            // per lo stesso appuntamento aspetta la prima e, dopo il commit, trova invoiceId.
+            agendaEvent = await AgendaEvent.schema(schema).findOne({
+                where: { id: agendaEventId, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) },
+                transaction: t,
+                lock: t.LOCK.UPDATE
+            });
+
+            if (!agendaEvent) {
+                return { kind: 'agenda-not-found' } as const;
+            }
+
+            if (agendaEvent.get('recurrence')) {
+                return { kind: 'recurring-event' } as const;
+            }
+
+            const agendaPatient = agendaEvent.get('patient') as Record<string, unknown> | null;
+            if (!agendaPatient?.id || agendaPatient.id !== invoiceFields.patientID) {
+                return { kind: 'patient-mismatch' } as const;
+            }
+
+            const linkedInvoiceId = agendaEvent.get('invoiceId') as string | null;
+            if (linkedInvoiceId) {
+                await agendaEvent.update(
+                    { status: 'COMPLETED', erasable: false },
+                    { transaction: t }
+                );
+                return { kind: 'already-invoiced', invoiceId: linkedInvoiceId } as const;
+            }
+
+            // Difesa aggiuntiva per eventuali record riallineati/migrati nei quali il riferimento
+            // sulla fattura esiste ma quello sull'appuntamento non e' ancora valorizzato.
+            const invoiceForAgenda = await InvoiceScoped.findOne({
+                where: { agendaEventId },
+                attributes: ['id'],
+                transaction: t,
+                lock: t.LOCK.UPDATE
+            });
+            if (invoiceForAgenda) {
+                const invoiceId = invoiceForAgenda.get('id') as string;
+                await agendaEvent.update(
+                    { invoiceId, status: 'COMPLETED', erasable: false },
+                    { transaction: t }
+                );
+                return { kind: 'already-invoiced', invoiceId } as const;
+            }
+
+            // La fattura rende automaticamente la prestazione COMPLETED: non puo' quindi
+            // essere emessa prima che la seduta sia iniziata. Il controllo usa l'orologio
+            // del server ed e' dentro la stessa transazione/lock degli altri vincoli, percio'
+            // non e' aggirabile modificando il client o inviando direttamente la richiesta.
+            const agendaStartValue = agendaEvent.get('start') as string | null;
+            const agendaStartTimestamp = agendaStartValue
+                ? Date.parse(agendaStartValue)
+                : Number.NaN;
+            if (
+                Number.isFinite(agendaStartTimestamp) &&
+                agendaStartTimestamp > Date.now()
+            ) {
+                return {
+                    kind: 'future-appointment',
+                    availableAt: agendaStartValue
+                } as const;
+            }
+        }
+
         const tenant = await Tenant.findByPk(tenantId, { transaction: t, lock: t.LOCK.UPDATE });
         if (!tenant) {
             throw new Error('Tenant non trovato: impossibile assegnare il numero progressivo del documento');
@@ -281,6 +361,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         const createdInvoice = await InvoiceScoped.create(
             {
                 ...invoiceFields,
+                agendaEventId: agendaEventId ?? null,
                 ...fiscal.fields,
                 ...toPersistedTotals(fiscal.totals),
                 fiscalNotes: fiscal.fiscalNotes,
@@ -331,15 +412,47 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         // Fattura emessa a partire da un appuntamento: il collegamento va scritto nella STESSA
         // transazione, altrimenti un errore qui lascerebbe una fattura senza appuntamento
         // collegato e la dashboard mostrerebbe di nuovo "da emettere" per una seduta già fatturata.
-        if (agendaEventId) {
-            await AgendaEvent.schema(schema).update(
-                { invoiceId },
-                { where: { id: agendaEventId }, transaction: t }
+        if (agendaEvent) {
+            await agendaEvent.update(
+                { invoiceId, status: 'COMPLETED', erasable: false },
+                { transaction: t }
             );
         }
 
-        return createdInvoice;
+        return { kind: 'created', invoice: createdInvoice } as const;
     });
+
+    if (transactionResult.kind === 'agenda-not-found') {
+        return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
+    }
+    if (transactionResult.kind === 'patient-mismatch') {
+        return sendErrorResponse(res, 422, 'Il paziente della fattura non coincide con quello dell’appuntamento');
+    }
+    if (transactionResult.kind === 'recurring-event') {
+        return sendErrorResponse(
+            res,
+            422,
+            'Prima di fatturare, separa la singola occorrenza dalla serie ricorrente'
+        );
+    }
+    if (transactionResult.kind === 'already-invoiced') {
+        return sendErrorResponse(
+            res,
+            409,
+            'Per questo appuntamento è già stata emessa una fattura',
+            { invoiceId: transactionResult.invoiceId }
+        );
+    }
+    if (transactionResult.kind === 'future-appointment') {
+        return sendErrorResponse(
+            res,
+            409,
+            'Non è possibile fatturare un appuntamento futuro. La fattura sarà disponibile dall’inizio della seduta.',
+            { availableAt: transactionResult.availableAt }
+        );
+    }
+
+    const invoice = transactionResult.invoice;
 
     const invoiceWithLines = await InvoiceScoped.findByPk(invoice.get('id') as string, {
         include: [
@@ -452,7 +565,14 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
     }
 
     const body = req.body.invoice ?? req.body;
-    const { products: requestedProducts, services: requestedServices, ...invoiceFields } = body;
+    // Il legame con l'appuntamento nasce esclusivamente nel flusso atomico di saveInvoice:
+    // consentirne la modifica con una PUT aggirerebbe lock e controllo uno-a-uno.
+    const {
+        products: requestedProducts,
+        services: requestedServices,
+        agendaEventId: _immutableAgendaEventId,
+        ...invoiceFields
+    } = body;
     const shouldReplaceLines = Array.isArray(requestedProducts) || Array.isArray(requestedServices);
 
     let updateData: Record<string, unknown> = { ...invoiceFields };
@@ -584,12 +704,21 @@ export const deleteInvoice = asyncHandler(async (req: Request, res: Response) =>
         return sendErrorResponse(res, 404, 'Fattura non trovata');
     }
 
+    const linkedAgendaEvent = await AgendaEvent.schema(schema).findOne({
+        where: { invoiceId: id },
+        attributes: ['id']
+    });
+    if (linkedAgendaEvent) {
+        return sendErrorResponse(
+            res,
+            409,
+            'Una fattura collegata a un appuntamento effettuato non può essere eliminata. Utilizza lo storno.'
+        );
+    }
+
     await Promise.all([
         InvoiceProductScoped.destroy({ where: { InvoiceId: id } }),
-        InvoiceServiceScoped.destroy({ where: { InvoiceId: id } }),
-        // L'appuntamento eventualmente collegato torna "da fatturare": senza questo resterebbe
-        // puntato a una fattura inesistente e la dashboard lo darebbe per emesso.
-        AgendaEvent.schema(schema).update({ invoiceId: null }, { where: { invoiceId: id } })
+        InvoiceServiceScoped.destroy({ where: { InvoiceId: id } })
     ]);
     await InvoiceScoped.destroy({ where: { id } });
 

@@ -19,7 +19,7 @@ const TIME_OFF_SCOPE_FIELDS = {
     structureField: 'structureId',
     // I soli record migrati possono non avere una sede certa; restano visibili finché
     // una successiva bonifica non li assegna esplicitamente.
-    includeUnassigned: true
+    includeUnassigned: false
 };
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

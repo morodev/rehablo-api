@@ -1,14 +1,14 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
-import { patientScopeWhere } from '../../../middleware/rbac.js';
+import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
 import HumanBodyPoint from '../models/humanBodyPoint.model.js';
 import HumanBodyEvent from '../models/humanBodyEvent.model.js';
 import { assertEvaluationEditable } from '../../evaluations/services/evaluationGuard.js';
 
-// NOTA RBAC: i dati clinici del body map appartengono al PAZIENTE, non all'operatore che li
-// ha inseriti (una valutazione è condivisa dagli operatori del centro, vedi FASE E). L'ampiezza
-// si eredita quindi dai pazienti visibili, non dal campo `userId` del singolo record.
+// NOTA RBAC: l'anagrafica del paziente è condivisa per sede, ma con scope `own` i dati
+// clinici restano dell'operatore che li ha prodotti. Per scope più ampi la visibilità
+// viene invece ereditata dalla sede del paziente.
 
 interface HumanBodyEventInput {
     eventType: string;
@@ -16,10 +16,13 @@ interface HumanBodyEventInput {
 
 export const createHumanBodyPoint = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    await assertEvaluationEditable(schema, req.body?.evaluationId);
+    await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined);
     const events: HumanBodyEventInput[] = req.body.humanBodyEvents ?? [];
 
-    const point = await HumanBodyPoint.schema(schema).create(req.body);
+    const point = await HumanBodyPoint.schema(schema).create({
+        ...req.body,
+        userId: req.access!.userId
+    });
 
     if (events.length > 0) {
         await HumanBodyEvent.schema(schema).bulkCreate(
@@ -35,10 +38,9 @@ export const getAllHumanBodyPointsWithEvents = asyncHandler(async (req: Request,
     const userId = req.user!.id;
     const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
 
-    // FASE E: quando è indicata una valutazione, i punti sono scoperti per `evaluationId` (una
-    // valutazione è condivisa dagli operatori del centro, quindi NON si filtra più per `userId`).
-    // Senza `evaluationId` (uso legacy) si mantiene il comportamento storico filtrando per operatore.
-    const where: Record<string, unknown> = { patientId, ...patientScopeWhere(req, schema) };
+    // Con evaluationId si filtra la singola valutazione; patientResourceScopeWhere mantiene
+    // comunque lo scope autore per gli operatori con permesso `own`.
+    const where: Record<string, unknown> = { patientId, ...patientResourceScopeWhere(req, schema) };
     if (evaluationId) {
         where.evaluationId = evaluationId;
     } else {
@@ -72,7 +74,7 @@ export const getAllHumanBodyPoints = asyncHandler(async (req: Request, res: Resp
     const userId = req.user!.id;
     const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
 
-    const where: Record<string, unknown> = { patientId, ...patientScopeWhere(req, schema) };
+    const where: Record<string, unknown> = { patientId, ...patientResourceScopeWhere(req, schema) };
     if (evaluationId) {
         where.evaluationId = evaluationId;
     } else {
@@ -87,7 +89,7 @@ export const getAllHumanBodyPoints = asyncHandler(async (req: Request, res: Resp
 export const getHumanBodyPointById = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const point = await HumanBodyPoint.schema(schema).findOne({
-        where: { id: req.params.pointId, ...patientScopeWhere(req, schema) }
+        where: { id: req.params.pointId, ...patientResourceScopeWhere(req, schema) }
     });
     if (!point) {
         return sendErrorResponse(res, 404, 'Human body point not found');
@@ -98,7 +100,7 @@ export const getHumanBodyPointById = asyncHandler(async (req: Request, res: Resp
 export const deleteHumanBodyPoint = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const removed = await HumanBodyPoint.schema(schema).destroy({
-        where: { id: req.params.pointId, ...patientScopeWhere(req, schema) }
+        where: { id: req.params.pointId, ...patientResourceScopeWhere(req, schema) }
     });
     if (removed === 0) {
         return sendErrorResponse(res, 404, 'Human body point not found');
