@@ -12,6 +12,7 @@ import Patient from '../../patients/models/patient.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import TimeOffRequest from '../models/timeOffRequest.model.js';
 import { StructureUser } from '../../auth/models/index.js';
+import { getInvoiceAgendaLinksByEventIds, getLinkedInvoiceId } from '../../invoice/services/invoiceAgendaEvent.service.js';
 
 /**
  * Campi per il filtro row-level RBAC.
@@ -41,6 +42,12 @@ async function withInvoiceStatus(
     const plainEvents = agendaEvents.map((event) =>
         event.get({ plain: true }) as Record<string, any>
     );
+    const eventIds = plainEvents.map((event) => event.id as string).filter(Boolean);
+    const links = await getInvoiceAgendaLinksByEventIds(schema, eventIds);
+    const linkedInvoiceByEventId = new Map(links.map((link) => [link.agendaEventId, link.invoiceId]));
+    plainEvents.forEach((event) => {
+        event.invoiceId = event.invoiceId ?? linkedInvoiceByEventId.get(event.id) ?? null;
+    });
     const invoiceIds = Array.from(new Set(
         plainEvents
             .map((event) => event.invoiceId as string | null | undefined)
@@ -131,6 +138,8 @@ async function rejectInvalidPatient(
         emails: plain.emails,
         phoneNumbers: plain.phoneNumbers
     };
+    // Keep a scalar reference for indexed reporting while preserving the immutable snapshot.
+    event.patientId = plain.id;
     return false;
 }
 
@@ -380,12 +389,13 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     if (!current) {
         return sendErrorResponse(res, 404, `Error updating agendaEvent with id=${id}`);
     }
-    if (current.get('invoiceId')) {
+    const linkedInvoiceId = await getLinkedInvoiceId(schema, current.id, current.get('invoiceId') as string | null);
+    if (linkedInvoiceId) {
         return sendErrorResponse(
             res,
             409,
             'Appuntamento fatturato: modifica e cambio stato non sono consentiti',
-            { invoiceId: current.get('invoiceId') }
+            { invoiceId: linkedInvoiceId }
         );
     }
 
@@ -404,6 +414,7 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     const candidate = { ...current.get({ plain: true }), ...event };
     if (await rejectInvalidPatient(res, schema, candidate)) return;
     event.patient = candidate.patient;
+    event.patientId = candidate.patientId;
 
     const scheduleChanged = ['calendarId', 'structureId', 'start', 'end', 'duration', 'recurrence']
         .some((field) => Object.prototype.hasOwnProperty.call(event, field));
@@ -433,12 +444,13 @@ export const deleteAgendaEvent = asyncHandler(async (req: Request, res: Response
     if (!current) {
         return sendErrorResponse(res, 404, 'Appuntamento non trovato');
     }
-    if (current.get('invoiceId')) {
+    const linkedInvoiceId = await getLinkedInvoiceId(schema, current.id, current.get('invoiceId') as string | null);
+    if (linkedInvoiceId) {
         return sendErrorResponse(
             res,
             409,
             'Appuntamento fatturato: eliminazione non consentita',
-            { invoiceId: current.get('invoiceId') }
+            { invoiceId: linkedInvoiceId }
         );
     }
 
@@ -496,6 +508,7 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
     event.structureId = recurringCandidate.structureId;
     event.calendarId = recurringCandidate.calendarId;
     event.patient = recurringCandidate.patient;
+    event.patientId = recurringCandidate.patientId;
 
     if (mode === 'single') {
         const { range, recurringEventId, ...newEvent } = event;

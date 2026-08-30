@@ -130,8 +130,10 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
     const vatBuckets: Record<string, number> = { '4': 0, '5': 0, '10': 0, '22': 0, ESENTE: 0 };
 
     lines.forEach((line) => {
-        totalRivals += (rivals * line.totalLinePrice) / 100;
         const discountedPrice = line.totalLinePrice - applyDiscount(discount, line.totalLinePrice);
+        if (isRivals) {
+            totalRivals += (rivals * discountedPrice) / 100;
+        }
 
         if (line.vatKey === 'ESENTE') {
             vatBuckets.ESENTE += 0; // operazione esente/non imponibile: nessuna IVA dovuta.

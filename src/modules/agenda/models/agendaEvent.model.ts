@@ -11,6 +11,8 @@ export interface AgendaEventAttributes {
     isFirstInstance?: boolean | null;
     title?: string | null;
     patient?: Record<string, unknown> | null;
+    /** Riferimento interrogabile; `patient` resta lo snapshot anagrafico storico. */
+    patientId?: string | null;
     description?: string | null;
     start?: string | null;
     end?: string | null;
@@ -21,7 +23,7 @@ export interface AgendaEventAttributes {
     erasable?: boolean | null;
     eventTypeId?: string | null;
     /**
-     * Fattura emessa per questo appuntamento (1 fattura ↔ 1 appuntamento).
+     * Fattura emessa per questo appuntamento (1 fattura ↔ 1 appuntamento nel flusso storico).
      *
      * È l'unica fonte di verità per le colonne "documento fiscale" e "stato pagamento"
      * della dashboard: se valorizzato il documento è emesso e lo stato del pagamento è
@@ -43,6 +45,7 @@ export class AgendaEvent
     declare isFirstInstance: boolean | null;
     declare title: string | null;
     declare patient: Record<string, unknown> | null;
+    declare patientId: string | null;
     declare description: string | null;
     declare start: string | null;
     declare end: string | null;
@@ -64,6 +67,7 @@ AgendaEvent.init(
         isFirstInstance: DataTypes.BOOLEAN,
         title: DataTypes.STRING,
         patient: DataTypes.JSON,
+        patientId: { type: DataTypes.UUID, allowNull: true },
         description: DataTypes.STRING,
         start: { type: DataTypes.STRING, allowNull: true },
         end: { type: DataTypes.STRING, allowNull: true },
@@ -79,7 +83,16 @@ AgendaEvent.init(
             unique: 'agenda_events_invoice_id_unique'
         }
     },
-    { sequelize, modelName: 'agendaEvent', tableName: 'agenda_events' }
+    {
+        sequelize,
+        modelName: 'agendaEvent',
+        tableName: 'agenda_events',
+        indexes: [
+            { name: 'agenda_events_structure_start_status_idx', fields: ['structureId', 'start', 'status'] },
+            { name: 'agenda_events_calendar_start_status_idx', fields: ['calendarId', 'start', 'status'] },
+            { name: 'agenda_events_patient_start_idx', fields: ['patientId', 'start'] }
+        ]
+    }
 );
 
 export default AgendaEvent;

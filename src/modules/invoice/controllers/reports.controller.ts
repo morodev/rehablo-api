@@ -4,9 +4,11 @@ import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendSuccessResponse } from '../../../utils/response.js';
 import { patientScopeWhere } from '../../../middleware/rbac.js';
 import Invoice from '../models/invoice.model.js';
+import InvoicePayment from '../models/invoicePayment.model.js';
 import Tenant from '../../auth/models/tenant.model.js';
 import { getMissingIssuerFields } from '../utils/issuer.js';
 import { resolveFiscalProfile } from '../utils/fiscalRegime.js';
+import { getPaymentSummaries } from '../services/payment.service.js';
 
 /**
  * Aggregazioni economiche per la dashboard di direzione.
@@ -28,7 +30,6 @@ interface MonthlyBucket {
 }
 
 const VOID_STATUS = 'void';
-const PAID_STATUS = 'paid';
 
 function monthKey(date: Date): string {
     return `${date.getFullYear()}-${`${date.getMonth() + 1}`.padStart(2, '0')}`;
@@ -50,26 +51,37 @@ export const getOverview = asyncHandler(async (req: Request, res: Response) => {
 
     const now = new Date();
     const rangeStart = new Date(now.getFullYear(), now.getMonth() - (months - 1), 1);
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const todayEnd = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
+    const rangeStartKey = rangeStart.toISOString().slice(0, 7) + '-01';
+    const todayKey = now.toLocaleDateString('en-CA', { timeZone: 'Europe/Rome' });
 
     // Un'unica lettura: le fatture del periodo con i soli campi che servono ai totali.
     const invoices = await InvoiceScoped.findAll({
         where: {
-            emissionDate: { [Op.gte]: rangeStart.toISOString() },
+            emissionDate: { [Op.gte]: rangeStartKey },
             ...patientScopeWhere(req, schema, 'patientID')
         },
-        attributes: ['id', 'emissionDate', 'status', 'invoiceTotal']
+        attributes: ['id', 'emissionDate', 'status', 'invoiceTotal', 'documentType']
     });
 
-    // Lo scaduto va guardato su tutto lo storico, non solo sul periodo del grafico.
-    const unpaidInvoices = await InvoiceScoped.findAll({
+    // Il saldo aperto va guardato su tutto lo storico, non solo sul periodo del grafico.
+    const allInvoices = await InvoiceScoped.findAll({
         where: {
-            status: { [Op.notIn]: [VOID_STATUS, PAID_STATUS] },
+            status: { [Op.ne]: VOID_STATUS },
             ...patientScopeWhere(req, schema, 'patientID')
         },
-        attributes: ['id', 'invoiceTotal']
+        attributes: ['id', 'invoiceTotal', 'status', 'documentType']
     });
+    const allPlain = allInvoices.map((invoice) => invoice.get({ plain: true }) as Record<string, any>);
+    const paymentSummaries = await getPaymentSummaries(schema, allPlain);
+    const invoiceIds = allPlain.map((invoice) => invoice.id);
+    const payments = invoiceIds.length ? await InvoicePayment.schema(schema).findAll({
+        where: {
+            invoiceId: { [Op.in]: invoiceIds },
+            status: 'POSTED',
+            paidAt: { [Op.gte]: rangeStartKey }
+        },
+        attributes: ['amount', 'paidAt']
+    }) : [];
 
     const buckets = new Map<string, MonthlyBucket>();
     for (let i = 0; i < months; i++) {
@@ -79,6 +91,7 @@ export const getOverview = asyncHandler(async (req: Request, res: Response) => {
 
     let todayBilled = 0;
     let todayCollected = 0;
+    let todayOutstanding = 0;
 
     invoices.forEach((invoice) => {
         const status = (invoice.get('status') as string | null) ?? '';
@@ -86,7 +99,8 @@ export const getOverview = asyncHandler(async (req: Request, res: Response) => {
             return;
         }
 
-        const total = Number(invoice.get('invoiceTotal')) || 0;
+        const sign = invoice.get('documentType') === 'nota_di_credito' ? -1 : 1;
+        const total = sign * (Number(invoice.get('invoiceTotal')) || 0);
 
         // `emissionDate` può arrivare come Date o come stringa a seconda del driver.
         const rawDate = invoice.get('emissionDate') as Date | string | null;
@@ -98,23 +112,30 @@ export const getOverview = asyncHandler(async (req: Request, res: Response) => {
         const bucket = buckets.get(monthKey(emitted));
         if (bucket) {
             bucket.billed += total;
-            if (status === PAID_STATUS) {
-                bucket.collected += total;
-            }
         }
 
-        if (emitted >= todayStart && emitted < todayEnd) {
+        if (String(rawDate).slice(0, 10) === todayKey) {
             todayBilled += total;
-            if (status === PAID_STATUS) {
-                todayCollected += total;
+            if (sign > 0) {
+                todayOutstanding += paymentSummaries.get(invoice.get('id') as string)?.balance ?? 0;
             }
         }
     });
 
-    const outstanding = unpaidInvoices.reduce(
-        (sum, invoice) => sum + (Number(invoice.get('invoiceTotal')) || 0),
-        0
-    );
+    payments.forEach((payment) => {
+        const rawDate = payment.get('paidAt') as Date | string | null;
+        if (!rawDate) return;
+        const key = String(rawDate).slice(0, 7);
+        const amount = Number(payment.get('amount')) || 0;
+        const bucket = buckets.get(key);
+        if (bucket) bucket.collected += amount;
+        if (String(rawDate).slice(0, 10) === todayKey) todayCollected += amount;
+    });
+
+    const outstanding = allPlain.reduce((sum, invoice) => {
+        if (invoice.documentType === 'nota_di_credito') return sum;
+        return sum + (paymentSummaries.get(invoice.id)?.balance ?? 0);
+    }, 0);
 
     const monthly = [...buckets.values()].map((bucket) => ({
         month: bucket.month,
@@ -129,7 +150,9 @@ export const getOverview = asyncHandler(async (req: Request, res: Response) => {
             today: {
                 billed: Math.round(todayBilled * 100) / 100,
                 collected: Math.round(todayCollected * 100) / 100,
-                toCollect: Math.round((todayBilled - todayCollected) * 100) / 100
+                // Residuo dei documenti emessi oggi. Non si sottrae l'incassato odierno dal
+                // fatturato odierno: un pagamento di oggi può riferirsi a una fattura più vecchia.
+                toCollect: Math.round(todayOutstanding * 100) / 100
             },
             monthly,
             outstanding: Math.round(outstanding * 100) / 100

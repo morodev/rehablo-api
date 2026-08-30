@@ -10,6 +10,8 @@ export interface InvoiceAttributes {
     discSellingPrice?: number | null;
     invoiceVAT?: number | null;
     patientID?: string | null;
+    /** Sede fiscale/operativa congelata sul documento per filtri e report multi-sede. */
+    structureId?: string | null;
     /** Appuntamento da cui nasce il documento. NULL per le fatture create manualmente. */
     agendaEventId?: string | null;
     isCashPro: boolean;
@@ -122,6 +124,7 @@ export class Invoice extends Model<InvoiceAttributes, InvoiceCreationAttributes>
     declare discSellingPrice: number | null;
     declare invoiceVAT: number | null;
     declare patientID: string | null;
+    declare structureId: string | null;
     declare agendaEventId: string | null;
     declare isCashPro: boolean;
     declare cashPro: string | null;
@@ -159,6 +162,7 @@ Invoice.init(
         discSellingPrice: DataTypes.DECIMAL(10, 2),
         invoiceVAT: DataTypes.DECIMAL(10, 2),
         patientID: DataTypes.UUID,
+        structureId: { type: DataTypes.UUID, allowNull: true },
         // Un appuntamento non puo' generare piu' documenti. PostgreSQL consente invece
         // piu' valori NULL, quindi le fatture create manualmente restano ammesse.
         agendaEventId: {
@@ -191,7 +195,15 @@ Invoice.init(
         issuer: { type: DataTypes.JSONB, allowNull: true },
         fiscalNotes: { type: DataTypes.JSONB, allowNull: true }
     },
-    { sequelize, modelName: 'invoice', tableName: 'invoices' }
+    {
+        sequelize,
+        modelName: 'invoice',
+        tableName: 'invoices',
+        indexes: [
+            { name: 'invoices_structure_emission_idx', fields: ['structureId', 'emissionDate'] },
+            { name: 'invoices_structure_due_idx', fields: ['structureId', 'paymentTerms'] }
+        ]
+    }
 );
 
 export default Invoice;

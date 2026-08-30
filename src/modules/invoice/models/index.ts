@@ -1,6 +1,8 @@
 import Invoice from './invoice.model.js';
 import InvoiceProduct from './invoiceProduct.model.js';
 import InvoiceService from './invoiceService.model.js';
+import InvoicePayment from './invoicePayment.model.js';
+import InvoiceAgendaEvent from './invoiceAgendaEvent.model.js';
 
 /**
  * Centralised associations for the "invoice" tenant-scoped models (dynamic "rehablo_<tenantId>" schema).
@@ -26,7 +28,13 @@ export function registerInvoiceAssociations(): void {
 
     Invoice.hasMany(InvoiceService, { as: 'services', foreignKey: 'InvoiceId' });
     InvoiceService.belongsTo(Invoice, { foreignKey: 'InvoiceId' });
+
+    Invoice.hasMany(InvoicePayment, { as: 'payments', foreignKey: 'invoiceId' });
+    InvoicePayment.belongsTo(Invoice, { foreignKey: 'invoiceId' });
+
+    Invoice.hasMany(InvoiceAgendaEvent, { as: 'appointmentLinks', foreignKey: 'invoiceId' });
+    InvoiceAgendaEvent.belongsTo(Invoice, { foreignKey: 'invoiceId' });
 }
 
-export { Invoice, InvoiceProduct, InvoiceService };
+export { Invoice, InvoiceProduct, InvoiceService, InvoicePayment, InvoiceAgendaEvent };
 

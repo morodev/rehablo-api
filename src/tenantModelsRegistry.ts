@@ -2,7 +2,7 @@ import { registerTenantScopedModel } from './utils/tenantSchema.js';
 
 import Patient from './modules/patients/models/patient.model.js';
 import { registerProductsServicesAssociations, Category, Product, Service } from './modules/products-services/models/index.js';
-import { registerInvoiceAssociations, Invoice, InvoiceProduct, InvoiceService } from './modules/invoice/models/index.js';
+import { registerInvoiceAssociations, Invoice, InvoiceProduct, InvoiceService, InvoicePayment, InvoiceAgendaEvent } from './modules/invoice/models/index.js';
 import EventType from './modules/agenda/models/eventType.model.js';
 import AgendaEvent from './modules/agenda/models/agendaEvent.model.js';
 import AgendaEventException from './modules/agenda/models/agendaEventException.model.js';
@@ -66,6 +66,8 @@ export function registerTenantModels(): void {
     registerTenantScopedModel(Invoice);
     registerTenantScopedModel(InvoiceProduct);
     registerTenantScopedModel(InvoiceService);
+    registerTenantScopedModel(InvoicePayment);
+    registerTenantScopedModel(InvoiceAgendaEvent);
     registerTenantScopedModel(EventType);
     registerTenantScopedModel(AgendaEvent);
     registerTenantScopedModel(AgendaEventException);

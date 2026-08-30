@@ -29,6 +29,7 @@ import evaluationRoutes from './modules/evaluations/routes/evaluation.routes.js'
 import measurementsRoutes from './modules/measurements/routes/measurements.routes.js';
 import noteRoutes from './modules/notes/routes/note.routes.js';
 import maintenanceRoutes from './modules/maintenance/routes/maintenance.routes.js';
+import reportsRoutes from './modules/reports/routes/reports.routes.js';
 
 async function bootstrap() {
     const app = express();
@@ -69,6 +70,7 @@ async function bootstrap() {
     app.use(measurementsRoutes);
     app.use(noteRoutes);
     app.use(maintenanceRoutes);
+    app.use(reportsRoutes);
 
     app.use(notFoundHandler);
     app.use(errorHandler);

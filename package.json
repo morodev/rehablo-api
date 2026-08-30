@@ -15,7 +15,7 @@
     "lint": "tsc --noEmit",
     "audit:rbac": "node scripts/audit-rbac.mjs",
     "backfill:structure": "tsx src/scripts/backfillStructureId.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "tsx --test src/modules/invoice/services/payment.service.test.ts src/modules/invoice/utils/evalTotals.test.ts src/modules/reports/services/analytics.service.test.ts"
   },
   "author": "Luca Moro",
   "license": "UNLICENSED",
@@ -37,6 +37,7 @@
     "nodemailer": "^6.9.13",
     "pg": "^8.11.5",
     "pg-hstore": "^2.3.4",
+    "rrule": "^2.8.1",
     "sequelize": "^6.37.3",
     "stripe": "^15.7.0",
     "typescript": "^5.4.5"

@@ -2,20 +2,26 @@ import { Request, Response } from 'express';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
-import { patientScopeWhere, scopeWhere } from '../../../middleware/rbac.js';
+import { getUserId, patientScopeWhere, scopeWhere } from '../../../middleware/rbac.js';
 import { sequelize } from '../../../config/database.js';
 import Invoice from '../models/invoice.model.js';
 import InvoiceProduct from '../models/invoiceProduct.model.js';
 import InvoiceService from '../models/invoiceService.model.js';
+import InvoicePayment from '../models/invoicePayment.model.js';
 import Product from '../../products-services/models/product.model.js';
 import Service from '../../products-services/models/service.model.js';
 import Patient from '../../patients/models/patient.model.js';
 import Tenant from '../../auth/models/tenant.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
+import EventType from '../../agenda/models/eventType.model.js';
+import { User } from '../../auth/models/index.js';
+import InvoiceAgendaEvent from '../models/invoiceAgendaEvent.model.js';
+import { getInvoiceAgendaLinksByEventIds } from '../services/invoiceAgendaEvent.service.js';
 import { evalTotals, EvalTotalsResult, toPersistedTotals } from '../utils/evalTotals.js';
 import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
 import { buildFiscalNotes, FiscalProfile, isStampDutyDue, resolveFiscalProfile } from '../utils/fiscalRegime.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
+import { decorateInvoicesWithPayments } from '../services/payment.service.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AGENDA_SCOPE_FIELDS = {
@@ -57,9 +63,19 @@ function getScopedModels(schema: string) {
     const ServiceScoped = Service.schema(schema);
     const InvoiceProductScoped = InvoiceProduct.schema(schema);
     const InvoiceServiceScoped = InvoiceService.schema(schema);
+    const InvoicePaymentScoped = InvoicePayment.schema(schema);
+    const InvoiceAgendaEventScoped = InvoiceAgendaEvent.schema(schema);
 
 
-    return { InvoiceScoped, ProductScoped, ServiceScoped, InvoiceProductScoped, InvoiceServiceScoped };
+    return {
+        InvoiceScoped,
+        ProductScoped,
+        ServiceScoped,
+        InvoiceProductScoped,
+        InvoiceServiceScoped,
+        InvoicePaymentScoped,
+        InvoiceAgendaEventScoped
+    };
 }
 
 interface ResolvedInvoiceLine {
@@ -117,6 +133,116 @@ const toEvalLine = (line: ResolvedInvoiceLine) => ({
     sellingPrice: line.unitPrice,
     quantity: line.quantity,
     productVat: line.vat
+});
+
+const invoiceDateFormatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Rome',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+});
+
+function invoiceLocalDate(value: Date): string {
+    const parts = invoiceDateFormatter.formatToParts(value);
+    const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return `${byType.year}-${byType.month}-${byType.day}`;
+}
+
+/**
+ * Appuntamenti completati e non ancora fatturati utilizzabili nella nuova fattura.
+ * Prezzo e IVA arrivano dal servizio di catalogo collegato, mai dallo snapshot dell'agenda.
+ */
+export const findEligibleAppointments = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const patientId = String(req.query.patientId ?? '');
+    const through = String(req.query.through ?? '');
+    if (!UUID_REGEX.test(patientId)) {
+        return sendErrorResponse(res, 400, 'Paziente non valido');
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(through)) {
+        return sendErrorResponse(res, 400, 'Data limite non valida');
+    }
+
+    const patient = await Patient.schema(schema).findOne({
+        where: { [Op.and]: [{ id: patientId }, patientScopeWhere(req, schema, 'id')] },
+        attributes: ['id']
+    });
+    if (!patient) {
+        return sendErrorResponse(res, 404, 'Paziente non trovato');
+    }
+
+    const rows = await AgendaEvent.schema(schema).findAll({
+        where: {
+            [Op.and]: [
+                { [Op.or]: [{ patientId }, { patient: { id: patientId } as any }] },
+                { [Op.or]: [{ recurrence: null }, { recurrence: '' }] },
+                { status: { [Op.in]: ['COMPLETED', 'completed'] } },
+                { invoiceId: null },
+                scopeWhere(req, AGENDA_SCOPE_FIELDS)
+            ]
+        },
+        order: [['start', 'DESC']]
+    });
+
+    const now = Date.now();
+    const datedRows = rows.filter((event) => {
+        const timestamp = Date.parse(String(event.get('start') ?? ''));
+        return Number.isFinite(timestamp)
+            && timestamp <= now
+            && invoiceLocalDate(new Date(timestamp)) <= through;
+    });
+    const eventIds = datedRows.map((event) => event.id);
+    const existingLinks = await getInvoiceAgendaLinksByEventIds(schema, eventIds);
+    const alreadyLinked = new Set(existingLinks.map((link) => link.agendaEventId));
+    const eligibleRows = datedRows.filter((event) => !alreadyLinked.has(event.id));
+
+    const eventTypeIds = [...new Set(eligibleRows.map((event) => event.eventTypeId).filter(Boolean))] as string[];
+    const eventTypes = eventTypeIds.length
+        ? await EventType.schema(schema).findAll({ where: { id: { [Op.in]: eventTypeIds } } })
+        : [];
+    const eventTypeById = new Map(eventTypes.map((eventType) => [eventType.id, eventType]));
+    const serviceIds = [...new Set(eventTypes.map((eventType) => eventType.linkedServiceId).filter(Boolean))] as string[];
+    const services = serviceIds.length
+        ? await Service.schema(schema).findAll({ where: { id: { [Op.in]: serviceIds }, isActive: true } })
+        : [];
+    const serviceById = new Map(services.map((service) => [service.id, service]));
+
+    const operatorIds = [...new Set(eligibleRows.map((event) => event.calendarId).filter(Boolean))] as string[];
+    const operators = operatorIds.length
+        ? await User.findAll({ where: { id: { [Op.in]: operatorIds } }, attributes: ['id', 'name', 'surname'] })
+        : [];
+    const operatorById = new Map(operators.map((operator) => [operator.id, operator]));
+
+    const appointments = eligibleRows.map((event) => {
+        const eventType = event.eventTypeId ? eventTypeById.get(event.eventTypeId) : null;
+        const service = eventType?.linkedServiceId ? serviceById.get(eventType.linkedServiceId) : null;
+        const operator = event.calendarId ? operatorById.get(event.calendarId) : null;
+        return {
+            id: event.id,
+            start: event.start,
+            end: event.end,
+            title: event.title ?? eventType?.title ?? 'Prestazione',
+            status: event.status,
+            eventTypeId: event.eventTypeId ?? null,
+            operatorId: event.calendarId ?? null,
+            operatorName: operator
+                ? [operator.name, operator.surname].filter(Boolean).join(' ')
+                : 'Professionista non disponibile',
+            service: service ? {
+                id: service.id,
+                type: 'SERVICE',
+                name: service.name,
+                code: service.code,
+                description: service.description,
+                productVat: service.productVat,
+                sellingPrice: Number(service.sellingPrice) || 0,
+                categoryId: service.categoryId,
+                isActive: service.isActive
+            } : null
+        };
+    });
+
+    return sendSuccessResponse(res, 200, { appointments }, 'Appuntamenti fatturabili caricati');
 });
 
 /** Esito dell'applicazione del regime fiscale al documento in corso di emissione. */
@@ -206,19 +332,71 @@ function applyFiscalRules(params: {
 
 export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { InvoiceScoped, ProductScoped, ServiceScoped, InvoiceProductScoped, InvoiceServiceScoped } =
-        getScopedModels(schema);
+    const {
+        InvoiceScoped,
+        ProductScoped,
+        ServiceScoped,
+        InvoiceProductScoped,
+        InvoiceServiceScoped,
+        InvoicePaymentScoped,
+        InvoiceAgendaEventScoped
+    } = getScopedModels(schema);
 
-    const { products: requestedProducts = [], services: requestedServices = [], agendaEventId, ...invoiceFields } = req.body;
+    const {
+        products: requestedProducts = [],
+        services: requestedServices = [],
+        appointments: requestedAppointments,
+        agendaEventId,
+        paymentDate,
+        status: requestedStatus,
+        structureId: _clientStructureId,
+        ...invoiceFields
+    } = req.body;
 
-    if (agendaEventId != null && (typeof agendaEventId !== 'string' || !UUID_REGEX.test(agendaEventId))) {
-        return sendErrorResponse(res, 400, 'Identificativo appuntamento non valido');
+    if (requestedAppointments !== undefined && !Array.isArray(requestedAppointments)) {
+        return sendErrorResponse(res, 400, 'Elenco appuntamenti non valido');
     }
+
+    const hasExplicitAppointments = Array.isArray(requestedAppointments);
+    const appointmentSelections: Array<{ agendaEventId: string; serviceId: string | null }> =
+        hasExplicitAppointments
+            ? requestedAppointments.map((selection: any) => ({
+                agendaEventId: selection?.agendaEventId,
+                serviceId: selection?.serviceId ?? null
+            }))
+            : agendaEventId
+                ? [{ agendaEventId, serviceId: requestedServices[0]?.id ?? null }]
+                : [];
+
+    if (appointmentSelections.length > 200) {
+        return sendErrorResponse(res, 400, 'Puoi collegare al massimo 200 appuntamenti per fattura');
+    }
+    if (appointmentSelections.some((selection) =>
+        typeof selection.agendaEventId !== 'string'
+        || !UUID_REGEX.test(selection.agendaEventId)
+        || (hasExplicitAppointments && (!selection.serviceId || !UUID_REGEX.test(selection.serviceId)))
+    )) {
+        return sendErrorResponse(res, 400, 'Identificativo appuntamento o servizio non valido');
+    }
+    const agendaEventIds = appointmentSelections.map((selection) => selection.agendaEventId);
+    if (new Set(agendaEventIds).size !== agendaEventIds.length) {
+        return sendErrorResponse(res, 400, 'Lo stesso appuntamento è stato selezionato più volte');
+    }
+
+    // Nel nuovo flusso le prestazioni degli appuntamenti sono risolte e aggiunte server-side;
+    // `services` continua a contenere esclusivamente le righe manuali. Il vecchio flusso agenda,
+    // che invia un singolo `agendaEventId`, ha già il servizio in `services` e resta invariato.
+    const servicesWithAppointments = hasExplicitAppointments
+        ? [
+            ...requestedServices,
+            ...appointmentSelections.map((selection) => ({ id: selection.serviceId, quantity: 1 }))
+        ]
+        : requestedServices;
 
     const [{ lines: productLines, missingId: missingProductId }, { lines: serviceLines, missingId: missingServiceId }] =
         await Promise.all([
             resolveCatalogLines(requestedProducts, ProductScoped),
-            resolveCatalogLines(requestedServices, ServiceScoped)
+            resolveCatalogLines(servicesWithAppointments, ServiceScoped)
         ]);
 
     if (missingProductId) {
@@ -261,14 +439,21 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         invoiceFields.documentYear ?? new Date(invoiceFields.emissionDate ?? Date.now()).getFullYear();
 
     let stsExcluded = Boolean(invoiceFields.stsExcluded);
+    let invoiceStructureId = req.access?.structureId ?? null;
     if (invoiceFields.patientID) {
         // Si può fatturare solo a un paziente che si ha il diritto di vedere.
         const patient = await Patient.schema(schema).findOne({
-            where: { id: invoiceFields.patientID, ...patientScopeWhere(req, schema, 'id') }
+            where: {
+                [Op.and]: [
+                    { id: invoiceFields.patientID },
+                    patientScopeWhere(req, schema, 'id')
+                ]
+            }
         });
         if (!patient) {
             return sendErrorResponse(res, 404, 'Paziente non trovato');
         }
+        invoiceStructureId = patient.get('structureId') as string | null;
         if (patient.get('stsOppositionToDataSending')) {
             stsExcluded = true;
         }
@@ -278,71 +463,98 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     // se una qualsiasi parte fallisce, non deve restare un numero "bruciato" senza fattura, né
     // una fattura senza le sue righe.
     const transactionResult = await sequelize.transaction(async (t) => {
-        let agendaEvent: AgendaEvent | null = null;
+        let agendaEvents: AgendaEvent[] = [];
 
-        if (agendaEventId) {
-            // Il lock rende atomico il controllo "non ancora fatturato": una seconda richiesta
-            // per lo stesso appuntamento aspetta la prima e, dopo il commit, trova invoiceId.
-            agendaEvent = await AgendaEvent.schema(schema).findOne({
-                where: { id: agendaEventId, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) },
+        if (agendaEventIds.length > 0) {
+            // Tutti gli appuntamenti vengono bloccati nello stesso ordine: oltre a rendere atomico
+            // il controllo evita deadlock fra due richieste concorrenti con selezioni sovrapposte.
+            agendaEvents = await AgendaEvent.schema(schema).findAll({
+                where: { id: { [Op.in]: agendaEventIds }, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) },
+                order: [['id', 'ASC']],
                 transaction: t,
                 lock: t.LOCK.UPDATE
             });
 
-            if (!agendaEvent) {
+            if (agendaEvents.length !== agendaEventIds.length) {
                 return { kind: 'agenda-not-found' } as const;
             }
 
-            if (agendaEvent.get('recurrence')) {
+            if (agendaEvents.some((event) => event.get('recurrence'))) {
                 return { kind: 'recurring-event' } as const;
             }
+            const eventStructures = new Set(
+                agendaEvents.map((event) => event.get('structureId') as string | null).filter(Boolean)
+            );
+            if (eventStructures.size > 1
+                || (invoiceStructureId && [...eventStructures].some((id) => id !== invoiceStructureId))) {
+                return { kind: 'structure-mismatch' } as const;
+            }
+            invoiceStructureId = ([...eventStructures][0] as string | undefined) ?? invoiceStructureId;
 
-            const agendaPatient = agendaEvent.get('patient') as Record<string, unknown> | null;
-            if (!agendaPatient?.id || agendaPatient.id !== invoiceFields.patientID) {
+            const hasPatientMismatch = agendaEvents.some((event) => {
+                const agendaPatient = event.get('patient') as Record<string, unknown> | null;
+                const agendaPatientId = event.get('patientId') as string | null;
+                return (agendaPatientId ?? agendaPatient?.id ?? null) !== invoiceFields.patientID;
+            });
+            if (hasPatientMismatch) {
                 return { kind: 'patient-mismatch' } as const;
             }
 
-            const linkedInvoiceId = agendaEvent.get('invoiceId') as string | null;
-            if (linkedInvoiceId) {
-                await agendaEvent.update(
-                    { status: 'COMPLETED', erasable: false },
-                    { transaction: t }
-                );
-                return { kind: 'already-invoiced', invoiceId: linkedInvoiceId } as const;
+            const cancelledEvent = agendaEvents.find((event) =>
+                ['CANCELLED', 'CANCELED'].includes(String(event.get('status') ?? '').toUpperCase())
+            );
+            if (cancelledEvent) {
+                return { kind: 'cancelled-appointment' } as const;
+            }
+
+            const legacyLinkedEvent = agendaEvents.find((event) => Boolean(event.get('invoiceId')));
+            if (legacyLinkedEvent) {
+                return {
+                    kind: 'already-invoiced',
+                    invoiceId: legacyLinkedEvent.get('invoiceId') as string
+                } as const;
+            }
+
+            const existingLinks = await InvoiceAgendaEventScoped.findAll({
+                where: { agendaEventId: { [Op.in]: agendaEventIds } },
+                attributes: ['invoiceId'],
+                transaction: t,
+                lock: t.LOCK.UPDATE
+            });
+            if (existingLinks.length > 0) {
+                return {
+                    kind: 'already-invoiced',
+                    invoiceId: existingLinks[0].get('invoiceId') as string
+                } as const;
             }
 
             // Difesa aggiuntiva per eventuali record riallineati/migrati nei quali il riferimento
             // sulla fattura esiste ma quello sull'appuntamento non e' ancora valorizzato.
             const invoiceForAgenda = await InvoiceScoped.findOne({
-                where: { agendaEventId },
+                where: { agendaEventId: { [Op.in]: agendaEventIds } },
                 attributes: ['id'],
                 transaction: t,
                 lock: t.LOCK.UPDATE
             });
             if (invoiceForAgenda) {
                 const invoiceId = invoiceForAgenda.get('id') as string;
-                await agendaEvent.update(
-                    { invoiceId, status: 'COMPLETED', erasable: false },
-                    { transaction: t }
-                );
                 return { kind: 'already-invoiced', invoiceId } as const;
             }
 
-            // La fattura rende automaticamente la prestazione COMPLETED: non puo' quindi
-            // essere emessa prima che la seduta sia iniziata. Il controllo usa l'orologio
-            // del server ed e' dentro la stessa transazione/lock degli altri vincoli, percio'
-            // non e' aggirabile modificando il client o inviando direttamente la richiesta.
-            const agendaStartValue = agendaEvent.get('start') as string | null;
-            const agendaStartTimestamp = agendaStartValue
-                ? Date.parse(agendaStartValue)
-                : Number.NaN;
-            if (
-                Number.isFinite(agendaStartTimestamp) &&
-                agendaStartTimestamp > Date.now()
-            ) {
+            // Nessun appuntamento futuro né successivo alla data di emissione può entrare nel
+            // documento. Il controllo resta server-side e dentro gli stessi lock della creazione.
+            const emissionDate = String(invoiceFields.emissionDate ?? invoiceLocalDate(new Date())).slice(0, 10);
+            const invalidDateEvent = agendaEvents.find((event) => {
+                const startValue = event.get('start') as string | null;
+                const timestamp = startValue ? Date.parse(startValue) : Number.NaN;
+                return !Number.isFinite(timestamp)
+                    || timestamp > Date.now()
+                    || invoiceLocalDate(new Date(timestamp)) > emissionDate;
+            });
+            if (invalidDateEvent) {
                 return {
                     kind: 'future-appointment',
-                    availableAt: agendaStartValue
+                    availableAt: invalidDateEvent.get('start') as string | null
                 } as const;
             }
         }
@@ -361,7 +573,9 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         const createdInvoice = await InvoiceScoped.create(
             {
                 ...invoiceFields,
-                agendaEventId: agendaEventId ?? null,
+                agendaEventId: agendaEventIds.length === 1 ? agendaEventIds[0] : null,
+                structureId: invoiceStructureId,
+                status: 'unpaid',
                 ...fiscal.fields,
                 ...toPersistedTotals(fiscal.totals),
                 fiscalNotes: fiscal.fiscalNotes,
@@ -406,17 +620,52 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                     },
                     { transaction: t }
                 )
+            ),
+            ...appointmentSelections.map((selection) =>
+                InvoiceAgendaEventScoped.create(
+                    {
+                        invoiceId,
+                        agendaEventId: selection.agendaEventId,
+                        serviceId: selection.serviceId
+                    },
+                    { transaction: t }
+                )
             )
         ]);
+
+        // Compatibility during the frontend/backend rolling deployment: an old client can still
+        // emit an already-paid document. Convert that flag into a real, dated movement.
+        if (String(requestedStatus ?? '').toLowerCase() === 'paid' && fiscal.totals.invoiceTotal > 0) {
+            const paidAt = typeof paymentDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(paymentDate)
+                ? paymentDate
+                : String(invoiceFields.emissionDate ?? new Date().toISOString()).slice(0, 10);
+            await InvoicePaymentScoped.create(
+                {
+                    invoiceId,
+                    amount: fiscal.totals.invoiceTotal,
+                    paidAt: new Date(`${paidAt}T12:00:00.000Z`),
+                    method: invoiceFields.paymentMethod ?? null,
+                    source: 'USER',
+                    status: 'POSTED',
+                    createdByUserId: getUserId(req)
+                },
+                { transaction: t }
+            );
+            await createdInvoice.update({ status: 'paid' }, { transaction: t });
+        }
 
         // Fattura emessa a partire da un appuntamento: il collegamento va scritto nella STESSA
         // transazione, altrimenti un errore qui lascerebbe una fattura senza appuntamento
         // collegato e la dashboard mostrerebbe di nuovo "da emettere" per una seduta già fatturata.
-        if (agendaEvent) {
-            await agendaEvent.update(
-                { invoiceId, status: 'COMPLETED', erasable: false },
+        if (agendaEvents.length > 0) {
+            await Promise.all(agendaEvents.map((event) => event.update(
+                {
+                    ...(agendaEvents.length === 1 ? { invoiceId } : {}),
+                    status: 'COMPLETED',
+                    erasable: false
+                },
                 { transaction: t }
-            );
+            )));
         }
 
         return { kind: 'created', invoice: createdInvoice } as const;
@@ -427,6 +676,12 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     }
     if (transactionResult.kind === 'patient-mismatch') {
         return sendErrorResponse(res, 422, 'Il paziente della fattura non coincide con quello dell’appuntamento');
+    }
+    if (transactionResult.kind === 'structure-mismatch') {
+        return sendErrorResponse(res, 422, 'Gli appuntamenti selezionati non appartengono alla stessa sede del paziente');
+    }
+    if (transactionResult.kind === 'cancelled-appointment') {
+        return sendErrorResponse(res, 422, 'Un appuntamento annullato non può essere fatturato');
     }
     if (transactionResult.kind === 'recurring-event') {
         return sendErrorResponse(
@@ -457,38 +712,78 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const invoiceWithLines = await InvoiceScoped.findByPk(invoice.get('id') as string, {
         include: [
             { model: InvoiceProductScoped, as: 'products' },
-            { model: InvoiceServiceScoped, as: 'services' }
+            { model: InvoiceServiceScoped, as: 'services' },
+            { model: InvoiceAgendaEventScoped, as: 'appointmentLinks' }
         ]
     });
 
-    return sendSuccessResponse(res, 201, invoiceWithLines, 'Invoice Created');
+    const [decoratedInvoice] = await decorateInvoicesWithPayments(schema, invoiceWithLines ? [invoiceWithLines] : []);
+    return sendSuccessResponse(res, 201, decoratedInvoice, 'Invoice Created');
 });
 
 export const findAllInvoices = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped } = getScopedModels(schema);
+    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped, InvoiceAgendaEventScoped } = getScopedModels(schema);
 
-    const page = parseInt((req.query.page as string) ?? '1', 10);
-    const size = parseInt((req.query.size as string) ?? '10', 10);
+    const page = Math.max(parseInt((req.query.page as string) ?? '1', 10) || 1, 1);
+    const size = Math.min(Math.max(parseInt((req.query.size as string) ?? '10', 10) || 10, 1), 100);
+    const paymentState = String(req.query.paymentState ?? 'all');
+    const dueState = String(req.query.dueState ?? 'all');
+    if (!['all', 'unpaid', 'partial', 'paid', 'void'].includes(paymentState)) {
+        return sendErrorResponse(res, 400, 'Filtro stato pagamento non valido');
+    }
+    if (!['all', 'overdue', 'today', 'next7', 'no_due'].includes(dueState)) {
+        return sendErrorResponse(res, 400, 'Filtro scadenza non valido');
+    }
 
-    const { count, rows } = await InvoiceScoped.findAndCountAll({
+    const rows = await InvoiceScoped.findAll({
         // Le fatture non hanno un proprietario: l'ampiezza si eredita dai pazienti visibili.
         where: patientScopeWhere(req, schema, 'patientID'),
         include: [
             { model: InvoiceProductScoped, as: 'products' },
-            { model: InvoiceServiceScoped, as: 'services' }
+            { model: InvoiceServiceScoped, as: 'services' },
+            { model: InvoiceAgendaEventScoped, as: 'appointmentLinks' }
         ],
-        limit: size,
-        offset: (page - 1) * size,
-        distinct: true
+        order: [['emissionDate', 'DESC']]
     });
 
+    const allInvoices = await decorateInvoicesWithPayments(schema, rows);
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Rome' });
+    const next7 = new Date(Date.parse(`${today}T12:00:00.000Z`) + 7 * 86_400_000).toISOString().slice(0, 10);
+    const filtered = allInvoices.filter((invoice) => {
+        if (paymentState !== 'all' && invoice.paymentStatus !== paymentState) return false;
+        if (dueState === 'all') return true;
+        if (invoice.balance <= 0 || invoice.paymentStatus === 'void') return false;
+        const due = invoice.paymentTerms ? String(invoice.paymentTerms).slice(0, 10) : null;
+        if (dueState === 'no_due') return !due;
+        if (!due) return false;
+        if (dueState === 'overdue') return due < today;
+        if (dueState === 'today') return due === today;
+        return due > today && due <= next7;
+    });
+    const aggregates = filtered.reduce(
+        (totals, invoice) => {
+            if (invoice.paymentStatus !== 'void') {
+                const sign = invoice.documentType === 'nota_di_credito' ? -1 : 1;
+                totals.billedTotal += sign * (Number(invoice.invoiceTotal) || 0);
+                totals.paidAmount += Number(invoice.paidAmount) || 0;
+                if (sign > 0) totals.balance += Number(invoice.balance) || 0;
+            }
+            return totals;
+        },
+        { billedTotal: 0, paidAmount: 0, balance: 0 }
+    );
+    Object.keys(aggregates).forEach((key) => {
+        aggregates[key as keyof typeof aggregates] = Math.round(aggregates[key as keyof typeof aggregates] * 100) / 100;
+    });
+    const invoices = filtered.slice((page - 1) * size, page * size);
     return sendSuccessResponse(
         res,
         200,
         {
-            pagination: { length: count, size, page, lastPage: Math.max(Math.ceil(count / size), 1) },
-            invoices: rows
+            pagination: { length: filtered.length, size, page, lastPage: Math.max(Math.ceil(filtered.length / size), 1) },
+            invoices,
+            aggregates
         },
         'Fatture caricate correttamente'
     );
@@ -496,7 +791,7 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
 
 export const searchInvoices = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { InvoiceScoped } = getScopedModels(schema);
+    const { InvoiceScoped, InvoiceAgendaEventScoped } = getScopedModels(schema);
     const query = (req.query.query as string) || '';
 
     const invoices = await InvoiceScoped.findAll({
@@ -510,21 +805,24 @@ export const searchInvoices = asyncHandler(async (req: Request, res: Response) =
                     ]
                 }
             ]
-        }
+        },
+        include: [{ model: InvoiceAgendaEventScoped, as: 'appointmentLinks' }]
     });
 
-    return sendSuccessResponse(res, 200, invoices, 'Ricerca completata');
+    const decoratedInvoices = await decorateInvoicesWithPayments(schema, invoices);
+    return sendSuccessResponse(res, 200, decoratedInvoices, 'Ricerca completata');
 });
 
 export const findOneInvoice = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped } = getScopedModels(schema);
+    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped, InvoiceAgendaEventScoped } = getScopedModels(schema);
 
     const invoice = await InvoiceScoped.findOne({
         where: { id: req.params.invoiceId, ...patientScopeWhere(req, schema, 'patientID') },
         include: [
             { model: InvoiceProductScoped, as: 'products' },
-            { model: InvoiceServiceScoped, as: 'services' }
+            { model: InvoiceServiceScoped, as: 'services' },
+            { model: InvoiceAgendaEventScoped, as: 'appointmentLinks' }
         ]
     });
 
@@ -542,7 +840,10 @@ export const findOneInvoice = asyncHandler(async (req: Request, res: Response) =
         plainInvoice.issuerIsFallback = true;
     }
 
-    return sendSuccessResponse(res, 200, { invoice: plainInvoice }, 'Fattura caricata correttamente');
+    const [decoratedInvoice] = await decorateInvoicesWithPayments(schema, [invoice]);
+    if (plainInvoice.issuerIsFallback) decoratedInvoice.issuerIsFallback = true;
+    if (plainInvoice.issuer) decoratedInvoice.issuer = plainInvoice.issuer;
+    return sendSuccessResponse(res, 200, { invoice: decoratedInvoice }, 'Fattura caricata correttamente');
 });
 
 /**
@@ -553,7 +854,14 @@ export const findOneInvoice = asyncHandler(async (req: Request, res: Response) =
  */
 export const updateInvoice = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { InvoiceScoped, ProductScoped, ServiceScoped, InvoiceProductScoped, InvoiceServiceScoped } =
+    const {
+        InvoiceScoped,
+        ProductScoped,
+        ServiceScoped,
+        InvoiceProductScoped,
+        InvoiceServiceScoped,
+        InvoicePaymentScoped
+    } =
         getScopedModels(schema);
     const id = req.params.invoiceId;
 
@@ -563,6 +871,9 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
     if (!existingInvoice) {
         return sendErrorResponse(res, 404, 'Fattura non trovata');
     }
+    if (String(existingInvoice.get('status') ?? '').toLowerCase() === 'void') {
+        return sendErrorResponse(res, 409, 'Una fattura stornata non può più essere modificata');
+    }
 
     const body = req.body.invoice ?? req.body;
     // Il legame con l'appuntamento nasce esclusivamente nel flusso atomico di saveInvoice:
@@ -571,11 +882,31 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
         products: requestedProducts,
         services: requestedServices,
         agendaEventId: _immutableAgendaEventId,
+        appointments: _immutableAppointments,
+        structureId: _immutableStructureId,
+        paymentDate: _paymentDate,
+        status: requestedStatus,
         ...invoiceFields
     } = body;
     const shouldReplaceLines = Array.isArray(requestedProducts) || Array.isArray(requestedServices);
+    const postedPaidAmount = Number(await InvoicePaymentScoped.sum('amount', {
+        where: { invoiceId: id, status: 'POSTED' }
+    })) || 0;
 
-    let updateData: Record<string, unknown> = { ...invoiceFields };
+    if (String(requestedStatus ?? '').toLowerCase() === 'void' && postedPaidAmount > 0) {
+        return sendErrorResponse(
+            res,
+            409,
+            'Prima di stornare la fattura devi annullare i movimenti di pagamento registrati.'
+        );
+    }
+
+    // Payment state is derived from immutable movements. A direct status write is accepted only
+    // for the fiscal lifecycle action `void`; paid/unpaid/partial cannot desynchronise balances.
+    let updateData: Record<string, unknown> = {
+        ...invoiceFields,
+        ...(String(requestedStatus ?? '').toLowerCase() === 'void' ? { status: 'void' } : {})
+    };
 
     if (shouldReplaceLines) {
         const [
@@ -622,6 +953,14 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
             },
             evalLines: { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) }
         });
+
+        if (fiscal.totals.invoiceTotal + 0.001 < postedPaidAmount) {
+            return sendErrorResponse(
+                res,
+                409,
+                'Il nuovo totale della fattura non pu\u00f2 essere inferiore agli incassi gi\u00e0 registrati.'
+            );
+        }
 
         updateData = {
             ...updateData,
@@ -683,7 +1022,8 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
             { model: InvoiceServiceScoped, as: 'services' }
         ]
     });
-    return sendSuccessResponse(res, 200, updatedInvoice, 'Fattura aggiornata correttamente');
+    const [decoratedInvoice] = await decorateInvoicesWithPayments(schema, updatedInvoice ? [updatedInvoice] : []);
+    return sendSuccessResponse(res, 200, decoratedInvoice, 'Fattura aggiornata correttamente');
 });
 
 /**
@@ -694,7 +1034,7 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
  */
 export const deleteInvoice = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped } = getScopedModels(schema);
+    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped, InvoicePaymentScoped, InvoiceAgendaEventScoped } = getScopedModels(schema);
     const id = req.params.invoiceId;
 
     const removedInvoice = await InvoiceScoped.findOne({
@@ -708,11 +1048,24 @@ export const deleteInvoice = asyncHandler(async (req: Request, res: Response) =>
         where: { invoiceId: id },
         attributes: ['id']
     });
-    if (linkedAgendaEvent) {
+    const linkedAppointment = await InvoiceAgendaEventScoped.findOne({
+        where: { invoiceId: id },
+        attributes: ['id']
+    });
+    if (linkedAgendaEvent || linkedAppointment) {
         return sendErrorResponse(
             res,
             409,
             'Una fattura collegata a un appuntamento effettuato non può essere eliminata. Utilizza lo storno.'
+        );
+    }
+
+    const paymentCount = await InvoicePaymentScoped.count({ where: { invoiceId: id } });
+    if (paymentCount > 0) {
+        return sendErrorResponse(
+            res,
+            409,
+            'Una fattura con movimenti di pagamento non può essere eliminata. Annulla i movimenti e utilizza lo storno.'
         );
     }
 
@@ -796,6 +1149,7 @@ export const exportSistemaTS = asyncHandler(async (req: Request, res: Response) 
 
 export default {
     saveInvoice,
+    findEligibleAppointments,
     findAllInvoices,
     searchInvoices,
     findOneInvoice,
