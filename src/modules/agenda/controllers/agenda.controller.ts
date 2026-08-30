@@ -30,6 +30,30 @@ const AGENDA_SCOPE_FIELDS = {
 // "invalid input syntax for type uuid" (which the generic error handler turns into
 // an opaque 500).
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MISSED_ARRIVAL_GRACE_MS = 15 * 60_000;
+const APPOINTMENT_STATUSES = new Set(['CONFIRMED', 'COMPLETED', 'CANCELLED', 'NO_SHOW']);
+const MISSED_ARRIVAL_RESOLUTIONS = new Set(['ARRIVING', 'CANCELLED', 'NO_SHOW', 'COMPLETED']);
+const NO_SHOW_BILLING_DECISIONS = new Set(['PENDING', 'WAIVED']);
+const ATTENDANCE_MANAGED_FIELDS = [
+    'missedArrivalReportedAt',
+    'missedArrivalReportedBy',
+    'missedArrivalResolvedAt',
+    'missedArrivalResolvedBy',
+    'missedArrivalResolution',
+    'noShowBillingDecision'
+] as const;
+
+function removeAttendanceManagedFields(payload: Record<string, any>): void {
+    ATTENDANCE_MANAGED_FIELDS.forEach((field) => delete payload[field]);
+}
+
+function normalizedStatus(value: unknown): string {
+    return String(value ?? '').trim().toUpperCase();
+}
+
+function hasOpenMissedArrival(event: AgendaEvent): boolean {
+    return Boolean(event.get('missedArrivalReportedAt')) && !event.get('missedArrivalResolvedAt');
+}
 
 /**
  * Aggiunge al feed dell'agenda soltanto lo stato necessario alla UI.
@@ -345,6 +369,15 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
     // Il collegamento fiscale e' server-managed dal controller fatture. In particolare,
     // copia/incolla di un appuntamento gia' fatturato non deve duplicarne invoiceId.
     delete payload.invoiceId;
+    removeAttendanceManagedFields(payload);
+
+    if (payload.status !== undefined) {
+        const status = normalizedStatus(payload.status);
+        if (!APPOINTMENT_STATUSES.has(status) || status === 'NO_SHOW') {
+            return sendErrorResponse(res, 400, 'Stato appuntamento non valido');
+        }
+        payload.status = status;
+    }
 
     // Chi gestisce solo la propria agenda non può creare eventi nel calendario di altri.
     if (req.access?.scope === 'own') {
@@ -382,6 +415,7 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     const id = req.body.id;
     const event = { ...req.body.event };
     delete event.invoiceId;
+    removeAttendanceManagedFields(event);
 
     const current = await AgendaEvent.schema(schema).findOne({
         where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
@@ -397,6 +431,25 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
             'Appuntamento fatturato: modifica e cambio stato non sono consentiti',
             { invoiceId: linkedInvoiceId }
         );
+    }
+
+    if (event.status !== undefined) {
+        const status = normalizedStatus(event.status);
+        if (!APPOINTMENT_STATUSES.has(status)) {
+            return sendErrorResponse(res, 400, 'Stato appuntamento non valido');
+        }
+        if (status === 'NO_SHOW' && normalizedStatus(current.get('status')) !== 'NO_SHOW') {
+            return sendErrorResponse(res, 409, 'Usa la gestione del mancato arrivo per registrare un no-show');
+        }
+        event.status = status;
+
+        // Compatibilita' con i client precedenti: se una segnalazione aperta viene chiusa
+        // direttamente come effettuata o cancellata, manteniamo comunque l'audit completo.
+        if (hasOpenMissedArrival(current) && (status === 'COMPLETED' || status === 'CANCELLED')) {
+            event.missedArrivalResolvedAt = new Date();
+            event.missedArrivalResolvedBy = req.access!.userId;
+            event.missedArrivalResolution = status;
+        }
     }
 
     if (typeof event.title !== 'string' && event.title !== undefined) {
@@ -432,6 +485,136 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
 
     const updated = await AgendaEvent.schema(schema).findByPk(id);
     return sendSuccessResponse(res, 200, updated, 'Agenda event updated');
+});
+
+/**
+ * Apre un alert condiviso quando un appuntamento e' ancora confermato 15 minuti dopo l'inizio.
+ * Non cambiamo automaticamente lo stato: potrebbe essere una seduta iniziata ma non ancora chiusa.
+ */
+export const reportMissedArrival = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const id = req.params.agendaEventId;
+    if (!UUID_REGEX.test(id)) {
+        return sendErrorResponse(res, 400, 'Appuntamento non valido');
+    }
+
+    const event = await AgendaEvent.schema(schema).findOne({
+        where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
+    });
+    if (!event) {
+        return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
+    }
+    if (event.get('recurrence')) {
+        return sendErrorResponse(res, 422, 'Il mancato arrivo va registrato su un appuntamento singolo');
+    }
+    const linkedInvoiceId = await getLinkedInvoiceId(schema, event.id, event.get('invoiceId') as string | null);
+    if (linkedInvoiceId) {
+        return sendErrorResponse(res, 409, 'Appuntamento fatturato: segnalazione non consentita', { invoiceId: linkedInvoiceId });
+    }
+    if (normalizedStatus(event.get('status')) !== 'CONFIRMED') {
+        return sendErrorResponse(res, 409, 'Il mancato arrivo si può segnalare solo su un appuntamento confermato');
+    }
+    const patient = event.get('patient') as Record<string, unknown> | null;
+    if (!event.get('patientId') && !patient?.id) {
+        return sendErrorResponse(res, 422, 'La segnalazione richiede un appuntamento con paziente');
+    }
+    const startAt = Date.parse(String(event.get('start') ?? ''));
+    if (!Number.isFinite(startAt)) {
+        return sendErrorResponse(res, 422, 'Orario di inizio appuntamento non valido');
+    }
+    const availableAt = startAt + MISSED_ARRIVAL_GRACE_MS;
+    if (Date.now() < availableAt) {
+        return sendErrorResponse(res, 409, 'Il mancato arrivo sarà segnalabile 15 minuti dopo l\'inizio', {
+            availableAt: new Date(availableAt).toISOString()
+        });
+    }
+
+    if (!hasOpenMissedArrival(event)) {
+        await event.update({
+            missedArrivalReportedAt: new Date(),
+            missedArrivalReportedBy: req.access!.userId,
+            missedArrivalResolvedAt: null,
+            missedArrivalResolvedBy: null,
+            missedArrivalResolution: null,
+            noShowBillingDecision: null
+        });
+    }
+    return sendSuccessResponse(res, 200, event, 'Mancato arrivo segnalato');
+});
+
+/** Chiude l'alert dopo il contatto e applica l'esito scelto dall'operatore. */
+export const resolveMissedArrival = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const id = req.params.agendaEventId;
+    const resolution = normalizedStatus(req.body.resolution);
+    if (!UUID_REGEX.test(id)) {
+        return sendErrorResponse(res, 400, 'Appuntamento non valido');
+    }
+    if (!MISSED_ARRIVAL_RESOLUTIONS.has(resolution)) {
+        return sendErrorResponse(res, 400, 'Esito del contatto non valido');
+    }
+
+    const event = await AgendaEvent.schema(schema).findOne({
+        where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
+    });
+    if (!event) {
+        return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
+    }
+    const linkedInvoiceId = await getLinkedInvoiceId(schema, event.id, event.get('invoiceId') as string | null);
+    if (linkedInvoiceId) {
+        return sendErrorResponse(res, 409, 'Appuntamento fatturato: esito non modificabile', { invoiceId: linkedInvoiceId });
+    }
+    if (!hasOpenMissedArrival(event)) {
+        return sendErrorResponse(res, 409, 'Non esiste una segnalazione di mancato arrivo aperta');
+    }
+
+    let noShowBillingDecision: string | null = null;
+    if (resolution === 'NO_SHOW') {
+        noShowBillingDecision = normalizedStatus(req.body.noShowBillingDecision || 'PENDING');
+        if (!NO_SHOW_BILLING_DECISIONS.has(noShowBillingDecision)) {
+            return sendErrorResponse(res, 400, 'Decisione di addebito no-show non valida');
+        }
+    }
+    const status = resolution === 'ARRIVING' ? 'CONFIRMED' : resolution;
+    await event.update({
+        status,
+        missedArrivalResolvedAt: new Date(),
+        missedArrivalResolvedBy: req.access!.userId,
+        missedArrivalResolution: resolution,
+        noShowBillingDecision
+    });
+
+    return sendSuccessResponse(res, 200, event, 'Segnalazione di mancato arrivo chiusa');
+});
+
+/** Permette di cambiare la sola decisione economica senza alterare lo stato NO_SHOW. */
+export const updateNoShowBillingDecision = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const id = req.params.agendaEventId;
+    const decision = normalizedStatus(req.body.decision);
+    if (!UUID_REGEX.test(id)) {
+        return sendErrorResponse(res, 400, 'Appuntamento non valido');
+    }
+    if (!NO_SHOW_BILLING_DECISIONS.has(decision)) {
+        return sendErrorResponse(res, 400, 'Decisione di addebito no-show non valida');
+    }
+
+    const event = await AgendaEvent.schema(schema).findOne({
+        where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
+    });
+    if (!event) {
+        return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
+    }
+    if (normalizedStatus(event.get('status')) !== 'NO_SHOW') {
+        return sendErrorResponse(res, 409, 'La decisione economica è disponibile solo per i no-show');
+    }
+    const linkedInvoiceId = await getLinkedInvoiceId(schema, event.id, event.get('invoiceId') as string | null);
+    if (linkedInvoiceId) {
+        return sendErrorResponse(res, 409, 'Il no-show è già stato fatturato', { invoiceId: linkedInvoiceId });
+    }
+
+    await event.update({ noShowBillingDecision: decision });
+    return sendSuccessResponse(res, 200, event, 'Decisione economica aggiornata');
 });
 
 export const deleteAgendaEvent = asyncHandler(async (req: Request, res: Response) => {
@@ -484,6 +667,14 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
     const { event: requestedEvent, originalEvent, mode } = req.body;
     const event = { ...requestedEvent };
     delete event.invoiceId;
+    removeAttendanceManagedFields(event);
+    if (event.status !== undefined) {
+        const status = normalizedStatus(event.status);
+        if (!APPOINTMENT_STATUSES.has(status) || status === 'NO_SHOW') {
+            return sendErrorResponse(res, 400, 'Stato appuntamento non valido');
+        }
+        event.status = status;
+    }
 
     // Gate di accesso: se la serie non rientra nello scope, l'operazione si ferma qui.
     // Le modifiche successive agiscono tutte sullo stesso `recurringEventId`.
@@ -610,6 +801,9 @@ export default {
     findAgendaEventsByUsers,
     findAppointmentsForPatientById,
     updateAgendaEvent,
+    reportMissedArrival,
+    resolveMissedArrival,
+    updateNoShowBillingDecision,
     deleteAgendaEvent,
     getAllEventExceptions,
     updateRecurringEvent,

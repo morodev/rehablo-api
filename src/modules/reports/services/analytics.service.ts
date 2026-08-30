@@ -44,6 +44,7 @@ export interface ReportOccurrence {
     patientId: string | null;
     eventTypeId: string | null;
     invoiceId: string | null;
+    noShowBillingDecision: string | null;
     title: string | null;
     patientName: string;
 }
@@ -212,6 +213,7 @@ function eventToOccurrence(event: Record<string, any>, start: Date): ReportOccur
         patientId,
         eventTypeId: event.eventTypeId ?? null,
         invoiceId: event.invoiceId ?? null,
+        noShowBillingDecision: event.noShowBillingDecision ?? null,
         title: typeof event.title === 'string' ? event.title : event.title?.title ?? null,
         patientName: patientDisplayName(event.patient)
     };
@@ -315,10 +317,15 @@ function blankActivityTotals() {
         total: 0,
         completed: 0,
         cancelled: 0,
+        noShow: 0,
+        noShowInvoiced: 0,
+        noShowWaived: 0,
+        noShowPendingBilling: 0,
         confirmed: 0,
         pastUnresolved: 0,
         deliveredMinutes: 0,
-        cancellationRate: 0
+        cancellationRate: 0,
+        noShowRate: 0
     };
 }
 
@@ -329,6 +336,15 @@ function accumulateActivity(target: ReturnType<typeof blankActivityTotals>, occu
         target.deliveredMinutes += occurrence.durationMinutes;
     } else if (occurrence.status === 'CANCELLED') {
         target.cancelled += 1;
+    } else if (occurrence.status === 'NO_SHOW') {
+        target.noShow += 1;
+        if (occurrence.invoiceId) {
+            target.noShowInvoiced += 1;
+        } else if (occurrence.noShowBillingDecision === 'WAIVED') {
+            target.noShowWaived += 1;
+        } else {
+            target.noShowPendingBilling += 1;
+        }
     } else {
         target.confirmed += 1;
         if (occurrence.end.getTime() < Date.now()) target.pastUnresolved += 1;
@@ -336,8 +352,9 @@ function accumulateActivity(target: ReturnType<typeof blankActivityTotals>, occu
 }
 
 function finishActivity(target: ReturnType<typeof blankActivityTotals>) {
-    const denominator = target.completed + target.cancelled;
+    const denominator = target.completed + target.cancelled + target.noShow;
     target.cancellationRate = denominator ? Math.round((target.cancelled / denominator) * 10_000) / 100 : 0;
+    target.noShowRate = denominator ? Math.round((target.noShow / denominator) * 10_000) / 100 : 0;
     target.deliveredMinutes = Math.round(target.deliveredMinutes);
     return target;
 }
@@ -503,7 +520,8 @@ export async function aggregateActivity(
             title: row.title,
             status: row.status,
             operatorId: row.calendarId,
-            invoiceId: row.invoiceId
+            invoiceId: row.invoiceId,
+            noShowBillingDecision: row.noShowBillingDecision
         }))
     };
 }

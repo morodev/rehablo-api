@@ -20,6 +20,15 @@ export interface AgendaEventAttributes {
     recurrence?: string | null;
     duration?: string | null;
     status?: string | null;
+    /** Segnalazione operativa: il paziente non si e' presentato entro il tempo di tolleranza. */
+    missedArrivalReportedAt?: Date | null;
+    missedArrivalReportedBy?: string | null;
+    /** Chiusura della segnalazione dopo il contatto della segreteria/operatore. */
+    missedArrivalResolvedAt?: Date | null;
+    missedArrivalResolvedBy?: string | null;
+    missedArrivalResolution?: string | null;
+    /** Per NO_SHOW: PENDING = da decidere, WAIVED = scelto di non addebitare. */
+    noShowBillingDecision?: string | null;
     erasable?: boolean | null;
     eventTypeId?: string | null;
     /**
@@ -53,6 +62,12 @@ export class AgendaEvent
     declare recurrence: string | null;
     declare duration: string | null;
     declare status: string | null;
+    declare missedArrivalReportedAt: Date | null;
+    declare missedArrivalReportedBy: string | null;
+    declare missedArrivalResolvedAt: Date | null;
+    declare missedArrivalResolvedBy: string | null;
+    declare missedArrivalResolution: string | null;
+    declare noShowBillingDecision: string | null;
     declare erasable: boolean | null;
     declare eventTypeId: string | null;
     declare invoiceId: string | null;
@@ -75,6 +90,12 @@ AgendaEvent.init(
         recurrence: DataTypes.STRING,
         duration: DataTypes.STRING,
         status: DataTypes.STRING,
+        missedArrivalReportedAt: { type: DataTypes.DATE, allowNull: true },
+        missedArrivalReportedBy: { type: DataTypes.UUID, allowNull: true },
+        missedArrivalResolvedAt: { type: DataTypes.DATE, allowNull: true },
+        missedArrivalResolvedBy: { type: DataTypes.UUID, allowNull: true },
+        missedArrivalResolution: { type: DataTypes.STRING(24), allowNull: true },
+        noShowBillingDecision: { type: DataTypes.STRING(16), allowNull: true },
         erasable: { type: DataTypes.BOOLEAN, defaultValue: true },
         eventTypeId: { type: DataTypes.UUID, allowNull: true },
         invoiceId: {
@@ -90,7 +111,8 @@ AgendaEvent.init(
         indexes: [
             { name: 'agenda_events_structure_start_status_idx', fields: ['structureId', 'start', 'status'] },
             { name: 'agenda_events_calendar_start_status_idx', fields: ['calendarId', 'start', 'status'] },
-            { name: 'agenda_events_patient_start_idx', fields: ['patientId', 'start'] }
+            { name: 'agenda_events_patient_start_idx', fields: ['patientId', 'start'] },
+            { name: 'agenda_events_missed_arrival_idx', fields: ['structureId', 'missedArrivalReportedAt', 'missedArrivalResolvedAt'] }
         ]
     }
 );

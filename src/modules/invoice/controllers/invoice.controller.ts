@@ -506,6 +506,13 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             if (cancelledEvent) {
                 return { kind: 'cancelled-appointment' } as const;
             }
+            const waivedNoShow = agendaEvents.find((event) =>
+                String(event.get('status') ?? '').toUpperCase() === 'NO_SHOW'
+                && String(event.get('noShowBillingDecision') ?? '').toUpperCase() === 'WAIVED'
+            );
+            if (waivedNoShow) {
+                return { kind: 'waived-no-show' } as const;
+            }
 
             const legacyLinkedEvent = agendaEvents.find((event) => Boolean(event.get('invoiceId')));
             if (legacyLinkedEvent) {
@@ -661,7 +668,11 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             await Promise.all(agendaEvents.map((event) => event.update(
                 {
                     ...(agendaEvents.length === 1 ? { invoiceId } : {}),
-                    status: 'COMPLETED',
+                    // La fattura descrive la scelta economica, non trasforma un'assenza
+                    // in una prestazione erogata: il no-show resta tale nei report.
+                    status: String(event.get('status') ?? '').toUpperCase() === 'NO_SHOW'
+                        ? 'NO_SHOW'
+                        : 'COMPLETED',
                     erasable: false
                 },
                 { transaction: t }
@@ -682,6 +693,13 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     }
     if (transactionResult.kind === 'cancelled-appointment') {
         return sendErrorResponse(res, 422, 'Un appuntamento annullato non può essere fatturato');
+    }
+    if (transactionResult.kind === 'waived-no-show') {
+        return sendErrorResponse(
+            res,
+            409,
+            'Il no-show è segnato come non addebitabile. Modifica prima la decisione economica.'
+        );
     }
     if (transactionResult.kind === 'recurring-event') {
         return sendErrorResponse(

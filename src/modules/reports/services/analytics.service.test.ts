@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
     AnalyticsQuery,
+    ReportOccurrence,
+    aggregateActivity,
     comparisonRange,
     expandRecurringEvent,
     percentageChange
@@ -85,5 +87,40 @@ describe('analytics comparisons', () => {
     it('returns null when a percentage variation has no meaningful baseline', () => {
         assert.equal(percentageChange(10, 0), null);
         assert.equal(percentageChange(120, 100), 20);
+    });
+});
+
+describe('analytics no-show accounting', () => {
+    const occurrence = (overrides: Partial<ReportOccurrence>): ReportOccurrence => ({
+        id: 'event-1',
+        sourceEventId: 'event-1',
+        occurrenceKey: '2026-08-10T08:00:00.000Z',
+        start: new Date('2026-08-10T08:00:00.000Z'),
+        end: new Date('2026-08-10T09:00:00.000Z'),
+        durationMinutes: 60,
+        status: 'NO_SHOW',
+        calendarId: null,
+        structureId: null,
+        patientId: 'patient-1',
+        eventTypeId: null,
+        invoiceId: null,
+        noShowBillingDecision: 'PENDING',
+        title: 'Terapia',
+        patientName: 'Mario Rossi',
+        ...overrides
+    });
+
+    it('separates invoiced, waived and pending no-shows without counting delivered minutes', async () => {
+        const result = await aggregateActivity('unused', query({from: '2026-08-10', to: '2026-08-10'}), [
+            occurrence({id: 'pending'}),
+            occurrence({id: 'waived', noShowBillingDecision: 'WAIVED'}),
+            occurrence({id: 'invoiced', invoiceId: 'invoice-1'})
+        ]);
+
+        assert.equal(result.totals.noShow, 3);
+        assert.equal(result.totals.noShowPendingBilling, 1);
+        assert.equal(result.totals.noShowWaived, 1);
+        assert.equal(result.totals.noShowInvoiced, 1);
+        assert.equal(result.totals.deliveredMinutes, 0);
     });
 });

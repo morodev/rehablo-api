@@ -89,6 +89,8 @@ async function activityPayload(schema: string, query: AnalyticsQuery) {
                 total: percentageChange(current.totals.total, previous.totals.total),
                 completed: percentageChange(current.totals.completed, previous.totals.completed),
                 cancelled: percentageChange(current.totals.cancelled, previous.totals.cancelled),
+                noShow: percentageChange(current.totals.noShow, previous.totals.noShow),
+                noShowInvoiced: percentageChange(current.totals.noShowInvoiced, previous.totals.noShowInvoiced),
                 deliveredMinutes: percentageChange(current.totals.deliveredMinutes, previous.totals.deliveredMinutes)
             }
         }

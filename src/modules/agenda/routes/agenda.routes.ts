@@ -18,6 +18,9 @@ router.get('/agenda-events-patient', requirePermission('agenda', 'read'), agenda
 router.get('/agenda-events-holidays', requirePermission('agenda', 'read'), agendaController.findAllHolidays);
 router.post('/agenda-event', requirePermission('agenda', 'create'), agendaController.saveAgendaEvent);
 router.patch('/agenda-event', requirePermission('agenda', 'update'), agendaController.updateAgendaEvent);
+router.patch('/agenda-event/:agendaEventId/missed-arrival/report', requirePermission('agenda', 'update'), agendaController.reportMissedArrival);
+router.patch('/agenda-event/:agendaEventId/missed-arrival/resolve', requirePermission('agenda', 'update'), agendaController.resolveMissedArrival);
+router.patch('/agenda-event/:agendaEventId/no-show-billing', requirePermission('agenda', 'update'), agendaController.updateNoShowBillingDecision);
 router.delete('/agenda-event', requirePermission('agenda', 'delete'), agendaController.deleteAgendaEvent);
 router.get('/agenda-event-exceptions', requirePermission('agenda', 'read'), agendaController.getAllEventExceptions);
 router.patch('/recurring-event', requirePermission('agenda', 'update'), agendaController.updateRecurringEvent);
