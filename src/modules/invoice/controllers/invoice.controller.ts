@@ -21,7 +21,7 @@ import { evalTotals, EvalTotalsResult, toPersistedTotals } from '../utils/evalTo
 import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
 import { buildFiscalNotes, FiscalProfile, isStampDutyDue, resolveFiscalProfile } from '../utils/fiscalRegime.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
-import { decorateInvoicesWithPayments } from '../services/payment.service.js';
+import { decorateInvoicesWithPayments, syncInvoicePaymentStatus } from '../services/payment.service.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AGENDA_SCOPE_FIELDS = {
@@ -148,6 +148,17 @@ function invoiceLocalDate(value: Date): string {
     return `${byType.year}-${byType.month}-${byType.day}`;
 }
 
+const money = (value: unknown): number => Math.round((Number(value) || 0) * 100) / 100;
+
+interface AppointmentPaymentToTransfer {
+    agendaEventId: string;
+    amount: number;
+    paidAt: string | null;
+    method: string | null;
+    note: string | null;
+    recordedBy: string | null;
+}
+
 /**
  * Appuntamenti completati e non ancora fatturati utilizzabili nella nuova fattura.
  * Prezzo e IVA arrivano dal servizio di catalogo collegato, mai dallo snapshot dell'agenda.
@@ -238,7 +249,13 @@ export const findEligibleAppointments = asyncHandler(async (req: Request, res: R
                 sellingPrice: Number(service.sellingPrice) || 0,
                 categoryId: service.categoryId,
                 isActive: service.isActive
-            } : null
+            } : null,
+            appointmentExpectedAmount: service ? Number(service.sellingPrice) || 0 : null,
+            appointmentPriceSource: service ? 'SERVICE' : null,
+            appointmentPaymentStatus: event.appointmentPaymentStatus ?? 'unpaid',
+            appointmentPaidAmount: event.appointmentPaidAmount ?? null,
+            appointmentPaidAt: event.appointmentPaidAt ?? null,
+            appointmentPaymentMethod: event.appointmentPaymentMethod ?? null
         };
     });
 
@@ -464,6 +481,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     // una fattura senza le sue righe.
     const transactionResult = await sequelize.transaction(async (t) => {
         let agendaEvents: AgendaEvent[] = [];
+        let appointmentPayments: AppointmentPaymentToTransfer[] = [];
 
         if (agendaEventIds.length > 0) {
             // Tutti gli appuntamenti vengono bloccati nello stesso ordine: oltre a rendere atomico
@@ -564,6 +582,31 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                     availableAt: invalidDateEvent.get('start') as string | null
                 } as const;
             }
+
+            appointmentPayments = agendaEvents.flatMap((event) => {
+                const paymentStatus = String(event.get('appointmentPaymentStatus') ?? '').toLowerCase();
+                const amount = money(event.get('appointmentPaidAmount'));
+                if (!['paid', 'partial'].includes(paymentStatus) || amount <= 0) return [];
+
+                return [{
+                    agendaEventId: event.id,
+                    amount,
+                    paidAt: event.get('appointmentPaidAt') as string | null,
+                    method: event.get('appointmentPaymentMethod') as string | null,
+                    note: event.get('appointmentPaymentNote') as string | null,
+                    recordedBy: event.get('appointmentPaymentRecordedBy') as string | null
+                }];
+            });
+            const appointmentPaidTotal = money(
+                appointmentPayments.reduce((sum, payment) => sum + payment.amount, 0)
+            );
+            if (appointmentPaidTotal > money(fiscal.totals.invoiceTotal) + 0.009) {
+                return {
+                    kind: 'appointment-overpayment',
+                    paidAmount: appointmentPaidTotal,
+                    invoiceTotal: money(fiscal.totals.invoiceTotal)
+                } as const;
+            }
         }
 
         const tenant = await Tenant.findByPk(tenantId, { transaction: t, lock: t.LOCK.UPDATE });
@@ -640,16 +683,41 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             )
         ]);
 
-        // Compatibility during the frontend/backend rolling deployment: an old client can still
-        // emit an already-paid document. Convert that flag into a real, dated movement.
-        if (String(requestedStatus ?? '').toLowerCase() === 'paid' && fiscal.totals.invoiceTotal > 0) {
+        await Promise.all(appointmentPayments.map((payment) =>
+            InvoicePaymentScoped.create(
+                {
+                    invoiceId,
+                    agendaEventId: payment.agendaEventId,
+                    amount: payment.amount,
+                    paidAt: payment.paidAt ? new Date(`${payment.paidAt}T12:00:00.000Z`) : null,
+                    method: payment.method,
+                    note: payment.note,
+                    source: 'APPOINTMENT',
+                    status: 'POSTED',
+                    createdByUserId: payment.recordedBy ?? getUserId(req)
+                },
+                { transaction: t }
+            )
+        ));
+
+        const appointmentPaidTotal = money(
+            appointmentPayments.reduce((sum, payment) => sum + payment.amount, 0)
+        );
+        const requestedAsPaid = String(requestedStatus ?? '').toLowerCase() === 'paid';
+        const residualToRegister = requestedAsPaid
+            ? money(Math.max(money(fiscal.totals.invoiceTotal) - appointmentPaidTotal, 0))
+            : 0;
+
+        // CompatibilitÃ  con i client che emettono direttamente un documento saldato. Se esistono
+        // giÃ  incassi delle sedute, viene registrato soltanto l'eventuale residuo e mai un doppione.
+        if (residualToRegister > 0) {
             const paidAt = typeof paymentDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(paymentDate)
                 ? paymentDate
                 : String(invoiceFields.emissionDate ?? new Date().toISOString()).slice(0, 10);
             await InvoicePaymentScoped.create(
                 {
                     invoiceId,
-                    amount: fiscal.totals.invoiceTotal,
+                    amount: residualToRegister,
                     paidAt: new Date(`${paidAt}T12:00:00.000Z`),
                     method: invoiceFields.paymentMethod ?? null,
                     source: 'USER',
@@ -658,7 +726,9 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                 },
                 { transaction: t }
             );
-            await createdInvoice.update({ status: 'paid' }, { transaction: t });
+        }
+        if (appointmentPayments.length > 0 || residualToRegister > 0) {
+            await syncInvoicePaymentStatus(schema, invoiceId, t);
         }
 
         // Fattura emessa a partire da un appuntamento: il collegamento va scritto nella STESSA
@@ -722,6 +792,13 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             409,
             'Non è possibile fatturare un appuntamento futuro. La fattura sarà disponibile dall’inizio della seduta.',
             { availableAt: transactionResult.availableAt }
+        );
+    }
+    if (transactionResult.kind === 'appointment-overpayment') {
+        return sendErrorResponse(
+            res,
+            409,
+            `Gli incassi selezionati (â‚¬ ${transactionResult.paidAmount.toFixed(2)}) superano il totale della fattura (â‚¬ ${transactionResult.invoiceTotal.toFixed(2)}). Correggi gli incassi prima di emettere.`
         );
     }
 

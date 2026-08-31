@@ -4,12 +4,14 @@ import { sequelize } from '../../../config/database.js';
 export const INVOICE_PAYMENT_STATUSES = ['POSTED', 'VOID'] as const;
 export type InvoicePaymentStatus = (typeof INVOICE_PAYMENT_STATUSES)[number];
 
-export const INVOICE_PAYMENT_SOURCES = ['USER', 'LEGACY_IMPORT'] as const;
+export const INVOICE_PAYMENT_SOURCES = ['USER', 'LEGACY_IMPORT', 'APPOINTMENT'] as const;
 export type InvoicePaymentSource = (typeof INVOICE_PAYMENT_SOURCES)[number];
 
 export interface InvoicePaymentAttributes {
     id: string;
     invoiceId: string;
+    /** Seduta che ha originato il movimento, valorizzata solo per gli incassi pre-fattura. */
+    agendaEventId?: string | null;
     amount: number;
     /** Nullable only for payments imported from the old paid/unpaid flag. */
     paidAt?: Date | null;
@@ -26,6 +28,7 @@ export interface InvoicePaymentAttributes {
 export type InvoicePaymentCreationAttributes = Optional<
     InvoicePaymentAttributes,
     | 'id'
+    | 'agendaEventId'
     | 'paidAt'
     | 'method'
     | 'note'
@@ -43,6 +46,7 @@ export class InvoicePayment
     implements InvoicePaymentAttributes {
     declare id: string;
     declare invoiceId: string;
+    declare agendaEventId: string | null;
     declare amount: number;
     declare paidAt: Date | null;
     declare method: string | null;
@@ -59,6 +63,7 @@ InvoicePayment.init(
     {
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
         invoiceId: { type: DataTypes.UUID, allowNull: false },
+        agendaEventId: { type: DataTypes.UUID, allowNull: true },
         amount: { type: DataTypes.DECIMAL(10, 2), allowNull: false },
         paidAt: { type: DataTypes.DATEONLY, allowNull: true },
         method: { type: DataTypes.STRING, allowNull: true },
@@ -76,7 +81,8 @@ InvoicePayment.init(
         tableName: 'invoice_payments',
         indexes: [
             { name: 'invoice_payments_invoice_status_idx', fields: ['invoiceId', 'status'] },
-            { name: 'invoice_payments_paid_at_idx', fields: ['paidAt'] }
+            { name: 'invoice_payments_paid_at_idx', fields: ['paidAt'] },
+            { name: 'invoice_payments_agenda_event_unique', unique: true, fields: ['agendaEventId'] }
         ]
     }
 );

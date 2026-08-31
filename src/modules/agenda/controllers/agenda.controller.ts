@@ -8,6 +8,7 @@ import { sendNewEventMail } from '../../../services/email.service.js';
 import AgendaEvent from '../models/agendaEvent.model.js';
 import AgendaEventException from '../models/agendaEventException.model.js';
 import EventType from '../models/eventType.model.js';
+import Service from '../../products-services/models/service.model.js';
 import Patient from '../../patients/models/patient.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import TimeOffRequest from '../models/timeOffRequest.model.js';
@@ -34,6 +35,8 @@ const MISSED_ARRIVAL_GRACE_MS = 15 * 60_000;
 const APPOINTMENT_STATUSES = new Set(['CONFIRMED', 'COMPLETED', 'CANCELLED', 'NO_SHOW']);
 const MISSED_ARRIVAL_RESOLUTIONS = new Set(['ARRIVING', 'CANCELLED', 'NO_SHOW', 'COMPLETED']);
 const NO_SHOW_BILLING_DECISIONS = new Set(['PENDING', 'WAIVED']);
+const APPOINTMENT_PAYMENT_STATUSES = new Set(['unpaid', 'partial', 'paid']);
+const DATE_ONLY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 const ATTENDANCE_MANAGED_FIELDS = [
     'missedArrivalReportedAt',
     'missedArrivalReportedBy',
@@ -42,9 +45,76 @@ const ATTENDANCE_MANAGED_FIELDS = [
     'missedArrivalResolution',
     'noShowBillingDecision'
 ] as const;
+const APPOINTMENT_PAYMENT_MANAGED_FIELDS = [
+    'appointmentPaymentStatus',
+    'appointmentPaidAmount',
+    'appointmentPaidAt',
+    'appointmentPaymentMethod',
+    'appointmentPaymentNote',
+    'appointmentPaymentRecordedBy'
+] as const;
 
 function removeAttendanceManagedFields(payload: Record<string, any>): void {
     ATTENDANCE_MANAGED_FIELDS.forEach((field) => delete payload[field]);
+}
+
+function removeAppointmentPaymentManagedFields(payload: Record<string, any>): void {
+    APPOINTMENT_PAYMENT_MANAGED_FIELDS.forEach((field) => delete payload[field]);
+}
+
+type AppointmentPriceSource = 'SERVICE' | 'EVENT_TYPE' | null;
+interface AppointmentPrice {
+    amount: number | null;
+    source: AppointmentPriceSource;
+}
+
+const roundMoney = (value: unknown): number => Math.round(Number(value) * 100) / 100;
+
+function isValidDateOnly(value: unknown): value is string {
+    if (typeof value !== 'string' || !DATE_ONLY_REGEX.test(value)) return false;
+    const parsed = new Date(`${value}T12:00:00.000Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function todayInRome(): string {
+    return new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Rome' });
+}
+
+/** Risolve in blocco il prezzo autorevole: servizio collegato, altrimenti prezzo del tipo legacy. */
+async function appointmentPricesByEvent(
+    schema: string,
+    events: Array<Record<string, any>>
+): Promise<Map<string, AppointmentPrice>> {
+    const eventTypeIds = [...new Set(events.map((event) => event.eventTypeId).filter(Boolean))] as string[];
+    const eventTypes = eventTypeIds.length
+        ? await EventType.schema(schema).findAll({ where: { id: { [Op.in]: eventTypeIds } } })
+        : [];
+    const eventTypeById = new Map(eventTypes.map((eventType) => [eventType.id, eventType]));
+    const serviceIds = [...new Set(eventTypes.map((eventType) => eventType.linkedServiceId).filter(Boolean))] as string[];
+    const services = serviceIds.length
+        ? await Service.schema(schema).findAll({ where: { id: { [Op.in]: serviceIds } } })
+        : [];
+    const serviceById = new Map(services.map((service) => [service.id, service]));
+
+    return new Map<string, AppointmentPrice>(events.map((event): [string, AppointmentPrice] => {
+        const eventType = event.eventTypeId ? eventTypeById.get(event.eventTypeId) : null;
+        if (eventType?.linkedServiceId) {
+            const service = serviceById.get(eventType.linkedServiceId);
+            const servicePrice = Number(service?.sellingPrice);
+            return [event.id, {
+                amount: Number.isFinite(servicePrice) && servicePrice >= 0 ? roundMoney(servicePrice) : null,
+                source: service ? 'SERVICE' : null
+            }];
+        }
+
+        const eventTypePrice = Number(eventType?.price);
+        return [event.id, {
+            amount: Number.isFinite(eventTypePrice) && eventType?.price !== null && eventType?.price !== undefined
+                ? roundMoney(eventTypePrice)
+                : null,
+            source: eventType?.price !== null && eventType?.price !== undefined ? 'EVENT_TYPE' : null
+        }];
+    }));
 }
 
 function normalizedStatus(value: unknown): string {
@@ -67,10 +137,16 @@ async function withInvoiceStatus(
         event.get({ plain: true }) as Record<string, any>
     );
     const eventIds = plainEvents.map((event) => event.id as string).filter(Boolean);
-    const links = await getInvoiceAgendaLinksByEventIds(schema, eventIds);
+    const [links, appointmentPrices] = await Promise.all([
+        getInvoiceAgendaLinksByEventIds(schema, eventIds),
+        appointmentPricesByEvent(schema, plainEvents)
+    ]);
     const linkedInvoiceByEventId = new Map(links.map((link) => [link.agendaEventId, link.invoiceId]));
     plainEvents.forEach((event) => {
         event.invoiceId = event.invoiceId ?? linkedInvoiceByEventId.get(event.id) ?? null;
+        const price = appointmentPrices.get(event.id);
+        event.appointmentExpectedAmount = price?.amount ?? null;
+        event.appointmentPriceSource = price?.source ?? null;
     });
     const invoiceIds = Array.from(new Set(
         plainEvents
@@ -370,6 +446,7 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
     // copia/incolla di un appuntamento gia' fatturato non deve duplicarne invoiceId.
     delete payload.invoiceId;
     removeAttendanceManagedFields(payload);
+    removeAppointmentPaymentManagedFields(payload);
 
     if (payload.status !== undefined) {
         const status = normalizedStatus(payload.status);
@@ -416,6 +493,7 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     const event = { ...req.body.event };
     delete event.invoiceId;
     removeAttendanceManagedFields(event);
+    removeAppointmentPaymentManagedFields(event);
 
     const current = await AgendaEvent.schema(schema).findOne({
         where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
@@ -485,6 +563,116 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
 
     const updated = await AgendaEvent.schema(schema).findByPk(id);
     return sendSuccessResponse(res, 200, updated, 'Agenda event updated');
+});
+
+/** Registra l'incasso della singola seduta senza creare o modificare una fattura. */
+export const updateAppointmentPayment = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const id = req.params.agendaEventId;
+    const requestedStatus = String(req.body?.status ?? '').trim().toLowerCase();
+
+    if (!UUID_REGEX.test(id)) {
+        return sendErrorResponse(res, 400, 'Appuntamento non valido');
+    }
+    if (!APPOINTMENT_PAYMENT_STATUSES.has(requestedStatus)) {
+        return sendErrorResponse(res, 400, 'Stato incasso non valido');
+    }
+
+    const event = await AgendaEvent.schema(schema).findOne({
+        where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
+    });
+    if (!event) {
+        return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
+    }
+    if (event.get('recurrence') || event.get('recurringEventId')) {
+        return sendErrorResponse(res, 422, 'Prima di registrare l\'incasso, separa la singola occorrenza dalla serie');
+    }
+    const linkedInvoiceId = await getLinkedInvoiceId(schema, event.id, event.get('invoiceId') as string | null);
+    if (linkedInvoiceId) {
+        return sendErrorResponse(res, 409, 'Appuntamento giÃ  fatturato: gestisci i pagamenti dalla fattura', { invoiceId: linkedInvoiceId });
+    }
+    const appointmentStatus = normalizedStatus(event.get('status'));
+    if (!['CONFIRMED', 'COMPLETED'].includes(appointmentStatus)) {
+        return sendErrorResponse(res, 409, 'L\'incasso Ã¨ disponibile solo per una seduta confermata o effettuata');
+    }
+    const patient = event.get('patient') as Record<string, unknown> | null;
+    if (!event.get('patientId') && !patient?.id) {
+        return sendErrorResponse(res, 422, 'L\'incasso richiede un appuntamento con paziente');
+    }
+    const startAt = Date.parse(String(event.get('start') ?? ''));
+    if (!Number.isFinite(startAt) || startAt > Date.now()) {
+        return sendErrorResponse(res, 409, 'Non Ã¨ possibile registrare l\'incasso di un appuntamento futuro');
+    }
+
+    if (requestedStatus === 'unpaid') {
+        await event.update({
+            appointmentPaymentStatus: 'unpaid',
+            appointmentPaidAmount: null,
+            appointmentPaidAt: null,
+            appointmentPaymentMethod: null,
+            appointmentPaymentNote: null,
+            appointmentPaymentRecordedBy: req.access!.userId
+        });
+        const [decorated] = await withInvoiceStatus(schema, [event]);
+        return sendSuccessResponse(res, 200, decorated, 'Incasso seduta rimosso');
+    }
+
+    const paidAt = req.body?.paidAt;
+    if (!isValidDateOnly(paidAt)) {
+        return sendErrorResponse(res, 400, 'La data dell\'incasso Ã¨ obbligatoria');
+    }
+    if (paidAt > todayInRome()) {
+        return sendErrorResponse(res, 400, 'La data dell\'incasso non puÃ² essere futura');
+    }
+
+    const plainEvent = event.get({ plain: true }) as Record<string, any>;
+    const expected = (await appointmentPricesByEvent(schema, [plainEvent])).get(event.id)
+        ?? { amount: null, source: null };
+    const rawAmount = req.body?.amount;
+    const amount = (rawAmount === null || rawAmount === undefined || rawAmount === '') && requestedStatus === 'paid'
+        ? expected.amount
+        : roundMoney(rawAmount);
+    if (amount === null || !Number.isFinite(amount) || amount <= 0) {
+        return sendErrorResponse(res, 400, 'L\'importo dell\'incasso deve essere maggiore di zero');
+    }
+    if (expected.amount !== null && expected.amount > 0 && amount > expected.amount + 0.009) {
+        return sendErrorResponse(
+            res,
+            409,
+            `Il prezzo della seduta Ã¨ â‚¬ ${expected.amount.toFixed(2)}: l\'incasso non puÃ² essere superiore`,
+            { expectedAmount: expected.amount, priceSource: expected.source }
+        );
+    }
+
+    const method = typeof req.body?.method === 'string' ? req.body.method.trim() || null : null;
+    const note = typeof req.body?.note === 'string' ? req.body.note.trim() || null : null;
+    if (method && method.length > 255) {
+        return sendErrorResponse(res, 400, 'Metodo di pagamento troppo lungo');
+    }
+    if (note && note.length > 2000) {
+        return sendErrorResponse(res, 400, 'Nota incasso troppo lunga');
+    }
+
+    const paymentStatus = expected.amount !== null && expected.amount > 0 && amount < expected.amount - 0.009
+        ? 'partial'
+        : 'paid';
+    await event.update({
+        appointmentPaymentStatus: paymentStatus,
+        appointmentPaidAmount: amount,
+        appointmentPaidAt: paidAt,
+        appointmentPaymentMethod: method,
+        appointmentPaymentNote: note,
+        appointmentPaymentRecordedBy: req.access!.userId,
+        ...(req.body?.markCompleted === true && appointmentStatus === 'CONFIRMED' ? { status: 'COMPLETED' } : {})
+    });
+
+    const [decorated] = await withInvoiceStatus(schema, [event]);
+    return sendSuccessResponse(
+        res,
+        200,
+        decorated,
+        paymentStatus === 'partial' ? 'Acconto seduta registrato' : 'Incasso seduta registrato'
+    );
 });
 
 /**
@@ -801,6 +989,7 @@ export default {
     findAgendaEventsByUsers,
     findAppointmentsForPatientById,
     updateAgendaEvent,
+    updateAppointmentPayment,
     reportMissedArrival,
     resolveMissedArrival,
     updateNoShowBillingDecision,

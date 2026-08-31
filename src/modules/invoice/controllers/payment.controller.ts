@@ -5,6 +5,7 @@ import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import Invoice from '../models/invoice.model.js';
 import InvoicePayment from '../models/invoicePayment.model.js';
+import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import { syncInvoicePaymentStatus } from '../services/payment.service.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -125,6 +126,19 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
             },
             { transaction }
         );
+        if (payment.source === 'APPOINTMENT' && payment.agendaEventId) {
+            await AgendaEvent.schema(schema).update(
+                {
+                    appointmentPaymentStatus: 'unpaid',
+                    appointmentPaidAmount: null,
+                    appointmentPaidAt: null,
+                    appointmentPaymentMethod: null,
+                    appointmentPaymentNote: null,
+                    appointmentPaymentRecordedBy: getUserId(req)
+                },
+                { where: { id: payment.agendaEventId }, transaction }
+            );
+        }
         const summary = await syncInvoicePaymentStatus(schema, invoice.id, transaction);
         return { kind: 'voided', payment, summary } as const;
     });

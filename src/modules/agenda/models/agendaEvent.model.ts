@@ -29,6 +29,13 @@ export interface AgendaEventAttributes {
     missedArrivalResolution?: string | null;
     /** Per NO_SHOW: PENDING = da decidere, WAIVED = scelto di non addebitare. */
     noShowBillingDecision?: string | null;
+    /** Incasso operativo della seduta, indipendente dall'eventuale fattura emessa in seguito. */
+    appointmentPaymentStatus?: 'unpaid' | 'partial' | 'paid' | null;
+    appointmentPaidAmount?: number | null;
+    appointmentPaidAt?: string | null;
+    appointmentPaymentMethod?: string | null;
+    appointmentPaymentNote?: string | null;
+    appointmentPaymentRecordedBy?: string | null;
     erasable?: boolean | null;
     eventTypeId?: string | null;
     /**
@@ -68,6 +75,12 @@ export class AgendaEvent
     declare missedArrivalResolvedBy: string | null;
     declare missedArrivalResolution: string | null;
     declare noShowBillingDecision: string | null;
+    declare appointmentPaymentStatus: 'unpaid' | 'partial' | 'paid' | null;
+    declare appointmentPaidAmount: number | null;
+    declare appointmentPaidAt: string | null;
+    declare appointmentPaymentMethod: string | null;
+    declare appointmentPaymentNote: string | null;
+    declare appointmentPaymentRecordedBy: string | null;
     declare erasable: boolean | null;
     declare eventTypeId: string | null;
     declare invoiceId: string | null;
@@ -96,6 +109,12 @@ AgendaEvent.init(
         missedArrivalResolvedBy: { type: DataTypes.UUID, allowNull: true },
         missedArrivalResolution: { type: DataTypes.STRING(24), allowNull: true },
         noShowBillingDecision: { type: DataTypes.STRING(16), allowNull: true },
+        appointmentPaymentStatus: { type: DataTypes.STRING(16), allowNull: true, defaultValue: 'unpaid' },
+        appointmentPaidAmount: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
+        appointmentPaidAt: { type: DataTypes.DATEONLY, allowNull: true },
+        appointmentPaymentMethod: { type: DataTypes.STRING, allowNull: true },
+        appointmentPaymentNote: { type: DataTypes.TEXT, allowNull: true },
+        appointmentPaymentRecordedBy: { type: DataTypes.UUID, allowNull: true },
         erasable: { type: DataTypes.BOOLEAN, defaultValue: true },
         eventTypeId: { type: DataTypes.UUID, allowNull: true },
         invoiceId: {
@@ -112,7 +131,8 @@ AgendaEvent.init(
             { name: 'agenda_events_structure_start_status_idx', fields: ['structureId', 'start', 'status'] },
             { name: 'agenda_events_calendar_start_status_idx', fields: ['calendarId', 'start', 'status'] },
             { name: 'agenda_events_patient_start_idx', fields: ['patientId', 'start'] },
-            { name: 'agenda_events_missed_arrival_idx', fields: ['structureId', 'missedArrivalReportedAt', 'missedArrivalResolvedAt'] }
+            { name: 'agenda_events_missed_arrival_idx', fields: ['structureId', 'missedArrivalReportedAt', 'missedArrivalResolvedAt'] },
+            { name: 'agenda_events_payment_status_idx', fields: ['structureId', 'appointmentPaymentStatus', 'appointmentPaidAt'] }
         ]
     }
 );
