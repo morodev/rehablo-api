@@ -71,6 +71,12 @@ export function requirePermission(
             return sendErrorResponse(res, 401, 'unauthorized');
         }
 
+        // I principal paziente usano esclusivamente endpoint/DTO dedicati. Evita che un nuovo
+        // permesso aggiunto in futuro apra accidentalmente una rotta progettata per lo staff.
+        if (req.user.actor === 'patient') {
+            return sendErrorResponse(res, 403, 'Questa operazione è riservata allo staff');
+        }
+
         // Il super admin di piattaforma bypassa il controllo.
         if (req.user.isSuperAdmin) {
             req.access = {
@@ -110,6 +116,9 @@ export function requireAnyPermission(...required: Array<[Resource, Action]>) {
     return (req: Request, res: Response, next: NextFunction) => {
         if (!req.user) {
             return sendErrorResponse(res, 401, 'unauthorized');
+        }
+        if (req.user.actor === 'patient') {
+            return sendErrorResponse(res, 403, 'Questa operazione è riservata allo staff');
         }
         if (req.user.isSuperAdmin) return next();
 

@@ -6,11 +6,20 @@ import rbacController from '../controllers/rbac.controller.js';
 import tenantController from '../controllers/tenant.controller.js';
 import userController from '../controllers/user.controller.js';
 import structureController from '../controllers/structure.controller.js';
+import sessionController from '../controllers/session.controller.js';
+import { simpleRateLimit } from '../../../middleware/simpleRateLimit.js';
 
 const router = Router();
 
 // --- Authentication ---
 router.post('/auth/login', authController.login);
+router.post(
+    '/auth/session',
+    simpleRateLimit({ namespace: 'auth-session', windowMs: 15 * 60 * 1000, max: 20 }),
+    sessionController.createSession
+);
+router.post('/auth/session/context', sessionController.selectSessionContext);
+router.get('/auth/session/contexts', requireAuth, sessionController.listSessionContexts);
 // Refresh e logout si autenticano con il refresh token nel body, non con l'access token:
 // devono funzionare anche quando quest'ultimo è già scaduto (dura pochi minuti).
 router.post('/auth/refresh', authController.refresh);

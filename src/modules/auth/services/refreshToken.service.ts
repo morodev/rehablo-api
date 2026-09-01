@@ -17,6 +17,8 @@ export interface IssuedRefreshToken {
 export interface RefreshContext {
     tenantId?: string | null;
     structureId?: string | null;
+    actor?: 'staff' | 'patient';
+    patientAccessId?: string | null;
 }
 
 function hashToken(token: string): string {
@@ -56,6 +58,8 @@ export async function issueRefreshToken(
         expiresAt,
         tenantId: context.tenantId ?? null,
         structureId: context.structureId ?? null,
+        actor: context.actor ?? 'staff',
+        patientAccessId: context.patientAccessId ?? null,
         ...clientInfo(req)
     });
 
@@ -91,6 +95,8 @@ export interface RotationSuccess {
     familyId: string;
     tenantId: string | null;
     structureId: string | null;
+    actor: 'staff' | 'patient';
+    patientAccessId: string | null;
     refresh: IssuedRefreshToken;
 }
 
@@ -132,6 +138,8 @@ export async function rotateRefreshToken(
     const userId = record.get('userId') as string;
     const tenantId = (record.get('tenantId') as string) ?? null;
     const structureId = (record.get('structureId') as string) ?? null;
+    const actor = ((record.get('actor') as string) || 'staff') as 'staff' | 'patient';
+    const patientAccessId = (record.get('patientAccessId') as string) ?? null;
 
     const revokedAt = record.get('revokedAt') as Date | null;
 
@@ -143,8 +151,13 @@ export async function rotateRefreshToken(
         // Solo una ROTAZIONE recente è compatibile con una risposta persa. Logout, cambio sede
         // e reuse detection sono revoche volontarie: lì il rifiuto deve restare secco.
         if (revokedReason === 'rotated' && withinGrace) {
-            const refresh = await issueRefreshToken(req, userId, { tenantId, structureId }, familyId);
-            return { ok: true, userId, familyId, tenantId, structureId, refresh };
+            const refresh = await issueRefreshToken(
+                req,
+                userId,
+                { tenantId, structureId, actor, patientAccessId },
+                familyId
+            );
+            return { ok: true, userId, familyId, tenantId, structureId, actor, patientAccessId, refresh };
         }
 
         await revokeFamily(familyId, 'reuse_detected');
@@ -158,9 +171,32 @@ export async function rotateRefreshToken(
 
     // Rotazione: prima invalido il token presentato, poi ne emetto uno nuovo nella stessa famiglia.
     await record.update({ revokedAt: new Date(), revokedReason: 'rotated' });
-    const refresh = await issueRefreshToken(req, userId, { tenantId, structureId }, familyId);
+    const refresh = await issueRefreshToken(
+        req,
+        userId,
+        { tenantId, structureId, actor, patientAccessId },
+        familyId
+    );
 
-    return { ok: true, userId, familyId, tenantId, structureId, refresh };
+    return { ok: true, userId, familyId, tenantId, structureId, actor, patientAccessId, refresh };
+}
+
+/** Revoca soltanto le sessioni del collegamento paziente indicato. */
+export async function revokeForPatientAccess(patientAccessId: string, reason: string): Promise<number> {
+    const [affected] = await RefreshToken.update(
+        { revokedAt: new Date(), revokedReason: reason },
+        { where: { patientAccessId, revokedAt: { [Op.is]: null } } }
+    );
+    return affected;
+}
+
+/** Revoca le sessioni staff di un solo tenant senza interrompere gli altri centri. */
+export async function revokeForTenantMembership(userId: string, tenantId: string, reason: string): Promise<number> {
+    const [affected] = await RefreshToken.update(
+        { revokedAt: new Date(), revokedReason: reason },
+        { where: { userId, tenantId, actor: 'staff', revokedAt: { [Op.is]: null } } }
+    );
+    return affected;
 }
 
 /** Revoca il singolo token presentato (logout della sola sessione corrente). */

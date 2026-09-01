@@ -32,6 +32,12 @@ export interface AuthTokenPayload {
     role?: string | null;
     /** Permessi effettivi nel formato `resource:action:scope`. */
     perms?: string[];
+    /** Id della cartella locale selezionata per un principal paziente. */
+    pid?: string | null;
+    /** Id del collegamento globale account ↔ cartella. */
+    patientAccessId?: string | null;
+    /** Distingue un token applicativo da un token breve usato solo per scegliere il contesto. */
+    tokenUse?: 'application' | 'context_selection';
 
     [key: string]: unknown;
 }
@@ -67,6 +73,9 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
 
     try {
         const decoded = jwt.verify(token, env.jwtSecret) as AuthTokenPayload;
+        if (decoded.tokenUse === 'context_selection') {
+            return sendErrorResponse(res, 401, 'Seleziona un contesto prima di accedere ai dati');
+        }
         req.user = decoded;
         return next();
     } catch (err) {
@@ -76,14 +85,14 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
 
 /** Use on routes that must be restricted to super-admin users. */
 export function requireSuperAdmin(req: Request, res: Response, next: NextFunction) {
-    if (!req.user?.isSuperAdmin) {
+    if (req.user?.actor === 'patient' || !req.user?.isSuperAdmin) {
         return sendErrorResponse(res, 403, 'forbidden');
     }
     return next();
 }
 
 export function getCurrentTenantId(req: Request): string {
-    const tenantId = req.user?.tenants?.[0]?.id;
+    const tenantId = (req.user?.tid as string | undefined) ?? req.user?.tenants?.[0]?.id;
     if (!tenantId) {
         throw new Error('No tenant associated with the authenticated user');
     }

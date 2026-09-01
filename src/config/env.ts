@@ -107,6 +107,9 @@ export const env = {
      */
     refreshTokenGraceSeconds: positiveInt('REFRESH_TOKEN_GRACE_SECONDS', 60),
 
+    /** Durata del link monouso con cui il paziente attiva o collega un centro. */
+    patientPortalInviteTtlHours: positiveInt('PATIENT_PORTAL_INVITE_TTL_HOURS', 72),
+
     // Segreto per cifrare le credenziali dei dispositivi (API key dei vendor salvate per tenant).
     // In produzione impostare DEVICE_CREDENTIALS_SECRET a una stringa lunga e casuale.
     deviceCredentialsSecret: required('DEVICE_CREDENTIALS_SECRET', 'change-me-device-credentials-secret'),
@@ -124,6 +127,9 @@ export const env = {
     emailSecure: process.env.EMAIL_SECURE !== 'false',
     emailUser: process.env.EMAIL_AUTH_USER || '',
     emailPass: process.env.EMAIL_AUTH_PASS || '',
+    // Di default usa lo stesso indirizzo autenticato sull'SMTP: molti provider rifiutano alias
+    // non verificati con "Sender address rejected: not owned by user".
+    emailFrom: process.env.EMAIL_FROM || process.env.EMAIL_AUTH_USER || 'verification@rehablo.it',
 
     // CORS_ORIGIN: uno o più origin (dominio, senza path) separati da virgola, es.
     // "https://rehablo.it,https://www.rehablo.it". Eventuali slash finali vengono rimossi

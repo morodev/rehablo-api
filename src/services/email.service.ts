@@ -17,7 +17,19 @@ export const transporter = Nodemailer.createTransport({
     socketTimeout: 10_000
 });
 
-const emailDomain = process.env.EMAIL_DOMAIN || 'http://localhost:4200';
+// Il frontend usa HashLocationStrategy (`/#/route`). Normalizziamo anche configurazioni
+// storiche che includono già `/#` per evitare link con il frammento duplicato.
+const emailDomain = (process.env.EMAIL_DOMAIN || 'http://localhost:4200')
+    .replace(/\/+$/, '')
+    .replace(/\/#$/, '');
+
+export function frontendEmailLink(path: string): string {
+    return `${emailDomain}/#/${path.replace(/^\/+/, '')}`;
+}
+
+function sender(name: string): { name: string; address: string } {
+    return { name, address: env.emailFrom };
+}
 
 function baseTemplate(title: string, bodyHtml: string): string {
     return `<!DOCTYPE html>
@@ -42,9 +54,9 @@ function baseTemplate(title: string, bodyHtml: string): string {
 }
 
 export async function signUpSendMail(email: string, verificationToken: string) {
-    const link = `${emailDomain}/account-verification/${verificationToken}`;
+    const link = frontendEmailLink(`account-verification/${verificationToken}`);
     return transporter.sendMail({
-        from: '"Verifica account Rehablo" <verification@rehablo.it>',
+        from: sender('Verifica account Rehablo'),
         to: email,
         subject: 'Benvenuto in Rehablo',
         text: `Grazie per esserti registrato su Rehablo. Verifica il tuo account: ${link}`,
@@ -67,7 +79,7 @@ export async function sendNewEventMail(agendaEvent: any) {
     const hour = moment(agendaEvent.start).locale('it').format('LT');
 
     return transporter.sendMail({
-        from: '"Nuovo appuntamento" <appuntamenti@rehablo.it>',
+        from: sender('Nuovo appuntamento'),
         to: email,
         subject: "Dati di riepilogo per l'appuntamento",
         text: `Ciao ${name} ${surname}, è stato inserito un nuovo appuntamento ${day} ${eventDate} alle ${hour}.`,
@@ -81,14 +93,14 @@ export async function sendNewEventMail(agendaEvent: any) {
 }
 
 export async function sendForgotPasswordMail(email: string, resetPasswordToken: string) {
-    const link = `${emailDomain}/reset-password/${resetPasswordToken}`;
+    const link = frontendEmailLink(`reset-password/${resetPasswordToken}`);
 
     if (!env.isProduction || !env.emailHost) {
         console.log(`[email.service] reset password link for ${email}: ${link}`);
     }
 
     return transporter.sendMail({
-        from: '"Recupero password Rehablo" <forgotpassword@rehablo.it>',
+        from: sender('Recupero password Rehablo'),
         to: email,
         subject: 'Recupero password',
         text: `Reimposta la tua password: ${link}`,
@@ -96,6 +108,27 @@ export async function sendForgotPasswordMail(email: string, resetPasswordToken: 
             'Reimposta la password',
             `<p>Clicca sul link sottostante per procedere con il reset della password.</p>
              <p><a href="${link}" target="_blank">${link}</a></p>`
+        )
+    });
+}
+
+export async function sendPatientPortalInvitationMail(email: string, token: string, centerName: string) {
+    const link = frontendEmailLink(`patient-invitation/${token}`);
+
+    if (!env.isProduction || !env.emailHost) {
+        console.log(`[email.service] patient portal invitation for ${email}: ${link}`);
+    }
+
+    return transporter.sendMail({
+        from: sender('Portale paziente Rehablo'),
+        to: email,
+        subject: `${centerName} ti invita nel portale Rehablo`,
+        text: `${centerName} ti ha invitato a consultare i tuoi dati su Rehablo. Accetta l'invito: ${link}`,
+        html: baseTemplate(
+            'Accedi ai tuoi dati Rehablo',
+            `<p><strong>${centerName}</strong> ti ha invitato a consultare la tua cartella, gli appuntamenti e le fatture.</p>
+             <p>Il link è personale, monouso e a scadenza.</p>
+             <p><a href="${link}" target="_blank">Accetta l'invito</a></p>`
         )
     });
 }

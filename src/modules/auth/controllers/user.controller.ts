@@ -10,10 +10,11 @@ import { hasPermission } from '../rbac/permissions.js';
 import { DEFAULT_ROLE, isRoleCode, RoleCode, ROLE_DEFINITIONS } from '../rbac/roles.js';
 import { sendForgotPasswordMail, signUpSendMail } from '../../../services/email.service.js';
 import { licenseSecret } from './tenant.controller.js';
-import { revokeAllForUser } from '../services/refreshToken.service.js';
-import { Tenant, TenantUser, User, Structure, UserAvailability } from '../models/index.js';
+import { revokeAllForUser, revokeForTenantMembership } from '../services/refreshToken.service.js';
+import { Tenant, TenantUser, User, Structure, StructureUser, UserAvailability } from '../models/index.js';
 import { USER_AVAILABILITY_MODES } from '../models/user.model.js';
 import { validateUserStructureSelection } from '../services/userStructurePolicy.service.js';
+import { findUserByIdentityEmail } from '../services/identity.service.js';
 
 /**
  * Campi che non possono MAI arrivare dal client: determinano privilegi (super admin,
@@ -165,6 +166,7 @@ export const findAllUsersTenantByTenantId = asyncHandler(async (req: Request, re
     const users = (tenant.users ?? []).map((user: any) => ({
         ...user.get({ plain: true }),
         role: user.tenantUser?.role ?? null,
+        deactivatedAt: user.tenantUser?.deactivatedAt ?? null,
         structureIds: (user.structures ?? []).map((structure: any) => structure.id)
     }));
 
@@ -274,23 +276,26 @@ export const setUserActive = asyncHandler(async (req: Request, res: Response) =>
             attributes: ['userId']
         });
         const ownerIds = ownerMemberships.map((row) => row.get('userId') as string);
-        const activeOwners = await User.count({
-            where: { id: { [Op.in]: ownerIds }, deactivatedAt: null }
+        const activeOwners = await TenantUser.count({
+            where: { tenantId, userId: { [Op.in]: ownerIds }, deactivatedAt: null }
         });
         if (activeOwners <= 1) {
             return sendErrorResponse(res, 409, 'Lo studio deve avere almeno un titolare attivo');
         }
     }
 
-    await User.update({ deactivatedAt: active ? null : new Date() }, { where: { id: targetUserId } });
+    await membership.update({ deactivatedAt: active ? null : new Date() });
 
     // Le sessioni aperte sopravvivrebbero fino alla scadenza dell'access token: revocando
     // i refresh token la disattivazione diventa effettiva entro pochi minuti.
     if (!active) {
-        await revokeAllForUser(targetUserId, 'user_deactivated');
+        await revokeForTenantMembership(targetUserId, tenantId, 'tenant_membership_deactivated');
     }
 
-    const updatedUser = await User.findByPk(targetUserId, { attributes: { exclude: ['password'] } });
+    const updatedIdentity = await User.findByPk(targetUserId, { attributes: { exclude: ['password'] } });
+    const updatedUser = updatedIdentity
+        ? { ...updatedIdentity.get({ plain: true }), deactivatedAt: membership.get('deactivatedAt') }
+        : null;
 
     return sendSuccessResponse(
         res,
@@ -303,7 +308,7 @@ export const setUserActive = asyncHandler(async (req: Request, res: Response) =>
 export const deleteUser = asyncHandler(async (req: Request, res: Response) => {
     const userId = req.params.userId;
 
-    const { membership, user } = await findTenantMember(req, userId);
+    const { tenantId, membership, user } = await findTenantMember(req, userId);
     if (!membership || !user) {
         return sendErrorResponse(res, 404, 'Utente non trovato in questo studio');
     }
@@ -311,7 +316,7 @@ export const deleteUser = asyncHandler(async (req: Request, res: Response) => {
     // Il titolare dello studio non è eliminabile da nessuno, nemmeno da sé stesso:
     // è l'intestatario dell'abbonamento e il riferimento amministrativo del tenant.
     // Per revocarne l'accesso si usa la disattivazione (`PATCH /user/:userId/status`).
-    if (user.get('isTenant')) {
+    if (membership.get('role') === RoleCode.OWNER) {
         return sendErrorResponse(
             res,
             409,
@@ -325,8 +330,15 @@ export const deleteUser = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 403, 'Non puoi eliminare il tuo account');
     }
 
-    const deleted = await User.destroy({ where: { id: userId } });
-    await revokeAllForUser(userId, 'user_deleted');
+    const structures = await Structure.findAll({ where: { tenantId }, attributes: ['id'] });
+    const structureIds = structures.map((structure) => structure.get('id') as string);
+    if (structureIds.length) {
+        await StructureUser.destroy({
+            where: { userId, structureId: { [Op.in]: structureIds } }
+        });
+    }
+    const deleted = await TenantUser.destroy({ where: { tenantId, userId } });
+    await revokeForTenantMembership(userId, tenantId, 'tenant_membership_deleted');
 
     return sendSuccessResponse(res, 200, { deleted }, 'User removed');
 });
@@ -342,7 +354,13 @@ export const resetPassword = asyncHandler(async (req: Request, res: Response) =>
     }
 
     const hashedPassword = await bcrypt.hash(req.body.password, 12);
-    await User.update({ password: hashedPassword }, { where: { email: decoded.email } });
+    const user = decoded.sub
+        ? await User.findByPk(decoded.sub)
+        : await findUserByIdentityEmail(decoded.email);
+    if (!user) return sendErrorResponse(res, 400, 'Invalid or expired token');
+
+    await user.update({ password: hashedPassword });
+    await revokeAllForUser(user.get('id') as string, 'password_changed');
 
     return sendSuccessResponse(res, 204, {}, 'Password changed');
 });
@@ -357,7 +375,11 @@ export const verificationAccount = asyncHandler(async (req: Request, res: Respon
         return sendErrorResponse(res, 400, 'Invalid or expired token');
     }
 
-    await User.update({ isActive: true }, { where: { email: decoded.email } });
+    const user = decoded.sub
+        ? await User.findByPk(decoded.sub)
+        : await findUserByIdentityEmail(decoded.email);
+    if (!user) return sendErrorResponse(res, 400, 'Invalid or expired token');
+    await user.update({ isActive: true });
     return sendSuccessResponse(res, 200, {}, 'User activated');
 });
 
@@ -369,12 +391,12 @@ export const verificationAccount = asyncHandler(async (req: Request, res: Respon
 export const sendVerificationEmail = asyncHandler(async (req: Request, res: Response) => {
     const email = req.body.email;
 
-    const user = await User.findOne({ where: { email } });
+    const user = await findUserByIdentityEmail(email);
     if (!user) {
         return sendErrorResponse(res, 409, 'Email non trovata.');
     }
 
-    const verificationToken = jwt.sign({ email }, licenseSecret, { expiresIn: '12h' });
+    const verificationToken = jwt.sign({ sub: user.get('id'), email }, licenseSecret, { expiresIn: '12h' });
 
     // Fire-and-forget, same reasoning as forgotPassword/signup: don't let a slow/unreachable SMTP
     // delay the HTTP response.
@@ -388,12 +410,12 @@ export const sendVerificationEmail = asyncHandler(async (req: Request, res: Resp
 export const forgotPassword = asyncHandler(async (req: Request, res: Response) => {
     const email = req.query.email as string;
 
-    const user = await User.findOne({ where: { email } });
+    const user = await findUserByIdentityEmail(email);
     if (!user) {
         return sendErrorResponse(res, 409, 'Email non trovata.');
     }
 
-    const resetPasswordToken = jwt.sign({ email }, licenseSecret, { expiresIn: '12h' });
+    const resetPasswordToken = jwt.sign({ sub: user.get('id'), email }, licenseSecret, { expiresIn: '12h' });
 
     // Fire-and-forget, same reasoning as signup: don't let a slow/unreachable SMTP delay the
     // HTTP response (nodemailer can take several seconds to time out).

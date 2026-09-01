@@ -25,13 +25,15 @@ export interface RefreshTokenAttributes {
     /** Tenant e struttura attivi al momento dell'emissione: servono a riemettere l'access token. */
     tenantId?: string | null;
     structureId?: string | null;
+    actor: 'staff' | 'patient';
+    patientAccessId?: string | null;
     userAgent?: string | null;
     ipAddress?: string | null;
 }
 
 export type RefreshTokenCreationAttributes = Optional<
     RefreshTokenAttributes,
-    'id' | 'revokedAt' | 'revokedReason' | 'tenantId' | 'structureId' | 'userAgent' | 'ipAddress'
+    'id' | 'revokedAt' | 'revokedReason' | 'tenantId' | 'structureId' | 'actor' | 'patientAccessId' | 'userAgent' | 'ipAddress'
 >;
 
 export class RefreshToken
@@ -46,6 +48,8 @@ export class RefreshToken
     declare revokedReason: string | null;
     declare tenantId: string | null;
     declare structureId: string | null;
+    declare actor: 'staff' | 'patient';
+    declare patientAccessId: string | null;
     declare userAgent: string | null;
     declare ipAddress: string | null;
 }
@@ -61,6 +65,8 @@ RefreshToken.init(
         revokedReason: { type: DataTypes.STRING, allowNull: true },
         tenantId: { type: DataTypes.UUID, allowNull: true },
         structureId: { type: DataTypes.UUID, allowNull: true },
+        actor: { type: DataTypes.STRING(16), allowNull: false, defaultValue: 'staff' },
+        patientAccessId: { type: DataTypes.UUID, allowNull: true },
         userAgent: { type: DataTypes.STRING, allowNull: true },
         ipAddress: { type: DataTypes.STRING, allowNull: true }
     },

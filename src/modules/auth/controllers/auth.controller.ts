@@ -1,10 +1,19 @@
 import { Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import { Op } from 'sequelize';
 import { env } from '../../../config/env.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
-import { Tenant, User, Structure, StructureAvailability, TenantUser, StructureUser } from '../models/index.js';
+import {
+    PatientPortalAccess,
+    Tenant,
+    User,
+    Structure,
+    StructureAvailability,
+    TenantUser,
+    StructureUser
+} from '../models/index.js';
 import { findStructureById } from './structure.controller.js';
 import { getRolePermissions, resolveEffectiveRole } from '../rbac/roles.js';
 import {
@@ -18,13 +27,14 @@ import {
  * Builds the JWT payload (kept compatible with the previous microservice shape:
  * `tenants: [{id}]`, `selectedPremise`, etc.) so that the frontend doesn't need changes.
  */
-function buildTokenPayload(userInstance: any) {
+function buildTokenPayload(userInstance: any, actor: 'staff' | 'patient' = 'staff') {
     const payload = { ...userInstance.get({ plain: true }) };
     delete payload.password;
     payload.tenants = (payload.tenants || []).map((t: any) => ({ id: t.id, ...t }));
     payload.selectedPremise = payload.selectedPremise ?? null;
     payload.sub = payload.id;
-    payload.actor = 'staff';
+    payload.actor = actor;
+    payload.tokenUse = 'application';
     return payload;
 }
 
@@ -93,7 +103,14 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
     }
 
     const payload = buildTokenPayload(user);
-    const tenantId = payload.tenants?.[0]?.id ?? null;
+    const activeMembership = await TenantUser.findOne({
+        where: { userId: payload.id, deactivatedAt: null },
+        order: [['createdAt', 'ASC']]
+    });
+    const tenantId = (activeMembership?.get('tenantId') as string | undefined) ?? payload.tenants?.[0]?.id ?? null;
+    if (tenantId && !activeMembership) {
+        return sendErrorResponse(res, 403, 'Accesso al centro disattivato');
+    }
     Object.assign(payload, await buildRbacClaims(payload.id, tenantId, null));
     const token = signToken(payload);
 
@@ -169,7 +186,46 @@ export const refresh = asyncHandler(async (req: Request, res: Response) => {
         payload.selectedPremise = premise ? premise.get({ plain: true }) : null;
     }
 
-    Object.assign(payload, await buildRbacClaims(payload.id, result.tenantId, result.structureId));
+    if (result.actor === 'patient') {
+        const access = result.patientAccessId && result.tenantId
+            ? await PatientPortalAccess.findOne({
+                where: {
+                    id: result.patientAccessId,
+                    userId: payload.id,
+                    tenantId: result.tenantId,
+                    status: { [Op.in]: ['ACTIVE', 'HISTORICAL'] }
+                }
+            })
+            : null;
+        if (!access) {
+            await revokeFamily(result.familyId, 'patient_access_revoked');
+            return sendErrorResponse(res, 403, 'Accesso al centro revocato');
+        }
+        payload.actor = 'patient';
+        payload.isSuperAdmin = false;
+        payload.isTenant = false;
+        payload.tenants = [{ id: result.tenantId }];
+        payload.structures = [];
+        payload.selectedPremise = null;
+        payload.pid = access.get('patientId');
+        payload.patientAccessId = access.get('id');
+        payload.contextStatus = access.get('status');
+        payload.tid = result.tenantId;
+        payload.sid = null;
+        payload.role = 'PATIENT';
+        payload.perms = getRolePermissions('PATIENT');
+    } else {
+        const membership = result.tenantId
+            ? await TenantUser.findOne({
+                where: { tenantId: result.tenantId, userId: payload.id, deactivatedAt: null }
+            })
+            : null;
+        if (result.tenantId && !membership) {
+            await revokeFamily(result.familyId, 'tenant_membership_deactivated');
+            return sendErrorResponse(res, 403, 'Accesso al centro disattivato');
+        }
+        Object.assign(payload, await buildRbacClaims(payload.id, result.tenantId, result.structureId));
+    }
 
     return sendSuccessResponse(
         res,
@@ -200,7 +256,10 @@ export const logout = asyncHandler(async (req: Request, res: Response) => {
 
 export const loginPremise = asyncHandler(async (req: Request, res: Response) => {
     const structureId = req.params.premiseId;
-    const tenantId = req.user!.tenants[0].id;
+    if (req.user!.actor === 'patient') {
+        return sendErrorResponse(res, 403, 'Il paziente non seleziona una sede operativa');
+    }
+    const tenantId = (req.user!.tid as string | undefined) ?? req.user!.tenants[0].id;
     const email = req.user!.email;
     const userId = (req.user?.sub as string | undefined) ?? req.user!.id;
 

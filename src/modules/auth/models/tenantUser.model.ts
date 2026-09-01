@@ -8,6 +8,8 @@ export class TenantUser extends Model {
     declare userId: string;
     /** Ruolo BASE dell'utente all'interno del tenant (override per struttura su StructureUser). */
     declare role: RoleCode;
+    /** Sospensione limitata a questo tenant; non blocca la stessa identità in altri centri. */
+    declare deactivatedAt: Date | null;
 }
 
 TenantUser.init(
@@ -18,7 +20,8 @@ TenantUser.init(
             type: DataTypes.ENUM(...Object.values(RoleCode)),
             allowNull: false,
             defaultValue: DEFAULT_ROLE
-        }
+        },
+        deactivatedAt: { type: DataTypes.DATE, allowNull: true, defaultValue: null }
     },
     { sequelize, modelName: 'tenantUser', tableName: 'tenant_users' }
 );

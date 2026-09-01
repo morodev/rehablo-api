@@ -3,7 +3,7 @@ import { Op, fn, col, cast, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { scopeWhere } from '../../../middleware/rbac.js';
-import { Structure, StructureUser } from '../../auth/models/index.js';
+import { PatientPortalAccess, Structure, StructureUser } from '../../auth/models/index.js';
 import Patient from '../models/patient.model.js';
 
 /**
@@ -283,6 +283,13 @@ export const deletePatient = asyncHandler(async (req: Request, res: Response) =>
     await Patient.schema(schema).update(
         { archivedAt: new Date() },
         { where: { id, ...scope } }
+    );
+
+    // L'archiviazione rimuove il paziente dalle liste operative ma conserva il suo accesso
+    // storico in sola lettura. La revoca del portale resta un'azione esplicita e separata.
+    await PatientPortalAccess.update(
+        { status: 'HISTORICAL', historicalAt: new Date(), revokedAt: null, revokedByUserId: null },
+        { where: { tenantId: req.user!.tid ?? req.user!.tenants[0].id, patientId: id, status: 'ACTIVE' } }
     );
 
     return sendSuccessResponse(res, 200, removedPatient, 'Paziente archiviato correttamente');

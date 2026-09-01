@@ -30,6 +30,7 @@ import measurementsRoutes from './modules/measurements/routes/measurements.route
 import noteRoutes from './modules/notes/routes/note.routes.js';
 import maintenanceRoutes from './modules/maintenance/routes/maintenance.routes.js';
 import reportsRoutes from './modules/reports/routes/reports.routes.js';
+import patientPortalRoutes from './modules/patient-portal/routes/patientPortal.routes.js';
 
 async function bootstrap() {
     const app = express();
@@ -59,6 +60,7 @@ async function bootstrap() {
 
     // --- Domain routers (every module owns its own URL prefix-free routes, mounted at root) ---
     app.use(authRoutes);
+    app.use(patientPortalRoutes);
     app.use(patientRoutes);
     app.use(productsServicesRoutes);
     app.use(invoiceRoutes);

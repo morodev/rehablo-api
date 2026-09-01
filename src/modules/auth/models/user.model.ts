@@ -22,11 +22,8 @@ export interface UserAttributes {
      */
     isTenant: boolean;
     isPremium: boolean;
-    /**
-     * Sospensione dell'account: valorizzata quando un amministratore disattiva l'utente.
-     * È volutamente distinta da `isActive` (che indica la verifica dell'email), così la UI
-     * può differenziare "in attesa di verifica" da "disattivato" e la riattivazione non
-     * richiede un nuovo giro di verifica dell'indirizzo.
+    /** Blocco di sicurezza dell'intera identità, riservato alla piattaforma.
+     * Le sospensioni decise da un centro vivono invece su TenantUser.deactivatedAt.
      */
     deactivatedAt?: Date | null;
     // --- Dati identificativi del professionista sanitario, richiesti per il tracciato Sistema

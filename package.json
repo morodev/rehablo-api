@@ -15,7 +15,7 @@
     "lint": "tsc --noEmit",
     "audit:rbac": "node scripts/audit-rbac.mjs",
     "backfill:structure": "tsx src/scripts/backfillStructureId.ts",
-    "test": "tsx --test src/modules/invoice/services/payment.service.test.ts src/modules/invoice/utils/evalTotals.test.ts src/modules/reports/services/analytics.service.test.ts"
+    "test": "tsx --test src/modules/auth/models/userEmail.model.test.ts src/modules/invoice/services/payment.service.test.ts src/modules/invoice/utils/evalTotals.test.ts src/modules/reports/services/analytics.service.test.ts"
   },
   "author": "Luca Moro",
   "license": "UNLICENSED",
