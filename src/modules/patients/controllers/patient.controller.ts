@@ -1,10 +1,40 @@
 import { Request, Response } from 'express';
+import multer from 'multer';
 import { Op, fn, col, cast, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { scopeWhere } from '../../../middleware/rbac.js';
 import { PatientPortalAccess, Structure, StructureUser } from '../../auth/models/index.js';
+import { localStorageAdapter } from '../../measurements/storage/localStorageAdapter.js';
 import Patient from '../models/patient.model.js';
+
+const ALLOWED_PRIVACY_DOCUMENT_MIME_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png']);
+
+export const privacyDocumentUploadMiddleware = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 }
+}).single('file');
+
+function detectPrivacyDocumentMime(buffer: Buffer): string | null {
+    if (buffer.length >= 5 && buffer.subarray(0, 5).equals(Buffer.from('%PDF-'))) {
+        return 'application/pdf';
+    }
+    if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+        return 'image/jpeg';
+    }
+    if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+        return 'image/png';
+    }
+    return null;
+}
+
+function hasExpectedPrivacyDocumentExtension(fileName: string, mimeType: string): boolean {
+    const normalized = fileName.trim().toLowerCase();
+    if (mimeType === 'application/pdf') return normalized.endsWith('.pdf');
+    if (mimeType === 'image/jpeg') return normalized.endsWith('.jpg') || normalized.endsWith('.jpeg');
+    if (mimeType === 'image/png') return normalized.endsWith('.png');
+    return false;
+}
 
 /**
  * Campi usati per il filtro row-level RBAC.
@@ -122,6 +152,9 @@ export const savePatient = asyncHandler(async (req: Request, res: Response) => {
     const payload = sanitizePatientPayload(req.body);
     if (!payload.name || typeof payload.name !== 'string' || !payload.name.trim()) {
         return sendErrorResponse(res, 400, 'Il nome del paziente Ã¨ obbligatorio');
+    }
+    if (payload.privacyConsent !== true) {
+        return sendErrorResponse(res, 422, 'Il consenso privacy acquisito è obbligatorio per creare il paziente');
     }
     payload.name = payload.name.trim();
     if (typeof payload.surname === 'string') payload.surname = payload.surname.trim();
@@ -295,5 +328,100 @@ export const deletePatient = asyncHandler(async (req: Request, res: Response) =>
     return sendSuccessResponse(res, 200, removedPatient, 'Paziente archiviato correttamente');
 });
 
-export default { savePatient, findAndCountAll, findAll, findOne, searchPatients, update, deletePatient };
+export const uploadPrivacyDocument = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const patient = await Patient.unscoped().schema(schema).findOne({
+        where: { id: req.params.patientId, ...activePatientWhere(req) }
+    });
+
+    if (!patient) {
+        return sendErrorResponse(res, 404, 'Paziente non trovato');
+    }
+    if (!patient.privacyConsent) {
+        return sendErrorResponse(res, 409, 'Registra il consenso privacy prima di caricare il documento');
+    }
+    if (!req.file) {
+        return sendErrorResponse(res, 400, 'Il campo "file" (multipart/form-data) è obbligatorio');
+    }
+    const detectedMimeType = detectPrivacyDocumentMime(req.file.buffer);
+    if (
+        !ALLOWED_PRIVACY_DOCUMENT_MIME_TYPES.has(req.file.mimetype)
+        || !detectedMimeType
+        || detectedMimeType !== req.file.mimetype
+        || !hasExpectedPrivacyDocumentExtension(req.file.originalname, detectedMimeType)
+    ) {
+        return sendErrorResponse(res, 422, 'Il contenuto del file non corrisponde a un PDF, JPG o PNG valido.');
+    }
+    if (req.file.originalname.length > 255) {
+        return sendErrorResponse(res, 422, 'Il nome del file è troppo lungo (massimo 255 caratteri).');
+    }
+
+    const tenantId = req.user!.tenants[0].id;
+    const previousStoragePath = patient.privacyDocumentStoragePath;
+    const saved = await localStorageAdapter.save(tenantId, req.file.buffer, req.file.originalname);
+
+    try {
+        await patient.update({
+            privacyDocumentStoragePath: saved.storagePath,
+            privacyDocumentOriginalName: req.file.originalname,
+            privacyDocumentMimeType: detectedMimeType,
+            privacyDocumentSizeBytes: saved.sizeBytes,
+            privacyDocumentUploadedAt: new Date(),
+            privacyDocumentUploadedBy: req.access!.userId
+        });
+    } catch (error) {
+        await localStorageAdapter.remove(saved.storagePath).catch(() => undefined);
+        throw error;
+    }
+
+    if (previousStoragePath && previousStoragePath !== saved.storagePath) {
+        localStorageAdapter.remove(previousStoragePath).catch((error) => {
+            console.error('[privacy-document] impossibile rimuovere il file sostituito', error);
+        });
+    }
+
+    const updatedPatient = await Patient.schema(schema).findOne({
+        where: { id: req.params.patientId, ...activePatientWhere(req) }
+    });
+    return sendSuccessResponse(res, 200, updatedPatient, 'Documento privacy caricato correttamente');
+});
+
+export const downloadPrivacyDocument = asyncHandler(async (req: Request, res: Response) => {
+    const patient = await Patient.unscoped().schema(req.tenantSchema!).findOne({
+        where: { id: req.params.patientId, ...activePatientWhere(req) }
+    });
+
+    if (!patient) {
+        return sendErrorResponse(res, 404, 'Paziente non trovato');
+    }
+    if (!patient.privacyDocumentStoragePath) {
+        return sendErrorResponse(res, 404, 'Documento privacy non presente');
+    }
+
+    const buffer = await localStorageAdapter.read(patient.privacyDocumentStoragePath);
+    const originalName = patient.privacyDocumentOriginalName || 'consenso-privacy';
+    const asciiName = originalName.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+
+    res.setHeader('Content-Type', patient.privacyDocumentMimeType || 'application/octet-stream');
+    res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(originalName)}`
+    );
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    return res.status(200).send(buffer);
+});
+
+export default {
+    savePatient,
+    findAndCountAll,
+    findAll,
+    findOne,
+    searchPatients,
+    update,
+    deletePatient,
+    privacyDocumentUploadMiddleware,
+    uploadPrivacyDocument,
+    downloadPrivacyDocument
+};
 

@@ -1,9 +1,11 @@
 import { Request, Response } from 'express';
 import { Op, fn, col } from 'sequelize';
 import moment from 'moment';
+import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { scopeWhere } from '../../../middleware/rbac.js';
+import { getCurrentTenantId } from '../../../middleware/auth.js';
 import { sendNewEventMail } from '../../../services/email.service.js';
 import AgendaEvent from '../models/agendaEvent.model.js';
 import AgendaEventException from '../models/agendaEventException.model.js';
@@ -12,8 +14,13 @@ import Service from '../../products-services/models/service.model.js';
 import Patient from '../../patients/models/patient.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import TimeOffRequest from '../models/timeOffRequest.model.js';
-import { StructureUser } from '../../auth/models/index.js';
+import { StructureUser, TenantUser, User } from '../../auth/models/index.js';
 import { getInvoiceAgendaLinksByEventIds, getLinkedInvoiceId } from '../../invoice/services/invoiceAgendaEvent.service.js';
+import {
+    DeferredOperatorAssignment,
+    InvalidDeferredOperatorReassignmentError,
+    reassignDeferredOperatorAppointments
+} from '../services/operatorReassignment.service.js';
 
 /**
  * Campi per il filtro row-level RBAC.
@@ -244,6 +251,7 @@ async function rejectInvalidPatient(
 }
 
 async function rejectOperatorOutsideStructure(
+    req: Request,
     res: Response,
     event: Record<string, any>
 ): Promise<boolean> {
@@ -260,7 +268,21 @@ async function rejectOperatorOutsideStructure(
         return true;
     }
 
-    const assignment = await StructureUser.findOne({ where: { userId: calendarId, structureId } });
+    const [membership, identity, assignment] = await Promise.all([
+        TenantUser.findOne({
+            where: { tenantId: getCurrentTenantId(req), userId: calendarId }
+        }),
+        User.findByPk(calendarId, { attributes: ['id', 'deactivatedAt'] }),
+        StructureUser.findOne({ where: { userId: calendarId, structureId } })
+    ]);
+    if (!membership) {
+        sendErrorResponse(res, 409, 'L\'operatore non appartiene a questo studio');
+        return true;
+    }
+    if (!identity || membership.deactivatedAt || identity.deactivatedAt) {
+        sendErrorResponse(res, 409, 'L\'operatore e\' fuori dal team e non puo\' ricevere nuovi appuntamenti');
+        return true;
+    }
     if (assignment) return false;
 
     sendErrorResponse(res, 409, 'L\'operatore non è assegnato alla sede selezionata');
@@ -358,7 +380,21 @@ export const findAllAgendaEvents = asyncHandler(async (req: Request, res: Respon
     const endDate = new Date(req.query.end as string).toISOString();
 
     const agendaEvents = await AgendaEvent.schema(schema).findAll({
-        where: { start: { [Op.between]: [startDate, endDate] }, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
+        where: {
+            [Op.and]: [
+                {
+                    [Op.or]: [
+                        { start: { [Op.between]: [startDate, endDate] } },
+                        {
+                            recurrence: { [Op.not]: null },
+                            start: { [Op.lte]: endDate },
+                            end: { [Op.gte]: startDate }
+                        }
+                    ]
+                },
+                scopeWhere(req, AGENDA_SCOPE_FIELDS)
+            ]
+        }
     });
 
     return sendSuccessResponse(
@@ -464,7 +500,7 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
     // non potrebbe distinguere le sedi.
     payload.structureId = req.access?.structureId ?? null;
 
-    if (await rejectOperatorOutsideStructure(res, payload)) return;
+    if (await rejectOperatorOutsideStructure(req, res, payload)) return;
     if (await rejectInvalidPatient(res, schema, payload)) return;
 
     const eventTypeError = await validateAndNormalizeEventType(schema, payload);
@@ -548,9 +584,21 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     event.patientId = candidate.patientId;
 
     const scheduleChanged = ['calendarId', 'structureId', 'start', 'end', 'duration', 'recurrence']
-        .some((field) => Object.prototype.hasOwnProperty.call(event, field));
+        .some((field) => {
+            if (!Object.prototype.hasOwnProperty.call(event, field)) return false;
+            const incoming = event[field] ?? null;
+            const existing = current.get(field as keyof AgendaEvent) ?? null;
+            if (field === 'start' || field === 'end') {
+                const incomingTime = Date.parse(String(incoming));
+                const existingTime = Date.parse(String(existing));
+                if (Number.isFinite(incomingTime) && Number.isFinite(existingTime)) {
+                    return incomingTime !== existingTime;
+                }
+            }
+            return String(incoming) !== String(existing);
+        });
     if (scheduleChanged) {
-        if (await rejectOperatorOutsideStructure(res, candidate)) return;
+        if (await rejectOperatorOutsideStructure(req, res, candidate)) return;
         if (await rejectApprovedTimeOffConflict(res, schema, candidate, id)) return;
     }
 
@@ -563,6 +611,68 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
 
     const updated = await AgendaEvent.schema(schema).findByPk(id);
     return sendSuccessResponse(res, 200, updated, 'Agenda event updated');
+});
+
+/**
+ * Riassegna in blocco gli appuntamenti futuri rimasti sul calendario di un operatore
+ * disattivato. Ogni elemento porta il proprio replacementUserId: la UI puo' quindi
+ * assegnare un unico operatore a tutti oppure suddividere liberamente la selezione.
+ */
+export const reassignDeferredOperatorEvents = asyncHandler(async (req: Request, res: Response) => {
+    const rawAssignments = req.body?.assignments;
+    if (!Array.isArray(rawAssignments) || rawAssignments.length === 0 || rawAssignments.length > 500) {
+        return sendErrorResponse(res, 400, 'Seleziona da 1 a 500 appuntamenti da riassegnare');
+    }
+
+    const assignments: DeferredOperatorAssignment[] = [];
+    const uniqueTargets = new Set<string>();
+    for (const raw of rawAssignments) {
+        const eventId = typeof raw?.eventId === 'string' ? raw.eventId.trim() : '';
+        const replacementUserId = typeof raw?.replacementUserId === 'string'
+            ? raw.replacementUserId.trim()
+            : '';
+        const occurrenceStart = raw?.occurrenceStart == null
+            ? null
+            : String(raw.occurrenceStart);
+        if (!UUID_REGEX.test(eventId) || !UUID_REGEX.test(replacementUserId)) {
+            return sendErrorResponse(res, 400, 'Appuntamento o nuovo operatore non validi');
+        }
+        if (occurrenceStart && Number.isNaN(Date.parse(occurrenceStart))) {
+            return sendErrorResponse(res, 400, 'Occorrenza ricorrente non valida');
+        }
+
+        const targetKey = `${eventId}:${occurrenceStart ?? ''}`;
+        if (uniqueTargets.has(targetKey)) {
+            return sendErrorResponse(res, 400, 'La selezione contiene appuntamenti duplicati');
+        }
+        uniqueTargets.add(targetKey);
+        assignments.push({ eventId, occurrenceStart, replacementUserId });
+    }
+
+    try {
+        const result = await sequelize.transaction((transaction) =>
+            reassignDeferredOperatorAppointments(
+                getCurrentTenantId(req),
+                req.tenantSchema!,
+                assignments,
+                scopeWhere(req, AGENDA_SCOPE_FIELDS),
+                transaction
+            )
+        );
+        return sendSuccessResponse(
+            res,
+            200,
+            result,
+            result.reassignedAppointments === 1
+                ? 'Appuntamento riassegnato'
+                : `${result.reassignedAppointments} appuntamenti riassegnati`
+        );
+    } catch (error) {
+        if (error instanceof InvalidDeferredOperatorReassignmentError) {
+            return sendErrorResponse(res, 409, error.message);
+        }
+        throw error;
+    }
 });
 
 /** Registra l'incasso della singola seduta senza creare o modificare una fattura. */
@@ -882,7 +992,7 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
     const recurringCandidate = { ...recurringEvent.get({ plain: true }), ...event };
     recurringCandidate.structureId = req.access?.structureId ?? recurringCandidate.structureId;
     if (req.access?.scope === 'own') recurringCandidate.calendarId = req.access.userId;
-    if (await rejectOperatorOutsideStructure(res, recurringCandidate)) return;
+    if (await rejectOperatorOutsideStructure(req, res, recurringCandidate)) return;
     if (await rejectInvalidPatient(res, schema, recurringCandidate)) return;
     event.structureId = recurringCandidate.structureId;
     event.calendarId = recurringCandidate.calendarId;
@@ -986,6 +1096,7 @@ export const deleteRecurringEvent = asyncHandler(async (req: Request, res: Respo
 export default {
     saveAgendaEvent,
     findAllAgendaEvents,
+    reassignDeferredOperatorEvents,
     findAgendaEventsByUsers,
     findAppointmentsForPatientById,
     updateAgendaEvent,

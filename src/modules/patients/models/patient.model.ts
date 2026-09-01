@@ -39,6 +39,13 @@ export interface PatientAttributes {
     privacyConsentDate?: Date | null;
     /** Versione dell'informativa privacy accettata dal paziente, per tracciabilità in caso di aggiornamenti. */
     privacyPolicyVersion?: string | null;
+    /** Documento firmato che prova il consenso; il path resta interno allo storage del tenant. */
+    privacyDocumentStoragePath?: string | null;
+    privacyDocumentOriginalName?: string | null;
+    privacyDocumentMimeType?: string | null;
+    privacyDocumentSizeBytes?: number | null;
+    privacyDocumentUploadedAt?: Date | null;
+    privacyDocumentUploadedBy?: string | null;
     // --- Sistema Tessera Sanitaria (D.Lgs. 175/2014): il paziente ha diritto di opporsi
     // all'invio dei propri dati di spesa sanitaria al Sistema TS per la dichiarazione precompilata.
     // Se true, la fattura/ricevuta NON deve essere inclusa nel file di trasmissione annuale/mensile. ---
@@ -88,6 +95,12 @@ export class Patient extends Model<PatientAttributes, PatientCreationAttributes>
     declare privacyConsent: boolean;
     declare privacyConsentDate: Date | null;
     declare privacyPolicyVersion: string | null;
+    declare privacyDocumentStoragePath: string | null;
+    declare privacyDocumentOriginalName: string | null;
+    declare privacyDocumentMimeType: string | null;
+    declare privacyDocumentSizeBytes: number | null;
+    declare privacyDocumentUploadedAt: Date | null;
+    declare privacyDocumentUploadedBy: string | null;
     declare stsOppositionToDataSending: boolean;
     declare fseConsentFeeding: boolean | null;
     declare fseConsentViewing: boolean | null;
@@ -124,6 +137,12 @@ Patient.init(
         privacyConsent: { type: DataTypes.BOOLEAN, defaultValue: false },
         privacyConsentDate: DataTypes.DATE,
         privacyPolicyVersion: DataTypes.STRING,
+        privacyDocumentStoragePath: DataTypes.STRING,
+        privacyDocumentOriginalName: DataTypes.STRING,
+        privacyDocumentMimeType: DataTypes.STRING,
+        privacyDocumentSizeBytes: DataTypes.INTEGER,
+        privacyDocumentUploadedAt: DataTypes.DATE,
+        privacyDocumentUploadedBy: DataTypes.STRING,
         stsOppositionToDataSending: { type: DataTypes.BOOLEAN, defaultValue: false },
         fseConsentFeeding: { type: DataTypes.BOOLEAN, allowNull: true, defaultValue: null },
         fseConsentViewing: { type: DataTypes.BOOLEAN, allowNull: true, defaultValue: null },
@@ -133,6 +152,9 @@ Patient.init(
         sequelize,
         modelName: 'patient',
         tableName: 'patients',
+        defaultScope: {
+            attributes: { exclude: ['privacyDocumentStoragePath'] }
+        },
         indexes: [
             { name: 'patients_structure_archived_idx', fields: ['structureId', 'archivedAt'] },
             { name: 'patients_fiscal_code_idx', fields: ['fiscalCode'] }

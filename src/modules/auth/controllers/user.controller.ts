@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { Op } from 'sequelize';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
@@ -15,6 +16,12 @@ import { Tenant, TenantUser, User, Structure, StructureUser, UserAvailability } 
 import { USER_AVAILABILITY_MODES } from '../models/user.model.js';
 import { validateUserStructureSelection } from '../services/userStructurePolicy.service.js';
 import { findUserByIdentityEmail } from '../services/identity.service.js';
+import {
+    FutureAppointmentsRequireReplacementError,
+    getOperatorDeactivationImpact,
+    InvalidReplacementOperatorError,
+    reassignFutureAppointments
+} from '../../agenda/services/operatorReassignment.service.js';
 
 /**
  * Campi che non possono MAI arrivare dal client: determinano privilegi (super admin,
@@ -166,7 +173,11 @@ export const findAllUsersTenantByTenantId = asyncHandler(async (req: Request, re
     const users = (tenant.users ?? []).map((user: any) => ({
         ...user.get({ plain: true }),
         role: user.tenantUser?.role ?? null,
-        deactivatedAt: user.tenantUser?.deactivatedAt ?? null,
+        // La UI deve riflettere lo stesso stato effettivo usato dal login. In caso di
+        // account legacy il rapporto con il centro puo' essere attivo mentre sulla
+        // vecchia identita' globale e' ancora presente il blocco: nasconderlo farebbe
+        // comparire "Account attivo" anche se l'accesso viene poi rifiutato.
+        deactivatedAt: user.tenantUser?.deactivatedAt ?? user.deactivatedAt ?? null,
         structureIds: (user.structures ?? []).map((structure: any) => structure.id)
     }));
 
@@ -244,6 +255,25 @@ export const updateUserCalendarColor = asyncHandler(async (req: Request, res: Re
 });
 
 /**
+ * Prepara la disattivazione senza modificare dati: la UI usa il risultato per mostrare
+ * la scelta dell'operatore sostitutivo soltanto quando esistono appuntamenti futuri.
+ */
+export const getUserDeactivationImpact = asyncHandler(async (req: Request, res: Response) => {
+    const targetUserId = req.params.userId;
+    const { tenantId, membership } = await findTenantMember(req, targetUserId);
+    if (!membership) {
+        return sendErrorResponse(res, 404, 'Utente non trovato in questo studio');
+    }
+
+    const impact = await getOperatorDeactivationImpact(
+        tenantId,
+        req.tenantSchema!,
+        targetUserId
+    );
+    return sendSuccessResponse(res, 200, impact, 'Impatto disattivazione calcolato');
+});
+
+/**
  * Attiva / disattiva un utente.
  *
  * È l'alternativa alla cancellazione per il titolare dello studio, che non è eliminabile:
@@ -252,10 +282,21 @@ export const updateUserCalendarColor = asyncHandler(async (req: Request, res: Re
  */
 export const setUserActive = asyncHandler(async (req: Request, res: Response) => {
     const targetUserId = req.params.userId;
-    const { active } = req.body as { active?: boolean };
+    const { active, replacementUserId, deferReassignment } = req.body as {
+        active?: boolean;
+        replacementUserId?: string | null;
+        deferReassignment?: boolean;
+    };
 
     if (typeof active !== 'boolean') {
         return sendErrorResponse(res, 400, 'Il campo `active` è obbligatorio (boolean)');
+    }
+    if (replacementUserId && deferReassignment) {
+        return sendErrorResponse(
+            res,
+            400,
+            'Scegli se riassegnare subito oppure gestire gli appuntamenti in seguito'
+        );
     }
 
     // Nessuno può disattivare sé stesso: si chiuderebbe fuori dall'applicazione.
@@ -284,7 +325,78 @@ export const setUserActive = asyncHandler(async (req: Request, res: Response) =>
         }
     }
 
-    await membership.update({ deactivatedAt: active ? null : new Date() });
+    if (!active && !replacementUserId) {
+        const impact = await getOperatorDeactivationImpact(
+            tenantId,
+            req.tenantSchema!,
+            targetUserId
+        );
+        if (impact.hasFutureAppointments && deferReassignment !== true) {
+            return sendErrorResponse(
+                res,
+                409,
+                'Scegli se riassegnare subito gli appuntamenti futuri oppure gestirli in seguito',
+                { code: 'FUTURE_APPOINTMENTS_REQUIRE_REASSIGNMENT', impact }
+            );
+        }
+    }
+
+    try {
+        await sequelize.transaction(async (transaction) => {
+            const lockedMembership = await TenantUser.findOne({
+                where: { tenantId, userId: targetUserId },
+                transaction,
+                lock: transaction.LOCK.UPDATE
+            });
+            if (!lockedMembership) {
+                throw new Error('La membership da aggiornare non esiste piu');
+            }
+
+            if (!active && replacementUserId) {
+                await reassignFutureAppointments(
+                    tenantId,
+                    req.tenantSchema!,
+                    targetUserId,
+                    replacementUserId,
+                    transaction
+                );
+            }
+
+            await lockedMembership.update(
+                { deactivatedAt: active ? null : new Date() },
+                { transaction }
+            );
+
+            if (active && user.get('deactivatedAt')) {
+                // Gli account sospesi prima dell'introduzione di TenantUser conservavano
+                // anche il vecchio blocco globale. Senza questa bonifica il rapporto con lo
+                // studio tornava attivo, ma il login continuava a rispondere
+                // "Account non disponibile".
+                await User.update(
+                    { deactivatedAt: null },
+                    { where: { id: targetUserId }, transaction }
+                );
+            }
+        });
+    } catch (error) {
+        if (error instanceof FutureAppointmentsRequireReplacementError) {
+            return sendErrorResponse(
+                res,
+                409,
+                error.message,
+                { code: 'FUTURE_APPOINTMENTS_REQUIRE_REASSIGNMENT', impact: error.impact }
+            );
+        }
+        if (error instanceof InvalidReplacementOperatorError) {
+            return sendErrorResponse(
+                res,
+                409,
+                error.message,
+                { code: 'INVALID_REPLACEMENT_OPERATOR' }
+            );
+        }
+        throw error;
+    }
 
     // Le sessioni aperte sopravvivrebbero fino alla scadenza dell'access token: revocando
     // i refresh token la disattivazione diventa effettiva entro pochi minuti.
@@ -292,9 +404,12 @@ export const setUserActive = asyncHandler(async (req: Request, res: Response) =>
         await revokeForTenantMembership(targetUserId, tenantId, 'tenant_membership_deactivated');
     }
 
-    const updatedIdentity = await User.findByPk(targetUserId, { attributes: { exclude: ['password'] } });
+    const [updatedIdentity, updatedMembership] = await Promise.all([
+        User.findByPk(targetUserId, { attributes: { exclude: ['password'] } }),
+        TenantUser.findOne({ where: { tenantId, userId: targetUserId } })
+    ]);
     const updatedUser = updatedIdentity
-        ? { ...updatedIdentity.get({ plain: true }), deactivatedAt: membership.get('deactivatedAt') }
+        ? { ...updatedIdentity.get({ plain: true }), deactivatedAt: updatedMembership?.deactivatedAt ?? null }
         : null;
 
     return sendSuccessResponse(
@@ -432,6 +547,7 @@ export default {
     updateUser,
     updateUserCalendarVisibility,
     updateUserCalendarColor,
+    getUserDeactivationImpact,
     setUserActive,
     deleteUser,
     resetPassword,

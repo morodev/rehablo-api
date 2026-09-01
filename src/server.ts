@@ -16,6 +16,7 @@ import { registerTenantModels } from './tenantModelsRegistry.js';
 import { registerCatalogAssociations, syncCatalogModels, seedCatalogData } from './modules/human-body/models/catalog/index.js';
 import { registerProtocolCatalogAssociations, syncProtocolCatalogModels } from './modules/protocols/models/catalog/index.js';
 import { syncMeasurementCatalogModels, seedMeasurementCatalogData } from './modules/measurements/models/catalog/index.js';
+import { startAutomaticMissedArrivalSweep } from './modules/agenda/services/missedArrivalAutomation.service.js';
 
 import authRoutes from './modules/auth/routes/auth.routes.js';
 import patientRoutes from './modules/patients/routes/patient.routes.js';
@@ -142,6 +143,10 @@ async function bootstrap() {
 
     // Tenant-scoped models registry (synced lazily per-tenant via ensureTenantSchema)
     registerTenantModels();
+
+    // A fine appuntamento apre una segnalazione operativa se nessuno ha registrato
+    // un esito. Lo stato resta CONFIRMED finché un operatore non sceglie l'esito reale.
+    startAutomaticMissedArrivalSweep();
 
     app.listen(env.port, () => {
         console.log(`[rehablo-api] listening on port ${env.port} (${env.nodeEnv})`);

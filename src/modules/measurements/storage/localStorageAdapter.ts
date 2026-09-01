@@ -5,7 +5,7 @@ import { env } from '../../../config/env.js';
 import type { SavedFileMeta, StorageAdapter } from './storageAdapter.js';
 
 /**
- * Implementazione filesystem locale dello `StorageAdapter` (F0.1). Organizza i file per
+ * Implementazione filesystem locale dello `StorageAdapter`. Organizza i file per
  * `<tenantId>/<yyyy>/<mm>/<uuid>.<ext>` sotto `env.rawFileStorageDir`. Adatta per sviluppo/self-hosted;
  * sostituibile in futuro da un adapter S3/MinIO implementando la stessa interfaccia.
  */
@@ -34,8 +34,17 @@ export class LocalStorageAdapter implements StorageAdapter {
         const fullPath = path.join(this.baseDir, storagePath);
         return fs.readFile(fullPath);
     }
+
+    async remove(storagePath: string): Promise<void> {
+        const fullPath = path.join(this.baseDir, storagePath);
+        try {
+            await fs.unlink(fullPath);
+        } catch (error: any) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+    }
 }
 
-/** Istanza condivisa, usata dal servizio RawFile. */
+/** Istanza condivisa dai moduli che conservano file privati del tenant. */
 export const localStorageAdapter: StorageAdapter = new LocalStorageAdapter();
 

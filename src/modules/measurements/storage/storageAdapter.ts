@@ -1,8 +1,7 @@
 /**
- * Interfaccia astratta per la conservazione dei file grezzi (RawFile). Vedi
- * docs/REHABLO_OS_IMPLEMENTATION_PLAN.md (F0.1): oggi implementata su filesystem locale
- * (`LocalStorageAdapter`), domani sostituibile con un adapter S3/MinIO senza toccare il resto
- * del modulo (servizi/controller dipendono solo da questa interfaccia).
+ * Interfaccia astratta condivisa per la conservazione dei file privati del tenant (misurazioni,
+ * logo e documenti paziente). Oggi usa il filesystem locale; resta sostituibile con S3/MinIO
+ * senza cambiare i servizi e i controller che la utilizzano.
  */
 export interface SavedFileMeta {
     /** Percorso RELATIVO alla root dello storage (portabile tra ambienti/adapter diversi). */
@@ -16,5 +15,7 @@ export interface StorageAdapter {
     save(tenantId: string, buffer: Buffer, originalName: string): Promise<SavedFileMeta>;
     /** Rilegge il contenuto originale dato lo `storagePath` salvato in precedenza. */
     read(storagePath: string): Promise<Buffer>;
+    /** Rimuove un file non più referenziato. L'assenza del file è considerata idempotente. */
+    remove(storagePath: string): Promise<void>;
 }
 

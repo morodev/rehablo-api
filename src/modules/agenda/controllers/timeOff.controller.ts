@@ -5,7 +5,7 @@ import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.
 import { getCurrentTenantId } from '../../../middleware/auth.js';
 import { scopeWhere } from '../../../middleware/rbac.js';
 import { sequelize } from '../../../config/database.js';
-import { Structure, StructureUser, TenantUser } from '../../auth/models/index.js';
+import { Structure, StructureUser, TenantUser, User } from '../../auth/models/index.js';
 import TimeOffRequest, {
     TIME_OFF_STATUSES,
     TIME_OFF_TYPES,
@@ -75,13 +75,14 @@ async function validateTarget(req: Request, structureId: string, userId: string)
     }
 
     const tenantId = getCurrentTenantId(req);
-    const [structure, tenantMembership, structureMembership] = await Promise.all([
+    const [structure, tenantMembership, identity, structureMembership] = await Promise.all([
         Structure.findOne({ where: { id: structureId, tenantId } }),
-        TenantUser.findOne({ where: { tenantId, userId } }),
+        TenantUser.findOne({ where: { tenantId, userId, deactivatedAt: { [Op.is]: null } } }),
+        User.findOne({ where: { id: userId, deactivatedAt: { [Op.is]: null } }, attributes: ['id'] }),
         StructureUser.findOne({ where: { structureId, userId } })
     ]);
 
-    return !!structure && !!tenantMembership && !!structureMembership;
+    return !!structure && !!tenantMembership && !!identity && !!structureMembership;
 }
 
 function parsePeriod(startValue: unknown, endValue: unknown): { start: Date; end: Date } | null {

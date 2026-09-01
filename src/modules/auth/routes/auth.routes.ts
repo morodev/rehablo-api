@@ -8,6 +8,7 @@ import userController from '../controllers/user.controller.js';
 import structureController from '../controllers/structure.controller.js';
 import sessionController from '../controllers/session.controller.js';
 import { simpleRateLimit } from '../../../middleware/simpleRateLimit.js';
+import { resolveTenantSchema } from '../../../middleware/tenantSchema.js';
 
 const router = Router();
 
@@ -62,7 +63,8 @@ router.patch('/user/:userId/calendar-visibility', requireAuth, userController.up
 router.patch('/user/:userId/calendar-color', requireAuth, userController.updateUserCalendarColor);
 // Attivazione/sospensione dell'account: è l'alternativa alla cancellazione per il titolare
 // dello studio, che non è eliminabile. Riservata a chi amministra l'intero tenant.
-router.patch('/user/:userId/status', requireAuth, requirePermission('user', 'update', 'tenant'), userController.setUserActive);
+router.get('/user/:userId/deactivation-impact', requireAuth, requirePermission('user', 'update', 'tenant'), resolveTenantSchema, userController.getUserDeactivationImpact);
+router.patch('/user/:userId/status', requireAuth, requirePermission('user', 'update', 'tenant'), resolveTenantSchema, userController.setUserActive);
 router.delete('/user/:userId', requireAuth, requirePermission('user', 'delete'), userController.deleteUser);
 
 // --- Structures (premises) ---
