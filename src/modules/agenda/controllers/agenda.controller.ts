@@ -144,16 +144,49 @@ async function withInvoiceStatus(
         event.get({ plain: true }) as Record<string, any>
     );
     const eventIds = plainEvents.map((event) => event.id as string).filter(Boolean);
-    const [links, appointmentPrices] = await Promise.all([
+    const patientIds = Array.from(new Set(
+        plainEvents
+            .map((event) => {
+                const patient = event.patient && typeof event.patient === 'object'
+                    ? event.patient as Record<string, unknown>
+                    : null;
+                return (event.patientId ?? patient?.id) as string | null | undefined;
+            })
+            // Gli snapshot legacy possono contenere placeholder non UUID: non devono
+            // rendere invalida l'intera query del feed.
+            .filter((patientId): patientId is string =>
+                typeof patientId === 'string' && UUID_REGEX.test(patientId)
+            )
+    ));
+    const [links, appointmentPrices, patients] = await Promise.all([
         getInvoiceAgendaLinksByEventIds(schema, eventIds),
-        appointmentPricesByEvent(schema, plainEvents)
+        appointmentPricesByEvent(schema, plainEvents),
+        patientIds.length
+            ? Patient.schema(schema).findAll({
+                where: { id: { [Op.in]: patientIds } },
+                attributes: ['id', 'color']
+            })
+            : Promise.resolve([])
     ]);
     const linkedInvoiceByEventId = new Map(links.map((link) => [link.agendaEventId, link.invoiceId]));
+    const colorByPatientId = new Map(
+        patients.map((patient) => [patient.id, patient.color ?? null] as const)
+    );
     plainEvents.forEach((event) => {
         event.invoiceId = event.invoiceId ?? linkedInvoiceByEventId.get(event.id) ?? null;
         const price = appointmentPrices.get(event.id);
         event.appointmentExpectedAmount = price?.amount ?? null;
         event.appointmentPriceSource = price?.source ?? null;
+
+        // Il nome resta lo snapshot dell'appuntamento, mentre il colore è una preferenza
+        // corrente dell'anagrafica: una modifica deve riflettersi anche sugli eventi esistenti.
+        const patient = event.patient && typeof event.patient === 'object'
+            ? event.patient as Record<string, unknown>
+            : null;
+        const patientId = (event.patientId ?? patient?.id) as string | null | undefined;
+        if (patient && patientId && colorByPatientId.has(patientId)) {
+            event.patient = {...patient, color: colorByPatientId.get(patientId) ?? null};
+        }
     });
     const invoiceIds = Array.from(new Set(
         plainEvents
@@ -243,7 +276,8 @@ async function rejectInvalidPatient(
         surname: plain.surname,
         fiscalCode: plain.fiscalCode,
         emails: plain.emails,
-        phoneNumbers: plain.phoneNumbers
+        phoneNumbers: plain.phoneNumbers,
+        color: plain.color
     };
     // Keep a scalar reference for indexed reporting while preserving the immutable snapshot.
     event.patientId = plain.id;

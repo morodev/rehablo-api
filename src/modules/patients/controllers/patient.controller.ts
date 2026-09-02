@@ -6,7 +6,7 @@ import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.
 import { scopeWhere } from '../../../middleware/rbac.js';
 import { PatientPortalAccess, Structure, StructureUser } from '../../auth/models/index.js';
 import { localStorageAdapter } from '../../measurements/storage/localStorageAdapter.js';
-import Patient from '../models/patient.model.js';
+import Patient, { PATIENT_COLORS } from '../models/patient.model.js';
 
 const ALLOWED_PRIVACY_DOCUMENT_MIME_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png']);
 
@@ -62,6 +62,7 @@ const MUTABLE_PATIENT_FIELDS = [
     'emails',
     'tags',
     'phoneNumbers',
+    'color',
     'background',
     'notes',
     'privacyConsent',
@@ -92,6 +93,34 @@ function sanitizePatientPayload(raw: Record<string, unknown> | null | undefined)
         payload.fiscalCode = normalizeFiscalCode(payload.fiscalCode);
     }
     return payload;
+}
+
+const PATIENT_COLOR_VALUES: ReadonlySet<string> = new Set(PATIENT_COLORS);
+
+/**
+ * Normalizza il colore e impedisce di persistere valori diversi dalle dieci opzioni
+ * esposte dall'anagrafica. Il colore resta facoltativo.
+ */
+function sanitizePatientColor(payload: Record<string, unknown>): string | null {
+    if (!Object.prototype.hasOwnProperty.call(payload, 'color')) return null;
+
+    const value = payload.color;
+    if (value === null || (typeof value === 'string' && value.trim() === '')) {
+        payload.color = null;
+        return null;
+    }
+
+    if (typeof value !== 'string') {
+        return 'Colore paziente non valido';
+    }
+
+    const normalized = value.trim().toLowerCase();
+    if (!PATIENT_COLOR_VALUES.has(normalized)) {
+        return 'Colore paziente non valido';
+    }
+
+    payload.color = normalized;
+    return null;
 }
 
 function activePatientWhere(req: Request): Record<string | symbol, unknown> {
@@ -150,6 +179,10 @@ export const savePatient = asyncHandler(async (req: Request, res: Response) => {
     }
 
     const payload = sanitizePatientPayload(req.body);
+    const colorError = sanitizePatientColor(payload);
+    if (colorError) {
+        return sendErrorResponse(res, 422, colorError);
+    }
     if (!payload.name || typeof payload.name !== 'string' || !payload.name.trim()) {
         return sendErrorResponse(res, 400, 'Il nome del paziente Ã¨ obbligatorio');
     }
@@ -262,6 +295,10 @@ export const update = asyncHandler(async (req: Request, res: Response) => {
     }
 
     const payload = sanitizePatientPayload(req.body.contact ?? req.body);
+    const colorError = sanitizePatientColor(payload);
+    if (colorError) {
+        return sendErrorResponse(res, 422, colorError);
+    }
     if (Object.keys(payload).length === 0) {
         return sendErrorResponse(res, 400, 'Nessun campo aggiornabile ricevuto');
     }

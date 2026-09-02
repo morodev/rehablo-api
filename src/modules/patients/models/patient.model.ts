@@ -1,6 +1,21 @@
 import { DataTypes, Model, Optional } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 
+export const PATIENT_COLORS = [
+    'blue',
+    'emerald',
+    'violet',
+    'amber',
+    'rose',
+    'cyan',
+    'indigo',
+    'teal',
+    'fuchsia',
+    'orange'
+] as const;
+
+export type PatientColor = typeof PATIENT_COLORS[number];
+
 export interface PatientAttributes {
     id: string;
     tenantId: string;
@@ -29,6 +44,8 @@ export interface PatientAttributes {
     emails: Record<string, unknown>[];
     tags: string[];
     phoneNumbers: Record<string, unknown>[];
+    /** Colore opzionale scelto dall'utente per riconoscere il paziente nelle viste operative. */
+    color?: PatientColor | null;
     background: string;
     notes?: string | null;
     /** Archiviazione logica: preserva cartella clinica, appuntamenti e documenti collegati. */
@@ -60,7 +77,7 @@ export interface PatientAttributes {
 
 export type PatientCreationAttributes = Optional<
     PatientAttributes,
-    'id' | 'isShared' | 'sharedWith' | 'emails' | 'tags' | 'phoneNumbers' | 'background' | 'name' | 'archivedAt' | 'privacyConsent' | 'stsOppositionToDataSending'
+    'id' | 'isShared' | 'sharedWith' | 'emails' | 'tags' | 'phoneNumbers' | 'color' | 'background' | 'name' | 'archivedAt' | 'privacyConsent' | 'stsOppositionToDataSending'
 >;
 
 /**
@@ -89,6 +106,7 @@ export class Patient extends Model<PatientAttributes, PatientCreationAttributes>
     declare emails: Record<string, unknown>[];
     declare tags: string[];
     declare phoneNumbers: Record<string, unknown>[];
+    declare color: PatientColor | null;
     declare background: string;
     declare notes: string | null;
     declare archivedAt: Date | null;
@@ -131,6 +149,12 @@ Patient.init(
         emails: { type: DataTypes.ARRAY(DataTypes.JSON), defaultValue: [] },
         tags: { type: DataTypes.ARRAY(DataTypes.STRING), defaultValue: [] },
         phoneNumbers: { type: DataTypes.ARRAY(DataTypes.JSON), defaultValue: [] },
+        color: {
+            type: DataTypes.STRING,
+            allowNull: true,
+            defaultValue: null,
+            validate: { isIn: [[...PATIENT_COLORS]] }
+        },
         background: { type: DataTypes.STRING, defaultValue: 'assets/images/cards/17-640x480.jpg' },
         notes: DataTypes.TEXT,
         archivedAt: { type: DataTypes.DATE, allowNull: true, defaultValue: null },
