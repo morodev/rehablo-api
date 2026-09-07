@@ -36,14 +36,18 @@ export interface AgendaEventAttributes {
     appointmentPaymentMethod?: string | null;
     appointmentPaymentNote?: string | null;
     appointmentPaymentRecordedBy?: string | null;
+    /** Frozen customer price. Null on historical appointments with no agreed price recorded. */
+    appointmentExpectedAmount?: number | null;
+    appointmentNetAmount?: number | null;
+    appointmentVatRate?: number | null;
+    appointmentPriceRecordedAt?: Date | null;
+    appointmentPaymentHistoryKnown?: boolean;
     erasable?: boolean | null;
     eventTypeId?: string | null;
     /**
-     * Fattura emessa per questo appuntamento (1 fattura ↔ 1 appuntamento nel flusso storico).
-     *
-     * È l'unica fonte di verità per le colonne "documento fiscale" e "stato pagamento"
-     * della dashboard: se valorizzato il documento è emesso e lo stato del pagamento è
-     * quello della fattura collegata. Nessuno stato di pagamento viene duplicato qui.
+     * Legacy single-appointment document reference. Cumulative documents use InvoiceAgendaEvent.
+     * Payment and document state are independent; appointment compatibility columns summarize
+     * only movements owned by this appointment, never the full payment of a cumulative invoice.
      */
     invoiceId?: string | null;
 }
@@ -81,6 +85,11 @@ export class AgendaEvent
     declare appointmentPaymentMethod: string | null;
     declare appointmentPaymentNote: string | null;
     declare appointmentPaymentRecordedBy: string | null;
+    declare appointmentExpectedAmount: number | null;
+    declare appointmentNetAmount: number | null;
+    declare appointmentVatRate: number | null;
+    declare appointmentPriceRecordedAt: Date | null;
+    declare appointmentPaymentHistoryKnown: boolean;
     declare erasable: boolean | null;
     declare eventTypeId: string | null;
     declare invoiceId: string | null;
@@ -115,6 +124,11 @@ AgendaEvent.init(
         appointmentPaymentMethod: { type: DataTypes.STRING, allowNull: true },
         appointmentPaymentNote: { type: DataTypes.TEXT, allowNull: true },
         appointmentPaymentRecordedBy: { type: DataTypes.UUID, allowNull: true },
+        appointmentExpectedAmount: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
+        appointmentNetAmount: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
+        appointmentVatRate: { type: DataTypes.DECIMAL(5, 2), allowNull: true },
+        appointmentPriceRecordedAt: { type: DataTypes.DATE, allowNull: true },
+        appointmentPaymentHistoryKnown: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
         erasable: { type: DataTypes.BOOLEAN, defaultValue: true },
         eventTypeId: { type: DataTypes.UUID, allowNull: true },
         invoiceId: {

@@ -13,6 +13,7 @@ import { TENANT_OWNER_ROLE } from '../rbac/roles.js';
 import { isTaxRegimeCode } from '../../invoice/utils/fiscalRegime.js';
 import { Tenant, User, Structure, StructureAvailability, UserAvailability } from '../models/index.js';
 import { localStorageAdapter } from '../../measurements/storage/localStorageAdapter.js';
+import {markTenantSchemaReady, provisionTenantSchema} from '../../../utils/tenantSchema.js';
 
 export const stripe = env.stripeSecretKey ? new Stripe(env.stripeSecretKey) : (null as unknown as Stripe);
 
@@ -122,8 +123,13 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
             (newStructure as any).addUser(createdUser, { transaction })
         ]);
 
+        // Provisioning belongs to the registration transaction: the tenant is never returned
+        // before its complete schema and versioned migrations are ready.
+        await provisionTenantSchema(tenant.id, transaction);
+
         return { tenant, createdUser };
     });
+    markTenantSchemaReady(tenant.id);
 
     // Fire-and-forget: the verification email must NOT roll back tenant creation NOR slow down
     // the HTTP response if SMTP is misconfigured or temporarily unavailable/slow (nodemailer can

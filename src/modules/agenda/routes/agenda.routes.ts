@@ -5,6 +5,7 @@ import { resolveTenantSchema } from '../../../middleware/tenantSchema.js';
 import agendaController from '../controllers/agenda.controller.js';
 import eventTypeController from '../controllers/eventType.controller.js';
 import timeOffController from '../controllers/timeOff.controller.js';
+import { listAppointmentPayments, createAppointmentPayment, voidAppointmentPayment } from '../controllers/appointmentPayment.controller.js';
 
 const router = Router();
 
@@ -20,6 +21,9 @@ router.post('/agenda-event', requirePermission('agenda', 'create'), agendaContro
 router.patch('/agenda-event', requirePermission('agenda', 'update'), agendaController.updateAgendaEvent);
 router.patch('/agenda-events/reassign-operator', requirePermission('agenda', 'update', 'structure'), agendaController.reassignDeferredOperatorEvents);
 router.patch('/agenda-event/:agendaEventId/payment', requirePermission('agenda', 'update'), agendaController.updateAppointmentPayment);
+router.get('/agenda-event/:agendaEventId/payments', requirePermission('agenda', 'read'), listAppointmentPayments);
+router.post('/agenda-event/:agendaEventId/payments', requirePermission('agenda', 'update'), createAppointmentPayment);
+router.patch('/agenda-event/:agendaEventId/payments/:paymentId/void', requirePermission('agenda', 'update'), voidAppointmentPayment);
 router.patch('/agenda-event/:agendaEventId/missed-arrival/report', requirePermission('agenda', 'update'), agendaController.reportMissedArrival);
 router.patch('/agenda-event/:agendaEventId/missed-arrival/resolve', requirePermission('agenda', 'update'), agendaController.resolveMissedArrival);
 router.patch('/agenda-event/:agendaEventId/no-show-billing', requirePermission('agenda', 'update'), agendaController.updateNoShowBillingDecision);

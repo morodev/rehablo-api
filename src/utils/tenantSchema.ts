@@ -1,6 +1,10 @@
-import { ModelStatic, SyncOptions } from 'sequelize';
+import { ModelStatic, SyncOptions, Transaction } from 'sequelize';
 import { sequelize } from '../config/database.js';
 import { env } from '../config/env.js';
+import {
+    isTenantSchemaCurrent, lockTenantSchema, prepareTenantPaymentHistory,
+    recordTenantModelBaseline, runTenantMigrations
+} from './tenantMigrations.js';
 
 /**
  * Builds the dynamic Postgres schema name used for tenant-scoped business data.
@@ -83,40 +87,66 @@ export async function ensureTenantSchema(tenantId: string): Promise<string> {
 }
 
 async function syncTenantSchema(schemaName: string): Promise<string> {
-    await sequelize.createSchema(schemaName, {});
-
     const syncOptions = syncOptionsFor();
-
-    if (syncOptions) {
-        const failed: string[] = [];
-
-        for (const model of tenantScopedModels) {
-            try {
-                await model.schema(schemaName).sync(syncOptions);
-            } catch (err) {
-                // Un modello che non si allinea NON deve rendere inutilizzabile l'intero tenant.
-                // Prima, un errore su una qualsiasi delle ~30 tabelle usciva da
-                // `resolveTenantSchema` come 500 su OGNI richiesta di quel tenant e, non essendo
-                // mai raggiunta `ensuredSchemas.add()`, il sync completo veniva ritentato (e
-                // rifallito) a ogni chiamata: outage totale invece che degrado localizzato.
-                failed.push(model.name);
-                console.error(`[tenant-schema] sync di "${model.name}" fallito su ${schemaName}`, err);
-            }
-        }
-
-        if (failed.length > 0) {
-            console.error(
-                `[tenant-schema] ${schemaName}: modelli non allineati -> ${failed.join(', ')}. ` +
-                    'Le tabelle esistenti restano utilizzabili; se manca una colonna nuova, allinearla con una migration.'
-            );
-        }
+    if (syncOptions && !await isTenantSchemaCurrent(schemaName)) {
+        await sequelize.transaction(transaction => initializeTenantSchema(schemaName, syncOptions, transaction, true));
     }
-
-    // Marcato come pronto anche in presenza di errori parziali: ritentare il sync a ogni
-    // richiesta non ripara nulla e moltiplica il carico sul database.
     ensuredSchemas.add(schemaName);
-
     return schemaName;
+}
+
+async function initializeTenantSchema(
+    schemaName: string, syncOptions: SyncOptions, transaction: Transaction, recheckCurrent = false
+): Promise<void> {
+    await lockTenantSchema(sequelize, schemaName, transaction);
+    // A second API instance can complete the same tenant while this one waits for the lock.
+    if (recheckCurrent && await isTenantSchemaCurrent(schemaName, sequelize, transaction)) return;
+    await sequelize.query(`CREATE SCHEMA IF NOT EXISTS "${schemaName}"`, {transaction});
+    const repairHistoryKnown = await prepareTenantPaymentHistory(schemaName, sequelize, transaction);
+    // Schema sync and versioned migrations commit together. A failure keeps the tenant out of
+    // the ready cache and prevents requests from observing a partially upgraded schema.
+    const transactionalSyncOptions = {...syncOptions, transaction} as SyncOptions;
+    for (const model of tenantScopedModels) {
+        // Sequelize forwards unknown SyncOptions to every QueryInterface call; its v6 typings
+        // omit `transaction`, although the runtime supports and propagates it.
+        await model.schema(schemaName).sync(transactionalSyncOptions);
+    }
+    const completed = await runTenantMigrations(schemaName, repairHistoryKnown, sequelize, transaction);
+    if (completed.length) {
+        console.log(`[tenant-schema] ${schemaName}: migrazioni completate (${completed.join(', ')})`);
+    }
+    await recordTenantModelBaseline(schemaName, sequelize, transaction);
+}
+
+/** Provision a tenant in the caller's transaction, used during registration before it is returned. */
+export async function provisionTenantSchema(tenantId: string, transaction: Transaction): Promise<string> {
+    const schemaName = getTenantSchemaName(tenantId);
+    const syncOptions = syncOptionsFor();
+    if (syncOptions) await initializeTenantSchema(schemaName, syncOptions, transaction);
+    return schemaName;
+}
+
+/** Mark a schema provisioned in a transaction that has just committed successfully. */
+export function markTenantSchemaReady(tenantId: string): void {
+    ensuredSchemas.add(getTenantSchemaName(tenantId));
+}
+
+/**
+ * Upgrade every existing tenant before the HTTP listener starts. Work is bounded to avoid
+ * exhausting the Sequelize pool; a single failure rejects startup and therefore the deploy.
+ */
+export async function warmTenantSchemas(tenantIds: string[], concurrency = 2): Promise<number> {
+    const uniqueTenantIds = [...new Set(tenantIds)];
+    if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error('Tenant bootstrap concurrency must be positive');
+    let cursor = 0;
+    const worker = async () => {
+        while (cursor < uniqueTenantIds.length) {
+            const index = cursor++;
+            await ensureTenantSchema(uniqueTenantIds[index]);
+        }
+    };
+    await Promise.all(Array.from({length: Math.min(concurrency, uniqueTenantIds.length)}, worker));
+    return uniqueTenantIds.length;
 }
 
 /**

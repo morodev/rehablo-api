@@ -104,6 +104,9 @@ function evalVat(isRivals: boolean, rivals: number, vatRate: number, sellingPric
 }
 
 export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
+    // Invoice lines are currency amounts. Round each line's VAT before aggregation so
+    // ten individually agreed/paid appointments retain the sum of their customer amounts.
+    const money = (value: number): number => Math.round((value + Number.EPSILON) * 100) / 100;
     const rivals = invoiceFields.rivals || 0;
     const isRivals = !!invoiceFields.isRivals;
     // Il regime dell'emittente ha la precedenza sull'aliquota di catalogo: un forfettario non
@@ -113,7 +116,7 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
     // Unifica prodotti e servizi in un'unica lista di righe, applicando la quantità al prezzo
     // unitario (fix del bug "quantity ignorata").
     const lines = [...(invoiceFields.products ?? []), ...(invoiceFields.services ?? [])].map((line) => ({
-        totalLinePrice: line.sellingPrice * (line.quantity ?? 1),
+        totalLinePrice: money(line.sellingPrice * (line.quantity ?? 1)),
         vatKey: appliesVat ? normalizeVatRateKey(line.productVat) : 'ESENTE'
     }));
 
@@ -121,15 +124,18 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
     lines.forEach((line) => {
         totalSellingPrice += line.totalLinePrice;
     });
+    totalSellingPrice = money(totalSellingPrice);
 
     const discount = getPercDiscount(invoiceFields.discountType, invoiceFields.discountAmount || 0, totalSellingPrice);
-    const totalDiscSellingPrice = totalSellingPrice - applyDiscount(discount, totalSellingPrice);
+    const totalDiscSellingPrice = money(totalSellingPrice - applyDiscount(discount, totalSellingPrice));
 
     let totalRivals = 0;
     let vatFreeAmount = 0;
     const vatBuckets: Record<string, number> = { '4': 0, '5': 0, '10': 0, '22': 0, ESENTE: 0 };
 
     lines.forEach((line) => {
+        // Keep the proportional discount precise until the total; rounding it on every line
+        // would change a fixed document discount (e.g. 1 euro spread over three equal lines).
         const discountedPrice = line.totalLinePrice - applyDiscount(discount, line.totalLinePrice);
         if (isRivals) {
             totalRivals += (rivals * discountedPrice) / 100;
@@ -139,18 +145,19 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
             vatBuckets.ESENTE += 0; // operazione esente/non imponibile: nessuna IVA dovuta.
             vatFreeAmount += discountedPrice; // ...ma concorre alla soglia della marca da bollo.
         } else {
-            vatBuckets[line.vatKey] += evalVat(isRivals, rivals, Number(line.vatKey), discountedPrice);
+            vatBuckets[line.vatKey] += money(evalVat(isRivals, rivals, Number(line.vatKey), discountedPrice));
         }
     });
 
-    const totalProductVat = vatBuckets['4'] + vatBuckets['5'] + vatBuckets['10'] + vatBuckets['22'] + vatBuckets.ESENTE;
+    totalRivals = money(totalRivals);
+    const totalProductVat = money(vatBuckets['4'] + vatBuckets['5'] + vatBuckets['10'] + vatBuckets['22'] + vatBuckets.ESENTE);
 
     // Marca da bollo: il tributo è dovuto dall'emittente, ma entra nel totale a pagare SOLO se
     // riaddebitato al cliente (art. 15, c. 1, n. 3, DPR 633/72, che lo esclude dalla base imponibile).
     const stampChargedAmount =
         invoiceFields.isStamp && invoiceFields.stampChargedToPatient ? invoiceFields.stampAmount || 0 : 0;
 
-    const invoiceTotal = totalDiscSellingPrice + totalRivals + totalProductVat + stampChargedAmount;
+    const invoiceTotal = money(totalDiscSellingPrice + totalRivals + totalProductVat + stampChargedAmount);
 
     let taxWithholdingValue = 0;
     if (invoiceFields.isTaxWithholding) {
@@ -160,7 +167,8 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
             : ((totalSellingPrice + totalRivals) * taxWithholding) / 100;
     }
 
-    const netAmountDue = invoiceTotal - taxWithholdingValue;
+    taxWithholdingValue = money(taxWithholdingValue);
+    const netAmountDue = money(invoiceTotal - taxWithholdingValue);
 
     return {
         invoiceTotal,
@@ -168,7 +176,7 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
         discSellingPrice: totalDiscSellingPrice,
         invoiceNet: netAmountDue,
         invoiceVAT: totalProductVat,
-        vatFreeAmount,
+        vatFreeAmount: money(vatFreeAmount),
         rivalsAmount: totalRivals,
         taxWithholdingAmount: taxWithholdingValue,
         stampChargedAmount

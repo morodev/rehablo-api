@@ -1,164 +1,47 @@
 import { Request, Response } from 'express';
-import { Op } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
-import { sendSuccessResponse } from '../../../utils/response.js';
-import { patientScopeWhere } from '../../../middleware/rbac.js';
-import Invoice from '../models/invoice.model.js';
-import InvoicePayment from '../models/invoicePayment.model.js';
+import { sendSuccessResponse, sendErrorResponse } from '../../../utils/response.js';
+import { aggregateFinance, loadFinanceData, parseFinanceFilters, FinanceQuery } from '../../reports/services/finance.service.js';
+import { AnalyticsQueryError, localDateKey, parseAnalyticsQuery } from '../../reports/services/analytics.service.js';
 import Tenant from '../../auth/models/tenant.model.js';
 import { getMissingIssuerFields } from '../utils/issuer.js';
 import { resolveFiscalProfile } from '../utils/fiscalRegime.js';
-import { getPaymentSummaries } from '../services/payment.service.js';
 
-/**
- * Aggregazioni economiche per la dashboard di direzione.
- *
- * Perché un endpoint dedicato invece di calcolare lato client: `GET /invoice` è paginato
- * (default 10 elementi) e restituisce anche tutte le righe di ogni documento. Ricostruire
- * il fatturato di sei mesi sfogliando le pagine significherebbe decine di richieste e totali
- * sbagliati appena qualcuno cambia pagina.
- *
- * Le fatture stornate (`status = 'void'`) sono escluse da ogni totale: non concorrono né al
- * fatturato né all'incassato.
- */
-
-interface MonthlyBucket {
-    /** Chiave `YYYY-MM`. */
-    month: string;
-    billed: number;
-    collected: number;
-}
-
-const VOID_STATUS = 'void';
-
-function monthKey(date: Date): string {
-    return `${date.getFullYear()}-${`${date.getMonth() + 1}`.padStart(2, '0')}`;
-}
-
-/**
- * GET /reports/overview?months=6
- *
- * Restituisce:
- * - `today`:   fatturato, incassato e da incassare dei documenti emessi OGGI
- * - `monthly`: serie degli ultimi N mesi (default 6), dal più vecchio al più recente
- * - `outstanding`: totale non ancora incassato, senza limiti di periodo
- */
+/** Shared ledger aggregation: receipts use payment date, documents use issue date. */
 export const getOverview = asyncHandler(async (req: Request, res: Response) => {
-    const schema = req.tenantSchema!;
-    const InvoiceScoped = Invoice.schema(schema);
-
-    const months = Math.min(Math.max(parseInt((req.query.months as string) ?? '6', 10) || 6, 1), 24);
-
-    const now = new Date();
-    const rangeStart = new Date(now.getFullYear(), now.getMonth() - (months - 1), 1);
-    const rangeStartKey = rangeStart.toISOString().slice(0, 7) + '-01';
-    const todayKey = now.toLocaleDateString('en-CA', { timeZone: 'Europe/Rome' });
-
-    // Un'unica lettura: le fatture del periodo con i soli campi che servono ai totali.
-    const invoices = await InvoiceScoped.findAll({
-        where: {
-            emissionDate: { [Op.gte]: rangeStartKey },
-            ...patientScopeWhere(req, schema, 'patientID')
-        },
-        attributes: ['id', 'emissionDate', 'status', 'invoiceTotal', 'documentType']
-    });
-
-    // Il saldo aperto va guardato su tutto lo storico, non solo sul periodo del grafico.
-    const allInvoices = await InvoiceScoped.findAll({
-        where: {
-            status: { [Op.ne]: VOID_STATUS },
-            ...patientScopeWhere(req, schema, 'patientID')
-        },
-        attributes: ['id', 'invoiceTotal', 'status', 'documentType']
-    });
-    const allPlain = allInvoices.map((invoice) => invoice.get({ plain: true }) as Record<string, any>);
-    const paymentSummaries = await getPaymentSummaries(schema, allPlain);
-    const invoiceIds = allPlain.map((invoice) => invoice.id);
-    const payments = invoiceIds.length ? await InvoicePayment.schema(schema).findAll({
-        where: {
-            invoiceId: { [Op.in]: invoiceIds },
-            status: 'POSTED',
-            paidAt: { [Op.gte]: rangeStartKey }
-        },
-        attributes: ['amount', 'paidAt']
-    }) : [];
-
-    const buckets = new Map<string, MonthlyBucket>();
-    for (let i = 0; i < months; i++) {
-        const date = new Date(rangeStart.getFullYear(), rangeStart.getMonth() + i, 1);
-        buckets.set(monthKey(date), { month: monthKey(date), billed: 0, collected: 0 });
+    const months = Math.min(Math.max(parseInt(String(req.query.months ?? '6'), 10) || 6, 1), 24);
+    const todayKey = localDateKey(new Date());
+    const rangeStart = new Date(todayKey.slice(0, 7) + '-01T12:00:00Z');
+    rangeStart.setUTCMonth(rangeStart.getUTCMonth() - months + 1);
+    let query: FinanceQuery;
+    try {
+        query = { ...parseAnalyticsQuery(req), ...parseFinanceFilters(req),
+            from: rangeStart.toISOString().slice(0, 10), to: todayKey, granularity: 'month', compare: 'none' };
+    } catch (error) {
+        if (error instanceof AnalyticsQueryError) return sendErrorResponse(res, 400, error.message);
+        throw error;
     }
-
-    let todayBilled = 0;
-    let todayCollected = 0;
-    let todayOutstanding = 0;
-
-    invoices.forEach((invoice) => {
-        const status = (invoice.get('status') as string | null) ?? '';
-        if (status === VOID_STATUS) {
-            return;
-        }
-
-        const sign = invoice.get('documentType') === 'nota_di_credito' ? -1 : 1;
-        const total = sign * (Number(invoice.get('invoiceTotal')) || 0);
-
-        // `emissionDate` può arrivare come Date o come stringa a seconda del driver.
-        const rawDate = invoice.get('emissionDate') as Date | string | null;
-        const emitted = rawDate ? new Date(rawDate) : null;
-        if (!emitted || Number.isNaN(emitted.getTime())) {
-            return;
-        }
-
-        const bucket = buckets.get(monthKey(emitted));
-        if (bucket) {
-            bucket.billed += total;
-        }
-
-        if (String(rawDate).slice(0, 10) === todayKey) {
-            todayBilled += total;
-            if (sign > 0) {
-                todayOutstanding += paymentSummaries.get(invoice.get('id') as string)?.balance ?? 0;
-            }
-        }
+    const data = await loadFinanceData(req, query);
+    const monthlyReport = aggregateFinance(data, query);
+    const dailyReport = aggregateFinance(data, { ...query, from: todayKey, to: todayKey, granularity: 'day' });
+    const monthly = Array.from({ length: months }, (_, offset) => {
+        const date = new Date(rangeStart); date.setUTCMonth(date.getUTCMonth() + offset);
+        const month = date.toISOString().slice(0, 7);
+        const bucket = monthlyReport.series.find((row) => row.bucket === month);
+        return { month, billed: bucket?.billedTotal ?? 0, collected: bucket?.collected ?? 0,
+            collectedFromAppointments: bucket?.collectedFromAppointments ?? 0,
+            collectedFromInvoices: bucket?.collectedFromInvoices ?? 0 };
     });
-
-    payments.forEach((payment) => {
-        const rawDate = payment.get('paidAt') as Date | string | null;
-        if (!rawDate) return;
-        const key = String(rawDate).slice(0, 7);
-        const amount = Number(payment.get('amount')) || 0;
-        const bucket = buckets.get(key);
-        if (bucket) bucket.collected += amount;
-        if (String(rawDate).slice(0, 10) === todayKey) todayCollected += amount;
-    });
-
-    const outstanding = allPlain.reduce((sum, invoice) => {
-        if (invoice.documentType === 'nota_di_credito') return sum;
-        return sum + (paymentSummaries.get(invoice.id)?.balance ?? 0);
-    }, 0);
-
-    const monthly = [...buckets.values()].map((bucket) => ({
-        month: bucket.month,
-        billed: Math.round(bucket.billed * 100) / 100,
-        collected: Math.round(bucket.collected * 100) / 100
-    }));
-
-    return sendSuccessResponse(
-        res,
-        200,
-        {
-            today: {
-                billed: Math.round(todayBilled * 100) / 100,
-                collected: Math.round(todayCollected * 100) / 100,
-                // Residuo dei documenti emessi oggi. Non si sottrae l'incassato odierno dal
-                // fatturato odierno: un pagamento di oggi può riferirsi a una fattura più vecchia.
-                toCollect: Math.round(todayOutstanding * 100) / 100
-            },
-            monthly,
-            outstanding: Math.round(outstanding * 100) / 100
-        },
-        'Riepilogo economico caricato'
-    );
+    const totals = dailyReport.totals;
+    return sendSuccessResponse(res, 200, {
+        today: { billed: totals.billedTotal, collected: totals.collected, toCollect: totals.issuedOutstanding,
+            collectedFromAppointments: totals.collectedFromAppointments, collectedFromInvoices: totals.collectedFromInvoices },
+        monthly, outstanding: totals.outstanding, invoiceOutstanding: totals.invoiceOutstanding,
+        appointmentOutstanding: totals.appointmentOutstanding, collectedUnbilled: totals.collectedUnbilled,
+        undatedLegacyPaid: totals.undatedLegacyPaid, unknownAppointmentCount: totals.unknownAppointmentCount,
+        excludedMixedInvoiceCount: totals.excludedMixedInvoiceCount,
+        balanceAsOf: dailyReport.balanceAsOf, attributionPolicy: dailyReport.attributionPolicy
+    }, 'Riepilogo economico caricato');
 });
 
 /**

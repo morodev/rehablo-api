@@ -6,19 +6,16 @@ import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import Patient from '../../patients/models/patient.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
-import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import InvoiceProduct from '../../invoice/models/invoiceProduct.model.js';
 import InvoiceService from '../../invoice/models/invoiceService.model.js';
 import { getPaymentSummaries } from '../../invoice/services/payment.service.js';
 import {
-    getInvoiceAgendaLinksByEventIds,
     getInvoiceAgendaLinksByInvoiceIds
 } from '../../invoice/services/invoiceAgendaEvent.service.js';
 import {
     aggregateActivity,
     AnalyticsQuery,
     AnalyticsQueryError,
-    bucketKey,
     comparisonRange,
     localDateKey,
     loadOccurrences,
@@ -26,11 +23,15 @@ import {
     percentageChange
 } from '../services/analytics.service.js';
 
+import { aggregateFinance, loadFinanceData, parseFinanceFilters, therapyPaymentsPayload } from '../services/finance.service.js';
+
 const money = (value: unknown): number => Math.round((Number(value) || 0) * 100) / 100;
 
 function queryOr400(req: Request, res: Response): AnalyticsQuery | null {
     try {
-        return parseAnalyticsQuery(req);
+        const query = parseAnalyticsQuery(req);
+        parseFinanceFilters(req);
+        return query;
     } catch (error) {
         if (error instanceof AnalyticsQueryError) {
             sendErrorResponse(res, 400, error.message);
@@ -49,30 +50,12 @@ function invoiceWhere(req: Request, query: AnalyticsQuery, extra: Record<string 
     return where;
 }
 
-async function invoiceAttributionWhere(schema: string, query: AnalyticsQuery) {
+async function invoiceAttributionWhere(req: Request, query: AnalyticsQuery) {
     if (!query.operatorId && !query.eventTypeId) return {};
-    const where: Record<string, any> = {};
-    if (query.operatorId) where.calendarId = query.operatorId;
-    if (query.eventTypeId) where.eventTypeId = query.eventTypeId;
-    const events = await AgendaEvent.schema(schema).findAll({ where, attributes: ['id', 'invoiceId'] });
-    const eventIds = events.map((event) => event.id);
-    const links = await getInvoiceAgendaLinksByEventIds(schema, eventIds);
-    const invoiceIds = [...new Set([
-        ...events.map((event) => event.invoiceId).filter(Boolean),
-        ...links.map((link) => link.invoiceId)
-    ])] as string[];
-    return {
-        [Op.or]: [
-            { id: { [Op.in]: invoiceIds } },
-            { agendaEventId: { [Op.in]: eventIds } }
-        ]
-    };
+    const data = await loadFinanceData(req, { ...query, ...parseFinanceFilters(req) });
+    return { id: { [Op.in]: [...data.attributableInvoiceIds] } };
 }
 
-function signed(invoice: Record<string, any>, field: string): number {
-    const sign = invoice.documentType === 'nota_di_credito' ? -1 : 1;
-    return sign * (Number(invoice[field]) || 0);
-}
 
 async function activityPayload(schema: string, query: AnalyticsQuery) {
     const occurrences = await loadOccurrences(schema, query);
@@ -186,110 +169,24 @@ export const getPatients = asyncHandler(async (req: Request, res: Response) => {
     }, 'Statistiche pazienti caricate');
 });
 
-async function financePayload(req: Request, query: AnalyticsQuery, withGlobalBalances = true) {
-    const schema = req.tenantSchema!;
-    const InvoiceScoped = Invoice.schema(schema);
-    const attributionWhere = await invoiceAttributionWhere(schema, query);
-    const issuedRows = await InvoiceScoped.findAll({
-        where: invoiceWhere(req, query, {
-            ...attributionWhere,
-            emissionDate: { [Op.between]: [query.from, query.to] },
-            status: { [Op.ne]: 'void' }
-        }),
-        attributes: ['id', 'emissionDate', 'invoiceTotal', 'invoiceNet', 'sellingPrice', 'discSellingPrice', 'status', 'documentType', 'agendaEventId']
-    });
-    const issued = issuedRows.map((row) => row.get({ plain: true }) as Record<string, any>);
 
-    const allRows = withGlobalBalances
-        ? await InvoiceScoped.findAll({
-            where: invoiceWhere(req, query, { ...attributionWhere, status: { [Op.ne]: 'void' } }),
-            attributes: ['id', 'invoiceTotal', 'status', 'documentType', 'paymentTerms', 'agendaEventId']
-        })
-        : issuedRows;
-    const all = allRows.map((row) => row.get({ plain: true }) as Record<string, any>);
-    const summaries = await getPaymentSummaries(schema, all);
-    const invoiceIds = all.map((invoice) => invoice.id);
-    const payments = invoiceIds.length ? await InvoicePayment.schema(schema).findAll({
-        where: {
-            invoiceId: { [Op.in]: invoiceIds },
-            status: 'POSTED',
-            paidAt: { [Op.between]: [query.from, query.to] }
-        },
-        attributes: ['invoiceId', 'amount', 'paidAt']
-    }) : [];
-
-    const totals = {
-        billedTotal: money(issued.reduce((sum, invoice) => sum + signed(invoice, 'invoiceTotal'), 0)),
-        billedNet: money(issued.reduce((sum, invoice) => sum + signed(invoice, 'invoiceNet'), 0)),
-        discounts: money(issued.reduce((sum, invoice) => sum + Math.max((Number(invoice.sellingPrice) || 0) - (Number(invoice.discSellingPrice) || 0), 0), 0)),
-        collected: money(payments.reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0)),
-        outstanding: 0,
-        overdue: 0,
-        undatedLegacyPaid: 0,
-        unbilledCompleted: 0,
-        unbilledEstimatedValue: 0
-    };
-    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Rome' });
-    all.forEach((invoice) => {
-        if (invoice.documentType === 'nota_di_credito') return;
-        const summary = summaries.get(invoice.id)!;
-        totals.outstanding += summary.balance;
-        if (summary.balance > 0 && invoice.paymentTerms && String(invoice.paymentTerms).slice(0, 10) < today) {
-            totals.overdue += summary.balance;
-        }
-        if (summary.hasUndatedLegacyPayments) totals.undatedLegacyPaid += summary.paidAmount;
-    });
-
-    const occurrences = await loadOccurrences(schema, query);
-    const unbilled = occurrences.filter((row) => row.status === 'COMPLETED' && !row.invoiceId);
-    totals.unbilledCompleted = unbilled.length;
-    const typeIds = [...new Set(unbilled.map((row) => row.eventTypeId).filter(Boolean))] as string[];
-    const prices = typeIds.length ? await import('../../agenda/models/eventType.model.js').then(({ default: EventType }) =>
-        EventType.schema(schema).findAll({ where: { id: { [Op.in]: typeIds } }, attributes: ['id', 'price'] })
-    ) : [];
-    const priceByType = new Map(prices.map((row) => [row.id, Number(row.price) || 0]));
-    totals.unbilledEstimatedValue = money(unbilled.reduce((sum, row) => sum + (row.eventTypeId ? priceByType.get(row.eventTypeId) ?? 0 : 0), 0));
-    totals.outstanding = money(totals.outstanding);
-    totals.overdue = money(totals.overdue);
-    totals.undatedLegacyPaid = money(totals.undatedLegacyPaid);
-
-    const series = new Map<string, { bucket: string; billedTotal: number; billedNet: number; collected: number }>();
-    issued.forEach((invoice) => {
-        const date = new Date(`${String(invoice.emissionDate).slice(0, 10)}T12:00:00.000Z`);
-        const bucket = bucketKey(date, query.granularity);
-        const value = series.get(bucket) ?? { bucket, billedTotal: 0, billedNet: 0, collected: 0 };
-        value.billedTotal += signed(invoice, 'invoiceTotal');
-        value.billedNet += signed(invoice, 'invoiceNet');
-        series.set(bucket, value);
-    });
-    payments.forEach((payment) => {
-        const date = new Date(`${String(payment.paidAt).slice(0, 10)}T12:00:00.000Z`);
-        const bucket = bucketKey(date, query.granularity);
-        const value = series.get(bucket) ?? { bucket, billedTotal: 0, billedNet: 0, collected: 0 };
-        value.collected += Number(payment.amount) || 0;
-        series.set(bucket, value);
-    });
-
-    return {
-        period: query,
-        totals,
-        series: [...series.values()].sort((a, b) => a.bucket.localeCompare(b.bucket)).map((value) => ({
-            ...value,
-            billedTotal: money(value.billedTotal),
-            billedNet: money(value.billedNet),
-            collected: money(value.collected)
-        }))
-    };
-}
+export const getTherapyPayments = asyncHandler(async (req: Request, res: Response) => {
+    const query = queryOr400(req, res);
+    if (!query) return;
+    const financialQuery = { ...query, ...parseFinanceFilters(req) };
+    const page = Math.max(parseInt(String(req.query.page ?? '1'), 10) || 1, 1);
+    const size = Math.min(Math.max(parseInt(String(req.query.size ?? '25'), 10) || 25, 1), 100);
+    return sendSuccessResponse(res, 200, await therapyPaymentsPayload(req, financialQuery, page, size), 'Incassi terapie caricati');
+});
 
 export const getFinance = asyncHandler(async (req: Request, res: Response) => {
     const query = queryOr400(req, res);
     if (!query) return;
-    const current = await financePayload(req, query);
-    const previousQuery = comparisonRange(query);
-    // Incassi del periodo precedente possono riferirsi a fatture emesse ancora prima: per il
-    // confronto serve quindi lo stesso perimetro completo usato nel periodo corrente.
-    const previous = previousQuery ? await financePayload(req, previousQuery) : null;
+    const financialQuery = { ...query, ...parseFinanceFilters(req) };
+    const data = await loadFinanceData(req, financialQuery);
+    const current = aggregateFinance(data, financialQuery);
+    const previousQuery = comparisonRange(financialQuery);
+    const previous = previousQuery ? aggregateFinance(data, { ...financialQuery, ...previousQuery }) : null;
     return sendSuccessResponse(res, 200, {
         ...current,
         comparison: previous ? {
@@ -350,15 +247,17 @@ export const getOperators = asyncHandler(async (req: Request, res: Response) => 
             return;
         }
 
-        const share = value / linkedEvents.length;
-        linkedEvents
-            .filter((event) => !query.operatorId || event!.calendarId === query.operatorId)
-            .filter((event) => !query.eventTypeId || event!.eventTypeId === query.eventTypeId)
-            .forEach((event) => {
-                const operatorId = event!.calendarId ?? null;
-                if (!operatorId) unassignedRevenue += share;
-                else revenueByOperator.set(operatorId, (revenueByOperator.get(operatorId) ?? 0) + share);
-            });
+        // Whole document attribution is possible only if every linked therapy belongs
+        // to the same operator and satisfies the type filter. Mixed documents stay unassigned.
+        const operatorIds = [...new Set(linkedEvents.map((event) => event!.calendarId ?? null))];
+        if (operatorIds.length !== 1 || (query.eventTypeId && linkedEvents.some((event) => event!.eventTypeId !== query.eventTypeId))) {
+            if (!query.operatorId && !query.eventTypeId) unassignedRevenue += value;
+            return;
+        }
+        const operatorId = operatorIds[0];
+        if (query.operatorId && operatorId !== query.operatorId) return;
+        if (!operatorId) unassignedRevenue += value;
+        else revenueByOperator.set(operatorId, (revenueByOperator.get(operatorId) ?? 0) + value);
     });
     return sendSuccessResponse(res, 200, {
         period: query,
@@ -366,7 +265,8 @@ export const getOperators = asyncHandler(async (req: Request, res: Response) => 
             ...operator,
             attributedRevenue: money(revenueByOperator.get(operator.operatorId) ?? 0)
         })),
-        unassignedRevenue: money(unassignedRevenue)
+        unassignedRevenue: money(unassignedRevenue),
+        attributionPolicy: 'whole_document_when_all_linked_therapies_match'
     }, 'Statistiche operatori caricate');
 });
 
@@ -375,7 +275,7 @@ export const getCatalog = asyncHandler(async (req: Request, res: Response) => {
     if (!query) return;
     const schema = req.tenantSchema!;
     const activity = await aggregateActivity(schema, query);
-    const attributionWhere = await invoiceAttributionWhere(schema, query);
+    const attributionWhere = await invoiceAttributionWhere(req, query);
     const invoiceRows = await Invoice.schema(schema).findAll({
         where: invoiceWhere(req, query, {
             ...attributionWhere,
@@ -426,14 +326,14 @@ export const getReceivables = asyncHandler(async (req: Request, res: Response) =
     const validBuckets = ['all', 'overdue', 'today', 'next7', 'no_due'];
     if (!validBuckets.includes(bucket)) return sendErrorResponse(res, 400, 'Filtro scadenza non valido');
 
-    const attributionWhere = await invoiceAttributionWhere(req.tenantSchema!, query);
+    const attributionWhere = await invoiceAttributionWhere(req, query);
     const rows = await Invoice.schema(req.tenantSchema!).findAll({
         where: invoiceWhere(req, query, {
             ...attributionWhere,
             status: { [Op.ne]: 'void' },
             documentType: { [Op.ne]: 'nota_di_credito' }
         }),
-        attributes: ['id', 'patientID', 'documentNumber', 'documentYear', 'documentType', 'emissionDate', 'paymentTerms', 'invoiceTotal', 'status']
+        attributes: ['id', 'patientID', 'documentNumber', 'documentYear', 'documentType', 'emissionDate', 'paymentTerms', 'invoiceTotal', 'invoiceNet', 'status']
     });
     const invoices = rows.map((row) => row.get({ plain: true }) as Record<string, any>);
     const summaries = await getPaymentSummaries(req.tenantSchema!, invoices);
@@ -483,6 +383,7 @@ export default {
     getSummary,
     getActivity,
     getFinance,
+    getTherapyPayments,
     getOperators,
     getCatalog,
     getPatients,

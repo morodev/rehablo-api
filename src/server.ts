@@ -8,7 +8,7 @@ import { env } from './config/env.js';
 import { connectDatabase } from './config/database.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
 
-import { registerAuthAssociations, syncAuthModels } from './modules/auth/models/index.js';
+import { registerAuthAssociations, syncAuthModels, Tenant } from './modules/auth/models/index.js';
 import { assignBootstrapRoles } from './modules/auth/rbac/bootstrap.js';
 import { purgeExpiredRefreshTokens } from './modules/auth/services/refreshToken.service.js';
 import { runStructureBackfill } from './modules/auth/services/structureBackfill.service.js';
@@ -17,6 +17,7 @@ import { registerCatalogAssociations, syncCatalogModels, seedCatalogData } from 
 import { registerProtocolCatalogAssociations, syncProtocolCatalogModels } from './modules/protocols/models/catalog/index.js';
 import { syncMeasurementCatalogModels, seedMeasurementCatalogData } from './modules/measurements/models/catalog/index.js';
 import { startAutomaticMissedArrivalSweep } from './modules/agenda/services/missedArrivalAutomation.service.js';
+import {warmTenantSchemas} from './utils/tenantSchema.js';
 
 import authRoutes from './modules/auth/routes/auth.routes.js';
 import patientRoutes from './modules/patients/routes/patient.routes.js';
@@ -141,8 +142,15 @@ async function bootstrap() {
     await syncMeasurementCatalogModels();
     await seedMeasurementCatalogData();
 
-    // Tenant-scoped models registry (synced lazily per-tenant via ensureTenantSchema)
+    // Register first, then upgrade every existing tenant before accepting traffic. This moves
+    // DDL and data migrations out of the first user request after a deploy.
     registerTenantModels();
+    const tenantRows = await Tenant.findAll({attributes: ['id'], raw: true}) as unknown as Array<{id: string}>;
+    console.log(`[database] inizializzazione di ${tenantRows.length} tenant prima dell'apertura HTTP`);
+    const readyTenants = await warmTenantSchemas(
+        tenantRows.map(tenant => tenant.id), env.tenantSchemaBootstrapConcurrency
+    );
+    console.log(`[database] ${readyTenants} tenant pronti; apertura HTTP consentita`);
 
     // A fine appuntamento apre una segnalazione operativa se nessuno ha registrato
     // un esito. Lo stato resta CONFIRMED finché un operatore non sceglie l'esito reale.

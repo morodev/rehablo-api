@@ -34,7 +34,7 @@ import PatientPortalAudit from './modules/patient-portal/models/patientPortalAud
 
 /**
  * Registers every tenant-scoped model (i.e. living in the dynamic "rehablo_<tenantId>" schema)
- * so that `ensureTenantSchema()` can sync them automatically the first time a tenant is touched.
+ * so the startup bootstrap can prepare every existing tenant before HTTP traffic is accepted.
  */
 export function registerTenantModels(): void {
     registerHumanBodyAssociations();

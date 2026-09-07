@@ -12,18 +12,18 @@ export interface InvoicePaymentSummary {
 const money = (value: unknown): number => Math.round((Number(value) || 0) * 100) / 100;
 
 export function summarizeInvoicePayments(
-    invoice: { invoiceTotal?: unknown; status?: unknown },
+    invoice: { invoiceTotal?: unknown; invoiceNet?: unknown; status?: unknown; documentType?: unknown },
     payments: Array<{ amount?: unknown; status?: unknown; paidAt?: unknown; source?: unknown }>
 ): InvoicePaymentSummary {
-    if (String(invoice.status ?? '').toLowerCase() === 'void') {
-        return { paidAmount: 0, balance: 0, paymentStatus: 'void', hasUndatedLegacyPayments: false };
-    }
-
-    const total = Math.max(money(invoice.invoiceTotal), 0);
     const posted = payments.filter((payment) => payment.status === 'POSTED');
+    if (String(invoice.status ?? '').toLowerCase() === 'void' || invoice.documentType === 'nota_di_credito') {
+        return { paidAmount: money(posted.reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0)),
+            balance: 0, paymentStatus: 'void', hasUndatedLegacyPayments: posted.some(payment => !payment.paidAt) };
+    }
+    const total = Math.max(money(invoice.invoiceNet ?? invoice.invoiceTotal), 0);
     // Deployment compatibility: before the tenant migration has run, an old `paid` invoice has
     // no movement yet. Preserve its balance and expose it as an undated legacy payment.
-    const legacyStatusFallback = posted.length === 0 && String(invoice.status ?? '').toLowerCase() === 'paid';
+    const legacyStatusFallback = payments.length === 0 && String(invoice.status ?? '').toLowerCase() === 'paid';
     const paidAmount = legacyStatusFallback
         ? total
         : money(posted.reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0));
@@ -83,7 +83,7 @@ export async function syncInvoicePaymentStatus(
     transaction?: Transaction
 ): Promise<InvoicePaymentSummary> {
     const invoice = await Invoice.schema(schema).findByPk(invoiceId, {
-        attributes: ['id', 'invoiceTotal', 'status'],
+        attributes: ['id', 'invoiceTotal', 'invoiceNet', 'documentType', 'status'],
         transaction,
         lock: transaction ? transaction.LOCK.UPDATE : undefined
     });

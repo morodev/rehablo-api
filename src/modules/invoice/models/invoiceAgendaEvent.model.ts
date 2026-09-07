@@ -7,6 +7,8 @@ export interface InvoiceAgendaEventAttributes {
     agendaEventId: string;
     /** Servizio di catalogo scelto per trasformare l'appuntamento in una riga fattura. */
     serviceId?: string | null;
+    /** Fiscal cancellation releases the appointment without deleting its document audit trail. */
+    releasedAt?: Date | null;
 }
 
 export type InvoiceAgendaEventCreationAttributes = Optional<InvoiceAgendaEventAttributes, 'id'>;
@@ -25,6 +27,7 @@ export class InvoiceAgendaEvent
     declare invoiceId: string;
     declare agendaEventId: string;
     declare serviceId: string | null;
+    declare releasedAt: Date | null;
 }
 
 InvoiceAgendaEvent.init(
@@ -33,17 +36,18 @@ InvoiceAgendaEvent.init(
         invoiceId: { type: DataTypes.UUID, allowNull: false },
         agendaEventId: {
             type: DataTypes.UUID,
-            allowNull: false,
-            unique: 'invoice_agenda_events_agenda_event_id_unique'
+            allowNull: false
         },
-        serviceId: { type: DataTypes.UUID, allowNull: true }
+        serviceId: { type: DataTypes.UUID, allowNull: true },
+        releasedAt: { type: DataTypes.DATE, allowNull: true }
     },
     {
         sequelize,
         modelName: 'invoiceAgendaEvent',
         tableName: 'invoice_agenda_events',
         indexes: [
-            { name: 'invoice_agenda_events_invoice_id_idx', fields: ['invoiceId'] }
+            { name: 'invoice_agenda_events_invoice_id_idx', fields: ['invoiceId'] },
+            { name: 'invoice_agenda_events_active_event_unique', unique: true, fields: ['agendaEventId'], where: { releasedAt: null } }
         ]
     }
 );

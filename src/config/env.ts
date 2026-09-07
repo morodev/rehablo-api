@@ -54,7 +54,7 @@ export const env = {
 
     /**
      * Strategia di allineamento degli schemi per-tenant (`rehablo_<tenantId>`), applicata da
-     * `ensureTenantSchema()` alla prima richiesta di ogni tenant dopo un riavvio.
+     * al bootstrap per tutti i tenant e durante la registrazione per quelli nuovi.
      *
      * - `additive` (DEFAULT): crea le tabelle mancanti e aggiunge le colonne nuove. Non tocca
      *   colonne esistenti né vincoli.
@@ -78,6 +78,8 @@ export const env = {
         console.warn(`[env] TENANT_SCHEMA_SYNC="${raw}" non riconosciuto. Uso "additive".`);
         return 'additive' as const;
     })() as 'additive' | 'full' | 'off',
+    /** Numero massimo di tenant inizializzati insieme prima di aprire la porta HTTP. */
+    tenantSchemaBootstrapConcurrency: positiveInt('TENANT_SCHEMA_BOOTSTRAP_CONCURRENCY', 2),
 
     jwtSecret: required('JWT_SECRET', 'change-me-please-use-a-long-random-string'),
     /**

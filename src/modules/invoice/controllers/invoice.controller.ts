@@ -18,10 +18,12 @@ import { User } from '../../auth/models/index.js';
 import InvoiceAgendaEvent from '../models/invoiceAgendaEvent.model.js';
 import { getInvoiceAgendaLinksByEventIds } from '../services/invoiceAgendaEvent.service.js';
 import { evalTotals, EvalTotalsResult, toPersistedTotals } from '../utils/evalTotals.js';
+import { applyAppointmentPriceSnapshot } from '../utils/appointmentInvoicePrice.js';
 import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
 import { buildFiscalNotes, FiscalProfile, isStampDutyDue, resolveFiscalProfile } from '../utils/fiscalRegime.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
 import { decorateInvoicesWithPayments, syncInvoicePaymentStatus } from '../services/payment.service.js';
+import { appointmentPricesByEvent, ensureAppointmentPaymentHistory, isValidPaymentDate, linkAppointmentPayments } from '../services/appointmentPayment.service.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AGENDA_SCOPE_FIELDS = {
@@ -150,15 +152,6 @@ function invoiceLocalDate(value: Date): string {
 
 const money = (value: unknown): number => Math.round((Number(value) || 0) * 100) / 100;
 
-interface AppointmentPaymentToTransfer {
-    agendaEventId: string;
-    amount: number;
-    paidAt: string | null;
-    method: string | null;
-    note: string | null;
-    recordedBy: string | null;
-}
-
 /**
  * Appuntamenti completati e non ancora fatturati utilizzabili nella nuova fattura.
  * Prezzo e IVA arrivano dal servizio di catalogo collegato, mai dallo snapshot dell'agenda.
@@ -223,11 +216,18 @@ export const findEligibleAppointments = asyncHandler(async (req: Request, res: R
         ? await User.findAll({ where: { id: { [Op.in]: operatorIds } }, attributes: ['id', 'name', 'surname'] })
         : [];
     const operatorById = new Map(operators.map((operator) => [operator.id, operator]));
+    const prices = await appointmentPricesByEvent(schema, eligibleRows);
+    const issuerTenant = await Tenant.findByPk(req.user!.tenants[0].id, { attributes: ['taxRegime'] });
+    const fiscalProfile = resolveFiscalProfile(issuerTenant?.get({ plain: true }) ?? {});
 
     const appointments = eligibleRows.map((event) => {
         const eventType = event.eventTypeId ? eventTypeById.get(event.eventTypeId) : null;
         const service = eventType?.linkedServiceId ? serviceById.get(eventType.linkedServiceId) : null;
         const operator = event.calendarId ? operatorById.get(event.calendarId) : null;
+        const price = prices.get(event.id);
+        const invoicePrice = service ? applyAppointmentPriceSnapshot(price, {
+            unitPrice: Number(service.sellingPrice) || 0, vat: service.productVat
+        }, fiscalProfile.appliesVat) : null;
         return {
             id: event.id,
             start: event.start,
@@ -245,13 +245,14 @@ export const findEligibleAppointments = asyncHandler(async (req: Request, res: R
                 name: service.name,
                 code: service.code,
                 description: service.description,
-                productVat: service.productVat,
-                sellingPrice: Number(service.sellingPrice) || 0,
+                productVat: invoicePrice!.vat,
+                sellingPrice: invoicePrice!.unitPrice,
                 categoryId: service.categoryId,
                 isActive: service.isActive
             } : null,
-            appointmentExpectedAmount: service ? Number(service.sellingPrice) || 0 : null,
-            appointmentPriceSource: service ? 'SERVICE' : null,
+            appointmentExpectedAmount: price?.amount ?? null,
+            appointmentPriceSource: price?.source ?? null,
+            appointmentPriceEstimated: price?.estimated ?? true,
             appointmentPaymentStatus: event.appointmentPaymentStatus ?? 'unpaid',
             appointmentPaidAmount: event.appointmentPaidAmount ?? null,
             appointmentPaidAt: event.appointmentPaidAt ?? null,
@@ -369,6 +370,11 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         structureId: _clientStructureId,
         ...invoiceFields
     } = req.body;
+    const requestedPaymentDate = paymentDate ?? String(invoiceFields.emissionDate ?? invoiceLocalDate(new Date())).slice(0, 10);
+    if (String(requestedStatus ?? '').toLowerCase() === 'paid' && invoiceFields.documentType !== 'nota_di_credito'
+        && !isValidPaymentDate(requestedPaymentDate)) {
+        return sendErrorResponse(res, 400, 'La data del saldo deve essere valida e non futura');
+    }
 
     if (requestedAppointments !== undefined && !Array.isArray(requestedAppointments)) {
         return sendErrorResponse(res, 400, 'Elenco appuntamenti non valido');
@@ -398,6 +404,10 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const agendaEventIds = appointmentSelections.map((selection) => selection.agendaEventId);
     if (new Set(agendaEventIds).size !== agendaEventIds.length) {
         return sendErrorResponse(res, 400, 'Lo stesso appuntamento è stato selezionato più volte');
+    }
+
+    if (invoiceFields.documentType === 'nota_di_credito' && agendaEventIds.length > 0) {
+        return sendErrorResponse(res, 409, 'La nota di credito rettifica un documento: non pu? fatturare nuove sedute');
     }
 
     // Nel nuovo flusso le prestazioni degli appuntamenti sono risolte e aggiunte server-side;
@@ -444,7 +454,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     // Il regime fiscale dello studio decide IVA, natura, ritenuta e bollo: va applicato PRIMA di
     // calcolare i totali, non dopo (vedi docs/REGIME_FISCALE_IT.md).
     const fiscalProfile = resolveFiscalProfile(issuerData);
-    const fiscal = applyFiscalRules({
+    let fiscal = applyFiscalRules({
         profile: fiscalProfile,
         invoiceFields,
         evalLines: { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) }
@@ -481,7 +491,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     // una fattura senza le sue righe.
     const transactionResult = await sequelize.transaction(async (t) => {
         let agendaEvents: AgendaEvent[] = [];
-        let appointmentPayments: AppointmentPaymentToTransfer[] = [];
+        let appointmentPayments: InvoicePayment[] = [];
 
         if (agendaEventIds.length > 0) {
             // Tutti gli appuntamenti vengono bloccati nello stesso ordine: oltre a rendere atomico
@@ -541,7 +551,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             }
 
             const existingLinks = await InvoiceAgendaEventScoped.findAll({
-                where: { agendaEventId: { [Op.in]: agendaEventIds } },
+                where: { agendaEventId: { [Op.in]: agendaEventIds }, releasedAt: null },
                 attributes: ['invoiceId'],
                 transaction: t,
                 lock: t.LOCK.UPDATE
@@ -556,7 +566,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             // Difesa aggiuntiva per eventuali record riallineati/migrati nei quali il riferimento
             // sulla fattura esiste ma quello sull'appuntamento non e' ancora valorizzato.
             const invoiceForAgenda = await InvoiceScoped.findOne({
-                where: { agendaEventId: { [Op.in]: agendaEventIds } },
+                where: { agendaEventId: { [Op.in]: agendaEventIds }, status: { [Op.ne]: 'void' } },
                 attributes: ['id'],
                 transaction: t,
                 lock: t.LOCK.UPDATE
@@ -583,28 +593,31 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                 } as const;
             }
 
-            appointmentPayments = agendaEvents.flatMap((event) => {
-                const paymentStatus = String(event.get('appointmentPaymentStatus') ?? '').toLowerCase();
-                const amount = money(event.get('appointmentPaidAmount'));
-                if (!['paid', 'partial'].includes(paymentStatus) || amount <= 0) return [];
-
-                return [{
-                    agendaEventId: event.id,
-                    amount,
-                    paidAt: event.get('appointmentPaidAt') as string | null,
-                    method: event.get('appointmentPaymentMethod') as string | null,
-                    note: event.get('appointmentPaymentNote') as string | null,
-                    recordedBy: event.get('appointmentPaymentRecordedBy') as string | null
-                }];
+            const prices = await appointmentPricesByEvent(schema, agendaEvents.map(event => event.get({ plain: true })), t);
+            const eventsById = new Map(agendaEvents.map(event => [event.id, event]));
+            for (const [index, selection] of appointmentSelections.entries()) {
+                const price = prices.get(selection.agendaEventId);
+                const line = serviceLines[hasExplicitAppointments ? requestedServices.length + index : 0];
+                if (line) Object.assign(line, applyAppointmentPriceSnapshot(price, line, fiscalProfile.appliesVat));
+                const event = eventsById.get(selection.agendaEventId)!;
+                const history = await ensureAppointmentPaymentHistory(schema, event, t);
+                if (history.some(payment => payment.invoiceId)) {
+                    return { kind: 'already-invoiced', invoiceId: history.find(payment => payment.invoiceId)!.invoiceId! } as const;
+                }
+                appointmentPayments.push(...history.filter(payment => payment.status === 'POSTED'));
+            }
+            fiscal = applyFiscalRules({
+                profile: fiscalProfile, invoiceFields,
+                evalLines: { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) }
             });
             const appointmentPaidTotal = money(
-                appointmentPayments.reduce((sum, payment) => sum + payment.amount, 0)
+                appointmentPayments.reduce((sum, payment) => sum + Number(payment.amount), 0)
             );
-            if (appointmentPaidTotal > money(fiscal.totals.invoiceTotal) + 0.009) {
+            if (appointmentPaidTotal > money(fiscal.totals.invoiceNet ?? fiscal.totals.invoiceTotal) + 0.009) {
                 return {
                     kind: 'appointment-overpayment',
                     paidAmount: appointmentPaidTotal,
-                    invoiceTotal: money(fiscal.totals.invoiceTotal)
+                    invoiceTotal: money(fiscal.totals.invoiceNet ?? fiscal.totals.invoiceTotal)
                 } as const;
             }
         }
@@ -683,37 +696,21 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             )
         ]);
 
-        await Promise.all(appointmentPayments.map((payment) =>
-            InvoicePaymentScoped.create(
-                {
-                    invoiceId,
-                    agendaEventId: payment.agendaEventId,
-                    amount: payment.amount,
-                    paidAt: payment.paidAt ? new Date(`${payment.paidAt}T12:00:00.000Z`) : null,
-                    method: payment.method,
-                    note: payment.note,
-                    source: 'APPOINTMENT',
-                    status: 'POSTED',
-                    createdByUserId: payment.recordedBy ?? getUserId(req)
-                },
-                { transaction: t }
-            )
-        ));
+        // Reconcile the original movement IDs: invoice emission never creates a second receipt.
+        await linkAppointmentPayments(schema, agendaEventIds, invoiceId, t);
 
         const appointmentPaidTotal = money(
-            appointmentPayments.reduce((sum, payment) => sum + payment.amount, 0)
+            appointmentPayments.reduce((sum, payment) => sum + Number(payment.amount), 0)
         );
-        const requestedAsPaid = String(requestedStatus ?? '').toLowerCase() === 'paid';
+        const requestedAsPaid = invoiceFields.documentType !== 'nota_di_credito' && String(requestedStatus ?? '').toLowerCase() === 'paid';
         const residualToRegister = requestedAsPaid
-            ? money(Math.max(money(fiscal.totals.invoiceTotal) - appointmentPaidTotal, 0))
+            ? money(Math.max(money(fiscal.totals.invoiceNet ?? fiscal.totals.invoiceTotal) - appointmentPaidTotal, 0))
             : 0;
 
         // CompatibilitÃ  con i client che emettono direttamente un documento saldato. Se esistono
         // giÃ  incassi delle sedute, viene registrato soltanto l'eventuale residuo e mai un doppione.
         if (residualToRegister > 0) {
-            const paidAt = typeof paymentDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(paymentDate)
-                ? paymentDate
-                : String(invoiceFields.emissionDate ?? new Date().toISOString()).slice(0, 10);
+            const paidAt = requestedPaymentDate;
             await InvoicePaymentScoped.create(
                 {
                     invoiceId,
@@ -983,17 +980,66 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
         status: requestedStatus,
         ...invoiceFields
     } = body;
+    // Derived balances/totals and the debtor/document identity cannot be patched directly.
+    for (const field of ['invoiceTotal', 'invoiceNet', 'invoiceVAT', 'sellingPrice', 'discSellingPrice',
+        'paidAmount', 'balance', 'paymentStatus', 'id', 'createdAt', 'updatedAt']) delete invoiceFields[field];
+    if ((invoiceFields.patientID !== undefined && invoiceFields.patientID !== existingInvoice.patientID)
+        || (invoiceFields.documentType !== undefined && invoiceFields.documentType !== existingInvoice.documentType)) {
+        return sendErrorResponse(res, 409, 'Paziente e tipo documento non sono modificabili dopo l’emissione');
+    }
     const shouldReplaceLines = Array.isArray(requestedProducts) || Array.isArray(requestedServices);
     const postedPaidAmount = Number(await InvoicePaymentScoped.sum('amount', {
         where: { invoiceId: id, status: 'POSTED' }
     })) || 0;
 
-    if (String(requestedStatus ?? '').toLowerCase() === 'void' && postedPaidAmount > 0) {
-        return sendErrorResponse(
-            res,
-            409,
-            'Prima di stornare la fattura devi annullare i movimenti di pagamento registrati.'
-        );
+    // Fiscal cancellation releases appointments while preserving cash and the document link audit.
+    if (String(requestedStatus ?? '').toLowerCase() === 'void') {
+        await sequelize.transaction(async transaction => {
+            const invoice = await InvoiceScoped.findOne({
+                where: { id, ...patientScopeWhere(req, schema, 'patientID') },
+                transaction, lock: transaction.LOCK.UPDATE
+            });
+            if (!invoice || invoice.status === 'void') return;
+            const links = await InvoiceAgendaEvent.schema(schema).findAll({
+                where: { invoiceId: id, releasedAt: null }, transaction
+            });
+            const eventIds = [...new Set([...links.map(link => link.agendaEventId), invoice.agendaEventId].filter(Boolean))] as string[];
+            if (invoice.agendaEventId && !links.some(link => link.agendaEventId === invoice.agendaEventId)) {
+                await InvoiceAgendaEvent.schema(schema).create({
+                    invoiceId: id, agendaEventId: invoice.agendaEventId, serviceId: null, releasedAt: new Date()
+                }, { transaction });
+            }
+            if (eventIds.length) {
+                await AgendaEvent.schema(schema).findAll({
+                    where: { id: { [Op.in]: eventIds } }, order: [['id', 'ASC']],
+                    transaction, lock: transaction.LOCK.UPDATE
+                });
+                await InvoicePaymentScoped.update({ invoiceId: null }, {
+                    where: { invoiceId: id, agendaEventId: { [Op.in]: eventIds }, source: 'APPOINTMENT' }, transaction
+                });
+                await AgendaEvent.schema(schema).update({ invoiceId: null }, {
+                    where: { id: { [Op.in]: eventIds }, invoiceId: id }, transaction
+                });
+            }
+            await InvoiceAgendaEvent.schema(schema).update({ releasedAt: new Date() }, {
+                where: { invoiceId: id, releasedAt: null }, transaction
+            });
+            await invoice.update({ status: 'void', agendaEventId: null }, { transaction });
+        });
+        const updated = await InvoiceScoped.findByPk(id);
+        const [decorated] = await decorateInvoicesWithPayments(schema, updated ? [updated] : []);
+        return sendSuccessResponse(res, 200, decorated, 'Documento annullato; gli incassi restano registrati e le sedute tornano da fatturare');
+    }
+    if (shouldReplaceLines && (existingInvoice.agendaEventId || await InvoiceAgendaEvent.schema(schema).count({
+        where: { invoiceId: id, releasedAt: null }
+    }) > 0)) {
+        return sendErrorResponse(res, 409, 'Per correggere le prestazioni di una fattura collegata a sedute, annulla il documento e riemettilo');
+    }
+    if (!shouldReplaceLines && ['discountType', 'discountAmount', 'isRivals', 'rivals', 'isCashPro',
+        'isTaxWithholding', 'taxWithholding', 'vatNature', 'isStamp', 'stampAmount', 'stampChargedToPatient'].some(field =>
+        invoiceFields[field] !== undefined && String(invoiceFields[field] ?? '') !== String(existingInvoice.get(field as any) ?? '')
+    )) {
+        return sendErrorResponse(res, 409, 'Le modifiche economiche richiedono il ricalcolo delle righe della fattura');
     }
 
     // Payment state is derived from immutable movements. A direct status write is accepted only
@@ -1049,7 +1095,7 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
             evalLines: { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) }
         });
 
-        if (fiscal.totals.invoiceTotal + 0.001 < postedPaidAmount) {
+        if (fiscal.totals.invoiceNet + 0.001 < postedPaidAmount) {
             return sendErrorResponse(
                 res,
                 409,
@@ -1064,7 +1110,13 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
             fiscalNotes: fiscal.fiscalNotes
         };
 
-        await sequelize.transaction(async (t) => {
+        const replaced = await sequelize.transaction(async (t) => {
+            const locked = await InvoiceScoped.findByPk(id, { transaction: t, lock: t.LOCK.UPDATE });
+            if (!locked || locked.status === 'void') return false;
+            const currentPaid = Number(await InvoicePaymentScoped.sum('amount', {
+                where: { invoiceId: id, status: 'POSTED' }, transaction: t
+            })) || 0;
+            if (fiscal.totals.invoiceNet + 0.009 < currentPaid) return false;
             await InvoiceScoped.update(updateData, { where: { id }, transaction: t });
             await InvoiceProductScoped.destroy({ where: { InvoiceId: id }, transaction: t });
             await InvoiceServiceScoped.destroy({ where: { InvoiceId: id }, transaction: t });
@@ -1103,10 +1155,18 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
                     )
                 )
             ]);
+            await syncInvoicePaymentStatus(schema, id, t);
+            return true;
         });
+        if (!replaced) return sendErrorResponse(res, 409, 'La fattura o i suoi incassi sono cambiati: ricarica il documento');
     } else {
-        const [rowsUpdated] = await InvoiceScoped.update(updateData, { where: { id } });
-        if (rowsUpdated === 0) {
+        const updated = await sequelize.transaction(async transaction => {
+            const locked = await InvoiceScoped.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
+            if (!locked || locked.status === 'void') return false;
+            await locked.update(updateData, { transaction });
+            return true;
+        });
+        if (!updated) {
             return sendErrorResponse(res, 404, 'Impossibile aggiornare la fattura');
         }
     }
@@ -1132,45 +1192,30 @@ export const deleteInvoice = asyncHandler(async (req: Request, res: Response) =>
     const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped, InvoicePaymentScoped, InvoiceAgendaEventScoped } = getScopedModels(schema);
     const id = req.params.invoiceId;
 
-    const removedInvoice = await InvoiceScoped.findOne({
-        where: { id, ...patientScopeWhere(req, schema, 'patientID') }
+    const result = await sequelize.transaction(async transaction => {
+        const removedInvoice = await InvoiceScoped.findOne({
+            where: { id, ...patientScopeWhere(req, schema, 'patientID') }, transaction, lock: transaction.LOCK.UPDATE
+        });
+        if (!removedInvoice) return { kind: 'missing' } as const;
+        const linkedAgendaEvent = await AgendaEvent.schema(schema).findOne({
+            where: { invoiceId: id }, attributes: ['id'], transaction
+        });
+        const linkedAppointment = await InvoiceAgendaEventScoped.findOne({
+            where: { invoiceId: id }, attributes: ['id'], transaction
+        });
+        if (linkedAgendaEvent || linkedAppointment) return { kind: 'linked' } as const;
+        if (await InvoicePaymentScoped.count({ where: { invoiceId: id }, transaction }) > 0) {
+            return { kind: 'history' } as const;
+        }
+        await InvoiceProductScoped.destroy({ where: { InvoiceId: id }, transaction });
+        await InvoiceServiceScoped.destroy({ where: { InvoiceId: id }, transaction });
+        await removedInvoice.destroy({ transaction });
+        return { kind: 'deleted', removedInvoice } as const;
     });
-    if (!removedInvoice) {
-        return sendErrorResponse(res, 404, 'Fattura non trovata');
-    }
-
-    const linkedAgendaEvent = await AgendaEvent.schema(schema).findOne({
-        where: { invoiceId: id },
-        attributes: ['id']
-    });
-    const linkedAppointment = await InvoiceAgendaEventScoped.findOne({
-        where: { invoiceId: id },
-        attributes: ['id']
-    });
-    if (linkedAgendaEvent || linkedAppointment) {
-        return sendErrorResponse(
-            res,
-            409,
-            'Una fattura collegata a un appuntamento effettuato non può essere eliminata. Utilizza lo storno.'
-        );
-    }
-
-    const paymentCount = await InvoicePaymentScoped.count({ where: { invoiceId: id } });
-    if (paymentCount > 0) {
-        return sendErrorResponse(
-            res,
-            409,
-            'Una fattura con movimenti di pagamento non può essere eliminata. Annulla i movimenti e utilizza lo storno.'
-        );
-    }
-
-    await Promise.all([
-        InvoiceProductScoped.destroy({ where: { InvoiceId: id } }),
-        InvoiceServiceScoped.destroy({ where: { InvoiceId: id } })
-    ]);
-    await InvoiceScoped.destroy({ where: { id } });
-
-    return sendSuccessResponse(res, 200, { removedInvoice }, 'Fattura eliminata correttamente');
+    if (result.kind === 'missing') return sendErrorResponse(res, 404, 'Fattura non trovata');
+    if (result.kind === 'linked') return sendErrorResponse(res, 409, 'Una fattura collegata a sedute non pu? essere eliminata. Utilizza lo storno.');
+    if (result.kind === 'history') return sendErrorResponse(res, 409, 'Una fattura con storico incassi non pu? essere eliminata. Utilizza lo storno del documento.');
+    return sendSuccessResponse(res, 200, { removedInvoice: result.removedInvoice }, 'Fattura eliminata correttamente');
 });
 
 /**

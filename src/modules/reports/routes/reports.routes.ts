@@ -9,6 +9,7 @@ router.use(requireAuth, resolveTenantSchema);
 
 router.get('/reports/analytics/summary', requirePermission('dashboard', 'read'), analyticsController.getSummary);
 router.get('/reports/analytics/activity', requirePermission('dashboard', 'read'), analyticsController.getActivity);
+router.get('/reports/analytics/therapy-payments', requirePermission('invoice', 'read'), analyticsController.getTherapyPayments);
 router.get('/reports/analytics/finance', requirePermission('invoice', 'read'), analyticsController.getFinance);
 router.get('/reports/analytics/operators', requirePermission('invoice', 'read'), analyticsController.getOperators);
 router.get('/reports/analytics/catalog', requirePermission('invoice', 'read'), analyticsController.getCatalog);

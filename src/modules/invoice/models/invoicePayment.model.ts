@@ -9,7 +9,7 @@ export type InvoicePaymentSource = (typeof INVOICE_PAYMENT_SOURCES)[number];
 
 export interface InvoicePaymentAttributes {
     id: string;
-    invoiceId: string;
+    invoiceId?: string | null;
     /** Seduta che ha originato il movimento, valorizzata solo per gli incassi pre-fattura. */
     agendaEventId?: string | null;
     amount: number;
@@ -45,7 +45,7 @@ export class InvoicePayment
     extends Model<InvoicePaymentAttributes, InvoicePaymentCreationAttributes>
     implements InvoicePaymentAttributes {
     declare id: string;
-    declare invoiceId: string;
+    declare invoiceId: string | null;
     declare agendaEventId: string | null;
     declare amount: number;
     declare paidAt: Date | null;
@@ -62,7 +62,7 @@ export class InvoicePayment
 InvoicePayment.init(
     {
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
-        invoiceId: { type: DataTypes.UUID, allowNull: false },
+        invoiceId: { type: DataTypes.UUID, allowNull: true },
         agendaEventId: { type: DataTypes.UUID, allowNull: true },
         amount: { type: DataTypes.DECIMAL(10, 2), allowNull: false },
         paidAt: { type: DataTypes.DATEONLY, allowNull: true },
@@ -82,7 +82,7 @@ InvoicePayment.init(
         indexes: [
             { name: 'invoice_payments_invoice_status_idx', fields: ['invoiceId', 'status'] },
             { name: 'invoice_payments_paid_at_idx', fields: ['paidAt'] },
-            { name: 'invoice_payments_agenda_event_unique', unique: true, fields: ['agendaEventId'] }
+            { name: 'invoice_payments_agenda_event_status_idx', fields: ['agendaEventId', 'status'] }
         ]
     }
 );

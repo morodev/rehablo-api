@@ -13,7 +13,7 @@ export async function getInvoiceAgendaLinksByEventIds(
 ): Promise<InvoiceAgendaLink[]> {
     if (agendaEventIds.length === 0) return [];
     const rows = await InvoiceAgendaEvent.schema(schema).findAll({
-        where: { agendaEventId: { [Op.in]: agendaEventIds } },
+        where: { agendaEventId: { [Op.in]: agendaEventIds }, releasedAt: null },
         attributes: ['invoiceId', 'agendaEventId', 'serviceId']
     });
     return rows.map((row) => row.get({ plain: true }) as InvoiceAgendaLink);
@@ -25,7 +25,7 @@ export async function getInvoiceAgendaLinksByInvoiceIds(
 ): Promise<InvoiceAgendaLink[]> {
     if (invoiceIds.length === 0) return [];
     const rows = await InvoiceAgendaEvent.schema(schema).findAll({
-        where: { invoiceId: { [Op.in]: invoiceIds } },
+        where: { invoiceId: { [Op.in]: invoiceIds }, releasedAt: null },
         attributes: ['invoiceId', 'agendaEventId', 'serviceId']
     });
     return rows.map((row) => row.get({ plain: true }) as InvoiceAgendaLink);
@@ -38,7 +38,7 @@ export async function getLinkedInvoiceId(
 ): Promise<string | null> {
     if (legacyInvoiceId) return legacyInvoiceId;
     const row = await InvoiceAgendaEvent.schema(schema).findOne({
-        where: { agendaEventId },
+        where: { agendaEventId, releasedAt: null },
         attributes: ['invoiceId']
     });
     return (row?.get('invoiceId') as string | undefined) ?? null;

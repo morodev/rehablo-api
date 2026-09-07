@@ -7,6 +7,7 @@ import Invoice from '../models/invoice.model.js';
 import InvoicePayment from '../models/invoicePayment.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import { syncInvoicePaymentStatus } from '../services/payment.service.js';
+import { syncAppointmentPaymentStatus } from '../services/appointmentPayment.service.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
@@ -45,7 +46,7 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
     const schema = req.tenantSchema!;
     const amount = Number(req.body?.amount);
     const paidAt = req.body?.paidAt;
-    if (!Number.isFinite(amount) || amount <= 0) {
+    if (!Number.isFinite(amount) || Math.round(amount * 100) < 1) {
         return sendErrorResponse(res, 400, 'L’importo del pagamento deve essere maggiore di zero');
     }
     if (!isValidDateOnly(paidAt)) {
@@ -53,6 +54,10 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
     }
     if (paidAt > todayInRome()) {
         return sendErrorResponse(res, 400, 'La data del pagamento non può essere futura');
+    }
+    if ((req.body?.method != null && (typeof req.body.method !== 'string' || req.body.method.length > 255))
+        || (req.body?.note != null && (typeof req.body.note !== 'string' || req.body.note.length > 2000))) {
+        return sendErrorResponse(res, 400, 'Metodo o nota di pagamento non validi');
     }
 
     const result = await sequelize.transaction(async (transaction) => {
@@ -109,6 +114,12 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
     if (!invoice) return sendErrorResponse(res, 404, 'Fattura non trovata');
 
     const result = await sequelize.transaction(async (transaction) => {
+        // Invoice lock always precedes movement/event locks, including fiscal cancellation.
+        const lockedInvoice = await Invoice.schema(schema).findOne({
+            where: { id: invoice.id, ...patientScopeWhere(req, schema, 'patientID') },
+            transaction, lock: transaction.LOCK.UPDATE
+        });
+        if (!lockedInvoice) return { kind: 'not-found' } as const;
         const payment = await InvoicePayment.schema(schema).findOne({
             where: { id: req.params.paymentId, invoiceId: invoice.id },
             transaction,
@@ -127,17 +138,10 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
             { transaction }
         );
         if (payment.source === 'APPOINTMENT' && payment.agendaEventId) {
-            await AgendaEvent.schema(schema).update(
-                {
-                    appointmentPaymentStatus: 'unpaid',
-                    appointmentPaidAmount: null,
-                    appointmentPaidAt: null,
-                    appointmentPaymentMethod: null,
-                    appointmentPaymentNote: null,
-                    appointmentPaymentRecordedBy: getUserId(req)
-                },
-                { where: { id: payment.agendaEventId }, transaction }
-            );
+            const event = await AgendaEvent.schema(schema).findByPk(payment.agendaEventId, {
+                transaction, lock: transaction.LOCK.UPDATE
+            });
+            if (event) await syncAppointmentPaymentStatus(schema, event, transaction, getUserId(req));
         }
         const summary = await syncInvoicePaymentStatus(schema, invoice.id, transaction);
         return { kind: 'voided', payment, summary } as const;
@@ -158,15 +162,25 @@ export const setLegacyPaymentDate = asyncHandler(async (req: Request, res: Respo
     const invoice = await findScopedInvoice(req);
     if (!invoice) return sendErrorResponse(res, 404, 'Fattura non trovata');
 
-    const payment = await InvoicePayment.schema(req.tenantSchema!).findOne({
-        where: { id: req.params.paymentId, invoiceId: invoice.id }
+    const result = await sequelize.transaction(async transaction => {
+        const lockedInvoice = await Invoice.schema(req.tenantSchema!).findOne({
+            where: { id: invoice.id, ...patientScopeWhere(req, req.tenantSchema!, 'patientID') },
+            transaction, lock: transaction.LOCK.UPDATE
+        });
+        if (!lockedInvoice) return { kind: 'missing' } as const;
+        const payment = await InvoicePayment.schema(req.tenantSchema!).findOne({
+            where: { id: req.params.paymentId, invoiceId: invoice.id }, transaction, lock: transaction.LOCK.UPDATE
+        });
+        if (!payment) return { kind: 'missing' } as const;
+        if (payment.source !== 'LEGACY_IMPORT' || payment.paidAt || payment.status !== 'POSTED') return { kind: 'immutable' } as const;
+        await payment.update({ paidAt: new Date(`${paidAt}T12:00:00.000Z`) }, { transaction });
+        return { kind: 'updated', payment } as const;
     });
-    if (!payment) return sendErrorResponse(res, 404, 'Pagamento non trovato');
-    if (payment.source !== 'LEGACY_IMPORT' || payment.paidAt) {
+    if (result.kind === 'missing') return sendErrorResponse(res, 404, 'Pagamento non trovato');
+    if (result.kind === 'immutable') {
         return sendErrorResponse(res, 409, 'La data è modificabile solo sui pagamenti legacy senza data');
     }
-    await payment.update({ paidAt: new Date(`${paidAt}T12:00:00.000Z`) });
-    return sendSuccessResponse(res, 200, { payment }, 'Data del pagamento completata');
+    return sendSuccessResponse(res, 200, { payment: result.payment }, 'Data del pagamento completata');
 });
 
 export default { listPayments, createPayment, voidPayment, setLegacyPaymentDate };
