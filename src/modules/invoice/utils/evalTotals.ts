@@ -23,6 +23,8 @@ const STANDARD_VAT_RATES = ['4', '5', '10', '22'];
 export interface InvoiceLineInput {
     /** Prezzo UNITARIO di riga (dal catalogo Product/Service, non dal client: vedi invoice.controller.ts). */
     sellingPrice: number;
+    /** Original net tariff, when a concession was already applied to this appointment. */
+    originalSellingPrice?: number | null;
     /** Quantità della riga (default 1 se assente). */
     quantity?: number | null;
     /** Aliquota IVA standard come stringa ("4"|"5"|"10"|"22") oppure natura di esenzione (es. "N4"). */
@@ -172,7 +174,8 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
 
     return {
         invoiceTotal,
-        sellingPrice: totalSellingPrice,
+        sellingPrice: money([...(invoiceFields.products ?? []), ...(invoiceFields.services ?? [])]
+            .reduce((sum, line) => sum + money((line.originalSellingPrice ?? line.sellingPrice) * (line.quantity ?? 1)), 0)),
         discSellingPrice: totalDiscSellingPrice,
         invoiceNet: netAmountDue,
         invoiceVAT: totalProductVat,

@@ -10,7 +10,17 @@ import { Op } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import InvoiceAgendaEvent from '../models/invoiceAgendaEvent.model.js';
-import { createAppointmentPayment, updateAppointmentPaymentCompatibility, voidAppointmentPayment } from '../../agenda/controllers/appointmentPayment.controller.js';
+import { createAppointmentPayment, updateAppointmentPaymentCompatibility, voidAppointmentPayment, updateAppointmentPricing } from '../../agenda/controllers/appointmentPayment.controller.js';
+import { resolveAppointmentAdjustment } from '../utils/appointmentAdjustment.js';
+import { saveInvoice, findEligibleAppointments } from '../controllers/invoice.controller.js';
+import Invoice from '../models/invoice.model.js';
+import InvoiceService from '../models/invoiceService.model.js';
+import InvoiceProduct from '../models/invoiceProduct.model.js';
+import Service from '../../products-services/models/service.model.js';
+import Product from '../../products-services/models/product.model.js';
+import Patient from '../../patients/models/patient.model.js';
+import Tenant from '../../auth/models/tenant.model.js';
+import EventType from '../../agenda/models/eventType.model.js';
 
 describe('summarizeInvoicePayments', () => {
     it('derives unpaid, partial and paid states only from posted movements', () => {
@@ -153,6 +163,17 @@ describe('appointment ledger and agreed prices', () => {
 });
 
 describe('appointment payment HTTP handlers with an in-memory ledger', () => {
+    it('validates discounts, VAT and existing receipts without turning a partial payment into a discount', () => {
+        assert.deepEqual(resolveAppointmentAdjustment(50, 'DISCOUNT', 25, 0, 0), {adjustment: 'DISCOUNT', amount: 25, netAmount: 25});
+        assert.deepEqual(resolveAppointmentAdjustment(122, 'DISCOUNT', 61, 30, 22), {adjustment: 'DISCOUNT', amount: 61, netAmount: 50});
+        assert.equal(resolveAppointmentAdjustment(50, null, null, 25, 0).amount, 50);
+        for (const discount of [-5, 0, 0.001, 50, 51, NaN, Infinity, '25']) {
+            assert.throws(() => resolveAppointmentAdjustment(50, 'DISCOUNT', discount, 0, 0));
+        }
+        assert.throws(() => resolveAppointmentAdjustment(50, 'DISCOUNT', 30, 25, 0), /inferiore agli incassi/);
+        assert.throws(() => resolveAppointmentAdjustment(50, 'COMPLIMENTARY', null, 1, 0), /inferiore agli incassi/);
+        assert.equal(resolveAppointmentAdjustment(null, 'COMPLIMENTARY', null, 0, null).amount, 0);
+    });
     it('appends instalments, refuses destructive compatibility edits and voids only the selected movement', async context => {
         const eventId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
         const rows: any[] = [];
@@ -211,5 +232,117 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
         assert.equal(final.data.summary.balance, 100);
         assert.equal(event.appointmentPaymentStatus, 'unpaid');
         assert.equal(rows.length, 2);
+        const discounted = await invoke(createAppointmentPayment, {amount: 25, paidAt: '2026-03-01',
+            pricing: {adjustment: 'DISCOUNT', discountAmount: 75, note: 'Agevolazione'}});
+        assert.equal(discounted.code, 201);
+        assert.equal(discounted.data.summary.expectedAmount, 25);
+        assert.equal(discounted.data.summary.balance, 0);
+        assert.equal(event.appointmentOriginalAmount, 100);
+        assert.equal(event.appointmentPriceAdjustment, 'DISCOUNT');
+        assert.equal(event.appointmentPriceAdjustmentNote, 'Agevolazione');
+        assert.equal(rows.length, 3);
+        assert.equal((await invoke(updateAppointmentPricing, {adjustment: 'COMPLIMENTARY'})).code, 400);
+        await invoke(voidAppointmentPayment, {reason: 'Incasso errato'}, rows[2].id);
+        const gift = await invoke(updateAppointmentPricing, {adjustment: 'COMPLIMENTARY'});
+        assert.equal(gift.code, 200);
+        assert.equal(gift.data.summary.expectedAmount, 0);
+        assert.equal(gift.data.summary.paidAmount, 0);
+        assert.equal(gift.data.summary.balance, 0);
+        assert.equal(event.appointmentPriceAdjustment, 'COMPLIMENTARY');
+        assert.equal(rows.length, 3);
+        assert.equal((await invoke(createAppointmentPayment, {amount: 1, paidAt: '2026-03-01'})).code, 409);
+        assert.equal((await invoke(updateAppointmentPricing, {adjustment: null})).data.summary.expectedAmount, 100);
+        assert.equal(event.appointmentPriceAdjustment, null);
+        event.invoiceId = 'invoice';
+        assert.equal((await invoke(updateAppointmentPricing, {adjustment: 'DISCOUNT', discountAmount: 25})).code, 409);
+        event.invoiceId = null;
+        assert.equal((await invoke(updateAppointmentPricing, {adjustment: 'DISCOUNT', discountAmount: 25}, undefined, true)).code, 404);
     });
+});
+
+describe('invoicing appointment concessions through the HTTP handlers', () => {
+    const eventId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const serviceId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const patientId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    const record = (values: any) => ({...values,
+        get(key?: any) { return typeof key === 'string' ? this[key]
+            : Object.fromEntries(Object.entries(this).filter(([, value]) => typeof value !== 'function')); },
+        async update(values: any) { Object.assign(this, values); return this; }
+    });
+    function setup(context: any, adjustment: 'DISCOUNT' | 'COMPLIMENTARY') {
+        const event = record({id: eventId, patientId, status: 'COMPLETED', start: '2026-01-05T10:00:00Z',
+            calendarId: null, recurrence: null, invoiceId: null, eventTypeId: 'type',
+            appointmentExpectedAmount: adjustment === 'DISCOUNT' ? 25 : 0, appointmentOriginalAmount: 50,
+            appointmentPriceAdjustment: adjustment, appointmentNetAmount: adjustment === 'DISCOUNT' ? 25 : 0,
+            appointmentVatRate: 0, appointmentPaymentHistoryKnown: true});
+        const tenant = record({id: 'tenant', businessName: 'Studio test', taxCode: 'TEST', address: 'Via Test 1',
+            city: 'Milano', zipCode: '20100', taxRegime: 'RF01', lastDocumentNumberByYear: {}});
+        const receipts = adjustment === 'DISCOUNT' ? [record({id: 'cash', agendaEventId: eventId, invoiceId: null,
+            amount: 25, status: 'POSTED', source: 'APPOINTMENT', paidAt: '2026-01-05'})] : [];
+        const lines: any[] = [];
+        let created: any = null;
+        context.mock.method(sequelize, 'transaction', async (callback: any) => callback({LOCK: {UPDATE: 'UPDATE'}}));
+        context.mock.method(Tenant, 'findByPk', async () => tenant);
+        context.mock.method(AgendaEvent, 'schema', () => ({findAll: async () => [event]}));
+        context.mock.method(Patient, 'schema', () => ({findOne: async () => record({id: patientId})}));
+        context.mock.method(EventType, 'schema', () => ({findAll: async () => [record({id: 'type', linkedServiceId: serviceId})]}));
+        context.mock.method(Service, 'schema', () => ({findAll: async () => [record({id: serviceId, name: 'Terapia', sellingPrice: 80, productVat: 'N4', isActive: true})]}));
+        context.mock.method(Product, 'schema', () => ({findAll: async () => []}));
+        context.mock.method(InvoiceProduct, 'schema', () => ({}));
+        context.mock.method(InvoiceService, 'schema', () => ({create: async (values: any) => {lines.push(values); return record(values);}}));
+        context.mock.method(InvoiceAgendaEvent, 'schema', () => ({findAll: async () => [], create: async (values: any) => record(values)}));
+        context.mock.method(Invoice, 'schema', () => ({
+            findOne: async () => null,
+            create: async (values: any) => {created = record({...values, id: 'invoice', services: lines}); return created;},
+            findByPk: async () => created
+        }));
+        context.mock.method(InvoicePayment, 'schema', () => ({findAll: async () => receipts,
+            update: async (values: any) => receipts.forEach(payment => Object.assign(payment, values)),
+            create: async () => {throw new Error('Invoice emission must not create another receipt');}
+        }));
+        const invoke = (handler: any, body: any) => new Promise<any>((resolve, reject) => {
+            const response = {code: 0, status(code: number) {this.code = code; return this;},
+                json(data: any) {resolve({code: this.code, ...data}); return this;}};
+            handler({tenantSchema: 'test_tenant', body, query: {patientId, through: '2026-01-31'},
+                user: {sub: 'user', tenants: [{id: 'tenant'}]}, access: {scope: 'tenant', resource: 'invoice'}}, response, reject);
+        });
+        return {invoke, event, tenant, receipts, lines};
+    }
+
+    for (const cumulative of [false, true]) {
+        it(`keeps the discounted 25 euro price and original 50 euro tariff in a ${cumulative ? 'cumulative' : 'single'} invoice`, async context => {
+            const state = setup(context, 'DISCOUNT');
+            const eligible = await state.invoke(findEligibleAppointments, {});
+            assert.equal(eligible.data.appointments[0].service.sellingPrice, 25);
+            assert.equal(eligible.data.appointments[0].service.originalSellingPrice, 50);
+            const response = await state.invoke(saveInvoice, {patientID: patientId, documentType: 'fattura',
+                emissionDate: '2026-01-10', status: 'paid',
+                ...(cumulative ? {appointments: [{agendaEventId: eventId, serviceId}]}
+                    : {agendaEventId: eventId, services: [{id: serviceId, quantity: 1}]})});
+            assert.equal(response.code, 201);
+            assert.equal(response.data.invoiceTotal, 25);
+            assert.equal(response.data.sellingPrice, 50);
+            assert.equal(response.data.discSellingPrice, 25);
+            assert.equal(response.data.balance, 0);
+            assert.equal(response.data.paidAmount, 25);
+            assert.equal(state.lines[0].servicePrice, 25);
+            assert.equal(state.lines[0].originalServicePrice, 50);
+            assert.equal(state.receipts.length, 1);
+            assert.equal(state.receipts[0].id, 'cash');
+            assert.equal(state.receipts[0].invoiceId, 'invoice');
+        });
+
+        it(`blocks a complimentary session in a ${cumulative ? 'cumulative' : 'single'} invoice before allocating a number`, async context => {
+            const state = setup(context, 'COMPLIMENTARY');
+            assert.deepEqual((await state.invoke(findEligibleAppointments, {})).data.appointments, []);
+            const response = await state.invoke(saveInvoice, {patientID: patientId, documentType: 'fattura',
+                emissionDate: '2026-01-10', status: 'unpaid',
+                ...(cumulative ? {appointments: [{agendaEventId: eventId, serviceId}]}
+                    : {agendaEventId: eventId, services: [{id: serviceId, quantity: 1}]})});
+            assert.equal(response.code, 409);
+            assert.match(response.message, /omaggio/);
+            assert.equal(state.lines.length, 0);
+            assert.deepEqual(state.tenant.lastDocumentNumberByYear, {});
+        });
+    }
 });

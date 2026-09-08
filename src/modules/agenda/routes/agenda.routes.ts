@@ -5,7 +5,7 @@ import { resolveTenantSchema } from '../../../middleware/tenantSchema.js';
 import agendaController from '../controllers/agenda.controller.js';
 import eventTypeController from '../controllers/eventType.controller.js';
 import timeOffController from '../controllers/timeOff.controller.js';
-import { listAppointmentPayments, createAppointmentPayment, voidAppointmentPayment } from '../controllers/appointmentPayment.controller.js';
+import { listAppointmentPayments, createAppointmentPayment, voidAppointmentPayment, updateAppointmentPricing } from '../controllers/appointmentPayment.controller.js';
 
 const router = Router();
 
@@ -23,6 +23,7 @@ router.patch('/agenda-events/reassign-operator', requirePermission('agenda', 'up
 router.patch('/agenda-event/:agendaEventId/payment', requirePermission('agenda', 'update'), agendaController.updateAppointmentPayment);
 router.get('/agenda-event/:agendaEventId/payments', requirePermission('agenda', 'read'), listAppointmentPayments);
 router.post('/agenda-event/:agendaEventId/payments', requirePermission('agenda', 'update'), createAppointmentPayment);
+router.patch('/agenda-event/:agendaEventId/pricing', requirePermission('agenda', 'update'), updateAppointmentPricing);
 router.patch('/agenda-event/:agendaEventId/payments/:paymentId/void', requirePermission('agenda', 'update'), voidAppointmentPayment);
 router.patch('/agenda-event/:agendaEventId/complete-if-untouched', requirePermission('agenda', 'update'), agendaController.completeAppointmentIfUntouched);
 router.patch('/agenda-event/:agendaEventId/missed-arrival/report', requirePermission('agenda', 'update'), agendaController.reportMissedArrival);

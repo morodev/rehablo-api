@@ -7,6 +7,7 @@ export interface InvoiceServiceAttributes {
     ServiceId: string;
     quantity?: number | null;
     servicePrice?: number | null;
+    originalServicePrice?: number | null;
     totalPrice?: number | null;
     percentageDiscount?: number | null;
     discountAmount?: number | null;
@@ -27,6 +28,7 @@ export class InvoiceService
     declare ServiceId: string;
     declare quantity: number | null;
     declare servicePrice: number | null;
+    declare originalServicePrice: number | null;
     declare totalPrice: number | null;
     declare percentageDiscount: number | null;
     declare discountAmount: number | null;
@@ -41,6 +43,7 @@ InvoiceService.init(
         ServiceId: { type: DataTypes.UUID, allowNull: false },
         quantity: DataTypes.INTEGER,
         servicePrice: DataTypes.DECIMAL(10, 2),
+        originalServicePrice: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
         totalPrice: DataTypes.DECIMAL(10, 2),
         percentageDiscount: DataTypes.INTEGER,
         discountAmount: DataTypes.DECIMAL(10, 2),

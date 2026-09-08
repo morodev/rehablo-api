@@ -33,6 +33,15 @@ const occurrences = (events: Array<Record<string, any>>) => events.map((row) => 
 }));
 
 describe('shared cash and document reporting', () => {
+    it('excludes complimentary sessions from unbilled work without inventing cash', () => {
+        const input = data({events: [event({expectedAmount: 0, appointmentPriceAdjustment: 'COMPLIMENTARY'})], payments: []});
+        const result = aggregateFinance(input, query());
+        assert.equal(result.totals.collected, 0);
+        assert.equal(result.totals.outstanding, 0);
+        assert.equal(result.totals.unbilledCompleted, 0);
+        assert.equal(aggregateTherapyPayments(input, query({documentStatus: 'unbilled'}), occurrences(input.events)).totals.count, 0);
+        assert.equal(aggregateTherapyPayments(input, query(), occurrences(input.events)).details[0].appointmentPriceAdjustment, 'COMPLIMENTARY');
+    });
     it('counts cash immediately in January and only revenue when invoicing it in March', () => {
         const before = aggregateFinance(data(), query());
         assert.equal(before.totals.collected, 100);

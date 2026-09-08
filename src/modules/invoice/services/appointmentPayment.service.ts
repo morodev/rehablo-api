@@ -104,7 +104,7 @@ export function summarizeAppointmentPayments(expectedAmount: number | null, paym
     const paidAmount = paymentMoney(posted.reduce((sum, payment) => sum + Number(payment.amount), 0));
     const balance = expectedAmount === null ? null : paymentMoney(Math.max(expectedAmount - paidAmount, 0));
     return { paidAmount, expectedAmount, balance,
-        paymentStatus: paidAmount <= 0 ? 'unpaid' : balance !== null && balance <= 0.009 ? 'paid' : 'partial',
+        paymentStatus: expectedAmount === 0 ? 'paid' : paidAmount <= 0 ? 'unpaid' : balance !== null && balance <= 0.009 ? 'paid' : 'partial',
         methods: [...new Set(posted.map(payment => payment.method || null))],
         hasUndatedPayments: posted.some(payment => !payment.paidAt) };
 }

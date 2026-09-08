@@ -4,7 +4,8 @@ import moment from 'moment';
 import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
-import { scopeWhere } from '../../../middleware/rbac.js';
+import { getGrantedPermissions, scopeWhere } from '../../../middleware/rbac.js';
+import { hasPermission } from '../../auth/rbac/permissions.js';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
 import { sendNewEventMail } from '../../../services/email.service.js';
 import AgendaEvent from '../models/agendaEvent.model.js';
@@ -18,6 +19,7 @@ import Invoice from '../../invoice/models/invoice.model.js';
 import TimeOffRequest from '../models/timeOffRequest.model.js';
 import { StructureUser, TenantUser, User } from '../../auth/models/index.js';
 import { getInvoiceAgendaLinksByEventIds, getLinkedInvoiceId } from '../../invoice/services/invoiceAgendaEvent.service.js';
+import { patientPaymentPositionsByReferenceEvents } from '../services/patientPaymentPosition.service.js';
 import {
     DeferredOperatorAssignment,
     InvalidDeferredOperatorReassignmentError,
@@ -64,6 +66,11 @@ const APPOINTMENT_PAYMENT_MANAGED_FIELDS = [
     'appointmentPaymentNote',
     'appointmentPaymentRecordedBy',
     'appointmentExpectedAmount',
+    'appointmentOriginalAmount',
+    'appointmentPriceAdjustment',
+    'appointmentPriceAdjustmentNote',
+    'appointmentPriceAdjustedBy',
+    'appointmentPriceAdjustedAt',
     'appointmentNetAmount',
     'appointmentVatRate',
     'appointmentPriceRecordedAt',
@@ -386,10 +393,25 @@ export const findAllAgendaEvents = asyncHandler(async (req: Request, res: Respon
         }
     });
 
+    let decoratedEvents = await withInvoiceStatus(schema, agendaEvents);
+    const canReadFinance = Boolean(req.user?.isSuperAdmin)
+        || hasPermission(getGrantedPermissions(req), 'invoice', 'read');
+    if (req.query.includePatientPaymentPosition === 'true' && canReadFinance) {
+        const positions = await patientPaymentPositionsByReferenceEvents(
+            schema,
+            decoratedEvents,
+            scopeWhere(req, AGENDA_SCOPE_FIELDS)
+        );
+        decoratedEvents = decoratedEvents.map(event => ({
+            ...event,
+            patientPaymentPosition: positions.get(event.id) ?? null
+        }));
+    }
+
     return sendSuccessResponse(
         res,
         200,
-        { agendaEvents: await withInvoiceStatus(schema, agendaEvents) },
+        { agendaEvents: decoratedEvents },
         'Agenda events loaded'
     );
 });
@@ -614,15 +636,17 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
         const financialContextChanged = ['patientId', 'structureId', 'eventTypeId'].some(field =>
             event[field] !== undefined && String(event[field] ?? '') !== String(locked.get(field as any) ?? '')
         );
-        if (financialContextChanged && (Number(locked.appointmentPaidAmount) > 0
+        if (financialContextChanged && (locked.appointmentPriceAdjustment || Number(locked.appointmentPaidAmount) > 0
             || await InvoicePayment.schema(schema).count({ where: { agendaEventId: id }, transaction }) > 0)) {
             return 'history';
         }
         if (event.eventTypeId !== undefined && event.eventTypeId !== locked.eventTypeId) {
             Object.assign(event, await snapshotAppointmentPrice(schema, {
                 ...locked.get({ plain: true }), ...event,
-                appointmentExpectedAmount: null, appointmentNetAmount: null, appointmentVatRate: null
+                appointmentExpectedAmount: null, appointmentNetAmount: null, appointmentVatRate: null,
+                appointmentOriginalAmount: null
             }, transaction));
+            event.appointmentOriginalAmount = null;
         }
         await locked.update(event, { transaction });
         return 'updated';

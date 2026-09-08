@@ -84,6 +84,7 @@ interface ResolvedInvoiceLine {
     id: string;
     quantity: number;
     unitPrice: number;
+    originalUnitPrice?: number | null;
     /** Aliquota/natura IVA presa dal catalogo (es. "22", "N4"), mai dal client. */
     vat: string | null;
     name: string | null;
@@ -133,6 +134,7 @@ async function resolveCatalogLines(
 
 const toEvalLine = (line: ResolvedInvoiceLine) => ({
     sellingPrice: line.unitPrice,
+    originalSellingPrice: line.originalUnitPrice,
     quantity: line.quantity,
     productVat: line.vat
 });
@@ -198,7 +200,8 @@ export const findEligibleAppointments = asyncHandler(async (req: Request, res: R
     const eventIds = datedRows.map((event) => event.id);
     const existingLinks = await getInvoiceAgendaLinksByEventIds(schema, eventIds);
     const alreadyLinked = new Set(existingLinks.map((link) => link.agendaEventId));
-    const eligibleRows = datedRows.filter((event) => !alreadyLinked.has(event.id));
+    const eligibleRows = datedRows.filter((event) => !alreadyLinked.has(event.id)
+        && event.appointmentPriceAdjustment !== 'COMPLIMENTARY');
 
     const eventTypeIds = [...new Set(eligibleRows.map((event) => event.eventTypeId).filter(Boolean))] as string[];
     const eventTypes = eventTypeIds.length
@@ -228,6 +231,9 @@ export const findEligibleAppointments = asyncHandler(async (req: Request, res: R
         const invoicePrice = service ? applyAppointmentPriceSnapshot(price, {
             unitPrice: Number(service.sellingPrice) || 0, vat: service.productVat
         }, fiscalProfile.appliesVat) : null;
+        const originalPrice = service && event.appointmentPriceAdjustment === 'DISCOUNT'
+            ? applyAppointmentPriceSnapshot({...price!, amount: Number(event.appointmentOriginalAmount), netAmount: null},
+                {unitPrice: Number(service.sellingPrice) || 0, vat: service.productVat}, fiscalProfile.appliesVat).unitPrice : null;
         return {
             id: event.id,
             start: event.start,
@@ -247,10 +253,13 @@ export const findEligibleAppointments = asyncHandler(async (req: Request, res: R
                 description: service.description,
                 productVat: invoicePrice!.vat,
                 sellingPrice: invoicePrice!.unitPrice,
+                originalSellingPrice: originalPrice,
                 categoryId: service.categoryId,
                 isActive: service.isActive
             } : null,
             appointmentExpectedAmount: price?.amount ?? null,
+            appointmentOriginalAmount: event.appointmentOriginalAmount ?? null,
+            appointmentPriceAdjustment: event.appointmentPriceAdjustment ?? null,
             appointmentPriceSource: price?.source ?? null,
             appointmentPriceEstimated: price?.estimated ?? true,
             appointmentPaymentStatus: event.appointmentPaymentStatus ?? 'unpaid',
@@ -534,6 +543,9 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             if (cancelledEvent) {
                 return { kind: 'cancelled-appointment' } as const;
             }
+            if (agendaEvents.some(event => event.appointmentPriceAdjustment === 'COMPLIMENTARY')) {
+                return { kind: 'complimentary-appointment' } as const;
+            }
             const waivedNoShow = agendaEvents.find((event) =>
                 String(event.get('status') ?? '').toUpperCase() === 'NO_SHOW'
                 && String(event.get('noShowBillingDecision') ?? '').toUpperCase() === 'WAIVED'
@@ -600,6 +612,11 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                 const line = serviceLines[hasExplicitAppointments ? requestedServices.length + index : 0];
                 if (line) Object.assign(line, applyAppointmentPriceSnapshot(price, line, fiscalProfile.appliesVat));
                 const event = eventsById.get(selection.agendaEventId)!;
+                if (line && event.appointmentPriceAdjustment === 'DISCOUNT' && event.appointmentOriginalAmount != null) {
+                    line.originalUnitPrice = applyAppointmentPriceSnapshot({ ...price!,
+                        amount: Number(event.appointmentOriginalAmount), netAmount: null
+                    }, line, fiscalProfile.appliesVat).unitPrice;
+                }
                 const history = await ensureAppointmentPaymentHistory(schema, event, t);
                 if (history.some(payment => payment.invoiceId)) {
                     return { kind: 'already-invoiced', invoiceId: history.find(payment => payment.invoiceId)!.invoiceId! } as const;
@@ -675,6 +692,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                         ServiceId: line.id,
                         quantity: line.quantity,
                         servicePrice: line.unitPrice,
+                        originalServicePrice: line.originalUnitPrice ?? null,
                         totalPrice: line.unitPrice * line.quantity,
                         percentageDiscount: line.percentageDiscount,
                         discountAmount: line.discountAmount,
@@ -760,6 +778,9 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     }
     if (transactionResult.kind === 'cancelled-appointment') {
         return sendErrorResponse(res, 422, 'Un appuntamento annullato non può essere fatturato');
+    }
+    if (transactionResult.kind === 'complimentary-appointment') {
+        return sendErrorResponse(res, 409, 'La seduta è omaggio e non può essere fatturata');
     }
     if (transactionResult.kind === 'waived-no-show') {
         return sendErrorResponse(

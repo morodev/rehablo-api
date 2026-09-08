@@ -38,6 +38,11 @@ export interface AgendaEventAttributes {
     appointmentPaymentRecordedBy?: string | null;
     /** Frozen customer price. Null on historical appointments with no agreed price recorded. */
     appointmentExpectedAmount?: number | null;
+    appointmentOriginalAmount?: number | null;
+    appointmentPriceAdjustment?: 'DISCOUNT' | 'COMPLIMENTARY' | null;
+    appointmentPriceAdjustmentNote?: string | null;
+    appointmentPriceAdjustedBy?: string | null;
+    appointmentPriceAdjustedAt?: Date | null;
     appointmentNetAmount?: number | null;
     appointmentVatRate?: number | null;
     appointmentPriceRecordedAt?: Date | null;
@@ -86,6 +91,11 @@ export class AgendaEvent
     declare appointmentPaymentNote: string | null;
     declare appointmentPaymentRecordedBy: string | null;
     declare appointmentExpectedAmount: number | null;
+    declare appointmentOriginalAmount: number | null;
+    declare appointmentPriceAdjustment: 'DISCOUNT' | 'COMPLIMENTARY' | null;
+    declare appointmentPriceAdjustmentNote: string | null;
+    declare appointmentPriceAdjustedBy: string | null;
+    declare appointmentPriceAdjustedAt: Date | null;
     declare appointmentNetAmount: number | null;
     declare appointmentVatRate: number | null;
     declare appointmentPriceRecordedAt: Date | null;
@@ -125,6 +135,11 @@ AgendaEvent.init(
         appointmentPaymentNote: { type: DataTypes.TEXT, allowNull: true },
         appointmentPaymentRecordedBy: { type: DataTypes.UUID, allowNull: true },
         appointmentExpectedAmount: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
+        appointmentOriginalAmount: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
+        appointmentPriceAdjustment: { type: DataTypes.STRING(16), allowNull: true },
+        appointmentPriceAdjustmentNote: { type: DataTypes.TEXT, allowNull: true },
+        appointmentPriceAdjustedBy: { type: DataTypes.UUID, allowNull: true },
+        appointmentPriceAdjustedAt: { type: DataTypes.DATE, allowNull: true },
         appointmentNetAmount: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
         appointmentVatRate: { type: DataTypes.DECIMAL(5, 2), allowNull: true },
         appointmentPriceRecordedAt: { type: DataTypes.DATE, allowNull: true },

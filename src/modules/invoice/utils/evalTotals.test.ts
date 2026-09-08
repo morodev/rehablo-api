@@ -6,6 +6,15 @@ import { applyAppointmentPriceSnapshot } from './appointmentInvoicePrice.js';
 const service = { sellingPrice: 100, quantity: 1, productVat: 'N4' };
 
 describe('evalTotals fiscal options', () => {
+    it('invoices only the reduced price, while preserving original tariff and discount totals', () => {
+        const totals = evalTotals({services: [{...service, sellingPrice: 25, originalSellingPrice: 50}]});
+        assert.equal(totals.sellingPrice, 50);
+        assert.equal(totals.discSellingPrice, 25);
+        assert.equal(totals.invoiceTotal, 25);
+        const withVat = evalTotals({services: [{...service, sellingPrice: 50, originalSellingPrice: 100, productVat: '22'}]});
+        assert.equal(withVat.invoiceTotal, 61);
+        assert.equal(withVat.invoiceVAT, 11);
+    });
     it('does not apply rivals when the option is disabled', () => {
         const totals = evalTotals({ services: [service], isRivals: false, rivals: 4 });
         assert.equal(totals.rivalsAmount, 0);

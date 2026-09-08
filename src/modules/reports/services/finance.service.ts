@@ -167,7 +167,8 @@ function matchesEvent(event: Record<string, any>, financial: ReturnType<typeof e
     const status = financial.paymentScope === 'invoice' && financial.invoicePaymentStatus && financial.invoicePaymentStatus !== 'void'
         ? financial.invoicePaymentStatus : financial.paymentStatus;
     return (query.paymentStatus === 'all' || (query.paymentStatus === 'unknown' ? financial.paymentStatus === 'unknown' : status === query.paymentStatus)) &&
-        (query.documentStatus === 'all' || (query.documentStatus === 'invoiced') === !!event.invoiceId) &&
+        (query.documentStatus === 'all' || (event.appointmentPriceAdjustment !== 'COMPLIMENTARY'
+            && (query.documentStatus === 'invoiced') === !!event.invoiceId)) &&
         (!query.paymentMethod || financial.paymentMethods.includes(query.paymentMethod)) &&
         (!query.statuses?.length || query.statuses.includes(String(event.status).toUpperCase()));
 }
@@ -227,7 +228,7 @@ export function aggregateFinance(data: FinanceData, query: FinanceQuery) {
         }
     });
     events.forEach((event) => {
-        if (event.invoiceId) return;
+        if (event.invoiceId || event.appointmentPriceAdjustment === 'COMPLIMENTARY') return;
         const financial = financialByEvent.get(event.id)!;
         if (financial.eligible) {
             totals.appointmentOutstanding += financial.balance ?? 0;
@@ -267,7 +268,8 @@ export function aggregateTherapyPayments(data: FinanceData, query: FinanceQuery,
         const { payments, eligible, ...fields } = financial;
         return [{ id: occurrence.id, start: occurrence.start, patientName: occurrence.patientName,
             title: occurrence.title, status: occurrence.status, operatorId: occurrence.calendarId,
-            eventTypeId: occurrence.eventTypeId, invoiceId: event.invoiceId ?? null, ...fields }];
+            eventTypeId: occurrence.eventTypeId, invoiceId: event.invoiceId ?? null,
+            appointmentPriceAdjustment: event.appointmentPriceAdjustment ?? null, ...fields }];
     }).sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime() || a.id.localeCompare(b.id));
     const selectedEventIds = new Set(rows.map((row) => row.id));
     const selectedInvoiceIds = new Set(rows.map((row) => row.invoiceId).filter((id) => id && data.attributableInvoiceIds.has(id)));
