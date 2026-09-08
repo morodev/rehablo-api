@@ -23,6 +23,10 @@ import {
     InvalidDeferredOperatorReassignmentError,
     reassignDeferredOperatorAppointments
 } from '../services/operatorReassignment.service.js';
+import {
+    shouldAutoCompleteAppointment,
+    shouldOpenAttendanceCorrection
+} from '../services/missedArrivalAutomation.service.js';
 
 /**
  * Campi per il filtro row-level RBAC.
@@ -544,6 +548,18 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
         }
         event.status = status;
 
+        // Se una seduta terminata viene riaperta da COMPLETED a CONFIRMED, si tratta
+        // di una correzione della presenza. Apriamo contestualmente la verifica così
+        // il job automatico non la richiude prima della scelta del no-show.
+        if (shouldOpenAttendanceCorrection(current.get({ plain: true }), status)) {
+            event.missedArrivalReportedAt = new Date();
+            event.missedArrivalReportedBy = req.access!.userId;
+            event.missedArrivalResolvedAt = null;
+            event.missedArrivalResolvedBy = null;
+            event.missedArrivalResolution = null;
+            event.noShowBillingDecision = null;
+        }
+
         // Compatibilita' con i client precedenti: se una segnalazione aperta viene chiusa
         // direttamente come effettuata o cancellata, manteniamo comunque l'audit completo.
         if (hasOpenMissedArrival(current) && (status === 'COMPLETED' || status === 'CANCELLED')) {
@@ -738,6 +754,44 @@ export const reportMissedArrival = asyncHandler(async (req: Request, res: Respon
         });
     }
     return sendSuccessResponse(res, 200, event, 'Mancato arrivo segnalato');
+});
+
+/** Completa la seduta soltanto se e' terminata ed e' ancora priva di azioni esplicite. */
+export const completeAppointmentIfUntouched = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const id = req.params.agendaEventId;
+    if (!UUID_REGEX.test(id)) {
+        return sendErrorResponse(res, 400, 'Appuntamento non valido');
+    }
+
+    const TenantAgendaEvent = AgendaEvent.schema(schema);
+    const scope = scopeWhere(req, AGENDA_SCOPE_FIELDS);
+    const event = await TenantAgendaEvent.findOne({ where: { id, ...scope } });
+    if (!event) {
+        return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
+    }
+
+    if (shouldAutoCompleteAppointment(event.get({ plain: true }))) {
+        await TenantAgendaEvent.update(
+            { status: 'COMPLETED' },
+            {
+                where: {
+                    id,
+                    ...scope,
+                    status: { [Op.iLike]: 'CONFIRMED' },
+                    invoiceId: null,
+                    missedArrivalReportedAt: null,
+                    [Op.and]: [
+                        { [Op.or]: [{ recurrence: null }, { recurrence: '' }] },
+                        { [Op.or]: [{ recurringEventId: null }, { recurringEventId: '' }] }
+                    ]
+                }
+            }
+        );
+    }
+
+    const updated = await TenantAgendaEvent.findOne({ where: { id, ...scope } });
+    return sendSuccessResponse(res, 200, updated, 'Stato appuntamento verificato');
 });
 
 /** Chiude l'alert dopo il contatto e applica l'esito scelto dall'operatore. */
@@ -1007,6 +1061,7 @@ export default {
     findAppointmentsForPatientById,
     updateAgendaEvent,
     updateAppointmentPayment,
+    completeAppointmentIfUntouched,
     reportMissedArrival,
     resolveMissedArrival,
     updateNoShowBillingDecision,

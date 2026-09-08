@@ -15,6 +15,7 @@ router.get('/patient/search', requirePermission('patient', 'read'), patientContr
 router.get('/patient', requirePermission('patient', 'read'), patientController.findAndCountAll);
 router.post('/patient/:patientId/privacy-document', requirePermission('patient', 'update'), patientController.privacyDocumentUploadMiddleware, patientController.uploadPrivacyDocument);
 router.get('/patient/:patientId/privacy-document', requirePermission('patient', 'read'), patientController.downloadPrivacyDocument);
+router.patch('/patient/:patientId/default-event-type', requirePermission('patient', 'update'), patientController.setDefaultEventType);
 router.get('/patient/:patientId', requirePermission('patient', 'read'), patientController.findOne);
 router.put('/patient/:patientId', requirePermission('patient', 'update'), patientController.update);
 router.delete('/patient/:patientId', requirePermission('patient', 'delete'), patientController.deletePatient);

@@ -9,9 +9,11 @@ type MigrationModule = {
     }): Promise<void>;
 };
 export const APPOINTMENT_LEDGER_VERSION = '20260907-unify-appointment-payment-ledger';
+export const PATIENT_DEFAULT_EVENT_TYPE_VERSION = '20260908-add-patient-default-event-type';
 export const TENANT_MODEL_BASELINE_VERSION = '20260907-tenant-model-baseline-v1';
 const tenantMigrations: Array<{version: string; module: MigrationModule}> = [
-    {version: APPOINTMENT_LEDGER_VERSION, module: require('../../migrations/20260907-unify-appointment-payment-ledger.js')}
+    {version: APPOINTMENT_LEDGER_VERSION, module: require('../../migrations/20260907-unify-appointment-payment-ledger.js')},
+    {version: PATIENT_DEFAULT_EVENT_TYPE_VERSION, module: require('../../migrations/20260908-add-patient-default-event-type.js')}
 ];
 
 export function requiredTenantSchemaVersions(): string[] {

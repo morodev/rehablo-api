@@ -7,23 +7,40 @@ import Tenant from '../../auth/models/tenant.model.js';
 import { getMissingIssuerFields } from '../utils/issuer.js';
 import { resolveFiscalProfile } from '../utils/fiscalRegime.js';
 
+const DATE_KEY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+export function resolveOverviewDate(value: unknown, todayKey = localDateKey(new Date())): string {
+    const candidate = value === undefined || value === null || value === '' ? todayKey : String(value);
+    const parsed = new Date(`${candidate}T12:00:00.000Z`);
+    if (!DATE_KEY_PATTERN.test(candidate)
+        || !Number.isFinite(parsed.getTime())
+        || parsed.toISOString().slice(0, 10) !== candidate
+        || candidate > todayKey) {
+        throw new AnalyticsQueryError('Data del riepilogo non valida');
+    }
+    return candidate;
+}
+
 /** Shared ledger aggregation: receipts use payment date, documents use issue date. */
 export const getOverview = asyncHandler(async (req: Request, res: Response) => {
     const months = Math.min(Math.max(parseInt(String(req.query.months ?? '6'), 10) || 6, 1), 24);
     const todayKey = localDateKey(new Date());
-    const rangeStart = new Date(todayKey.slice(0, 7) + '-01T12:00:00Z');
-    rangeStart.setUTCMonth(rangeStart.getUTCMonth() - months + 1);
+    let reportDay: string;
     let query: FinanceQuery;
     try {
+        reportDay = resolveOverviewDate(req.query.date, todayKey);
+        const rangeStart = new Date(reportDay.slice(0, 7) + '-01T12:00:00Z');
+        rangeStart.setUTCMonth(rangeStart.getUTCMonth() - months + 1);
         query = { ...parseAnalyticsQuery(req), ...parseFinanceFilters(req),
-            from: rangeStart.toISOString().slice(0, 10), to: todayKey, granularity: 'month', compare: 'none' };
+            from: rangeStart.toISOString().slice(0, 10), to: reportDay, granularity: 'month', compare: 'none' };
     } catch (error) {
         if (error instanceof AnalyticsQueryError) return sendErrorResponse(res, 400, error.message);
         throw error;
     }
     const data = await loadFinanceData(req, query);
     const monthlyReport = aggregateFinance(data, query);
-    const dailyReport = aggregateFinance(data, { ...query, from: todayKey, to: todayKey, granularity: 'day' });
+    const dailyReport = aggregateFinance(data, { ...query, from: reportDay, to: reportDay, granularity: 'day' });
+    const rangeStart = new Date(query.from + 'T12:00:00Z');
     const monthly = Array.from({ length: months }, (_, offset) => {
         const date = new Date(rangeStart); date.setUTCMonth(date.getUTCMonth() + offset);
         const month = date.toISOString().slice(0, 7);
@@ -34,6 +51,7 @@ export const getOverview = asyncHandler(async (req: Request, res: Response) => {
     });
     const totals = dailyReport.totals;
     return sendSuccessResponse(res, 200, {
+        day: reportDay,
         today: { billed: totals.billedTotal, collected: totals.collected, toCollect: totals.issuedOutstanding,
             collectedFromAppointments: totals.collectedFromAppointments, collectedFromInvoices: totals.collectedFromInvoices },
         monthly, outstanding: totals.outstanding, invoiceOutstanding: totals.invoiceOutstanding,
@@ -75,5 +93,4 @@ export const getIssuerStatus = asyncHandler(async (req: Request, res: Response) 
 });
 
 export default { getOverview, getIssuerStatus };
-
 

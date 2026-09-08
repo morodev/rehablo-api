@@ -2,8 +2,8 @@ import { Op, QueryTypes } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 import AgendaEvent, { AgendaEventAttributes } from '../models/agendaEvent.model.js';
 
-export const AUTOMATIC_MISSED_ARRIVAL_INTERVAL_MS = 30_000;
-export const AUTOMATIC_MISSED_ARRIVAL_LOOKBACK_MS = 24 * 60 * 60_000;
+export const AUTOMATIC_APPOINTMENT_COMPLETION_INTERVAL_MS = 30_000;
+export const AUTOMATIC_APPOINTMENT_COMPLETION_LOOKBACK_MS = 24 * 60 * 60_000;
 
 const TENANT_SCHEMA_PATTERN = /^rehablo_[a-z0-9]+$/i;
 const preparedSchemas = new Set<string>();
@@ -46,10 +46,10 @@ export function appointmentEndAt(event: AppointmentLike): Date | null {
 }
 
 /**
- * Decide se aprire la segnalazione operativa senza attribuire automaticamente
- * l'esito COMPLETED o NO_SHOW all'appuntamento.
+ * Decide se completare un appuntamento terminato che non ha ricevuto alcun esito
+ * o segnalazione esplicita.
  */
-export function shouldAutoReportMissedArrival(
+export function shouldAutoCompleteAppointment(
     event: AppointmentLike,
     now: Date = new Date()
 ): boolean {
@@ -63,7 +63,25 @@ export function shouldAutoReportMissedArrival(
     if (!end) return false;
 
     const elapsed = now.getTime() - end.getTime();
-    return elapsed >= 0 && elapsed <= AUTOMATIC_MISSED_ARRIVAL_LOOKBACK_MS;
+    return elapsed >= 0 && elapsed <= AUTOMATIC_APPOINTMENT_COMPLETION_LOOKBACK_MS;
+}
+
+/**
+ * Riaprire manualmente una seduta gia' completata serve a correggerne la presenza.
+ * La segnalazione impedisce al job automatico di completarla di nuovo prima che
+ * l'operatore possa scegliere l'esito corretto.
+ */
+export function shouldOpenAttendanceCorrection(
+    event: AppointmentLike,
+    nextStatus: string,
+    now: Date = new Date()
+): boolean {
+    if (String(event.status ?? '').toUpperCase() !== 'COMPLETED') return false;
+    if (String(nextStatus ?? '').toUpperCase() !== 'CONFIRMED') return false;
+    if (event.missedArrivalReportedAt) return false;
+
+    const end = appointmentEndAt(event);
+    return Boolean(end && now.getTime() >= end.getTime());
 }
 
 /**
@@ -105,14 +123,14 @@ export async function ensureMissedArrivalWorkflowColumns(schema: string): Promis
     preparedSchemas.add(schema);
 }
 
-export async function autoReportEndedMissedArrivalsForSchema(
+export async function autoCompleteEndedAppointmentsForSchema(
     schema: string,
     now: Date = new Date()
 ): Promise<number> {
     await ensureMissedArrivalWorkflowColumns(schema);
     const TenantAgendaEvent = AgendaEvent.schema(schema);
     const earliestCandidateStart = new Date(
-        now.getTime() - AUTOMATIC_MISSED_ARRIVAL_LOOKBACK_MS * 2
+        now.getTime() - AUTOMATIC_APPOINTMENT_COMPLETION_LOOKBACK_MS * 2
     ).toISOString();
 
     const singleAppointmentWhere = {
@@ -147,21 +165,13 @@ export async function autoReportEndedMissedArrivalsForSchema(
         }
     });
 
-    let reported = 0;
+    let completed = 0;
     for (const candidate of candidates) {
         const event = candidate.get({ plain: true }) as AgendaEventAttributes;
-        if (!shouldAutoReportMissedArrival(event, now)) continue;
+        if (!shouldAutoCompleteAppointment(event, now)) continue;
 
-        const end = appointmentEndAt(event)!;
         const [updated] = await TenantAgendaEvent.update(
-            {
-                missedArrivalReportedAt: end,
-                missedArrivalReportedBy: null,
-                missedArrivalResolvedAt: null,
-                missedArrivalResolvedBy: null,
-                missedArrivalResolution: null,
-                noShowBillingDecision: null
-            },
+            { status: 'COMPLETED' },
             {
                 // Il filtro rende il job idempotente e impedisce di sovrascrivere
                 // un esito registrato mentre lo sweep era in corso.
@@ -174,13 +184,13 @@ export async function autoReportEndedMissedArrivalsForSchema(
                 }
             }
         );
-        reported += updated;
+        completed += updated;
     }
 
-    return reported;
+    return completed;
 }
 
-export async function autoReportEndedMissedArrivalsForAllTenants(
+export async function autoCompleteEndedAppointmentsForAllTenants(
     now: Date = new Date()
 ): Promise<number> {
     const schemas = await sequelize.query<{ schemaName: string }>(
@@ -191,31 +201,31 @@ export async function autoReportEndedMissedArrivalsForAllTenants(
         { type: QueryTypes.SELECT }
     );
 
-    let reported = 0;
+    let completed = 0;
     for (const { schemaName } of schemas) {
         try {
-            reported += await autoReportEndedMissedArrivalsForSchema(schemaName, now);
+            completed += await autoCompleteEndedAppointmentsForSchema(schemaName, now);
         } catch (error) {
-            console.error(`[agenda] sweep mancati arrivi fallito per ${schemaName}`, error);
+            console.error(`[agenda] completamento automatico fallito per ${schemaName}`, error);
         }
     }
-    return reported;
+    return completed;
 }
 
-export function startAutomaticMissedArrivalSweep(
-    intervalMs = AUTOMATIC_MISSED_ARRIVAL_INTERVAL_MS
+export function startAutomaticAppointmentCompletionSweep(
+    intervalMs = AUTOMATIC_APPOINTMENT_COMPLETION_INTERVAL_MS
 ): NodeJS.Timeout {
     let running = false;
     const run = async () => {
         if (running) return;
         running = true;
         try {
-            const reported = await autoReportEndedMissedArrivalsForAllTenants();
-            if (reported > 0) {
-                console.log(`[agenda] ${reported} mancati arrivi segnalati automaticamente`);
+            const completed = await autoCompleteEndedAppointmentsForAllTenants();
+            if (completed > 0) {
+                console.log(`[agenda] ${completed} appuntamenti completati automaticamente`);
             }
         } catch (error) {
-            console.error('[agenda] sweep automatico dei mancati arrivi fallito', error);
+            console.error('[agenda] completamento automatico degli appuntamenti fallito', error);
         } finally {
             running = false;
         }

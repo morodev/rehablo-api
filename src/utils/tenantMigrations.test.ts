@@ -9,18 +9,19 @@ import {
 } from './tenantSchema.js';
 import {
     APPOINTMENT_LEDGER_VERSION, prepareTenantPaymentHistory, runTenantMigrations,
-    TENANT_MODEL_BASELINE_VERSION
+    PATIENT_DEFAULT_EVENT_TYPE_VERSION, TENANT_MODEL_BASELINE_VERSION
 } from './tenantMigrations.js';
 
 const require = createRequire(import.meta.url);
 const migration = require('../../migrations/20260907-unify-appointment-payment-ledger.js');
+const patientDefaultMigration = require('../../migrations/20260908-add-patient-default-event-type.js');
 const tenant = '00000000-0000-4000-8000-000000000001';
 const schema = 'rehablo_' + tenant.replaceAll('-', '');
 const original = {
     query: sequelize.query, transaction: sequelize.transaction, createSchema: sequelize.createSchema,
-    migrate: migration.up, mode: env.tenantSchemaSync
+    migrate: migration.up, patientDefaultMigrate: patientDefaultMigration.up, mode: env.tenantSchemaSync
 };
-let queries: string[], order: string[], applied: boolean, syncs: number, migrations: number;
+let queries: string[], order: string[], applied: boolean, patientDefaultApplied: boolean, syncs: number, migrations: number;
 let historyExists: boolean, agendaExists: boolean, transactionStarts: number, baselineApplied: boolean;
 let lastSyncOptions: any;
 let migrationWork: (options: any) => Promise<void>;
@@ -33,7 +34,7 @@ registerTenantScopedModel({schema: () => ({sync: async (options: any) => {
 beforeEach(() => {
     invalidateTenantSchemaCache();
     env.tenantSchemaSync = 'additive';
-    queries = []; order = []; applied = false; syncs = 0; migrations = 0;
+    queries = []; order = []; applied = false; patientDefaultApplied = false; syncs = 0; migrations = 0;
     historyExists = false; agendaExists = true; transactionStarts = 0; baselineApplied = false;
     lastSyncOptions = undefined;
     migrationWork = async () => {};
@@ -58,10 +59,14 @@ beforeEach(() => {
         if (sql.includes('ADD COLUMN IF NOT EXISTS "appointmentPaymentHistoryKnown"')) {order.push('preserve-history'); historyExists = true;}
         if (sql.startsWith('SELECT "version"')) return [[
             ...(applied ? [{version: APPOINTMENT_LEDGER_VERSION}] : []),
+            ...(patientDefaultApplied ? [{version: PATIENT_DEFAULT_EVENT_TYPE_VERSION}] : []),
             ...(baselineApplied ? [{version: TENANT_MODEL_BASELINE_VERSION}] : [])
         ]];
         if (sql.startsWith('INSERT INTO') && options?.replacements?.version === APPOINTMENT_LEDGER_VERSION) {
             applied = true; order.push('record-version');
+        }
+        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === PATIENT_DEFAULT_EVENT_TYPE_VERSION) {
+            patientDefaultApplied = true; order.push('record-version');
         }
         if (sql.startsWith('INSERT INTO') && options?.replacements?.version === TENANT_MODEL_BASELINE_VERSION) {
             baselineApplied = true;
@@ -75,11 +80,17 @@ beforeEach(() => {
         migrations++; order.push('migrate');
         await migrationWork(options);
     };
+    patientDefaultMigration.up = async (_queryInterface: any, options: any) => {
+        assert.equal(options.schema, schema);
+        assert.equal(options.transaction, transaction);
+        migrations++; order.push('migrate');
+    };
 });
 
 after(() => {
     sequelize.query = original.query; sequelize.transaction = original.transaction;
     sequelize.createSchema = original.createSchema; migration.up = original.migrate;
+    patientDefaultMigration.up = original.patientDefaultMigrate;
     env.tenantSchemaSync = original.mode;
     invalidateTenantSchemaCache();
 });
@@ -87,8 +98,9 @@ after(() => {
 describe('tenant schema bootstrap', () => {
     it('preserves old history before model sync and records completion after migration', async () => {
         assert.equal(await ensureTenantSchema(tenant), schema);
-        assert.deepEqual(order, ['preserve-history', 'sync', 'migrate', 'record-version']);
+        assert.deepEqual(order, ['preserve-history', 'sync', 'migrate', 'record-version', 'migrate', 'record-version']);
         assert.equal(applied, true);
+        assert.equal(patientDefaultApplied, true);
         assert.equal(lastSyncOptions.transaction, transaction);
         assert.ok(queries.some(sql => sql.includes('DEFAULT false')));
         assert.ok(queries.some(sql => sql.includes('pg_advisory_xact_lock')));
@@ -100,7 +112,7 @@ describe('tenant schema bootstrap', () => {
     it('warms each existing tenant once before HTTP startup', async () => {
         assert.equal(await warmTenantSchemas([tenant, tenant], 2), 1);
         assert.equal(syncs, 1);
-        assert.equal(migrations, 1);
+        assert.equal(migrations, 2);
         assert.equal(transactionStarts, 1);
     });
 
@@ -108,7 +120,7 @@ describe('tenant schema bootstrap', () => {
         assert.equal(await provisionTenantSchema(tenant, transaction as any), schema);
         assert.equal(transactionStarts, 0);
         assert.equal(lastSyncOptions.transaction, transaction);
-        assert.deepEqual(order, ['preserve-history', 'sync', 'migrate', 'record-version']);
+        assert.deepEqual(order, ['preserve-history', 'sync', 'migrate', 'record-version', 'migrate', 'record-version']);
     });
 
     it('shares initialization between simultaneous requests and waits for migration completion', async () => {
@@ -124,7 +136,7 @@ describe('tenant schema bootstrap', () => {
         assert.equal(finished, 0);
         assert.equal(syncs, 1); assert.equal(migrations, 1);
         release(); await Promise.all([first, second]);
-        assert.equal(finished, 2); assert.equal(migrations, 1);
+        assert.equal(finished, 2); assert.equal(migrations, 2);
     });
 
     it('retries failed migrations without caching the tenant or saving completion', async () => {
@@ -133,14 +145,14 @@ describe('tenant schema bootstrap', () => {
         assert.equal(applied, false);
         migrationWork = async () => {};
         await ensureTenantSchema(tenant);
-        assert.equal(migrations, 2); assert.equal(applied, true);
+        assert.equal(migrations, 3); assert.equal(applied, true); assert.equal(patientDefaultApplied, true);
     });
 
     it('uses the persisted version after process-cache invalidation instead of importing again', async () => {
         await ensureTenantSchema(tenant);
         invalidateTenantSchemaCache();
         await ensureTenantSchema(tenant);
-        assert.equal(syncs, 1); assert.equal(migrations, 1);
+        assert.equal(syncs, 1); assert.equal(migrations, 2);
         assert.equal(transactionStarts, 1);
     });
 
@@ -160,5 +172,28 @@ describe('tenant schema bootstrap', () => {
         await assert.rejects(runTenantMigrations('public'), /Invalid tenant schema/);
         await assert.rejects(prepareTenantPaymentHistory('rehablo_bad"'), /Invalid tenant schema/);
         assert.equal(queries.length, 0);
+    });
+
+    it('adds the patient preference with an indexed SET NULL foreign key', async () => {
+        const migrationQueries: string[] = [];
+        const queryInterface = {
+            sequelize: {
+                query: async (sql: string) => {
+                    migrationQueries.push(sql);
+                    if (sql.includes('to_regclass')) {
+                        return [[{patients: schema + '.patients', eventTypes: schema + '.event_types'}]];
+                    }
+                    if (sql.includes('FROM pg_constraint')) return [[]];
+                    return [[]];
+                }
+            }
+        };
+
+        await original.patientDefaultMigrate(queryInterface as any, {schema, transaction});
+
+        assert.ok(migrationQueries.some(sql => sql.includes('ADD COLUMN IF NOT EXISTS "defaultEventTypeId" UUID NULL')));
+        assert.ok(migrationQueries.some(sql => sql.includes('patients_default_event_type_idx')));
+        assert.ok(migrationQueries.some(sql => sql.includes('FOREIGN KEY ("defaultEventTypeId")')));
+        assert.ok(migrationQueries.some(sql => sql.includes('ON UPDATE CASCADE ON DELETE SET NULL')));
     });
 });

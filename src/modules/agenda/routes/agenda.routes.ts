@@ -24,6 +24,7 @@ router.patch('/agenda-event/:agendaEventId/payment', requirePermission('agenda',
 router.get('/agenda-event/:agendaEventId/payments', requirePermission('agenda', 'read'), listAppointmentPayments);
 router.post('/agenda-event/:agendaEventId/payments', requirePermission('agenda', 'update'), createAppointmentPayment);
 router.patch('/agenda-event/:agendaEventId/payments/:paymentId/void', requirePermission('agenda', 'update'), voidAppointmentPayment);
+router.patch('/agenda-event/:agendaEventId/complete-if-untouched', requirePermission('agenda', 'update'), agendaController.completeAppointmentIfUntouched);
 router.patch('/agenda-event/:agendaEventId/missed-arrival/report', requirePermission('agenda', 'update'), agendaController.reportMissedArrival);
 router.patch('/agenda-event/:agendaEventId/missed-arrival/resolve', requirePermission('agenda', 'update'), agendaController.resolveMissedArrival);
 router.patch('/agenda-event/:agendaEventId/no-show-billing', requirePermission('agenda', 'update'), agendaController.updateNoShowBillingDecision);

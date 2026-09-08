@@ -1,9 +1,15 @@
 import { Request, Response } from 'express';
-import { fn, col, where as sequelizeWhere, Op, Transaction } from 'sequelize';
+import { fn, col, where as sequelizeWhere, Op, Transaction, type Order } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { sequelize } from '../../../config/database.js';
 import EventType from '../models/eventType.model.js';
+
+const EVENT_TYPE_ORDER: Order = [
+    ['isDefault', 'DESC'],
+    [fn('LOWER', col('title')), 'ASC'],
+    ['id', 'ASC']
+];
 
 /**
  * Garantisce che resti UN SOLO tipo appuntamento predefinito: azzera il flag su tutti gli altri.
@@ -58,14 +64,15 @@ export const createEventType = asyncHandler(async (req: Request, res: Response) 
 
 export const findAllEventType = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const eventsType = await EventType.schema(schema).findAll();
+    let eventsType = await EventType.schema(schema).findAll({ order: EVENT_TYPE_ORDER });
 
     if (eventsType.length === 0) {
-        const defaultEventTypes = await EventType.schema(schema).bulkCreate([
+        await EventType.schema(schema).bulkCreate([
             { title: 'Prima visita', erasable: false },
             { title: 'Visita di controllo', erasable: false }
         ]);
-        return sendSuccessResponse(res, 200, defaultEventTypes, 'Default Events Type loaded');
+        eventsType = await EventType.schema(schema).findAll({ order: EVENT_TYPE_ORDER });
+        return sendSuccessResponse(res, 200, eventsType, 'Default Events Type loaded');
     }
 
     return sendSuccessResponse(res, 200, eventsType, 'Events Type loaded');
@@ -138,7 +145,7 @@ export const setDefaultEventType = asyncHandler(async (req: Request, res: Respon
 
     // Si restituisce l'intero elenco: cambiare il predefinito tocca anche gli ALTRI tipi
     // (quello precedente perde il flag), quindi il client deve poter riallineare tutta la lista.
-    const eventsType = await EventType.schema(schema).findAll();
+    const eventsType = await EventType.schema(schema).findAll({ order: EVENT_TYPE_ORDER });
     return sendSuccessResponse(res, 200, eventsType, isDefault ? 'Default event type set' : 'Default event type removed');
 });
 
@@ -154,7 +161,8 @@ export const searchEventType = asyncHandler(async (req: Request, res: Response) 
     const query = (req.query.query as string) || '';
 
     const data = await EventType.schema(schema).findAll({
-        where: sequelizeWhere(fn('LOWER', col('title')), 'LIKE', `%${query.toLowerCase()}%`)
+        where: sequelizeWhere(fn('LOWER', col('title')), 'LIKE', `%${query.toLowerCase()}%`),
+        order: EVENT_TYPE_ORDER
     });
 
     return sendSuccessResponse(res, 200, data, 'Event Type searched');

@@ -46,6 +46,8 @@ export interface PatientAttributes {
     phoneNumbers: Record<string, unknown>[];
     /** Colore opzionale scelto dall'utente per riconoscere il paziente nelle viste operative. */
     color?: PatientColor | null;
+    /** Tipo appuntamento proposto quando questo paziente viene selezionato in agenda. */
+    defaultEventTypeId?: string | null;
     background: string;
     notes?: string | null;
     /** Archiviazione logica: preserva cartella clinica, appuntamenti e documenti collegati. */
@@ -77,7 +79,7 @@ export interface PatientAttributes {
 
 export type PatientCreationAttributes = Optional<
     PatientAttributes,
-    'id' | 'isShared' | 'sharedWith' | 'emails' | 'tags' | 'phoneNumbers' | 'color' | 'background' | 'name' | 'archivedAt' | 'privacyConsent' | 'stsOppositionToDataSending'
+    'id' | 'isShared' | 'sharedWith' | 'emails' | 'tags' | 'phoneNumbers' | 'color' | 'defaultEventTypeId' | 'background' | 'name' | 'archivedAt' | 'privacyConsent' | 'stsOppositionToDataSending'
 >;
 
 /**
@@ -107,6 +109,7 @@ export class Patient extends Model<PatientAttributes, PatientCreationAttributes>
     declare tags: string[];
     declare phoneNumbers: Record<string, unknown>[];
     declare color: PatientColor | null;
+    declare defaultEventTypeId: string | null;
     declare background: string;
     declare notes: string | null;
     declare archivedAt: Date | null;
@@ -155,6 +158,9 @@ Patient.init(
             defaultValue: null,
             validate: { isIn: [[...PATIENT_COLORS]] }
         },
+        // Il vincolo verso event_types viene aggiunto dalla migrazione tenant dopo che tutti i
+        // modelli sono stati sincronizzati, evitando dipendenze dall'ordine di bootstrap.
+        defaultEventTypeId: { type: DataTypes.UUID, allowNull: true, defaultValue: null },
         background: { type: DataTypes.STRING, defaultValue: 'assets/images/cards/17-640x480.jpg' },
         notes: DataTypes.TEXT,
         archivedAt: { type: DataTypes.DATE, allowNull: true, defaultValue: null },
@@ -181,7 +187,8 @@ Patient.init(
         },
         indexes: [
             { name: 'patients_structure_archived_idx', fields: ['structureId', 'archivedAt'] },
-            { name: 'patients_fiscal_code_idx', fields: ['fiscalCode'] }
+            { name: 'patients_fiscal_code_idx', fields: ['fiscalCode'] },
+            { name: 'patients_default_event_type_idx', fields: ['defaultEventTypeId'] }
         ]
     }
 );

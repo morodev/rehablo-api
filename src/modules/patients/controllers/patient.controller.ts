@@ -7,6 +7,9 @@ import { scopeWhere } from '../../../middleware/rbac.js';
 import { PatientPortalAccess, Structure, StructureUser } from '../../auth/models/index.js';
 import { localStorageAdapter } from '../../measurements/storage/localStorageAdapter.js';
 import Patient, { PATIENT_COLORS } from '../models/patient.model.js';
+import EventType from '../../agenda/models/eventType.model.js';
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const ALLOWED_PRIVACY_DOCUMENT_MIME_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png']);
 
@@ -340,6 +343,49 @@ export const update = asyncHandler(async (req: Request, res: Response) => {
     return sendSuccessResponse(res, 200, updatedPatient, 'Paziente aggiornato correttamente');
 });
 
+/**
+ * PATCH /patient/:patientId/default-event-type
+ *
+ * Il tipo abituale e' un'azione rapida dell'anagrafica e non fa parte della PUT generale:
+ * in questo modo un form paziente aperto da tempo non puo' cancellarlo con dati obsoleti.
+ */
+export const setDefaultEventType = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const patient = await Patient.schema(schema).findOne({
+        where: { id: req.params.patientId, ...activePatientWhere(req) }
+    });
+    if (!patient) {
+        return sendErrorResponse(res, 404, 'Paziente non trovato');
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(req.body ?? {}, 'eventTypeId')) {
+        return sendErrorResponse(res, 400, 'eventTypeId e\' obbligatorio');
+    }
+
+    const eventTypeId = req.body.eventTypeId;
+    if (eventTypeId !== null && (typeof eventTypeId !== 'string' || !UUID_REGEX.test(eventTypeId))) {
+        return sendErrorResponse(res, 422, 'Tipo appuntamento non valido');
+    }
+
+    if (eventTypeId) {
+        const eventType = await EventType.schema(schema).findByPk(eventTypeId, { attributes: ['id'] });
+        if (!eventType) {
+            return sendErrorResponse(res, 404, 'Tipo appuntamento non trovato');
+        }
+    }
+
+    await patient.update({ defaultEventTypeId: eventTypeId });
+    const updatedPatient = await Patient.schema(schema).findOne({
+        where: { id: patient.id, ...activePatientWhere(req) }
+    });
+    return sendSuccessResponse(
+        res,
+        200,
+        updatedPatient,
+        eventTypeId ? 'Tipo appuntamento abituale impostato' : 'Tipo appuntamento abituale rimosso'
+    );
+});
+
 export const deletePatient = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const id = req.params.patientId;
@@ -456,6 +502,7 @@ export default {
     findOne,
     searchPatients,
     update,
+    setDefaultEventType,
     deletePatient,
     privacyDocumentUploadMiddleware,
     uploadPrivacyDocument,
