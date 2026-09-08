@@ -24,6 +24,7 @@ const original = {
 };
 let queries: string[], order: string[], applied: boolean, patientDefaultApplied: boolean, syncs: number, migrations: number;
 let historyExists: boolean, agendaExists: boolean, transactionStarts: number, baselineApplied: boolean;
+let legacyBaselineApplied: boolean;
 let lastSyncOptions: any;
 let pricingApplied: boolean;
 let migrationWork: (options: any) => Promise<void>;
@@ -38,6 +39,7 @@ beforeEach(() => {
     env.tenantSchemaSync = 'additive';
     queries = []; order = []; applied = false; patientDefaultApplied = false; syncs = 0; migrations = 0;
     historyExists = false; agendaExists = true; transactionStarts = 0; baselineApplied = false;
+    legacyBaselineApplied = false;
     lastSyncOptions = undefined;
     pricingApplied = false;
     migrationWork = async () => {};
@@ -52,7 +54,7 @@ beforeEach(() => {
     sequelize.query = (async (sql: string, options?: any) => {
         queries.push(sql);
         if (sql.includes('to_regclass') && options?.replacements?.registry) {
-            return [[{registry: baselineApplied ? schema + '.schema_migrations' : null}]];
+            return [[{registry: baselineApplied || legacyBaselineApplied ? schema + '.schema_migrations' : null}]];
         }
         if (sql.includes('to_regclass')) return [[{agenda: agendaExists ? schema + '.agenda_events' : null}]];
         if (sql.includes('information_schema.columns')) return [[
@@ -64,6 +66,7 @@ beforeEach(() => {
             ...(applied ? [{version: APPOINTMENT_LEDGER_VERSION}] : []),
             ...(patientDefaultApplied ? [{version: PATIENT_DEFAULT_EVENT_TYPE_VERSION}] : []),
             ...(pricingApplied ? [{version: APPOINTMENT_PRICE_ADJUSTMENTS_VERSION}] : []),
+            ...(legacyBaselineApplied ? [{version: '20260907-tenant-model-baseline-v1'}] : []),
             ...(baselineApplied ? [{version: TENANT_MODEL_BASELINE_VERSION}] : [])
         ]];
         if (sql.startsWith('INSERT INTO') && options?.replacements?.version === APPOINTMENT_LEDGER_VERSION) {
@@ -162,6 +165,20 @@ describe('tenant schema bootstrap', () => {
         invalidateTenantSchemaCache();
         await ensureTenantSchema(tenant);
         assert.equal(syncs, 1); assert.equal(migrations, 3);
+        assert.equal(transactionStarts, 1);
+    });
+
+    it('resyncs an existing tenant when the registered model baseline changes', async () => {
+        applied = true;
+        patientDefaultApplied = true;
+        pricingApplied = true;
+        legacyBaselineApplied = true;
+
+        await ensureTenantSchema(tenant);
+
+        assert.equal(syncs, 1);
+        assert.equal(migrations, 0);
+        assert.equal(baselineApplied, true);
         assert.equal(transactionStarts, 1);
     });
 

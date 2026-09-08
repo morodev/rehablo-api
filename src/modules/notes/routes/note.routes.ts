@@ -3,11 +3,24 @@ import { requireAuth } from '../../../middleware/auth.js';
 import { requirePermission } from '../../../middleware/rbac.js';
 import { resolveTenantSchema } from '../../../middleware/tenantSchema.js';
 import noteController from '../controllers/note.controller.js';
+import noteImageController from '../controllers/noteImage.controller.js';
 import reminderController from '../controllers/reminder.controller.js';
 
 const router = Router();
 
 router.use(requireAuth, resolveTenantSchema);
+
+router.post(
+    '/note-images',
+    requirePermission('note', 'create'),
+    noteImageController.noteImageUploadMiddleware,
+    noteImageController.uploadNoteImage
+);
+router.get(
+    '/note-images/:imageId/content',
+    requirePermission('note', 'read'),
+    noteImageController.getNoteImageContent
+);
 
 router.get('/notes', requirePermission('note', 'read'), noteController.getNotes);
 router.post('/notes', requirePermission('note', 'create'), noteController.createNote);

@@ -13,6 +13,7 @@ import TimeOffRequest, {
     TimeOffType
 } from '../models/timeOffRequest.model.js';
 import TimeOffStatusHistory from '../models/timeOffStatusHistory.model.js';
+import { hasTimeOffRequestContentChanges } from '../services/timeOffRequestUpdate.service.js';
 
 const TIME_OFF_SCOPE_FIELDS = {
     ownerField: 'userId',
@@ -312,6 +313,18 @@ export const updateTimeOffRequest = asyncHandler(async (req: Request, res: Respo
         );
     }
 
+    const nextContent = {
+        type,
+        start: period.start,
+        end: period.end,
+        allDay: hasAllDay ? !!body.allDay : current.allDay,
+        reason: hasReason ? cleanText(body.reason) : current.reason
+    };
+    const contentChanged = hasTimeOffRequestContentChanges(current, nextContent);
+    if (!contentChanged) {
+        return sendSuccessResponse(res, 200, current, 'Richiesta di assenza invariata');
+    }
+
     const previousStatus = current.status;
     const nextStatus: TimeOffStatus = previousStatus === 'APPROVED' || previousStatus === 'REJECTED'
         ? 'PENDING'
@@ -321,11 +334,7 @@ export const updateTimeOffRequest = asyncHandler(async (req: Request, res: Respo
     await sequelize.transaction(async (transaction) => {
         await current.update(
             {
-                type,
-                start: period.start,
-                end: period.end,
-                allDay: hasAllDay ? !!body.allDay : current.allDay,
-                reason: hasReason ? cleanText(body.reason) : current.reason,
+                ...nextContent,
                 status: nextStatus,
                 reviewedByUserId: nextStatus === 'PENDING' ? null : current.reviewedByUserId,
                 reviewedAt: nextStatus === 'PENDING' ? null : current.reviewedAt,

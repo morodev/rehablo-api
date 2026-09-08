@@ -29,7 +29,7 @@ import {
 } from './modules/human-body/models/index.js';
 import { registerEvaluationAssociations, Evaluation } from './modules/evaluations/models/index.js';
 import { registerMeasurementAssociations, Observation, DeviceConnection, RawFile } from './modules/measurements/models/index.js';
-import { Note, Reminder } from './modules/notes/models/index.js';
+import { Note, NoteImage, Reminder } from './modules/notes/models/index.js';
 import PatientPortalAudit from './modules/patient-portal/models/patientPortalAudit.model.js';
 
 /**
@@ -60,6 +60,7 @@ export function registerTenantModels(): void {
     // in modo logico; nessun vincolo di ordine di sync richiesto (nessuna FK cross-tabella reale).
     registerTenantScopedModel(RawFile);
     registerTenantScopedModel(Note);
+    registerTenantScopedModel(NoteImage);
     registerTenantScopedModel(Reminder);
     registerTenantScopedModel(PatientPortalAudit);
     registerTenantScopedModel(Category);
