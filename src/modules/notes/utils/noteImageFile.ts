@@ -48,7 +48,13 @@ export function hasExpectedNoteImageExtension(fileName: string, mimeType: string
     return MIME_EXTENSIONS[mimeType]?.has(extension) ?? false;
 }
 
-export function validateNoteImageFile(file: Pick<Express.Multer.File, 'buffer' | 'mimetype' | 'originalname'>): string | null {
+interface NoteImageFile {
+    buffer: Buffer;
+    mimetype: string;
+    originalname: string;
+}
+
+export function validateNoteImageFile(file: NoteImageFile): string | null {
     const detectedMimeType = detectNoteImageMime(file.buffer);
     if (
         !NOTE_IMAGE_MIME_TYPES.has(file.mimetype)
