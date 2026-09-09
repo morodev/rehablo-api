@@ -1,6 +1,7 @@
 import Nodemailer from 'nodemailer';
 import moment from 'moment';
 import { env } from '../config/env.js';
+import { isPubliclyShareableUrl } from '../utils/publicUrl.js';
 
 export const transporter = Nodemailer.createTransport({
     host: env.emailHost,
@@ -22,6 +23,16 @@ export const transporter = Nodemailer.createTransport({
 const emailDomain = (process.env.EMAIL_DOMAIN || 'http://localhost:4200')
     .replace(/\/+$/, '')
     .replace(/\/#$/, '');
+
+// I link generati qui finiscono anche in messaggi WhatsApp, dove un URL non pubblico resta testo
+// non cliccabile: chi invia non se ne accorge, il paziente non può aprire il documento.
+if (!isPubliclyShareableUrl(emailDomain)) {
+    console.warn(
+        `[env] EMAIL_DOMAIN="${emailDomain}" non è un indirizzo pubblico: i link inviati ai pazienti ` +
+        'non saranno apribili (su WhatsApp non diventano nemmeno cliccabili). ' +
+        'Impostalo sull\'URL pubblico del frontend, es. https://app.rehablo.it'
+    );
+}
 
 export function frontendEmailLink(path: string): string {
     return `${emailDomain}/#/${path.replace(/^\/+/, '')}`;
@@ -129,6 +140,61 @@ export async function sendPatientPortalInvitationMail(email: string, token: stri
             `<p><strong>${centerName}</strong> ti ha invitato a consultare la tua cartella, gli appuntamenti e le fatture.</p>
              <p>Il link è personale, monouso e a scadenza.</p>
              <p><a href="${link}" target="_blank">Accetta l'invito</a></p>`
+        )
+    });
+}
+
+/** I dati anagrafici finiscono in un template HTML: senza escaping un apostrofo o un `<` romperebbe il markup. */
+function escapeHtml(value: string): string {
+    return value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+/**
+ * Consegna della fattura al paziente.
+ *
+ * L'email porta un LINK e non un allegato: il documento resta sul server, dietro un token a
+ * scadenza e revocabile. Una casella di posta viene inoltrata, archiviata e letta su dispositivi
+ * condivisi, e una fattura di fisioterapia rivela prestazioni sanitarie: il link permette di
+ * chiudere l'accesso in un secondo momento, cosa che un PDF già spedito non consente.
+ */
+export async function sendInvoiceMail(input: {
+    to: string;
+    link: string;
+    centerName: string;
+    documentLabel: string;
+    documentReference: string;
+    patientName?: string | null;
+    expiresAt: Date;
+}) {
+    const reference = `${input.documentLabel} ${input.documentReference}`;
+    const greeting = input.patientName ? `Ciao ${escapeHtml(input.patientName)},` : 'Buongiorno,';
+    const expiry = moment(input.expiresAt).locale('it').format('LL');
+
+    if (!env.isProduction || !env.emailHost) {
+        console.log(`[email.service] invoice link for ${input.to}: ${input.link}`);
+    }
+
+    return transporter.sendMail({
+        from: sender(input.centerName),
+        to: input.to,
+        subject: `${reference} - ${input.centerName}`,
+        text: `${input.patientName ? `Ciao ${input.patientName},` : 'Buongiorno,'}\n\n`
+            + `di seguito il link a ${input.documentLabel.toLowerCase()} ${input.documentReference} di ${input.centerName}.\n`
+            + `${input.link}\n\n`
+            + `Dalla pagina puoi stamparla o salvarla in PDF. Il link resta valido fino al ${expiry}.`,
+        html: baseTemplate(
+            escapeHtml(reference),
+            `<p>${greeting}</p>
+             <p>di seguito trovi ${escapeHtml(input.documentLabel.toLowerCase())}
+                <strong>${escapeHtml(input.documentReference)}</strong>
+                di <strong>${escapeHtml(input.centerName)}</strong>.</p>
+             <p><a href="${input.link}" target="_blank">Apri il documento</a></p>
+             <p style="color:#6b7280;font-size:14px;">Dalla pagina puoi stamparlo o salvarlo in PDF.
+                Il link è personale e resta valido fino al ${expiry}.</p>`
         )
     });
 }

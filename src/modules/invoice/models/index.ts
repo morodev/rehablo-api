@@ -3,6 +3,7 @@ import InvoiceProduct from './invoiceProduct.model.js';
 import InvoiceService from './invoiceService.model.js';
 import InvoicePayment from './invoicePayment.model.js';
 import InvoiceAgendaEvent from './invoiceAgendaEvent.model.js';
+import InvoiceShareLink, { syncInvoicePublicModels } from './invoiceShareLink.model.js';
 
 /**
  * Centralised associations for the "invoice" tenant-scoped models (dynamic "rehablo_<tenantId>" schema).
@@ -37,4 +38,6 @@ export function registerInvoiceAssociations(): void {
 }
 
 export { Invoice, InvoiceProduct, InvoiceService, InvoicePayment, InvoiceAgendaEvent };
+// `InvoiceShareLink` NON è tenant-scoped: sta in `public` (vedi il modello per il perché).
+export { InvoiceShareLink, syncInvoicePublicModels };
 

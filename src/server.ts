@@ -9,6 +9,7 @@ import { connectDatabase } from './config/database.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
 
 import { registerAuthAssociations, syncAuthModels, Tenant } from './modules/auth/models/index.js';
+import { syncInvoicePublicModels } from './modules/invoice/models/index.js';
 import { assignBootstrapRoles } from './modules/auth/rbac/bootstrap.js';
 import { purgeExpiredRefreshTokens } from './modules/auth/services/refreshToken.service.js';
 import { runStructureBackfill } from './modules/auth/services/structureBackfill.service.js';
@@ -23,6 +24,7 @@ import authRoutes from './modules/auth/routes/auth.routes.js';
 import patientRoutes from './modules/patients/routes/patient.routes.js';
 import productsServicesRoutes from './modules/products-services/routes/products-services.routes.js';
 import invoiceRoutes from './modules/invoice/routes/invoice.routes.js';
+import invoiceShareRoutes from './modules/invoice/routes/invoiceShare.routes.js';
 import agendaRoutes from './modules/agenda/routes/agenda.routes.js';
 import configurationRoutes from './modules/configuration/routes/configuration.routes.js';
 import humanBodyRoutes from './modules/human-body/routes/human-body.routes.js';
@@ -65,6 +67,8 @@ async function bootstrap() {
     app.use(patientPortalRoutes);
     app.use(patientRoutes);
     app.use(productsServicesRoutes);
+    // Prima del router fatture, che invece richiede l'autenticazione su tutte le sue rotte.
+    app.use(invoiceShareRoutes);
     app.use(invoiceRoutes);
     app.use(agendaRoutes);
     app.use(configurationRoutes);
@@ -84,6 +88,9 @@ async function bootstrap() {
     // Public-schema models (tenants/users/structures/availabilities)
     registerAuthAssociations();
     await syncAuthModels();
+    // Il link di consegna della fattura vive in `public`: dev'essere risolvibile da una richiesta
+    // anonima, che non ha un tenant da cui derivare lo schema.
+    await syncInvoicePublicModels();
 
     // RBAC: allinea i ruoli delle membership preesistenti (vedi docs/RBAC_DESIGN.md)
     await assignBootstrapRoles();

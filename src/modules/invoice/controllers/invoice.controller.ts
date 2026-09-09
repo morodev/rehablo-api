@@ -22,6 +22,7 @@ import { applyAppointmentPriceSnapshot } from '../utils/appointmentInvoicePrice.
 import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
 import { buildFiscalNotes, FiscalProfile, isStampDutyDue, resolveFiscalProfile } from '../utils/fiscalRegime.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
+import { invoiceEmissionMonth, parseInvoiceMonthFilter } from '../utils/invoiceFilters.js';
 import { decorateInvoicesWithPayments, syncInvoicePaymentStatus } from '../services/payment.service.js';
 import { appointmentPricesByEvent, ensureAppointmentPaymentHistory, isValidPaymentDate, linkAppointmentPayments } from '../services/appointmentPayment.service.js';
 
@@ -842,11 +843,15 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
     const size = Math.min(Math.max(parseInt((req.query.size as string) ?? '10', 10) || 10, 1), 100);
     const paymentState = String(req.query.paymentState ?? 'all');
     const dueState = String(req.query.dueState ?? 'all');
+    const month = parseInvoiceMonthFilter(req.query.month);
     if (!['all', 'unpaid', 'partial', 'paid', 'void'].includes(paymentState)) {
         return sendErrorResponse(res, 400, 'Filtro stato pagamento non valido');
     }
     if (!['all', 'overdue', 'today', 'next7', 'no_due'].includes(dueState)) {
         return sendErrorResponse(res, 400, 'Filtro scadenza non valido');
+    }
+    if (month === null) {
+        return sendErrorResponse(res, 400, 'Filtro mese non valido');
     }
 
     const rows = await InvoiceScoped.findAll({
@@ -864,6 +869,7 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Rome' });
     const next7 = new Date(Date.parse(`${today}T12:00:00.000Z`) + 7 * 86_400_000).toISOString().slice(0, 10);
     const filtered = allInvoices.filter((invoice) => {
+        if (month && invoiceEmissionMonth(invoice.emissionDate) !== month) return false;
         if (paymentState !== 'all' && invoice.paymentStatus !== paymentState) return false;
         if (dueState === 'all') return true;
         if (invoice.balance <= 0 || invoice.paymentStatus === 'void') return false;

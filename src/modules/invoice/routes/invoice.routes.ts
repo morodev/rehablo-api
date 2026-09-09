@@ -3,6 +3,7 @@ import { requireAuth } from '../../../middleware/auth.js';
 import { requirePermission } from '../../../middleware/rbac.js';
 import { resolveTenantSchema } from '../../../middleware/tenantSchema.js';
 import invoiceController from '../controllers/invoice.controller.js';
+import invoiceShareController from '../controllers/invoiceShare.controller.js';
 import reportsController from '../controllers/reports.controller.js';
 import paymentController from '../controllers/payment.controller.js';
 
@@ -19,6 +20,11 @@ router.get('/invoice/:invoiceId/payments', requirePermission('invoice', 'read'),
 router.post('/invoice/:invoiceId/payments', requirePermission('invoice', 'update'), paymentController.createPayment);
 router.post('/invoice/:invoiceId/payments/:paymentId/void', requirePermission('invoice', 'update'), paymentController.voidPayment);
 router.patch('/invoice/:invoiceId/payments/:paymentId/legacy-date', requirePermission('invoice', 'update'), paymentController.setLegacyPaymentDate);
+
+// Consegna del documento al paziente. È un'uscita di dati dal gestionale, quindi `export`:
+// lo stesso permesso dell'estrazione Sistema TS, non la semplice lettura.
+router.post('/invoice/:invoiceId/share', requirePermission('invoice', 'export'), invoiceShareController.createInvoiceShareLink);
+router.post('/invoice/:invoiceId/send-email', requirePermission('invoice', 'export'), invoiceShareController.sendInvoiceByEmail);
 
 router.post('/invoice', requirePermission('invoice', 'create'), invoiceController.saveInvoice);
 router.get('/invoice', requirePermission('invoice', 'read'), invoiceController.findAllInvoices);
