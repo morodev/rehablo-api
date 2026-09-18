@@ -27,6 +27,7 @@ import { findUserByIdentityEmail } from '../services/identity.service.js';
 import { normalizeIdentityEmail } from '../models/userEmail.model.js';
 import {
     AvailabilityValidationError,
+    emptyAvailabilitySchedule,
     isAvailabilityMode as isSupportedAvailabilityMode,
     normalizeAvailabilitySchedule
 } from '../services/userAvailabilityPolicy.service.js';
@@ -210,28 +211,32 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
     const targetStructures = role === RoleCode.OWNER
         ? structures
         : structures.filter((structure: any) => selectedStructureIds.includes(structure.id));
-    const mode = isSupportedAvailabilityMode(userToCreate.availabilityMode)
+    const requestedMode = isSupportedAvailabilityMode(userToCreate.availabilityMode)
         ? userToCreate.availabilityMode
         : 'INHERIT_STRUCTURE';
     const isOperationalRole = role !== RoleCode.OWNER && role !== RoleCode.SECRETARY;
+    const mode = isOperationalRole ? requestedMode : 'INHERIT_STRUCTURE';
+    userToCreate.availabilityMode = mode;
     const structureSchedule = mode === 'CUSTOM' && isOperationalRole
         ? (await StructureAvailability.findAll({
             where: {structureId: selectedStructureIds[0]},
             order: [['day', 'ASC']]
         })).map((availability) => availability.get({plain: true}))
         : [];
-    let normalizedSchedule;
-    try {
-        normalizedSchedule = normalizeAvailabilitySchedule(
-            requestedAvailabilities,
-            mode === 'CUSTOM' && isOperationalRole ? 'CUSTOM' : 'INHERIT_STRUCTURE',
-            structureSchedule
-        );
-    } catch (error) {
-        if (error instanceof AvailabilityValidationError) {
-            return sendErrorResponse(res, 400, error.message);
+    let normalizedSchedule = emptyAvailabilitySchedule();
+    if (mode === 'CUSTOM') {
+        try {
+            normalizedSchedule = normalizeAvailabilitySchedule(
+                requestedAvailabilities,
+                'CUSTOM',
+                structureSchedule
+            );
+        } catch (error) {
+            if (error instanceof AvailabilityValidationError) {
+                return sendErrorResponse(res, 400, error.message);
+            }
+            throw error;
         }
-        throw error;
     }
 
     const user: any = await sequelize.transaction(async (transaction) => {
@@ -256,7 +261,8 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
         console.error('[createUser] verification email could not be sent:', err);
     });
 
-    return sendSuccessResponse(res, 201, user, 'User for tenant created');
+    const createdTeamMember = await serializeTeamMember(tenantId, user.get('id') as string);
+    return sendSuccessResponse(res, 201, createdTeamMember, 'User for tenant created');
 });
 
 export const findAllUsersTenantByTenantId = asyncHandler(async (req: Request, res: Response) => {
@@ -458,28 +464,29 @@ export const updateTeamMemberProfile = asyncHandler(async (req: Request, res: Re
                 profile.email = email;
             }
 
-            const nextAvailabilityMode = profile.availabilityMode
+            const requestedAvailabilityMode = profile.availabilityMode
                 ?? targetUser.get('availabilityMode');
-            if (!isSupportedAvailabilityMode(nextAvailabilityMode)) {
+            if (!isSupportedAvailabilityMode(requestedAvailabilityMode)) {
                 throw new TeamProfileError(400, 'Modalita disponibilita non valida');
             }
 
             const hasSchedule = !!rawUser && Object.prototype.hasOwnProperty.call(rawUser, 'userAvailabilities');
             const isOperationalRole = nextRole !== RoleCode.OWNER && nextRole !== RoleCode.SECRETARY;
+            const nextAvailabilityMode = isOperationalRole
+                ? requestedAvailabilityMode
+                : 'INHERIT_STRUCTURE';
+            const availabilityModeChanged = nextAvailabilityMode !== targetUser.get('availabilityMode');
+            profile.availabilityMode = nextAvailabilityMode;
             const mustRevalidateExistingSchedule =
                 nextAvailabilityMode === 'CUSTOM' &&
-                isOperationalRole &&
-                (roleChanged || Array.isArray(body.structureIds));
+                (availabilityModeChanged || roleChanged || Array.isArray(body.structureIds));
             let normalizedSchedule: ReturnType<typeof normalizeAvailabilitySchedule> | null = null;
-            if (hasSchedule || mustRevalidateExistingSchedule) {
-                let structureSchedule: any[] = [];
-                if (nextAvailabilityMode === 'CUSTOM' && isOperationalRole) {
-                    structureSchedule = (await StructureAvailability.findAll({
-                        where: {structureId: requestedIds[0]},
-                        transaction,
-                        order: [['day', 'ASC']]
-                    })).map((availability) => availability.get({plain: true}));
-                }
+            if (nextAvailabilityMode === 'CUSTOM' && (hasSchedule || mustRevalidateExistingSchedule)) {
+                const structureSchedule = (await StructureAvailability.findAll({
+                    where: {structureId: requestedIds[0]},
+                    transaction,
+                    order: [['day', 'ASC']]
+                })).map((availability) => availability.get({plain: true}));
                 const scheduleToValidate = hasSchedule
                     ? rawUser!.userAvailabilities
                     : (await UserAvailability.findAll({
@@ -489,9 +496,7 @@ export const updateTeamMemberProfile = asyncHandler(async (req: Request, res: Re
                     })).map((availability) => availability.get({plain: true}));
                 normalizedSchedule = normalizeAvailabilitySchedule(
                     scheduleToValidate,
-                    nextAvailabilityMode === 'CUSTOM' && isOperationalRole
-                        ? 'CUSTOM'
-                        : 'INHERIT_STRUCTURE',
+                    'CUSTOM',
                     structureSchedule
                 );
             }

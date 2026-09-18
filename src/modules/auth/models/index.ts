@@ -2,7 +2,7 @@ import Tenant from './tenant.model.js';
 import User from './user.model.js';
 import Structure from './structure.model.js';
 import StructureAvailability from './structureAvailability.model.js';
-import UserAvailability from './userAvailability.model.js';
+import UserAvailability, { syncUserAvailabilitySchema } from './userAvailability.model.js';
 import TenantUser from './tenantUser.model.js';
 import StructureUser from './structureUser.model.js';
 import RefreshToken from './refreshToken.model.js';
@@ -61,7 +61,7 @@ export async function syncAuthModels(): Promise<void> {
     await Tenant.sync({ alter: true });
     await User.sync({ alter: true });
     await UserEmail.sync({ alter: true });
-    await UserAvailability.sync({ alter: true });
+    await syncUserAvailabilitySchema();
     await Structure.sync({ alter: true });
     await StructureAvailability.sync({ alter: true });
     await TenantUser.sync({ alter: true });
