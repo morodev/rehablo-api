@@ -16,6 +16,7 @@ router.get('/agenda-events', requirePermission('agenda', 'read'), agendaControll
 router.get('/agenda-dashboard', requirePermission('agenda', 'read'), agendaController.eventDashboardWithFilter);
 router.get('/agenda-events-by-users', requirePermission('agenda', 'read'), agendaController.findAgendaEventsByUsers);
 router.get('/agenda-events-patient', requirePermission('agenda', 'read'), agendaController.findAppointmentsForPatientById);
+router.get('/agenda-events/search', requirePermission('agenda', 'read'), agendaController.searchAgendaEvents);
 router.get('/agenda-events-holidays', requirePermission('agenda', 'read'), agendaController.findAllHolidays);
 router.post('/agenda-event', requirePermission('agenda', 'create'), agendaController.saveAgendaEvent);
 router.patch('/agenda-event', requirePermission('agenda', 'update'), agendaController.updateAgendaEvent);

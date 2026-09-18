@@ -1,24 +1,9 @@
 import { Request, Response } from 'express';
-import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
+import { fn, col, Op } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { Product, Category } from '../models/index.js';
-
-function paginate<T>(items: T[], page: number, size: number) {
-    const length = items.length;
-    const begin = page * size;
-    const end = Math.min(size * (page + 1), length);
-    const lastPage = Math.max(Math.ceil(length / size), 1);
-
-    if (page > lastPage) {
-        return { items: null, pagination: { lastPage } };
-    }
-
-    return {
-        items: items.slice(begin, end),
-        pagination: { length, size, page, lastPage, startIndex: begin, endIndex: end - 1 }
-    };
-}
+import { boundedInteger, textSearchWhere } from '../../../utils/search.js';
 
 export const saveProduct = asyncHandler(async (req: Request, res: Response) => {
     const product = await Product.schema(req.tenantSchema!).create(req.body);
@@ -27,30 +12,44 @@ export const saveProduct = asyncHandler(async (req: Request, res: Response) => {
 
 export const findAllProduct = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const page = parseInt((req.query.page as string) ?? '0', 10);
-    const size = parseInt((req.query.size as string) ?? '10', 10);
+    const page = boundedInteger(req.query.page, 0, 0, Number.MAX_SAFE_INTEGER);
+    const size = boundedInteger(req.query.size, 10, 1, 100);
     const includeInactive = req.query.includeInactive === 'true';
+    const search = textSearchWhere(['product.name', 'product.description', 'product.code'], req.query.query);
 
-    const products = await Product.schema(schema).findAll({
-        where: includeInactive ? {} : { isActive: true },
-        include: [{ model: Category.schema(schema) }]
+    const data = await Product.schema(schema).findAndCountAll({
+        where: {
+            [Op.and]: [includeInactive ? {} : { isActive: true }, ...(search ? [search] : [])]
+        },
+        include: [{ model: Category.schema(schema) }],
+        distinct: true,
+        limit: size,
+        offset: page * size,
+        order: [[fn('lower', col('product.name')), 'ASC'], ['id', 'ASC']]
     });
-    const { items, pagination } = paginate(products, page, size);
+    const pagination = {
+        length: data.count,
+        size,
+        page,
+        lastPage: Math.max(Math.ceil(data.count / size), 1),
+        startIndex: page * size,
+        endIndex: Math.min((page + 1) * size, data.count) - 1
+    };
 
-    return sendSuccessResponse(res, 200, { pagination, products: items }, 'Prodotti caricati correttamente');
+    return sendSuccessResponse(res, 200, { pagination, products: data.rows }, 'Prodotti caricati correttamente');
 });
 
 export const searchProducts = asyncHandler(async (req: Request, res: Response) => {
-    const query = (req.query.query as string) || '';
+    const search = textSearchWhere(['product.name', 'product.description', 'product.code'], req.query.query);
+    const limit = boundedInteger(req.query.limit, 20, 1, 50);
 
     const products = await Product.schema(req.tenantSchema!).findAll({
         where: {
             isActive: true,
-            [Op.or]: [
-                sequelizeWhere(fn('LOWER', col('name')), 'LIKE', `%${query.toLowerCase()}%`),
-                sequelizeWhere(fn('LOWER', col('description')), 'LIKE', `%${query.toLowerCase()}%`)
-            ]
-        }
+            ...(search ?? {})
+        },
+        order: [[fn('lower', col('product.name')), 'ASC'], ['id', 'ASC']],
+        limit
     });
 
     return sendSuccessResponse(res, 200, products, 'Ricerca completata');

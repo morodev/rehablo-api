@@ -6,6 +6,8 @@ import Patient from '../../patients/models/patient.model.js';
 import Observation from '../../measurements/models/observation.model.js';
 import { assertEvaluationEditable, assertNotFutureDate } from '../services/evaluationGuard.js';
 import { cloneEvaluation } from '../services/evaluationClone.js';
+import { boundedInteger, normalizeSearchQuery } from '../../../utils/search.js';
+import { Op } from 'sequelize';
 import {
     Evaluation,
     HumanBodyPoint,
@@ -94,7 +96,9 @@ export const createEvaluation = asyncHandler(async (req: Request, res: Response)
 /** Lists the evaluations of a patient (or of the whole tenant if `patientId` is omitted), most recent first. */
 export const getEvaluations = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { patientId, status } = req.query as { patientId?: string; status?: string };
+    const { patientId, status, query } = req.query as { patientId?: string; status?: string; query?: string };
+    const normalized = normalizeSearchQuery(query);
+    const limit = boundedInteger(req.query.limit, 1000, 1, 1000);
 
     const evaluations = await Evaluation.schema(schema).findAll({
         where: {
@@ -103,10 +107,39 @@ export const getEvaluations = asyncHandler(async (req: Request, res: Response) =
             ...scopeWhere(req, EVALUATION_SCOPE_FIELDS)
         },
         order: [['date', 'DESC']],
-        limit: 1000
+        // Con una ricerca il limite va applicato dopo il filtro su paziente e titolo, altrimenti
+        // una corrispondenza storica potrebbe sparire solo perché non è fra le ultime righe.
+        limit: normalized ? undefined : limit
     });
 
-    return sendSuccessResponse(res, 200, evaluations, 'Valutazioni caricate correttamente');
+    const patientIds = [...new Set(evaluations.map((evaluation) => evaluation.patientId))];
+    const patients = patientIds.length
+        ? await Patient.schema(schema).findAll({
+            where: { id: { [Op.in]: patientIds }, archivedAt: null },
+            attributes: ['id', 'name', 'surname', 'fiscalCode'],
+            raw: true
+        })
+        : [];
+    const patientsById = new Map(patients.map((patient: any) => [patient.id, patient]));
+    const tokens = normalized ? normalized.split(' ') : [];
+    const result: Array<Record<string, any>> = evaluations
+        .map((evaluation): Record<string, any> => {
+            const plain = evaluation.get({ plain: true }) as Record<string, any>;
+            return { ...plain, patient: patientsById.get(plain.patientId) ?? null };
+        })
+        .filter((evaluation) => {
+            if (!tokens.length) return true;
+            const haystack = normalizeSearchQuery([
+                evaluation.title,
+                evaluation.patient?.name,
+                evaluation.patient?.surname,
+                evaluation.patient?.fiscalCode
+            ].filter(Boolean).join(' '));
+            return tokens.every((token) => haystack.includes(token));
+        })
+        .slice(0, limit);
+
+    return sendSuccessResponse(res, 200, result, 'Valutazioni caricate correttamente');
 });
 
 /** Full detail of a single evaluation: every symptom/articularity/strength/questionnaire/scale/test attached to it. */

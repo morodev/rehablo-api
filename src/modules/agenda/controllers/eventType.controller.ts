@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { fn, col, where as sequelizeWhere, Op, Transaction, type Order } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
+import { boundedInteger, textSearchWhere } from '../../../utils/search.js';
 import { sequelize } from '../../../config/database.js';
 import EventType from '../models/eventType.model.js';
 
@@ -158,10 +159,12 @@ export const deleteEventType = asyncHandler(async (req: Request, res: Response) 
 
 export const searchEventType = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const query = (req.query.query as string) || '';
+    const search = textSearchWhere(['title', 'description'], req.query.query);
+    const limit = boundedInteger(req.query.limit, 20, 1, 50);
 
     const data = await EventType.schema(schema).findAll({
-        where: sequelizeWhere(fn('LOWER', col('title')), 'LIKE', `%${query.toLowerCase()}%`),
+        where: search ?? {},
+        limit,
         order: EVENT_TYPE_ORDER
     });
 

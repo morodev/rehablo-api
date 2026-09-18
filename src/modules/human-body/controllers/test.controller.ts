@@ -3,6 +3,7 @@ import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendSuccessResponse } from '../../../utils/response.js';
 import { Test } from '../models/catalog/index.js';
+import { boundedInteger, textSearchWhere } from '../../../utils/search.js';
 
 function toBase64Image(plain: Record<string, any>) {
     if (plain.image) {
@@ -35,16 +36,17 @@ export const getAllClinicTests = asyncHandler(async (_req: Request, res: Respons
 });
 
 export const searchTests = asyncHandler(async (req: Request, res: Response) => {
-    const query = ((req.query.query as string) || '').toLowerCase();
+    const search = textSearchWhere(['name', 'description'], req.query.query);
+    const requestedType = String(req.query.type ?? '').toLowerCase();
+    const type = ['clinic', 'neurology', 'orthopedic'].includes(requestedType) ? requestedType : null;
+    const limit = boundedInteger(req.query.limit, 20, 1, 50);
 
     const tests = await Test.findAll({
         where: {
-            [Op.or]: [
-                sequelizeWhere(fn('LOWER', col('name')), 'LIKE', `%${query}%`),
-                sequelizeWhere(fn('LOWER', col('description')), 'LIKE', `%${query}%`)
-            ]
+            [Op.and]: [...(search ? [search] : []), ...(type ? [{ type }] : [])]
         },
-        order: [[fn('lower', col('name')), 'ASC']]
+        order: [[fn('lower', col('name')), 'ASC']],
+        limit
     });
 
     const processed = tests.map((test) => toBase64Image(test.get({ plain: true })));

@@ -3,6 +3,7 @@ import { Op, fn, col, where as sequelizeWhere, Includeable } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendSuccessResponse } from '../../../utils/response.js';
 import { Scale, SectionScale, QuestionScale, AnswerScale } from '../models/catalog/index.js';
+import { boundedInteger, textSearchWhere } from '../../../utils/search.js';
 
 /**
  * Read-only access to the global scales catalog (public schema, shared by every tenant).
@@ -28,25 +29,14 @@ export const getAllScales = asyncHandler(async (_req: Request, res: Response) =>
 });
 
 export const searchScales = asyncHandler(async (req: Request, res: Response) => {
-    const query = ((req.query.query as string) || '').toLowerCase();
-    const words = query.split(' ').filter(Boolean);
+    const search = textSearchWhere(['scale.name', 'scale.description'], req.query.query);
+    const limit = boundedInteger(req.query.limit, 20, 1, 50);
 
     const scales = await Scale.findAll({
-        where: {
-            [Op.or]: [
-                sequelizeWhere(fn('LOWER', col('name')), 'LIKE', `%${query}%`),
-                sequelizeWhere(fn('LOWER', col('description')), 'LIKE', `%${query}%`),
-                {
-                    [Op.and]: words.map((word) => ({
-                        [Op.or]: [
-                            sequelizeWhere(fn('LOWER', col('name')), 'LIKE', `%${word}%`),
-                            sequelizeWhere(fn('LOWER', col('description')), 'LIKE', `%${word}%`)
-                        ]
-                    }))
-                }
-            ]
-        },
-        include: catalogInclude
+        where: search ?? {},
+        include: catalogInclude,
+        order: [['name', 'ASC']],
+        limit
     });
 
     return sendSuccessResponse(res, 200, scales, 'All scales loaded');

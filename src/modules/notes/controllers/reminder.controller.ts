@@ -5,6 +5,7 @@ import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.
 import { scopeWhere } from '../../../middleware/rbac.js';
 import Patient from '../../patients/models/patient.model.js';
 import Reminder, { ReminderPriority, ReminderStatus } from '../models/reminder.model.js';
+import { textSearchWhere } from '../../../utils/search.js';
 
 const REMINDER_SCOPE_FIELDS = {
     ownerField: 'assigneeUserId',
@@ -106,15 +107,10 @@ export const getReminders = asyncHandler(async (req: Request, res: Response) => 
         where.dueAt = { [Op.lte]: toDate };
     }
 
-    if (q?.trim()) {
-        where[Op.or as any] = [
-            { title: { [Op.iLike]: `%${q.trim()}%` } },
-            { description: { [Op.iLike]: `%${q.trim()}%` } }
-        ];
-    }
+    const search = textSearchWhere(['title', 'description'], q);
 
     const reminders = await Reminder.schema(schema).findAll({
-        where,
+        where: search ? { [Op.and]: [where, search] } : where,
         order: [
             ['status', 'ASC'],
             ['dueAt', 'ASC'],

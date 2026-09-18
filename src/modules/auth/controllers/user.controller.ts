@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { Op } from 'sequelize';
+import { Op, Transaction } from 'sequelize';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { sequelize } from '../../../config/database.js';
@@ -12,10 +12,24 @@ import { DEFAULT_ROLE, isRoleCode, RoleCode, ROLE_DEFINITIONS } from '../rbac/ro
 import { sendForgotPasswordMail, signUpSendMail } from '../../../services/email.service.js';
 import { licenseSecret } from './tenant.controller.js';
 import { revokeAllForUser, revokeForTenantMembership } from '../services/refreshToken.service.js';
-import { Tenant, TenantUser, User, Structure, StructureUser, UserAvailability } from '../models/index.js';
-import { USER_AVAILABILITY_MODES } from '../models/user.model.js';
+import {
+    Tenant,
+    TenantUser,
+    User,
+    Structure,
+    StructureAvailability,
+    StructureUser,
+    UserAvailability,
+    UserEmail
+} from '../models/index.js';
 import { validateUserStructureSelection } from '../services/userStructurePolicy.service.js';
 import { findUserByIdentityEmail } from '../services/identity.service.js';
+import { normalizeIdentityEmail } from '../models/userEmail.model.js';
+import {
+    AvailabilityValidationError,
+    isAvailabilityMode as isSupportedAvailabilityMode,
+    normalizeAvailabilitySchedule
+} from '../services/userAvailabilityPolicy.service.js';
 import {
     FutureAppointmentsRequireReplacementError,
     getOperatorDeactivationImpact,
@@ -48,8 +62,7 @@ function stripProtectedFields<T extends Record<string, any>>(payload: T): T {
 }
 
 function isAvailabilityMode(value: unknown): boolean {
-    return typeof value === 'string'
-        && (USER_AVAILABILITY_MODES as readonly string[]).includes(value);
+    return isSupportedAvailabilityMode(value);
 }
 
 /**
@@ -66,10 +79,80 @@ async function findTenantMember(req: Request, targetUserId: string) {
     return { tenantId, membership, user };
 }
 
+class TeamProfileError extends Error {
+    constructor(public readonly status: number, message: string) {
+        super(message);
+    }
+}
+
+const TEAM_PROFILE_FIELDS = [
+    'name',
+    'surname',
+    'email',
+    'calendarColor',
+    'availabilityMode'
+] as const;
+
+async function serializeTeamMember(tenantId: string, userId: string) {
+    const [user, membership, availabilities, tenantStructures, assignments] = await Promise.all([
+        User.findByPk(userId, { attributes: { exclude: ['password'] } }),
+        TenantUser.findOne({ where: {tenantId, userId} }),
+        UserAvailability.findAll({ where: {userId}, order: [['day', 'ASC']] }),
+        Structure.findAll({where: {tenantId}, attributes: ['id']}),
+        StructureUser.findAll({where: {userId}, attributes: ['structureId']})
+    ]);
+    if (!user || !membership) return null;
+
+    const allowedIds = new Set(tenantStructures.map((structure) => structure.get('id') as string));
+    return {
+        ...user.get({plain: true}),
+        role: membership.get('role'),
+        deactivatedAt: membership.get('deactivatedAt') ?? user.get('deactivatedAt') ?? null,
+        structureIds: assignments
+            .map((assignment) => assignment.get('structureId') as string)
+            .filter((id) => allowedIds.has(id)),
+        userAvailabilities: availabilities.map((availability) => availability.get({plain: true}))
+    };
+}
+
+async function syncTeamMemberStructures(
+    userId: string,
+    allowedIds: readonly string[],
+    requestedIds: readonly string[],
+    transaction: Transaction
+): Promise<void> {
+    const current = await StructureUser.findAll({
+        where: {userId, structureId: {[Op.in]: [...allowedIds]}},
+        transaction,
+        lock: transaction.LOCK.UPDATE
+    });
+    const currentIds = current.map((assignment) => assignment.get('structureId') as string);
+    const requested = new Set(requestedIds);
+    const toRemove = currentIds.filter((id) => !requested.has(id));
+    const toAdd = requestedIds.filter((id) => !currentIds.includes(id));
+
+    if (toRemove.length) {
+        await StructureUser.destroy({
+            where: {userId, structureId: {[Op.in]: toRemove}},
+            transaction
+        });
+    }
+    if (toAdd.length) {
+        await StructureUser.bulkCreate(
+            toAdd.map((structureId) => ({userId, structureId, role: null})),
+            {transaction}
+        );
+    }
+}
+
 
 export const createUser = asyncHandler(async (req: Request, res: Response) => {
     const tenantId = getCurrentTenantId(req);
     const newUser = { ...req.body };
+    const requestedAvailabilities = Object.prototype.hasOwnProperty.call(newUser, 'userAvailabilities')
+        ? newUser.userAvailabilities
+        : Array.from({length: 7}, (_, day) => ({day, enabled: false}));
+    delete newUser.userAvailabilities;
 
     const tenant: any = await Tenant.findByPk(tenantId, { include: Structure });
     if (!tenant) {
@@ -124,15 +207,44 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 400, structureSelectionError);
     }
 
-    const user: any = await User.create(userToCreate, { include: UserAvailability as any });
-
     const targetStructures = role === RoleCode.OWNER
         ? structures
         : structures.filter((structure: any) => selectedStructureIds.includes(structure.id));
+    const mode = isSupportedAvailabilityMode(userToCreate.availabilityMode)
+        ? userToCreate.availabilityMode
+        : 'INHERIT_STRUCTURE';
+    const isOperationalRole = role !== RoleCode.OWNER && role !== RoleCode.SECRETARY;
+    const structureSchedule = mode === 'CUSTOM' && isOperationalRole
+        ? (await StructureAvailability.findAll({
+            where: {structureId: selectedStructureIds[0]},
+            order: [['day', 'ASC']]
+        })).map((availability) => availability.get({plain: true}))
+        : [];
+    let normalizedSchedule;
+    try {
+        normalizedSchedule = normalizeAvailabilitySchedule(
+            requestedAvailabilities,
+            mode === 'CUSTOM' && isOperationalRole ? 'CUSTOM' : 'INHERIT_STRUCTURE',
+            structureSchedule
+        );
+    } catch (error) {
+        if (error instanceof AvailabilityValidationError) {
+            return sendErrorResponse(res, 400, error.message);
+        }
+        throw error;
+    }
 
-    // Nessun ruolo sulla struttura: `null` significa "eredita quello del tenant".
-    await Promise.all(targetStructures.map((structure: any) => structure.addUser(user)));
-    await tenant.addUser(user, { through: { role } });
+    const user: any = await sequelize.transaction(async (transaction) => {
+        const created = await User.create(userToCreate, {transaction});
+        await UserAvailability.bulkCreate(
+            normalizedSchedule.map((availability) => ({...availability, userId: created.get('id') as string})),
+            {transaction}
+        );
+        // Nessun ruolo sulla struttura: `null` significa "eredita quello del tenant".
+        await Promise.all(targetStructures.map((structure: any) => structure.addUser(created, {transaction})));
+        await tenant.addUser(created, {through: {role}, transaction});
+        return created;
+    });
 
     const verificationToken = jwt.sign({ email: user.get('email') }, licenseSecret, { expiresIn: '12h' });
 
@@ -252,6 +364,190 @@ export const updateUserCalendarColor = asyncHandler(async (req: Request, res: Re
     await User.update({ calendarColor: req.body.calendarColor }, { where: { id: userId } });
     const updatedUser = await User.findByPk(userId, { attributes: { exclude: ['password'] } });
     return sendSuccessResponse(res, 200, updatedUser, 'User updated');
+});
+
+/**
+ * Salvataggio amministrativo atomico del membro del team.
+ * Profilo, ruolo, sedi e disponibilita vengono confermati nella stessa transazione.
+ */
+export const updateTeamMemberProfile = asyncHandler(async (req: Request, res: Response) => {
+    const targetUserId = req.params.userId;
+    const tenantId = getCurrentTenantId(req);
+    const body = req.body as {
+        user?: Record<string, any>;
+        role?: string;
+        structureIds?: string[];
+    };
+    let roleChanged = false;
+
+    try {
+        await sequelize.transaction(async (transaction) => {
+            const [membership, targetUser, tenantStructures, currentAssignments] = await Promise.all([
+                TenantUser.findOne({
+                    where: {tenantId, userId: targetUserId},
+                    transaction,
+                    lock: transaction.LOCK.UPDATE
+                }),
+                User.findByPk(targetUserId, {transaction, lock: transaction.LOCK.UPDATE}),
+                Structure.findAll({where: {tenantId}, attributes: ['id'], transaction}),
+                StructureUser.findAll({where: {userId: targetUserId}, transaction})
+            ]);
+            if (!membership || !targetUser) {
+                throw new TeamProfileError(404, 'Utente non trovato in questo studio');
+            }
+
+            const currentRole = membership.get('role') as RoleCode;
+            const nextRoleValue = body.role ?? currentRole;
+            if (!isRoleCode(nextRoleValue) || !ROLE_DEFINITIONS[nextRoleValue].assignable) {
+                throw new TeamProfileError(400, 'Ruolo non valido o non assegnabile');
+            }
+            const nextRole = nextRoleValue as RoleCode;
+            roleChanged = nextRole !== currentRole;
+
+            if (roleChanged && targetUserId === getUserId(req)) {
+                throw new TeamProfileError(403, 'Non puoi modificare il tuo ruolo');
+            }
+            if (targetUser.get('isTenant') && nextRole !== RoleCode.OWNER) {
+                throw new TeamProfileError(409, 'Il ruolo del titolare dello studio non puo essere modificato');
+            }
+
+            const allowedIds = tenantStructures.map((structure) => structure.get('id') as string);
+            const currentIds = currentAssignments
+                .map((assignment) => assignment.get('structureId') as string)
+                .filter((id) => allowedIds.includes(id));
+            const requestedIds = nextRole === RoleCode.OWNER
+                ? allowedIds
+                : Array.isArray(body.structureIds)
+                    ? [...new Set(body.structureIds)]
+                    : currentIds;
+            const structureError = validateUserStructureSelection(nextRole, requestedIds, allowedIds);
+            if (structureError) throw new TeamProfileError(400, structureError);
+
+            if (currentRole === RoleCode.OWNER && nextRole !== RoleCode.OWNER) {
+                const owners = await TenantUser.count({where: {tenantId, role: RoleCode.OWNER}, transaction});
+                if (owners <= 1) {
+                    throw new TeamProfileError(409, 'Lo studio deve avere almeno un titolare');
+                }
+            }
+
+            const rawUser = body.user && typeof body.user === 'object' ? body.user : null;
+            const profile: Record<string, any> = {};
+            if (rawUser) {
+                for (const field of TEAM_PROFILE_FIELDS) {
+                    if (Object.prototype.hasOwnProperty.call(rawUser, field)) {
+                        profile[field] = rawUser[field];
+                    }
+                }
+            }
+
+            if (Object.prototype.hasOwnProperty.call(profile, 'email')) {
+                const email = normalizeIdentityEmail(profile.email);
+                if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                    throw new TeamProfileError(400, 'Email non valida');
+                }
+                const [emailOwner, userWithEmail] = await Promise.all([
+                    UserEmail.findOne({where: {normalizedEmail: email}, transaction}),
+                    User.findOne({where: {email}, transaction})
+                ]);
+                if (
+                    (emailOwner && emailOwner.get('userId') !== targetUserId) ||
+                    (userWithEmail && userWithEmail.get('id') !== targetUserId)
+                ) {
+                    throw new TeamProfileError(409, 'Email gia in uso da un altro utente');
+                }
+                profile.email = email;
+            }
+
+            const nextAvailabilityMode = profile.availabilityMode
+                ?? targetUser.get('availabilityMode');
+            if (!isSupportedAvailabilityMode(nextAvailabilityMode)) {
+                throw new TeamProfileError(400, 'Modalita disponibilita non valida');
+            }
+
+            const hasSchedule = !!rawUser && Object.prototype.hasOwnProperty.call(rawUser, 'userAvailabilities');
+            const isOperationalRole = nextRole !== RoleCode.OWNER && nextRole !== RoleCode.SECRETARY;
+            const mustRevalidateExistingSchedule =
+                nextAvailabilityMode === 'CUSTOM' &&
+                isOperationalRole &&
+                (roleChanged || Array.isArray(body.structureIds));
+            let normalizedSchedule: ReturnType<typeof normalizeAvailabilitySchedule> | null = null;
+            if (hasSchedule || mustRevalidateExistingSchedule) {
+                let structureSchedule: any[] = [];
+                if (nextAvailabilityMode === 'CUSTOM' && isOperationalRole) {
+                    structureSchedule = (await StructureAvailability.findAll({
+                        where: {structureId: requestedIds[0]},
+                        transaction,
+                        order: [['day', 'ASC']]
+                    })).map((availability) => availability.get({plain: true}));
+                }
+                const scheduleToValidate = hasSchedule
+                    ? rawUser!.userAvailabilities
+                    : (await UserAvailability.findAll({
+                        where: {userId: targetUserId},
+                        transaction,
+                        order: [['day', 'ASC']]
+                    })).map((availability) => availability.get({plain: true}));
+                normalizedSchedule = normalizeAvailabilitySchedule(
+                    scheduleToValidate,
+                    nextAvailabilityMode === 'CUSTOM' && isOperationalRole
+                        ? 'CUSTOM'
+                        : 'INHERIT_STRUCTURE',
+                    structureSchedule
+                );
+            }
+
+            if (Object.keys(profile).length) {
+                await targetUser.update(profile, {transaction});
+            }
+
+            if (profile.email) {
+                const primaryEmail = await UserEmail.findOne({
+                    where: {userId: targetUserId, isPrimary: true},
+                    transaction,
+                    lock: transaction.LOCK.UPDATE
+                });
+                if (primaryEmail) {
+                    await primaryEmail.update({
+                        email: profile.email,
+                        normalizedEmail: profile.email
+                    }, {transaction});
+                } else {
+                    await UserEmail.create({
+                        userId: targetUserId,
+                        email: profile.email,
+                        normalizedEmail: profile.email,
+                        isPrimary: true,
+                        verifiedAt: targetUser.get('isActive') ? new Date() : null
+                    }, {transaction});
+                }
+            }
+
+            if (roleChanged) {
+                await membership.update({role: nextRole}, {transaction});
+            }
+            await syncTeamMemberStructures(targetUserId, allowedIds, requestedIds, transaction);
+
+            if (normalizedSchedule) {
+                await UserAvailability.destroy({where: {userId: targetUserId}, transaction});
+                await UserAvailability.bulkCreate(
+                    normalizedSchedule.map((availability) => ({...availability, userId: targetUserId})),
+                    {transaction}
+                );
+            }
+        });
+    } catch (error) {
+        if (error instanceof TeamProfileError || error instanceof AvailabilityValidationError) {
+            const status = error instanceof TeamProfileError ? error.status : 400;
+            return sendErrorResponse(res, status, error.message);
+        }
+        throw error;
+    }
+
+    if (roleChanged) {
+        await revokeAllForUser(targetUserId, 'role_changed');
+    }
+    const updated = await serializeTeamMember(tenantId, targetUserId);
+    return sendSuccessResponse(res, 200, updated, 'Membro del team aggiornato');
 });
 
 /**
@@ -545,6 +841,7 @@ export default {
     createUser,
     findAllUsersTenantByTenantId,
     updateUser,
+    updateTeamMemberProfile,
     updateUserCalendarVisibility,
     updateUserCalendarColor,
     getUserDeactivationImpact,

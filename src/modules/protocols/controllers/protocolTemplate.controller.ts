@@ -8,6 +8,7 @@ import {
     ProtocolTemplateExercise,
     Exercise
 } from '../models/catalog/index.js';
+import { boundedInteger, textSearchWhere } from '../../../utils/search.js';
 
 /**
  * CRUD on the global reusable protocol templates catalog (public schema): a template is made of
@@ -71,17 +72,17 @@ export const findAllProtocolTemplates = asyncHandler(async (req: Request, res: R
 });
 
 export const searchProtocolTemplates = asyncHandler(async (req: Request, res: Response) => {
-    const query = ((req.query.query as string) || '').toLowerCase();
+    const search = textSearchWhere(
+        ['protocolTemplate.name', 'protocolTemplate.pathology', 'protocolTemplate.description'],
+        req.query.query
+    );
+    const limit = boundedInteger(req.query.limit, 20, 1, 50);
 
     const templates = await ProtocolTemplate.findAll({
-        where: {
-            [Op.or]: [
-                sequelizeWhere(fn('LOWER', col('name')), 'LIKE', `%${query}%`),
-                sequelizeWhere(fn('LOWER', col('pathology')), 'LIKE', `%${query}%`),
-                sequelizeWhere(fn('LOWER', col('description')), 'LIKE', `%${query}%`)
-            ]
-        },
-        include: templateInclude
+        where: search ?? {},
+        include: templateInclude,
+        order: [['name', 'ASC']],
+        limit
     });
 
     return sendSuccessResponse(res, 200, templates, 'Ricerca completata');

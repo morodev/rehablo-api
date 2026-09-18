@@ -55,6 +55,7 @@ router.put('/user/reset-password/:resetPasswordToken', userController.resetPassw
 // --- Users (requires auth) ---
 router.post('/user', requireAuth, requirePermission('user', 'create'), userController.createUser);
 router.get('/user', requireAuth, requirePermission('user', 'read'), userController.findAllUsersTenantByTenantId);
+router.patch('/user/:userId/team-profile', requireAuth, requirePermission('user', 'update', 'tenant'), userController.updateTeamMemberProfile);
 router.patch('/user/:userId', requireAuth, requirePermission('user', 'update'), userController.updateUser);
 // SELF-SERVICE: preferenze personali di calendario, modificabili da qualunque utente autenticato.
 // TODO(RBAC): il controller deve verificare che `userId` coincida con `req.user.sub`,

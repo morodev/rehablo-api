@@ -3,6 +3,7 @@ import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { Category, Product, Service } from '../models/index.js';
+import { boundedInteger, textSearchWhere } from '../../../utils/search.js';
 
 export const saveCategory = asyncHandler(async (req: Request, res: Response) => {
     const category = await Category.schema(req.tenantSchema!).create(req.body);
@@ -25,10 +26,22 @@ export const findAllCategories = asyncHandler(async (req: Request, res: Response
 });
 
 export const searchCategories = asyncHandler(async (req: Request, res: Response) => {
-    const query = (req.query.query as string) || '';
+    const search = textSearchWhere(['name'], req.query.query);
+    const limit = boundedInteger(req.query.limit, 20, 1, 50);
+    const appliesTo = String(req.query.appliesTo ?? '').toUpperCase();
 
     const categories = await Category.schema(req.tenantSchema!).findAll({
-        where: { isActive: true, [Op.or]: [sequelizeWhere(fn('LOWER', col('name')), 'LIKE', `%${query.toLowerCase()}%`)] }
+        where: {
+            [Op.and]: [
+                { isActive: true },
+                ...(search ? [search] : []),
+                ...(['PRODUCT', 'SERVICE'].includes(appliesTo)
+                    ? [{ [Op.or]: [{ appliesTo }, { appliesTo: 'BOTH' }] }]
+                    : [])
+            ]
+        },
+        order: [[fn('lower', col('name')), 'ASC'], ['id', 'ASC']],
+        limit
     });
 
     return sendSuccessResponse(res, 200, categories, 'Ricerca completata');

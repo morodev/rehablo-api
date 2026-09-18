@@ -19,6 +19,7 @@ import InvoiceAgendaEvent from '../models/invoiceAgendaEvent.model.js';
 import { getInvoiceAgendaLinksByEventIds } from '../services/invoiceAgendaEvent.service.js';
 import { evalTotals, EvalTotalsResult, toPersistedTotals } from '../utils/evalTotals.js';
 import { applyAppointmentPriceSnapshot } from '../utils/appointmentInvoicePrice.js';
+import { normalizeSearchQuery } from '../../../utils/search.js';
 import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
 import { buildFiscalNotes, FiscalProfile, isStampDutyDue, resolveFiscalProfile } from '../utils/fiscalRegime.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
@@ -154,6 +155,56 @@ function invoiceLocalDate(value: Date): string {
 }
 
 const money = (value: unknown): number => Math.round((Number(value) || 0) * 100) / 100;
+
+const PAYMENT_STATUS_SEARCH_LABELS: Record<string, string> = {
+    unpaid: 'non saldato insoluto da pagare',
+    partial: 'parzialmente saldato pagamento parziale',
+    paid: 'saldato pagato',
+    void: 'stornato annullato'
+};
+
+function invoiceMatchesSearch(invoice: Record<string, any>, queryValue: unknown): boolean {
+    const query = normalizeSearchQuery(queryValue);
+    if (!query) return true;
+    const patient = invoice.patient ?? {};
+    const documentNumber = invoice.documentNumber != null && invoice.documentYear != null
+        ? `${invoice.documentNumber}/${invoice.documentYear}`
+        : '';
+    const haystack = normalizeSearchQuery([
+        documentNumber,
+        invoice.documentNumber,
+        invoice.documentYear,
+        invoice.documentType,
+        String(invoice.documentType ?? '').replace(/_/g, ' '),
+        invoice.status,
+        invoice.paymentStatus,
+        PAYMENT_STATUS_SEARCH_LABELS[invoice.paymentStatus] ?? '',
+        invoice.paymentMethod,
+        patient.name,
+        patient.surname,
+        patient.fiscalCode
+    ].filter(Boolean).join(' '));
+    return query.split(' ').every((token) => haystack.includes(token));
+}
+
+async function attachInvoicePatients(
+    schema: string,
+    invoices: Array<Record<string, any>>
+): Promise<Array<Record<string, any>>> {
+    const patientIds = [...new Set(invoices.map((invoice) => invoice.patientID).filter(Boolean))] as string[];
+    const patients = patientIds.length
+        ? await Patient.schema(schema).findAll({
+            where: { id: { [Op.in]: patientIds } },
+            attributes: ['id', 'name', 'surname', 'fiscalCode'],
+            raw: true
+        })
+        : [];
+    const byId = new Map(patients.map((patient: any) => [patient.id, patient]));
+    return invoices.map((invoice): Record<string, any> => ({
+        ...invoice,
+        patient: byId.get(invoice.patientID) ?? null
+    }));
+}
 
 /**
  * Appuntamenti completati e non ancora fatturati utilizzabili nella nuova fattura.
@@ -865,10 +916,11 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
         order: [['emissionDate', 'DESC']]
     });
 
-    const allInvoices = await decorateInvoicesWithPayments(schema, rows);
+    const allInvoices = await attachInvoicePatients(schema, await decorateInvoicesWithPayments(schema, rows));
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Rome' });
     const next7 = new Date(Date.parse(`${today}T12:00:00.000Z`) + 7 * 86_400_000).toISOString().slice(0, 10);
     const filtered = allInvoices.filter((invoice) => {
+        if (!invoiceMatchesSearch(invoice, req.query.query)) return false;
         if (month && invoiceEmissionMonth(invoice.emissionDate) !== month) return false;
         if (paymentState !== 'all' && invoice.paymentStatus !== paymentState) return false;
         if (dueState === 'all') return true;
@@ -911,25 +963,19 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
 export const searchInvoices = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const { InvoiceScoped, InvoiceAgendaEventScoped } = getScopedModels(schema);
-    const query = (req.query.query as string) || '';
-
     const invoices = await InvoiceScoped.findAll({
-        where: {
-            [Op.and]: [
-                patientScopeWhere(req, schema, 'patientID'),
-                {
-                    [Op.or]: [
-                        sequelizeWhere(fn('LOWER', col('status')), 'LIKE', `%${query.toLowerCase()}%`),
-                        sequelizeWhere(fn('LOWER', col('paymentMethod')), 'LIKE', `%${query.toLowerCase()}%`)
-                    ]
-                }
-            ]
-        },
-        include: [{ model: InvoiceAgendaEventScoped, as: 'appointmentLinks' }]
+        where: patientScopeWhere(req, schema, 'patientID'),
+        include: [{ model: InvoiceAgendaEventScoped, as: 'appointmentLinks' }],
+        order: [['emissionDate', 'DESC']]
     });
 
-    const decoratedInvoices = await decorateInvoicesWithPayments(schema, invoices);
-    return sendSuccessResponse(res, 200, decoratedInvoices, 'Ricerca completata');
+    const decoratedInvoices = await attachInvoicePatients(schema, await decorateInvoicesWithPayments(schema, invoices));
+    return sendSuccessResponse(
+        res,
+        200,
+        decoratedInvoices.filter((invoice) => invoiceMatchesSearch(invoice, req.query.query)).slice(0, 100),
+        'Ricerca completata'
+    );
 });
 
 export const findOneInvoice = asyncHandler(async (req: Request, res: Response) => {

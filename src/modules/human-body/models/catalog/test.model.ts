@@ -1,7 +1,7 @@
 import { DataTypes, Model, Optional } from 'sequelize';
 import { sequelize } from '../../../../config/database.js';
 
-export const TEST_TYPES = ['clinic', 'orthopedic'] as const;
+export const TEST_TYPES = ['clinic', 'neurology', 'orthopedic'] as const;
 export type TestType = (typeof TEST_TYPES)[number];
 
 export interface TestAttributes {
@@ -23,7 +23,7 @@ export interface TestAttributes {
 export type TestCreationAttributes = Optional<TestAttributes, 'id' | 'isFullBody'>;
 
 /**
- * Global catalog of standardized clinical/orthopedic tests (e.g. Adson test), shared across every
+ * Global catalog of standardized clinical, neurological and orthopedic tests, shared across every
  * tenant. Lives in the "public" schema, NOT in a per-tenant schema (unlike `TestInstance`, which
  * records a specific patient's test outcome and IS tenant-scoped).
  */

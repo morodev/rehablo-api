@@ -5,6 +5,7 @@ import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.
 import HumanBodyQuestionnaire from '../models/humanBodyQuestionnaire.model.js';
 import HumanBodyQuestion from '../models/humanBodyQuestion.model.js';
 import HumanBodyAnswer from '../models/humanBodyAnswer.model.js';
+import { boundedInteger, textSearchWhere } from '../../../utils/search.js';
 
 interface QuestionInput {
     id?: string;
@@ -84,22 +85,23 @@ export const getQuestionnaireById = asyncHandler(async (req: Request, res: Respo
 
 export const searchQuestionnaires = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const query = ((req.query.query as string) || '').toLowerCase();
+    const search = textSearchWhere(
+        ['humanBodyQuestionnaire.title', 'humanBodyQuestionnaire.description'],
+        req.query.query
+    );
+    const limit = boundedInteger(req.query.limit, 20, 1, 50);
 
     const questionnaires = await HumanBodyQuestionnaire.schema(schema).findAll({
-        where: {
-            [Op.or]: [
-                sequelizeWhere(fn('LOWER', col('title')), 'LIKE', `%${query}%`),
-                sequelizeWhere(fn('LOWER', col('description')), 'LIKE', `%${query}%`)
-            ]
-        },
+        where: search ?? {},
         include: [
             {
                 model: HumanBodyQuestion.schema(schema),
                 required: false,
                 include: [{ model: HumanBodyAnswer.schema(schema), required: false }]
             }
-        ]
+        ],
+        order: [['title', 'ASC']],
+        limit
     });
 
     return sendSuccessResponse(res, 200, questionnaires, 'Search results loaded successfully');

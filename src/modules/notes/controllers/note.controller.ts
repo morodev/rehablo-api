@@ -5,6 +5,7 @@ import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.
 import { scopeWhere } from '../../../middleware/rbac.js';
 import Patient from '../../patients/models/patient.model.js';
 import Note, { NoteType } from '../models/note.model.js';
+import { boundedInteger, textSearchWhere } from '../../../utils/search.js';
 
 const NOTE_SCOPE_FIELDS = {
     ownerField: 'ownerUserId',
@@ -98,20 +99,16 @@ export const getNotes = asyncHandler(async (req: Request, res: Response) => {
         ...(archived !== undefined ? { archived } : { archived: false })
     };
 
-    if (q?.trim()) {
-        where[Op.or as any] = [
-            { title: { [Op.iLike]: `%${q.trim()}%` } },
-            { contentText: { [Op.iLike]: `%${q.trim()}%` } }
-        ];
-    }
+    const search = textSearchWhere(['title', 'contentText'], q);
+    const limit = boundedInteger(req.query.limit, 500, 1, 500);
 
     const notes = await Note.schema(schema).findAll({
-        where,
+        where: search ? { [Op.and]: [where, search] } : where,
         order: [
             ['pinned', 'DESC'],
             ['updatedAt', 'DESC']
         ],
-        limit: 500
+        limit
     });
 
     return sendSuccessResponse(res, 200, notes, 'Note caricate correttamente');

@@ -3,6 +3,7 @@ import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { Exercise } from '../models/catalog/index.js';
+import { boundedInteger, textSearchWhere } from '../../../utils/search.js';
 
 /** CRUD on the global reusable exercises catalog (public schema, shared by every tenant). */
 export const saveExercise = asyncHandler(async (req: Request, res: Response) => {
@@ -20,15 +21,13 @@ export const findAllExercises = asyncHandler(async (req: Request, res: Response)
 });
 
 export const searchExercises = asyncHandler(async (req: Request, res: Response) => {
-    const query = ((req.query.query as string) || '').toLowerCase();
+    const search = textSearchWhere(['name', 'description'], req.query.query);
+    const limit = boundedInteger(req.query.limit, 20, 1, 50);
 
     const exercises = await Exercise.findAll({
-        where: {
-            [Op.or]: [
-                sequelizeWhere(fn('LOWER', col('name')), 'LIKE', `%${query}%`),
-                sequelizeWhere(fn('LOWER', col('description')), 'LIKE', `%${query}%`)
-            ]
-        }
+        where: search ?? {},
+        order: [['name', 'ASC']],
+        limit
     });
 
     return sendSuccessResponse(res, 200, exercises, 'Ricerca completata');

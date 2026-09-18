@@ -22,6 +22,7 @@ import { StructureUser, TenantUser, User } from '../../auth/models/index.js';
 import { getInvoiceAgendaLinksByEventIds, getLinkedInvoiceId } from '../../invoice/services/invoiceAgendaEvent.service.js';
 import { patientPaymentPositionsByReferenceEvents } from '../services/patientPaymentPosition.service.js';
 import { overlayCurrentPatients } from '../services/currentPatientOverlay.service.js';
+import { boundedInteger, normalizeSearchQuery } from '../../../utils/search.js';
 import {
     DeferredOperatorAssignment,
     InvalidDeferredOperatorReassignmentError,
@@ -461,7 +462,12 @@ export const findAppointmentsForPatientById = asyncHandler(async (req: Request, 
     }
 
     const agendaEvents = await AgendaEvent.schema(schema).findAll({
-        where: { patient: { id: patientId } as any, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
+        where: {
+            [Op.and]: [
+                { [Op.or]: [{ patientId }, { patient: { id: patientId } as any }] },
+                scopeWhere(req, AGENDA_SCOPE_FIELDS)
+            ]
+        }
     });
 
     return sendSuccessResponse(
@@ -669,6 +675,46 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
 
     const updated = await AgendaEvent.schema(schema).findByPk(id);
     return sendSuccessResponse(res, 200, updated, 'Agenda event updated');
+});
+
+/** Bounded lookup used by autocomplete fields that must not depend on the visible calendar range. */
+export const searchAgendaEvents = asyncHandler(async (req: Request, res: Response) => {
+    const schema = req.tenantSchema!;
+    const patientId = String(req.query.patientId ?? '').trim();
+    if (patientId && !UUID_REGEX.test(patientId)) {
+        return sendErrorResponse(res, 400, 'Invalid patientId');
+    }
+
+    const limit = boundedInteger(req.query.limit, 20, 1, 50);
+    const patientCondition = patientId
+        ? { [Op.or]: [{ patientId }, { patient: { id: patientId } as any }] }
+        : {};
+    const rows = await AgendaEvent.schema(schema).findAll({
+        where: { [Op.and]: [scopeWhere(req, AGENDA_SCOPE_FIELDS), patientCondition] },
+        order: [['start', 'DESC']],
+        limit: 250
+    });
+    const query = normalizeSearchQuery(req.query.query);
+    const tokens = query ? query.split(' ') : [];
+    const decorated = await withInvoiceStatus(schema, rows);
+    const matches = decorated.filter((event) => {
+        if (!tokens.length) return true;
+        const patient = event.patient ?? {};
+        const start = event.start ? new Date(event.start) : null;
+        const date = start && Number.isFinite(start.getTime())
+            ? start.toLocaleDateString('it-IT', { timeZone: 'Europe/Rome' })
+            : '';
+        const haystack = normalizeSearchQuery([
+            event.title,
+            date,
+            patient.name,
+            patient.surname,
+            patient.fiscalCode
+        ].filter(Boolean).join(' '));
+        return tokens.every((token) => haystack.includes(token));
+    }).slice(0, limit);
+
+    return sendSuccessResponse(res, 200, { agendaEvents: matches }, 'Agenda events searched');
 });
 
 /**
@@ -1093,6 +1139,7 @@ export default {
     reassignDeferredOperatorEvents,
     findAgendaEventsByUsers,
     findAppointmentsForPatientById,
+    searchAgendaEvents,
     updateAgendaEvent,
     updateAppointmentPayment,
     completeAppointmentIfUntouched,

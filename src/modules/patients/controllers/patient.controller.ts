@@ -8,6 +8,7 @@ import { PatientPortalAccess, Structure, StructureUser } from '../../auth/models
 import { localStorageAdapter } from '../../measurements/storage/localStorageAdapter.js';
 import Patient, { PATIENT_COLORS } from '../models/patient.model.js';
 import EventType from '../../agenda/models/eventType.model.js';
+import { boundedInteger, normalizeSearchQuery, searchTokens } from '../../../utils/search.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -149,6 +150,60 @@ function activePatientWhere(req: Request): Record<string | symbol, unknown> {
     };
 }
 
+function fiscalCodePresent(): Record<string | symbol, unknown> {
+    return {
+        [Op.and]: [
+            { fiscalCode: { [Op.ne]: null } },
+            sequelizeWhere(fn('btrim', col('fiscalCode')), Op.ne, '')
+        ]
+    };
+}
+
+function fiscalCodeMissing(): Record<string | symbol, unknown> {
+    return {
+        [Op.or]: [
+            { fiscalCode: null },
+            sequelizeWhere(fn('btrim', col('fiscalCode')), Op.eq, '')
+        ]
+    };
+}
+
+function contactArrayPresent(field: 'emails' | 'phoneNumbers'): Record<string | symbol, unknown> {
+    return sequelizeWhere(fn('cardinality', col(field)), Op.gt, 0) as unknown as Record<string | symbol, unknown>;
+}
+
+function contactArrayMissing(field: 'emails' | 'phoneNumbers'): Record<string | symbol, unknown> {
+    return sequelizeWhere(fn('cardinality', col(field)), Op.eq, 0) as unknown as Record<string | symbol, unknown>;
+}
+
+function patientListWhere(
+    req: Request,
+    value?: unknown,
+    filters: { missingFiscalCode?: string; hasPhone?: string; hasEmail?: string } = {}
+): Record<string | symbol, unknown> {
+    const conditions: Array<Record<string | symbol, unknown>> = [activePatientWhere(req)];
+    for (const token of searchTokens(value)) {
+        const pattern = `%${token}%`;
+        conditions.push({
+            [Op.or]: [
+                sequelizeWhere(fn('LOWER', col('name')), Op.like, pattern),
+                sequelizeWhere(fn('LOWER', col('surname')), Op.like, pattern),
+                sequelizeWhere(fn('LOWER', col('fiscalCode')), Op.like, pattern),
+                sequelizeWhere(fn('LOWER', cast(col('emails'), 'text')), Op.like, pattern),
+                sequelizeWhere(fn('LOWER', cast(col('phoneNumbers'), 'text')), Op.like, pattern)
+            ]
+        });
+    }
+    if (filters.missingFiscalCode === 'true') {
+        conditions.push(fiscalCodeMissing());
+    }
+    if (filters.hasPhone === 'true') conditions.push(contactArrayPresent('phoneNumbers'));
+    if (filters.hasPhone === 'false') conditions.push(contactArrayMissing('phoneNumbers'));
+    if (filters.hasEmail === 'true') conditions.push(contactArrayPresent('emails'));
+    if (filters.hasEmail === 'false') conditions.push(contactArrayMissing('emails'));
+    return { [Op.and]: conditions };
+}
+
 async function resolveWritableStructureId(req: Request): Promise<string | null> {
     const structureId = req.access?.structureId ?? null;
     const tenantId = req.user!.tenants[0].id;
@@ -236,17 +291,34 @@ export const savePatient = asyncHandler(async (req: Request, res: Response) => {
 
 export const findAndCountAll = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { page, size } = req.query as { page?: string; size?: string };
+    const { page, size, query, missingFiscalCode, hasPhone, hasEmail } = req.query as Record<string, string | undefined>;
     const { limit, offset } = getPagination(page, size);
+    const baseWhere = patientListWhere(req, query);
+    const selectedWhere = patientListWhere(req, query, { missingFiscalCode, hasPhone, hasEmail });
 
-    const data = await Patient.schema(schema).findAndCountAll({
-        where: activePatientWhere(req),
-        limit,
-        offset,
-        order: [[fn('lower', col('name')), 'ASC']]
-    });
+    const PatientScoped = Patient.schema(schema);
+    const [data, total, withFiscalCode, withPhone, withoutEmail] = await Promise.all([
+        PatientScoped.findAndCountAll({
+            where: selectedWhere,
+            limit,
+            offset,
+            order: [[fn('lower', col('name')), 'ASC'], [fn('lower', col('surname')), 'ASC']]
+        }),
+        PatientScoped.count({ where: baseWhere }),
+        PatientScoped.count({ where: { [Op.and]: [baseWhere, fiscalCodePresent()] } }),
+        PatientScoped.count({ where: { [Op.and]: [baseWhere, contactArrayPresent('phoneNumbers')] } }),
+        PatientScoped.count({ where: { [Op.and]: [baseWhere, contactArrayMissing('emails')] } })
+    ]);
 
-    return sendSuccessResponse(res, 200, getPagingData(data, page, limit), 'Pazienti caricati correttamente');
+    const payload = getPagingData(data, page, limit) as Record<string, unknown>;
+    payload.summary = {
+        total,
+        withFiscalCode,
+        missingFiscalCode: Math.max(total - withFiscalCode, 0),
+        withPhone,
+        withoutEmail
+    };
+    return sendSuccessResponse(res, 200, payload, 'Pazienti caricati correttamente');
 });
 
 export const findAll = asyncHandler(async (req: Request, res: Response) => {
@@ -272,34 +344,13 @@ export const findOne = asyncHandler(async (req: Request, res: Response) => {
 
 export const searchPatients = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const query = ((req.query.query as string) || '').trim().toLowerCase();
-    const words = query.split(' ').filter(Boolean);
+    const query = normalizeSearchQuery(req.query.query);
+    const limit = boundedInteger(req.query.limit, 20, 1, 50);
 
     const patients = await Patient.schema(schema).findAll({
-        where: {
-            [Op.and]: [
-                activePatientWhere(req),
-                {
-                    [Op.or]: [
-                        sequelizeWhere(fn('LOWER', col('name')), Op.like, `%${query}%`),
-                        sequelizeWhere(fn('LOWER', col('surname')), Op.like, `%${query}%`),
-                        sequelizeWhere(fn('LOWER', col('fiscalCode')), Op.like, `%${query}%`),
-                        sequelizeWhere(fn('LOWER', cast(col('emails'), 'text')), Op.like, `%${query}%`),
-                        sequelizeWhere(fn('LOWER', cast(col('phoneNumbers'), 'text')), Op.like, `%${query}%`),
-                        {
-                            [Op.and]: words.map((word) => ({
-                                [Op.or]: [
-                                    sequelizeWhere(fn('LOWER', col('name')), Op.like, `%${word}%`),
-                                    sequelizeWhere(fn('LOWER', col('surname')), Op.like, `%${word}%`)
-                                ]
-                            }))
-                        }
-                    ]
-                }
-            ]
-        },
-        order: [[fn('lower', col('name')), 'ASC']],
-        limit: 50
+        where: patientListWhere(req, query),
+        order: [[fn('lower', col('name')), 'ASC'], [fn('lower', col('surname')), 'ASC']],
+        limit
     });
 
     return sendSuccessResponse(res, 200, patients, 'Ricerca completata');
