@@ -12,7 +12,7 @@ export const APPOINTMENT_LEDGER_VERSION = '20260907-unify-appointment-payment-le
 export const PATIENT_DEFAULT_EVENT_TYPE_VERSION = '20260908-add-patient-default-event-type';
 export const APPOINTMENT_PRICE_ADJUSTMENTS_VERSION = '20260908-add-appointment-price-adjustments';
 // Increment this whenever the tenant model registry changes, so existing schemas run model sync.
-export const TENANT_MODEL_BASELINE_VERSION = '20260908-tenant-model-baseline-v2';
+export const TENANT_MODEL_BASELINE_VERSION = '20260909-tenant-model-baseline-v3';
 const tenantMigrations: Array<{version: string; module: MigrationModule}> = [
     {version: APPOINTMENT_LEDGER_VERSION, module: require('../../migrations/20260907-unify-appointment-payment-ledger.js')},
     {version: PATIENT_DEFAULT_EVENT_TYPE_VERSION, module: require('../../migrations/20260908-add-patient-default-event-type.js')},

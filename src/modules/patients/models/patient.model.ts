@@ -75,6 +75,16 @@ export interface PatientAttributes {
     /** Consenso alla consultazione del FSE da parte di altri operatori sanitari (facoltativo, revocabile). */
     fseConsentViewing?: boolean | null;
     fseConsentDate?: Date | null;
+    // --- Preferenze di contatto per le comunicazioni di servizio (conferme appuntamento, invio fatture) ---
+    // Confermare un appuntamento è esecuzione del contratto (art. 6.1.b GDPR), non marketing: il
+    // consenso non è la base giuridica dell'invio, ma documenta la scelta del canale fatta dal
+    // paziente. Serve soprattutto per WhatsApp, dove il messaggio transita da Meta e il solo
+    // mittente rivela una relazione sanitaria (art. 9).
+    // Tre stati: null = mai chiesto, true = acconsente, false = ha rifiutato.
+    // Solo il rifiuto esplicito blocca l'invio, così le anagrafiche storiche non cambiano comportamento.
+    emailNotificationsConsent?: boolean | null;
+    whatsappNotificationsConsent?: boolean | null;
+    communicationConsentDate?: Date | null;
 }
 
 export type PatientCreationAttributes = Optional<
@@ -126,6 +136,9 @@ export class Patient extends Model<PatientAttributes, PatientCreationAttributes>
     declare fseConsentFeeding: boolean | null;
     declare fseConsentViewing: boolean | null;
     declare fseConsentDate: Date | null;
+    declare emailNotificationsConsent: boolean | null;
+    declare whatsappNotificationsConsent: boolean | null;
+    declare communicationConsentDate: Date | null;
 }
 
 Patient.init(
@@ -176,7 +189,10 @@ Patient.init(
         stsOppositionToDataSending: { type: DataTypes.BOOLEAN, defaultValue: false },
         fseConsentFeeding: { type: DataTypes.BOOLEAN, allowNull: true, defaultValue: null },
         fseConsentViewing: { type: DataTypes.BOOLEAN, allowNull: true, defaultValue: null },
-        fseConsentDate: DataTypes.DATE
+        fseConsentDate: DataTypes.DATE,
+        emailNotificationsConsent: { type: DataTypes.BOOLEAN, allowNull: true, defaultValue: null },
+        whatsappNotificationsConsent: { type: DataTypes.BOOLEAN, allowNull: true, defaultValue: null },
+        communicationConsentDate: DataTypes.DATE
     },
     {
         sequelize,

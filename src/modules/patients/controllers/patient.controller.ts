@@ -74,8 +74,25 @@ const MUTABLE_PATIENT_FIELDS = [
     'stsOppositionToDataSending',
     'fseConsentFeeding',
     'fseConsentViewing',
-    'fseConsentDate'
+    'fseConsentDate',
+    'emailNotificationsConsent',
+    'whatsappNotificationsConsent'
 ] as const;
+
+/**
+ * I consensi di contatto sono a tre stati: `null` = mai chiesto, `true`/`false` = scelta espressa.
+ * Qualunque scelta esplicita aggiorna la data, così resta tracciabile *quando* il paziente
+ * ha deciso. `communicationConsentDate` non è modificabile dal client di proposito.
+ */
+function stampCommunicationConsentDate(
+    payload: Record<string, unknown>,
+    current?: { emailNotificationsConsent?: boolean | null; whatsappNotificationsConsent?: boolean | null }
+): void {
+    const changed = (['emailNotificationsConsent', 'whatsappNotificationsConsent'] as const).some(
+        (field) => typeof payload[field] === 'boolean' && (!current || payload[field] !== current[field])
+    );
+    if (changed) payload.communicationConsentDate = new Date();
+}
 
 function normalizeFiscalCode(value: unknown): string | null {
     if (typeof value !== 'string') return value == null ? null : `${value}`.trim().toUpperCase() || null;
@@ -201,6 +218,7 @@ export const savePatient = asyncHandler(async (req: Request, res: Response) => {
         && !payload.fseConsentDate) {
         payload.fseConsentDate = new Date();
     }
+    stampCommunicationConsentDate(payload);
     const fiscalCode = normalizeFiscalCode(payload.fiscalCode);
     if (await fiscalCodeExists(schema, fiscalCode)) {
         return sendErrorResponse(res, 409, 'Esiste già un paziente con questo codice fiscale');
@@ -324,6 +342,7 @@ export const update = asyncHandler(async (req: Request, res: Response) => {
         || (typeof payload.fseConsentViewing === 'boolean'
             && payload.fseConsentViewing !== currentPatient.fseConsentViewing);
     if (fseChanged) payload.fseConsentDate = new Date();
+    stampCommunicationConsentDate(payload, currentPatient);
     const fiscalCode = Object.prototype.hasOwnProperty.call(payload, 'fiscalCode')
         ? normalizeFiscalCode(payload.fiscalCode)
         : null;

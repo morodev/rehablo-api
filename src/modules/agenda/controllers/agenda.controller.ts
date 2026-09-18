@@ -15,11 +15,13 @@ import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import { appointmentPricesByEvent, snapshotAppointmentPrice } from '../../invoice/services/appointmentPayment.service.js';
 import { updateAppointmentPaymentCompatibility } from './appointmentPayment.controller.js';
 import Patient from '../../patients/models/patient.model.js';
+import { shouldSendAppointmentEmail } from '../../patients/utils/contactConsent.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import TimeOffRequest from '../models/timeOffRequest.model.js';
 import { StructureUser, TenantUser, User } from '../../auth/models/index.js';
 import { getInvoiceAgendaLinksByEventIds, getLinkedInvoiceId } from '../../invoice/services/invoiceAgendaEvent.service.js';
 import { patientPaymentPositionsByReferenceEvents } from '../services/patientPaymentPosition.service.js';
+import { overlayCurrentPatients } from '../services/currentPatientOverlay.service.js';
 import {
     DeferredOperatorAssignment,
     InvalidDeferredOperatorReassignmentError,
@@ -77,6 +79,15 @@ const APPOINTMENT_PAYMENT_MANAGED_FIELDS = [
     'appointmentPaymentHistoryKnown'
 ] as const;
 
+const AGENDA_PATIENT_ATTRIBUTES = [
+    'id', 'name', 'surname', 'placeBirth', 'birthday', 'fiscalCode', 'gender',
+    'work', 'hobby', 'sport', 'title', 'address', 'emails', 'tags', 'phoneNumbers',
+    'color', 'defaultEventTypeId', 'background', 'notes',
+    'privacyConsent', 'privacyConsentDate', 'privacyPolicyVersion',
+    'stsOppositionToDataSending', 'fseConsentFeeding', 'fseConsentViewing', 'fseConsentDate',
+    'emailNotificationsConsent', 'whatsappNotificationsConsent', 'communicationConsentDate'
+] as const;
+
 function removeAttendanceManagedFields(payload: Record<string, any>): void {
     ATTENDANCE_MANAGED_FIELDS.forEach((field) => delete payload[field]);
 }
@@ -94,14 +105,14 @@ function hasOpenMissedArrival(event: AgendaEvent): boolean {
 }
 
 /**
- * Aggiunge al feed dell'agenda soltanto lo stato necessario alla UI.
+ * Aggiunge al feed lo stato necessario alla UI e sovrappone l'anagrafica corrente.
  * Le fatture vengono lette in blocco: una query per il feed, mai una query per appuntamento.
  */
 async function withInvoiceStatus(
     schema: string,
     agendaEvents: AgendaEvent[]
 ): Promise<Record<string, any>[]> {
-    const plainEvents = agendaEvents.map((event) =>
+    let plainEvents = agendaEvents.map((event) =>
         event.get({ plain: true }) as Record<string, any>
     );
     const eventIds = plainEvents.map((event) => event.id as string).filter(Boolean);
@@ -125,13 +136,14 @@ async function withInvoiceStatus(
         patientIds.length
             ? Patient.schema(schema).findAll({
                 where: { id: { [Op.in]: patientIds } },
-                attributes: ['id', 'color']
+                attributes: [...AGENDA_PATIENT_ATTRIBUTES]
             })
             : Promise.resolve([])
     ]);
     const linkedInvoiceByEventId = new Map(links.map((link) => [link.agendaEventId, link.invoiceId]));
-    const colorByPatientId = new Map(
-        patients.map((patient) => [patient.id, patient.color ?? null] as const)
+    plainEvents = overlayCurrentPatients(
+        plainEvents,
+        patients.map((patient) => patient.get({plain: true}) as Record<string, any>)
     );
     plainEvents.forEach((event) => {
         event.invoiceId = event.invoiceId ?? linkedInvoiceByEventId.get(event.id) ?? null;
@@ -139,16 +151,6 @@ async function withInvoiceStatus(
         event.appointmentExpectedAmount = price?.amount ?? null;
         event.appointmentPriceSource = price?.source ?? null;
         event.appointmentPriceEstimated = price?.estimated ?? true;
-
-        // Il nome resta lo snapshot dell'appuntamento, mentre il colore è una preferenza
-        // corrente dell'anagrafica: una modifica deve riflettersi anche sugli eventi esistenti.
-        const patient = event.patient && typeof event.patient === 'object'
-            ? event.patient as Record<string, unknown>
-            : null;
-        const patientId = (event.patientId ?? patient?.id) as string | null | undefined;
-        if (patient && patientId && colorByPatientId.has(patientId)) {
-            event.patient = {...patient, color: colorByPatientId.get(patientId) ?? null};
-        }
     });
     const invoiceIds = Array.from(new Set(
         plainEvents
@@ -523,13 +525,21 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
     const agendaEvent = await AgendaEvent.schema(schema).create(payload);
 
     const patient: any = agendaEvent.get('patient');
-    if (patient?.emails?.length > 0 && patient.emails[0]?.email) {
-        // Fire-and-forget: un SMTP non configurato/irraggiungibile non deve far fallire la
-        // creazione dell'appuntamento (già salvato correttamente a DB), stessa logica usata
-        // per signup/forgot-password in email.service.ts.
-        sendNewEventMail(agendaEvent.get({ plain: true })).catch((err) => {
-            console.error('[saveAgendaEvent] notification email could not be sent:', err);
+    if (patient?.id) {
+        // Il consenso si legge dall'anagrafica viva e non dallo snapshot dell'evento: una
+        // revoca deve avere effetto sul primo appuntamento successivo, non dal prossimo
+        // aggiornamento dei dati.
+        const consentRow = await Patient.schema(schema).findByPk(patient.id, {
+            attributes: ['emailNotificationsConsent']
         });
+        if (shouldSendAppointmentEmail(patient, consentRow?.get('emailNotificationsConsent'))) {
+            // Fire-and-forget: un SMTP non configurato/irraggiungibile non deve far fallire la
+            // creazione dell'appuntamento (già salvato correttamente a DB), stessa logica usata
+            // per signup/forgot-password in email.service.ts.
+            sendNewEventMail(agendaEvent.get({ plain: true })).catch((err) => {
+                console.error('[saveAgendaEvent] notification email could not be sent:', err);
+            });
+        }
     }
 
     return sendSuccessResponse(res, 201, agendaEvent, 'Agenda event created');
