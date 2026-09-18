@@ -1,3 +1,5 @@
+import { invoiceBreakdown } from './invoiceBreakdown.js';
+
 /**
  * Funzioni pure del link di consegna della fattura.
  *
@@ -33,6 +35,13 @@ export interface PublicInvoicePayload {
     invoiceVAT: number | null;
     invoiceTotal: number | null;
     invoiceNet: number | null;
+    adjustedSubtotal: number;
+    appointmentDiscountTotal: number;
+    documentDiscountTotal: number;
+    discountTotal: number;
+    rivalsAmount: number;
+    taxWithholdingAmount: number;
+    stampChargedAmount: number;
     isStamp: boolean;
     stampAmount: number | null;
     stampChargedToPatient: boolean;
@@ -68,6 +77,7 @@ export function buildPublicInvoicePayload(
     patient?: Record<string, any> | null
 ): PublicInvoicePayload {
     const issuer = invoice.issuer as Record<string, any> | null | undefined;
+    const breakdown = invoiceBreakdown(invoice);
 
     return {
         id: String(invoice.id),
@@ -82,12 +92,14 @@ export function buildPublicInvoicePayload(
         invoiceVAT: asNumber(invoice.invoiceVAT),
         invoiceTotal: asNumber(invoice.invoiceTotal),
         invoiceNet: asNumber(invoice.invoiceNet),
+        ...breakdown,
         isStamp: !!invoice.isStamp,
         stampAmount: asNumber(invoice.stampAmount),
         stampChargedToPatient: !!invoice.stampChargedToPatient,
         // Serve solo a marcare come "annullato" un documento stornato: senza, il paziente
         // potrebbe presentare al commercialista una fattura che non è più valida.
-        paymentStatus: asString(invoice.paymentStatus ?? invoice.status),
+        paymentStatus: String(invoice.status ?? '').toLowerCase() === 'void'
+            || invoice.paymentStatus === 'void' ? 'void' : null,
         fiscalNotes: Array.isArray(invoice.fiscalNotes) ? invoice.fiscalNotes.map(String) : [],
         issuer: issuer
             ? {

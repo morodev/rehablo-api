@@ -1,11 +1,12 @@
 import { Op, Transaction } from 'sequelize';
 import Invoice from '../models/invoice.model.js';
 import InvoicePayment from '../models/invoicePayment.model.js';
+import { decorateInvoiceWithBreakdown } from '../utils/invoiceBreakdown.js';
 
 export interface InvoicePaymentSummary {
     paidAmount: number;
     balance: number;
-    paymentStatus: 'unpaid' | 'partial' | 'paid' | 'void';
+    paymentStatus: 'unpaid' | 'partial' | 'paid' | 'void' | 'not_applicable';
     hasUndatedLegacyPayments: boolean;
 }
 
@@ -16,9 +17,13 @@ export function summarizeInvoicePayments(
     payments: Array<{ amount?: unknown; status?: unknown; paidAt?: unknown; source?: unknown }>
 ): InvoicePaymentSummary {
     const posted = payments.filter((payment) => payment.status === 'POSTED');
-    if (String(invoice.status ?? '').toLowerCase() === 'void' || invoice.documentType === 'nota_di_credito') {
+    if (String(invoice.status ?? '').toLowerCase() === 'void') {
         return { paidAmount: money(posted.reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0)),
             balance: 0, paymentStatus: 'void', hasUndatedLegacyPayments: posted.some(payment => !payment.paidAt) };
+    }
+    if (invoice.documentType === 'nota_di_credito') {
+        return { paidAmount: money(posted.reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0)),
+            balance: 0, paymentStatus: 'not_applicable', hasUndatedLegacyPayments: posted.some(payment => !payment.paidAt) };
     }
     const total = Math.max(money(invoice.invoiceNet ?? invoice.invoiceTotal), 0);
     // Deployment compatibility: before the tenant migration has run, an old `paid` invoice has
@@ -73,7 +78,7 @@ export async function decorateInvoicesWithPayments(
 ): Promise<Array<Record<string, any>>> {
     const invoices = invoiceRows.map((invoice) => invoice.get({ plain: true }) as Record<string, any>);
     const summaries = await getPaymentSummaries(schema, invoices);
-    return invoices.map((invoice) => ({ ...invoice, ...summaries.get(invoice.id) }));
+    return invoices.map((invoice) => decorateInvoiceWithBreakdown({ ...invoice, ...summaries.get(invoice.id) }));
 }
 
 /** Recomputes the compatibility status field after every posted/voided movement. */
@@ -98,7 +103,7 @@ export async function syncInvoicePaymentStatus(
         invoice.get({ plain: true }) as unknown as Record<string, unknown>,
         payments.map((payment) => payment.get({ plain: true }) as unknown as Record<string, unknown>)
     );
-    if (summary.paymentStatus !== 'void') {
+    if (['unpaid', 'partial', 'paid'].includes(summary.paymentStatus)) {
         await invoice.update({ status: summary.paymentStatus }, { transaction });
     }
     return summary;

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {describe, it} from 'node:test';
-import {invoiceEmissionMonth, parseInvoiceMonthFilter} from './invoiceFilters.js';
+import {invoiceEmissionMonth, invoicePaymentMonth, parseInvoiceMonthFilter} from './invoiceFilters.js';
 
 describe('invoice list month filter', () => {
     it('treats missing and explicit "all" values as no restriction', () => {
@@ -28,5 +28,11 @@ describe('invoice list month filter', () => {
         assert.equal(invoiceEmissionMonth('2026-09-14'), '2026-09');
         assert.equal(invoiceEmissionMonth('2026-09-14T10:00:00.000Z'), '2026-09');
         assert.equal(invoiceEmissionMonth(null), '');
+    });
+
+    it('attributes cash to the payment month independently from invoice emission', () => {
+        assert.equal(invoiceEmissionMonth('2026-08-31'), '2026-08');
+        assert.equal(invoicePaymentMonth('2026-09-01'), '2026-09');
+        assert.equal(invoicePaymentMonth(null), '');
     });
 });

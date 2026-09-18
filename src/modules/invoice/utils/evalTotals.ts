@@ -164,9 +164,11 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
     let taxWithholdingValue = 0;
     if (invoiceFields.isTaxWithholding) {
         const taxWithholding = invoiceFields.taxWithholding || 0;
+        // La ritenuta si applica all'imponibile dopo lo sconto documento. La rivalsa INPS
+        // concorre alla base; il contributo integrativo di cassa (isCashPro) ne resta escluso.
         taxWithholdingValue = invoiceFields.isCashPro
-            ? (totalSellingPrice * taxWithholding) / 100
-            : ((totalSellingPrice + totalRivals) * taxWithholding) / 100;
+            ? (totalDiscSellingPrice * taxWithholding) / 100
+            : ((totalDiscSellingPrice + totalRivals) * taxWithholding) / 100;
     }
 
     taxWithholdingValue = money(taxWithholdingValue);

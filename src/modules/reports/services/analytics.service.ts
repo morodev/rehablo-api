@@ -530,3 +530,11 @@ export function percentageChange(current: number, previous: number): number | nu
     if (previous === 0) return current === 0 ? 0 : null;
     return Math.round(((current - previous) / Math.abs(previous)) * 10_000) / 100;
 }
+
+/** Ripartisce solo lo sconto documento: le righe hanno già il prezzo concordato della seduta. */
+export function documentDiscountRatio(discountedSubtotal: unknown, storedLineSubtotal: unknown): number {
+    const subtotal = Number(storedLineSubtotal);
+    if (!Number.isFinite(subtotal) || subtotal <= 0) return 1;
+    const discounted = Number(discountedSubtotal);
+    return Number.isFinite(discounted) ? Math.min(Math.max(discounted, 0) / subtotal, 1) : 1;
+}

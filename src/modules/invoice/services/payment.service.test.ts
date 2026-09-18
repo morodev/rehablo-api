@@ -69,6 +69,17 @@ describe('summarizeInvoicePayments', () => {
         });
     });
 
+    it('marks credit notes as not applicable without treating them as void documents', () => {
+        assert.deepEqual(summarizeInvoicePayments(
+            { invoiceTotal: 100, status: 'unpaid', documentType: 'nota_di_credito' }, []
+        ), {
+            paidAmount: 0,
+            balance: 0,
+            paymentStatus: 'not_applicable',
+            hasUndatedLegacyPayments: false
+        });
+    });
+
     it('restores the debt after the last payment is voided, without a legacy fallback', () => {
         assert.deepEqual(summarizeInvoicePayments(
             { invoiceTotal: 100, status: 'paid' },
@@ -345,4 +356,41 @@ describe('invoicing appointment concessions through the HTTP handlers', () => {
             assert.deepEqual(state.tenant.lastDocumentNumberByYear, {});
         });
     }
+
+    it('rejects a 100% document discount before allocating an invoice number', async context => {
+        const state = setup(context, 'DISCOUNT');
+        const response = await state.invoke(saveInvoice, {patientID: patientId, documentType: 'fattura',
+            emissionDate: '2026-01-10', status: 'unpaid', discountType: 'percentage', discountAmount: 100,
+            appointments: [{agendaEventId: eventId, serviceId}]});
+        assert.equal(response.code, 400);
+        assert.match(response.message, /inferiore al 100%/);
+        assert.deepEqual(state.tenant.lastDocumentNumberByYear, {});
+    });
+
+    it('rejects invalid quantities and unsupported line discounts', async context => {
+        const state = setup(context, 'DISCOUNT');
+        const base = {patientID: patientId, documentType: 'fattura', emissionDate: '2026-01-10',
+            status: 'unpaid', agendaEventId: eventId};
+        const quantity = await state.invoke(saveInvoice, {
+            ...base, services: [{id: serviceId, quantity: 0}]
+        });
+        assert.equal(quantity.code, 400);
+        assert.match(quantity.message, /quantità/i);
+        const lineDiscount = await state.invoke(saveInvoice, {
+            ...base, services: [{id: serviceId, quantity: 1, percentageDiscount: 10}]
+        });
+        assert.equal(lineDiscount.code, 400);
+        assert.match(lineDiscount.message, /totale della fattura/i);
+        assert.deepEqual(state.tenant.lastDocumentNumberByYear, {});
+    });
+
+    it('rejects appointment receipts that exceed the discounted invoice net', async context => {
+        const state = setup(context, 'DISCOUNT');
+        const response = await state.invoke(saveInvoice, {patientID: patientId, documentType: 'fattura',
+            emissionDate: '2026-01-10', status: 'unpaid', discountType: 'value', discountAmount: 5,
+            appointments: [{agendaEventId: eventId, serviceId}]});
+        assert.equal(response.code, 409);
+        assert.match(response.message, /incassi selezionati/i);
+        assert.deepEqual(state.tenant.lastDocumentNumberByYear, {});
+    });
 });

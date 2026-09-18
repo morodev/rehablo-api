@@ -23,7 +23,7 @@ import { normalizeSearchQuery } from '../../../utils/search.js';
 import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
 import { buildFiscalNotes, FiscalProfile, isStampDutyDue, resolveFiscalProfile } from '../utils/fiscalRegime.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
-import { invoiceEmissionMonth, parseInvoiceMonthFilter } from '../utils/invoiceFilters.js';
+import { invoiceEmissionMonth, invoicePaymentMonth, parseInvoiceMonthFilter } from '../utils/invoiceFilters.js';
 import { decorateInvoicesWithPayments, syncInvoicePaymentStatus } from '../services/payment.service.js';
 import { appointmentPricesByEvent, ensureAppointmentPaymentHistory, isValidPaymentDate, linkAppointmentPayments } from '../services/appointmentPayment.service.js';
 
@@ -108,7 +108,19 @@ interface ResolvedInvoiceLine {
 async function resolveCatalogLines(
     requestedLines: Array<{ id?: string; quantity?: number; percentageDiscount?: number; discountAmount?: number }>,
     catalogModel: { findAll: (options: any) => Promise<any[]> }
-): Promise<{ lines: ResolvedInvoiceLine[]; missingId?: string }> {
+): Promise<{ lines: ResolvedInvoiceLine[]; missingId?: string; validationError?: string }> {
+    const invalidQuantity = requestedLines.find((line) =>
+        !Number.isInteger(Number(line?.quantity ?? 1)) || Number(line?.quantity ?? 1) <= 0
+    );
+    if (invalidQuantity) {
+        return { lines: [], validationError: 'La quantità di ogni riga deve essere un numero intero maggiore di zero' };
+    }
+    const unsupportedLineDiscount = requestedLines.find((line) =>
+        Number(line?.percentageDiscount ?? 0) !== 0 || Number(line?.discountAmount ?? 0) !== 0
+    );
+    if (unsupportedLineDiscount) {
+        return { lines: [], validationError: 'Gli sconti si applicano una sola volta al totale della fattura' };
+    }
     const ids = requestedLines.map((l) => l?.id).filter(Boolean);
     const catalogRows = ids.length ? await catalogModel.findAll({ where: { id: ids } }) : [];
     const byId = new Map(catalogRows.map((row) => [row.get('id') as string, row]));
@@ -118,16 +130,24 @@ async function resolveCatalogLines(
         return { lines: [], missingId: missing?.id ?? '(id mancante)' };
     }
 
+    const invalidCatalogPrice = catalogRows.find((row) => {
+        const value = Number(row.get('sellingPrice'));
+        return !Number.isFinite(value) || value < 0;
+    });
+    if (invalidCatalogPrice) {
+        return { lines: [], validationError: 'Il catalogo contiene un prezzo non valido' };
+    }
+
     const lines = requestedLines.map((requested) => {
         const catalog = byId.get(requested.id as string)!;
         return {
             id: requested.id as string,
-            quantity: requested.quantity ?? 1,
-            unitPrice: Number(catalog.get('sellingPrice')) || 0,
+            quantity: Number(requested.quantity ?? 1),
+            unitPrice: Number(catalog.get('sellingPrice')),
             vat: (catalog.get('productVat') as string | null) ?? null,
             name: (catalog.get('name') as string | null) ?? null,
-            percentageDiscount: requested.percentageDiscount ?? null,
-            discountAmount: requested.discountAmount ?? null
+            percentageDiscount: null,
+            discountAmount: null
         };
     });
 
@@ -152,6 +172,43 @@ function invoiceLocalDate(value: Date): string {
     const parts = invoiceDateFormatter.formatToParts(value);
     const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
     return `${byType.year}-${byType.month}-${byType.day}`;
+}
+
+function validateFinancialInput(
+    invoiceFields: Record<string, any>,
+    evalLines: { products: Array<{sellingPrice: number; quantity?: number | null}>;
+        services: Array<{sellingPrice: number; quantity?: number | null}> },
+    totals?: EvalTotalsResult
+): string | null {
+    const discountType = invoiceFields.discountType;
+    if (discountType != null && discountType !== '' && !['percentage', 'value'].includes(discountType)) {
+        return 'Tipo di sconto non valido';
+    }
+    const discountAmount = Number(invoiceFields.discountAmount ?? 0);
+    if (!Number.isFinite(discountAmount) || discountAmount < 0) return 'Importo dello sconto non valido';
+    const adjustedSubtotal = money([...evalLines.products, ...evalLines.services].reduce(
+        (sum, line) => sum + Number(line.sellingPrice) * Number(line.quantity ?? 1), 0
+    ));
+    if (discountAmount > 0 && !['percentage', 'value'].includes(discountType)) {
+        return 'Seleziona se lo sconto è percentuale o in valore';
+    }
+    if (discountType === 'percentage' && discountAmount >= 100) {
+        return 'Lo sconto percentuale deve essere inferiore al 100%';
+    }
+    if (discountType === 'value' && discountAmount >= adjustedSubtotal) {
+        return 'Lo sconto deve essere inferiore all’imponibile della fattura';
+    }
+    const validRate = (enabled: unknown, value: unknown) => !enabled
+        || (Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 100);
+    if (!validRate(invoiceFields.isRivals, invoiceFields.rivals)) return 'Aliquota rivalsa non valida';
+    if (!validRate(invoiceFields.isTaxWithholding, invoiceFields.taxWithholding)) return 'Aliquota ritenuta non valida';
+    if (invoiceFields.isStamp && (!Number.isFinite(Number(invoiceFields.stampAmount)) || Number(invoiceFields.stampAmount) <= 0)) {
+        return 'Importo della marca da bollo non valido';
+    }
+    if (totals && (totals.invoiceTotal <= 0 || totals.invoiceNet <= 0)) {
+        return 'Il totale e il netto della fattura devono essere maggiori di zero';
+    }
+    return null;
 }
 
 const money = (value: unknown): number => Math.round((Number(value) || 0) * 100) / 100;
@@ -431,6 +488,10 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         structureId: _clientStructureId,
         ...invoiceFields
     } = req.body;
+    if ((req.body.products !== undefined && !Array.isArray(req.body.products))
+        || (req.body.services !== undefined && !Array.isArray(req.body.services))) {
+        return sendErrorResponse(res, 400, 'Le righe prodotto e servizio devono essere elenchi validi');
+    }
     const requestedPaymentDate = paymentDate ?? String(invoiceFields.emissionDate ?? invoiceLocalDate(new Date())).slice(0, 10);
     if (String(requestedStatus ?? '').toLowerCase() === 'paid' && invoiceFields.documentType !== 'nota_di_credito'
         && !isValidPaymentDate(requestedPaymentDate)) {
@@ -481,11 +542,17 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         ]
         : requestedServices;
 
-    const [{ lines: productLines, missingId: missingProductId }, { lines: serviceLines, missingId: missingServiceId }] =
+    const [resolvedProducts, resolvedServices] =
         await Promise.all([
             resolveCatalogLines(requestedProducts, ProductScoped),
             resolveCatalogLines(servicesWithAppointments, ServiceScoped)
         ]);
+    const { lines: productLines, missingId: missingProductId } = resolvedProducts;
+    const { lines: serviceLines, missingId: missingServiceId } = resolvedServices;
+
+    if (resolvedProducts.validationError || resolvedServices.validationError) {
+        return sendErrorResponse(res, 400, resolvedProducts.validationError ?? resolvedServices.validationError!);
+    }
 
     if (missingProductId) {
         return sendErrorResponse(res, 400, `Prodotto non trovato nel catalogo: ${missingProductId}`);
@@ -520,6 +587,16 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         invoiceFields,
         evalLines: { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) }
     });
+    const initialFinancialError = validateFinancialInput(
+        invoiceFields,
+        { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) },
+        fiscal.totals
+    );
+    // Con gli appuntamenti il prezzo definitivo viene applicato dentro la transazione; la stessa
+    // validazione viene quindi ripetuta dopo aver acquisito e bloccato gli snapshot delle sedute.
+    if (initialFinancialError && agendaEventIds.length === 0) {
+        return sendErrorResponse(res, 400, initialFinancialError);
+    }
 
     // --- Adempimenti fiscali: numerazione progressiva senza "buchi" per anno fiscale, e
     // verifica automatica dell'eventuale opposizione del paziente all'invio Sistema TS. ---
@@ -679,6 +756,12 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                 profile: fiscalProfile, invoiceFields,
                 evalLines: { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) }
             });
+            const financialError = validateFinancialInput(
+                invoiceFields,
+                { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) },
+                fiscal.totals
+            );
+            if (financialError) return { kind: 'invalid-financials', message: financialError } as const;
             const appointmentPaidTotal = money(
                 appointmentPayments.reduce((sum, payment) => sum + Number(payment.amount), 0)
             );
@@ -864,6 +947,9 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             { availableAt: transactionResult.availableAt }
         );
     }
+    if (transactionResult.kind === 'invalid-financials') {
+        return sendErrorResponse(res, 400, transactionResult.message);
+    }
     if (transactionResult.kind === 'appointment-overpayment') {
         return sendErrorResponse(
             res,
@@ -888,7 +974,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
 
 export const findAllInvoices = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped, InvoiceAgendaEventScoped } = getScopedModels(schema);
+    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped, InvoicePaymentScoped, InvoiceAgendaEventScoped } = getScopedModels(schema);
 
     const page = Math.max(parseInt((req.query.page as string) ?? '1', 10) || 1, 1);
     const size = Math.min(Math.max(parseInt((req.query.size as string) ?? '10', 10) || 10, 1), 100);
@@ -919,9 +1005,8 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
     const allInvoices = await attachInvoicePatients(schema, await decorateInvoicesWithPayments(schema, rows));
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Rome' });
     const next7 = new Date(Date.parse(`${today}T12:00:00.000Z`) + 7 * 86_400_000).toISOString().slice(0, 10);
-    const filtered = allInvoices.filter((invoice) => {
+    const matchesNonMonthFilters = (invoice: Record<string, any>) => {
         if (!invoiceMatchesSearch(invoice, req.query.query)) return false;
-        if (month && invoiceEmissionMonth(invoice.emissionDate) !== month) return false;
         if (paymentState !== 'all' && invoice.paymentStatus !== paymentState) return false;
         if (dueState === 'all') return true;
         if (invoice.balance <= 0 || invoice.paymentStatus === 'void') return false;
@@ -931,19 +1016,46 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
         if (dueState === 'overdue') return due < today;
         if (dueState === 'today') return due === today;
         return due > today && due <= next7;
-    });
+    };
+    // Il mese della lista riguarda l'emissione; per gli incassi lo stesso mese viene applicato a
+    // paidAt, così un saldo di settembre resta in settembre anche per una fattura di agosto.
+    const cashScopeInvoices = allInvoices.filter(matchesNonMonthFilters);
+    const filtered = cashScopeInvoices.filter((invoice) =>
+        !month || invoiceEmissionMonth(invoice.emissionDate) === month
+    );
     const aggregates = filtered.reduce(
         (totals, invoice) => {
-            if (invoice.paymentStatus !== 'void') {
+            if (invoice.status !== 'void' && invoice.paymentStatus !== 'void') {
                 const sign = invoice.documentType === 'nota_di_credito' ? -1 : 1;
                 totals.billedTotal += sign * (Number(invoice.invoiceTotal) || 0);
-                totals.paidAmount += Number(invoice.paidAmount) || 0;
                 if (sign > 0) totals.balance += Number(invoice.balance) || 0;
             }
+            totals.paidAmount += Number(invoice.paidAmount) || 0;
             return totals;
         },
-        { billedTotal: 0, paidAmount: 0, balance: 0 }
+        { billedTotal: 0, paidAmount: 0, balance: 0, collectedInPeriod: 0, undatedPaidAmount: 0 }
     );
+    const cashScopeIds = cashScopeInvoices.map(invoice => invoice.id);
+    const paymentRows = cashScopeIds.length ? await InvoicePaymentScoped.findAll({
+        where: { invoiceId: { [Op.in]: cashScopeIds }, status: 'POSTED' },
+        attributes: ['invoiceId', 'amount', 'paidAt']
+    }) : [];
+    const invoicesWithUndatedMovements = new Set<string>();
+    paymentRows.forEach(row => {
+        const payment = row.get({ plain: true }) as Record<string, any>;
+        const paidAt = payment.paidAt ? String(payment.paidAt).slice(0, 10) : null;
+        if (!paidAt) {
+            aggregates.undatedPaidAmount += Number(payment.amount) || 0;
+            invoicesWithUndatedMovements.add(payment.invoiceId);
+        } else if (!month || invoicePaymentMonth(paidAt) === month) {
+            aggregates.collectedInPeriod += Number(payment.amount) || 0;
+        }
+    });
+    cashScopeInvoices.forEach(invoice => {
+        if (invoice.hasUndatedLegacyPayments && !invoicesWithUndatedMovements.has(invoice.id)) {
+            aggregates.undatedPaidAmount += Number(invoice.paidAmount) || 0;
+        }
+    });
     Object.keys(aggregates).forEach((key) => {
         aggregates[key as keyof typeof aggregates] = Math.round(aggregates[key as keyof typeof aggregates] * 100) / 100;
     });
@@ -1053,6 +1165,10 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
         status: requestedStatus,
         ...invoiceFields
     } = body;
+    if ((requestedProducts !== undefined && !Array.isArray(requestedProducts))
+        || (requestedServices !== undefined && !Array.isArray(requestedServices))) {
+        return sendErrorResponse(res, 400, 'Le righe prodotto e servizio devono essere elenchi validi');
+    }
     // Derived balances/totals and the debtor/document identity cannot be patched directly.
     for (const field of ['invoiceTotal', 'invoiceNet', 'invoiceVAT', 'sellingPrice', 'discSellingPrice',
         'paidAmount', 'balance', 'paymentStatus', 'id', 'createdAt', 'updatedAt']) delete invoiceFields[field];
@@ -1123,13 +1239,16 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
     };
 
     if (shouldReplaceLines) {
-        const [
-            { lines: productLines, missingId: missingProductId },
-            { lines: serviceLines, missingId: missingServiceId }
-        ] = await Promise.all([
+        const [resolvedProducts, resolvedServices] = await Promise.all([
             resolveCatalogLines(requestedProducts ?? [], ProductScoped),
             resolveCatalogLines(requestedServices ?? [], ServiceScoped)
         ]);
+        const { lines: productLines, missingId: missingProductId } = resolvedProducts;
+        const { lines: serviceLines, missingId: missingServiceId } = resolvedServices;
+
+        if (resolvedProducts.validationError || resolvedServices.validationError) {
+            return sendErrorResponse(res, 400, resolvedProducts.validationError ?? resolvedServices.validationError!);
+        }
 
         if (missingProductId) {
             return sendErrorResponse(res, 400, `Prodotto non trovato nel catalogo: ${missingProductId}`);
@@ -1149,24 +1268,32 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
             taxRegime: issuerSnapshot?.taxRegime ?? (issuerTenant?.get('taxRegime') as string | null)
         });
 
+        const mergedFinancialFields = {
+            discountType: invoiceFields.discountType ?? existingInvoice.get('discountType'),
+            discountAmount: invoiceFields.discountAmount ?? existingInvoice.get('discountAmount'),
+            isRivals: invoiceFields.isRivals ?? existingInvoice.get('isRivals'),
+            rivals: invoiceFields.rivals ?? existingInvoice.get('rivals'),
+            isCashPro: invoiceFields.isCashPro ?? existingInvoice.get('isCashPro'),
+            isTaxWithholding: invoiceFields.isTaxWithholding ?? existingInvoice.get('isTaxWithholding'),
+            taxWithholding: invoiceFields.taxWithholding ?? existingInvoice.get('taxWithholding'),
+            vatNature: invoiceFields.vatNature ?? existingInvoice.get('vatNature'),
+            isStamp: invoiceFields.isStamp ?? existingInvoice.get('isStamp'),
+            stampAmount: invoiceFields.stampAmount ?? existingInvoice.get('stampAmount'),
+            stampChargedToPatient:
+                invoiceFields.stampChargedToPatient ?? existingInvoice.get('stampChargedToPatient')
+        };
         const fiscal = applyFiscalRules({
             profile,
-            invoiceFields: {
-                discountType: invoiceFields.discountType ?? existingInvoice.get('discountType'),
-                discountAmount: invoiceFields.discountAmount ?? existingInvoice.get('discountAmount'),
-                isRivals: invoiceFields.isRivals ?? existingInvoice.get('isRivals'),
-                rivals: invoiceFields.rivals ?? existingInvoice.get('rivals'),
-                isCashPro: invoiceFields.isCashPro ?? existingInvoice.get('isCashPro'),
-                isTaxWithholding: invoiceFields.isTaxWithholding ?? existingInvoice.get('isTaxWithholding'),
-                taxWithholding: invoiceFields.taxWithholding ?? existingInvoice.get('taxWithholding'),
-                vatNature: invoiceFields.vatNature ?? existingInvoice.get('vatNature'),
-                isStamp: invoiceFields.isStamp ?? existingInvoice.get('isStamp'),
-                stampAmount: invoiceFields.stampAmount ?? existingInvoice.get('stampAmount'),
-                stampChargedToPatient:
-                    invoiceFields.stampChargedToPatient ?? existingInvoice.get('stampChargedToPatient')
-            },
+            invoiceFields: mergedFinancialFields,
             evalLines: { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) }
         });
+
+        const financialError = validateFinancialInput(
+            mergedFinancialFields,
+            { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) },
+            fiscal.totals
+        );
+        if (financialError) return sendErrorResponse(res, 400, financialError);
 
         if (fiscal.totals.invoiceNet + 0.001 < postedPaidAmount) {
             return sendErrorResponse(

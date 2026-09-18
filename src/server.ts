@@ -61,14 +61,15 @@ async function bootstrap() {
 
     app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+    // Keep the anonymous share endpoint before root-mounted authenticated routers.
+    app.use(invoiceShareRoutes);
+
 
     // --- Domain routers (every module owns its own URL prefix-free routes, mounted at root) ---
     app.use(authRoutes);
     app.use(patientPortalRoutes);
     app.use(patientRoutes);
     app.use(productsServicesRoutes);
-    // Prima del router fatture, che invece richiede l'autenticazione su tutte le sue rotte.
-    app.use(invoiceShareRoutes);
     app.use(invoiceRoutes);
     app.use(agendaRoutes);
     app.use(configurationRoutes);

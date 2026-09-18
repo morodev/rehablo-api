@@ -41,6 +41,22 @@ describe('evalTotals fiscal options', () => {
         assert.equal(totals.sellingPrice, 280);
         assert.equal(totals.invoiceTotal, 280);
     });
+
+    it('calculates withholding on the discounted base including INPS rivals', () => {
+        const totals = evalTotals({ services: [service], discountType: 'percentage', discountAmount: 10,
+            isRivals: true, rivals: 4, isTaxWithholding: true, taxWithholding: 20 });
+        assert.equal(totals.rivalsAmount, 3.6);
+        assert.equal(totals.taxWithholdingAmount, 18.72);
+        assert.equal(totals.invoiceTotal, 93.6);
+        assert.equal(totals.invoiceNet, 74.88);
+    });
+
+    it('excludes a professional fund contribution from the withholding base', () => {
+        const totals = evalTotals({ services: [service], discountType: 'percentage', discountAmount: 10,
+            isRivals: true, rivals: 4, isCashPro: true, isTaxWithholding: true, taxWithholding: 20 });
+        assert.equal(totals.taxWithholdingAmount, 18);
+        assert.equal(totals.invoiceNet, 75.6);
+    });
 });
 
 describe('invoicing paid appointment snapshots', () => {

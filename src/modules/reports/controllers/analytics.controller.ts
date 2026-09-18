@@ -17,6 +17,7 @@ import {
     AnalyticsQuery,
     AnalyticsQueryError,
     comparisonRange,
+    documentDiscountRatio,
     localDateKey,
     loadOccurrences,
     parseAnalyticsQuery,
@@ -291,6 +292,17 @@ export const getCatalog = asyncHandler(async (req: Request, res: Response) => {
         InvoiceService.schema(schema).findAll({ where: { InvoiceId: { [Op.in]: ids } } })
     ]) : [[], []];
     const invoiceById = new Map(invoices.map((invoice) => [invoice.id, invoice]));
+    // Le righe contengono già l'eventuale prezzo concordato sulla seduta. Il rapporto deve quindi
+    // distribuire soltanto lo sconto del documento; usare sellingPrice (tariffa originaria)
+    // applicherebbe una seconda volta lo sconto della seduta nei report.
+    const adjustedSubtotalByInvoice = new Map<string, number>();
+    [...products, ...services].forEach(row => {
+        const line = row.get({ plain: true }) as Record<string, any>;
+        adjustedSubtotalByInvoice.set(
+            line.InvoiceId,
+            (adjustedSubtotalByInvoice.get(line.InvoiceId) ?? 0) + (Number(line.totalPrice) || 0)
+        );
+    });
     const billed = new Map<string, { kind: 'PRODUCT' | 'SERVICE'; itemId: string; name: string; quantity: number; netRevenue: number }>();
     const addLine = (line: Record<string, any>, kind: 'PRODUCT' | 'SERVICE') => {
         const invoice = invoiceById.get(line.InvoiceId);
@@ -300,7 +312,8 @@ export const getCatalog = asyncHandler(async (req: Request, res: Response) => {
         const key = `${kind}:${itemId}`;
         const value = billed.get(key) ?? { kind, itemId, name, quantity: 0, netRevenue: 0 };
         const gross = Number(line.totalPrice) || 0;
-        const ratio = Number(invoice.sellingPrice) > 0 ? (Number(invoice.discSellingPrice) || 0) / Number(invoice.sellingPrice) : 1;
+        const adjustedSubtotal = adjustedSubtotalByInvoice.get(invoice.id) ?? 0;
+        const ratio = documentDiscountRatio(invoice.discSellingPrice, adjustedSubtotal);
         const sign = invoice.documentType === 'nota_di_credito' ? -1 : 1;
         value.quantity += sign * (Number(line.quantity) || 0);
         value.netRevenue += sign * gross * ratio;

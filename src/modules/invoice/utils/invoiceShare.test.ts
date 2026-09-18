@@ -45,10 +45,12 @@ test('il payload pubblico espone i dati del documento', () => {
 
     assert.equal(payload.documentNumber, 12);
     assert.equal(payload.invoiceTotal, 100);
+    assert.equal(payload.adjustedSubtotal, 100);
     assert.equal(payload.issuer?.businessName, 'Studio Rossi');
     assert.deepEqual(payload.fiscalNotes, ['Operazione esente IVA art. 10 n. 18']);
     assert.equal(payload.recipient?.name, 'Mario Bianchi');
     assert.equal((payload.services[0] as Record<string, unknown>).serviceName, 'Seduta');
+    assert.equal(payload.paymentStatus, null);
 });
 
 test('il payload pubblico non trasporta i dati gestionali', () => {

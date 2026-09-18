@@ -19,3 +19,8 @@ export function parseInvoiceMonthFilter(value: unknown): string | null {
 export function invoiceEmissionMonth(emissionDate: unknown): string {
     return String(emissionDate ?? '').slice(0, 7);
 }
+
+/** Il mese di incasso viene sempre dalla data del movimento, mai dalla data della fattura. */
+export function invoicePaymentMonth(paidAt: unknown): string {
+    return String(paidAt ?? '').slice(0, 7);
+}

@@ -5,6 +5,7 @@ import {
     ReportOccurrence,
     aggregateActivity,
     comparisonRange,
+    documentDiscountRatio,
     expandRecurringEvent,
     percentageChange
 } from './analytics.service.js';
@@ -122,5 +123,12 @@ describe('analytics no-show accounting', () => {
         assert.equal(result.totals.noShowWaived, 1);
         assert.equal(result.totals.noShowInvoiced, 1);
         assert.equal(result.totals.deliveredMinutes, 0);
+    });
+});
+
+describe('catalog revenue allocation', () => {
+    it('does not apply an appointment concession twice', () => {
+        assert.equal(25 * documentDiscountRatio(25, 25), 25);
+        assert.equal(25 * documentDiscountRatio(20, 25), 20);
     });
 });
