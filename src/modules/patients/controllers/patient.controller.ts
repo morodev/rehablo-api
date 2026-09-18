@@ -346,12 +346,31 @@ export const searchPatients = asyncHandler(async (req: Request, res: Response) =
     const schema = req.tenantSchema!;
     const query = normalizeSearchQuery(req.query.query);
     const limit = boundedInteger(req.query.limit, 20, 1, 50);
+    const relevanceOrder = req.query.order === 'relevance';
 
-    const patients = await Patient.schema(schema).findAll({
+    const candidates = await Patient.schema(schema).findAll({
         where: patientListWhere(req, query),
         order: [[fn('lower', col('name')), 'ASC'], [fn('lower', col('surname')), 'ASC']],
-        limit
+        limit: relevanceOrder ? 250 : limit
     });
+
+    const relevance = (patient: Patient): number => {
+        const name = normalizeSearchQuery(patient.name);
+        const surname = normalizeSearchQuery(patient.surname);
+        const fullName = `${name} ${surname}`.trim();
+        const reverseName = `${surname} ${name}`.trim();
+        if (query === fullName || query === reverseName) return 0;
+        if (fullName.startsWith(query) || reverseName.startsWith(query)) return 1;
+        if (name.startsWith(query) || surname.startsWith(query)) return 2;
+        return 3;
+    };
+    const patients = relevanceOrder
+        ? candidates
+            .sort((left, right) => relevance(left) - relevance(right)
+                || String(left.name ?? '').localeCompare(String(right.name ?? ''), 'it', {sensitivity: 'base'})
+                || String(left.surname ?? '').localeCompare(String(right.surname ?? ''), 'it', {sensitivity: 'base'}))
+            .slice(0, limit)
+        : candidates;
 
     return sendSuccessResponse(res, 200, patients, 'Ricerca completata');
 });

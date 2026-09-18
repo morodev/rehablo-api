@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { Op, fn, col } from 'sequelize';
+import { Op, fn, col, cast, where as sequelizeWhere } from 'sequelize';
 import moment from 'moment';
 import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -22,7 +22,8 @@ import { StructureUser, TenantUser, User } from '../../auth/models/index.js';
 import { getInvoiceAgendaLinksByEventIds, getLinkedInvoiceId } from '../../invoice/services/invoiceAgendaEvent.service.js';
 import { patientPaymentPositionsByReferenceEvents } from '../services/patientPaymentPosition.service.js';
 import { overlayCurrentPatients } from '../services/currentPatientOverlay.service.js';
-import { boundedInteger, normalizeSearchQuery } from '../../../utils/search.js';
+import { boundedInteger, normalizeSearchQuery, searchTokens } from '../../../utils/search.js';
+import {agendaDateBoundary, expandAgendaSearchOccurrences} from '../services/agendaSearch.service.js';
 import {
     DeferredOperatorAssignment,
     InvalidDeferredOperatorReassignmentError,
@@ -40,6 +41,11 @@ import {
  */
 const AGENDA_SCOPE_FIELDS = {
     ownerField: 'calendarId',
+    structureField: 'structureId',
+    includeUnassigned: false
+};
+const PATIENT_SCOPE_FIELDS = {
+    ownerField: 'userId',
     structureField: 'structureId',
     includeUnassigned: false
 };
@@ -677,7 +683,21 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     return sendSuccessResponse(res, 200, updated, 'Agenda event updated');
 });
 
-/** Bounded lookup used by autocomplete fields that must not depend on the visible calendar range. */
+function commaSeparated(value: unknown): string[] {
+    return String(value ?? '').split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function validDateBoundary(value: unknown, endOfDay: boolean): Date | null {
+    if (!value) return null;
+    const text = String(value).trim();
+    const agendaBoundary = agendaDateBoundary(text, endOfDay);
+    if (agendaBoundary) return agendaBoundary;
+    const parsed = moment(text);
+    if (!parsed.isValid()) return null;
+    return (endOfDay ? parsed.endOf('day') : parsed.startOf('day')).toDate();
+}
+
+/** Ricerca paginata indipendente dalla finestra attualmente caricata in agenda. */
 export const searchAgendaEvents = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const patientId = String(req.query.patientId ?? '').trim();
@@ -685,36 +705,145 @@ export const searchAgendaEvents = asyncHandler(async (req: Request, res: Respons
         return sendErrorResponse(res, 400, 'Invalid patientId');
     }
 
-    const limit = boundedInteger(req.query.limit, 20, 1, 50);
-    const patientCondition = patientId
-        ? { [Op.or]: [{ patientId }, { patient: { id: patientId } as any }] }
-        : {};
-    const rows = await AgendaEvent.schema(schema).findAll({
-        where: { [Op.and]: [scopeWhere(req, AGENDA_SCOPE_FIELDS), patientCondition] },
-        order: [['start', 'DESC']],
-        limit: 250
-    });
     const query = normalizeSearchQuery(req.query.query);
-    const tokens = query ? query.split(' ') : [];
-    const decorated = await withInvoiceStatus(schema, rows);
-    const matches = decorated.filter((event) => {
-        if (!tokens.length) return true;
-        const patient = event.patient ?? {};
-        const start = event.start ? new Date(event.start) : null;
-        const date = start && Number.isFinite(start.getTime())
-            ? start.toLocaleDateString('it-IT', { timeZone: 'Europe/Rome' })
-            : '';
-        const haystack = normalizeSearchQuery([
-            event.title,
-            date,
-            patient.name,
-            patient.surname,
-            patient.fiscalCode
-        ].filter(Boolean).join(' '));
-        return tokens.every((token) => haystack.includes(token));
-    }).slice(0, limit);
+    const pagedPatientSearch = req.query.period !== undefined
+        || req.query.page !== undefined
+        || req.query.size !== undefined;
+    if (pagedPatientSearch && !patientId && query.length < 2) {
+        return sendErrorResponse(res, 400, 'Inserisci almeno due caratteri oppure seleziona un paziente');
+    }
 
-    return sendSuccessResponse(res, 200, { agendaEvents: matches }, 'Agenda events searched');
+    const calendarIds = commaSeparated(req.query.calendarIds);
+    const eventTypeIds = commaSeparated(req.query.eventTypeIds);
+    const statuses = commaSeparated(req.query.statuses).map((status) => status.toUpperCase());
+    if ([...calendarIds, ...eventTypeIds].some((id) => !UUID_REGEX.test(id))) {
+        return sendErrorResponse(res, 400, 'Filtro operatore o prestazione non valido');
+    }
+    if (statuses.some((status) => !APPOINTMENT_STATUSES.has(status))) {
+        return sendErrorResponse(res, 400, 'Filtro stato non valido');
+    }
+
+    const period = req.query.period === undefined ? null : String(req.query.period);
+    if (period !== null && period !== 'upcoming' && period !== 'history') {
+        return sendErrorResponse(res, 400, 'Periodo non valido');
+    }
+    const from = validDateBoundary(req.query.from, false);
+    const to = validDateBoundary(req.query.to, true);
+    if ((req.query.from && !from) || (req.query.to && !to) || (from && to && from > to)) {
+        return sendErrorResponse(res, 400, 'Intervallo date non valido');
+    }
+
+    const pageIndex = boundedInteger(req.query.page, 0, 0, 100000);
+    const pageSize = boundedInteger(req.query.size ?? req.query.limit, 20, 1, 50);
+    let matchingPatientIds: string[] = patientId ? [patientId] : [];
+    if (!patientId && query) {
+        const patientConditions: Array<Record<string | symbol, any>> = [
+            scopeWhere(req, PATIENT_SCOPE_FIELDS),
+            {archivedAt: null}
+        ];
+        for (const token of searchTokens(query)) {
+            const pattern = `%${token}%`;
+            patientConditions.push({
+                [Op.or]: [
+                    sequelizeWhere(fn('LOWER', col('name')), Op.like, pattern),
+                    sequelizeWhere(fn('LOWER', col('surname')), Op.like, pattern),
+                    sequelizeWhere(fn('LOWER', col('fiscalCode')), Op.like, pattern),
+                    sequelizeWhere(fn('LOWER', cast(col('emails'), 'text')), Op.like, pattern),
+                    sequelizeWhere(fn('LOWER', cast(col('phoneNumbers'), 'text')), Op.like, pattern)
+                ]
+            });
+        }
+        const matchingPatients = await Patient.schema(schema).findAll({
+            where: {[Op.and]: patientConditions},
+            attributes: ['id'],
+            limit: 50
+        });
+        matchingPatientIds = matchingPatients.map((patient) => patient.id);
+    } else if (patientId) {
+        const patient = await Patient.schema(schema).findOne({
+            where: {id: patientId, archivedAt: null, ...scopeWhere(req, PATIENT_SCOPE_FIELDS)},
+            attributes: ['id']
+        });
+        if (!patient) return sendErrorResponse(res, 404, 'Paziente non trovato');
+    }
+
+    if (pagedPatientSearch && !matchingPatientIds.length) {
+        return sendSuccessResponse(res, 200, {
+            contents: [],
+            agendaEvents: [],
+            pagination: {pageIndex, pageSize, totalItems: 0, totalPages: 0}
+        }, 'Agenda events searched');
+    }
+
+    const conditions: Array<Record<string | symbol, any>> = [scopeWhere(req, AGENDA_SCOPE_FIELDS)];
+    if (patientId || pagedPatientSearch) {
+        conditions.push({
+            [Op.or]: [
+                {patientId: {[Op.in]: matchingPatientIds}},
+                ...matchingPatientIds.map((id) => ({patient: {id} as any}))
+            ]
+        });
+    }
+    if (calendarIds.length) conditions.push({calendarId: {[Op.in]: calendarIds}});
+    if (eventTypeIds.length) conditions.push({eventTypeId: {[Op.in]: eventTypeIds}});
+    if (statuses.length) conditions.push({status: {[Op.in]: statuses}});
+
+    const rows = await AgendaEvent.schema(schema).findAll({
+        where: {[Op.and]: conditions},
+        order: [['start', pagedPatientSearch ? 'ASC' : 'DESC']],
+        ...(!pagedPatientSearch && !patientId && !query ? {limit: 250} : {})
+    });
+    const decorated = await withInvoiceStatus(schema, rows);
+    const recurringIds = rows
+        .filter((row) => !!String(row.get('recurrence') ?? '').trim())
+        .map((row) => row.id);
+    const exceptions = recurringIds.length
+        ? await AgendaEventException.schema(schema).findAll({where: {eventId: {[Op.in]: recurringIds}}})
+        : [];
+    const now = new Date();
+    const queryTokens = query ? query.split(' ') : [];
+    const matches = expandAgendaSearchOccurrences(
+        decorated,
+        exceptions.map((exception) => exception.get({plain: true})),
+        from,
+        to
+    ).filter((event) => {
+        const end = new Date(event.end ?? event.start);
+        if (Number.isNaN(end.getTime())) return false;
+        if (period === 'upcoming' && end < now) return false;
+        if (period === 'history' && end >= now) return false;
+        if (!pagedPatientSearch && queryTokens.length) {
+            const patient = event.patient ?? {};
+            const start = event.start ? new Date(event.start) : null;
+            const date = start && Number.isFinite(start.getTime())
+                ? start.toLocaleDateString('it-IT', {timeZone: 'Europe/Rome'})
+                : '';
+            const haystack = normalizeSearchQuery([
+                event.title,
+                date,
+                patient.name,
+                patient.surname,
+                patient.fiscalCode,
+                JSON.stringify(patient.emails ?? []),
+                JSON.stringify(patient.phoneNumbers ?? [])
+            ].filter(Boolean).join(' '));
+            return queryTokens.every((token) => haystack.includes(token));
+        }
+        return true;
+    }).sort((left, right) => {
+        const difference = new Date(left.start).getTime() - new Date(right.start).getTime();
+        return period === 'upcoming' ? difference : -difference;
+    });
+    const totalItems = matches.length;
+    const totalPages = totalItems ? Math.ceil(totalItems / pageSize) : 0;
+    const contents = matches.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize);
+
+    return sendSuccessResponse(res, 200, {
+        contents,
+        // Contratto mantenuto per l'autocomplete appuntamenti di Note e promemoria.
+        agendaEvents: contents,
+        pagination: {pageIndex, pageSize, totalItems, totalPages}
+    }, 'Agenda events searched');
 });
 
 /**
