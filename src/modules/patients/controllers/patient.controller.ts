@@ -8,6 +8,8 @@ import { PatientPortalAccess, Structure, StructureUser } from '../../auth/models
 import { localStorageAdapter } from '../../measurements/storage/localStorageAdapter.js';
 import Patient, { PATIENT_COLORS } from '../models/patient.model.js';
 import EventType from '../../agenda/models/eventType.model.js';
+import EventTypeStructure from '../../agenda/models/eventTypeStructure.model.js';
+import { itemAvailableInStructure } from '../../products-services/services/structureAvailability.service.js';
 import { boundedInteger, normalizeSearchQuery, searchTokens } from '../../../utils/search.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -460,6 +462,15 @@ export const setDefaultEventType = asyncHandler(async (req: Request, res: Respon
         const eventType = await EventType.schema(schema).findByPk(eventTypeId, { attributes: ['id'] });
         if (!eventType) {
             return sendErrorResponse(res, 404, 'Tipo appuntamento non trovato');
+        }
+        const patientStructureId = typeof patient.get === 'function'
+            ? patient.get('structureId') as string | null
+            : (patient as any).structureId as string | null;
+        const structureId = patientStructureId ?? req.access?.structureId;
+        if (!await itemAvailableInStructure(
+            eventType, EventTypeStructure, schema, 'eventTypeId', structureId
+        )) {
+            return sendErrorResponse(res, 409, 'Il tipo appuntamento non e disponibile nella sede del paziente');
         }
     }
 

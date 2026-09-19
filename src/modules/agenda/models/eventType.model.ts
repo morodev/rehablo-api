@@ -12,22 +12,16 @@ export interface EventTypeAttributes {
     erasable: boolean;
     editable: boolean;
     linkedServiceId?: string | null;
-    /**
-     * Tipo proposto automaticamente quando si crea un appuntamento in agenda.
-     *
-     * Al massimo UNO per tenant: l'unicità è garantita lato server (vedi
-     * `eventType.controller.ts`), non dal client, perché farla con più chiamate HTTP
-     * significherebbe restare con due predefiniti se una delle due fallisse.
-     */
+    /** Flag aggregato legacy; il default operativo e salvato per sede in event_type_structures. */
     isDefault: boolean;
+    availabilityMode: 'ALL' | 'SELECTED';
 }
 
 export type EventTypeCreationAttributes = Optional<
     EventTypeAttributes,
-    'id' | 'icon' | 'duration' | 'color' | 'erasable' | 'editable' | 'isDefault'
+    'id' | 'icon' | 'duration' | 'color' | 'erasable' | 'editable' | 'isDefault' | 'availabilityMode'
 >;
 
-/** Tenant-scoped model: always access through `EventType.schema(req.tenantSchema)`. */
 export class EventType extends Model<EventTypeAttributes, EventTypeCreationAttributes> implements EventTypeAttributes {
     declare id: string;
     declare title: string;
@@ -40,24 +34,25 @@ export class EventType extends Model<EventTypeAttributes, EventTypeCreationAttri
     declare editable: boolean;
     declare linkedServiceId: string | null;
     declare isDefault: boolean;
+    declare availabilityMode: 'ALL' | 'SELECTED';
 }
 
 EventType.init(
     {
-        id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
-        title: { type: DataTypes.STRING, allowNull: false },
+        id: {type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true},
+        title: {type: DataTypes.STRING, allowNull: false},
         description: DataTypes.STRING,
         price: DataTypes.INTEGER,
-        icon: { type: DataTypes.STRING, defaultValue: 'event' },
-        duration: { type: DataTypes.INTEGER, defaultValue: 60, allowNull: false },
-        color: { type: DataTypes.STRING, defaultValue: 'text-green-500' },
-        erasable: { type: DataTypes.BOOLEAN, defaultValue: true },
-        editable: { type: DataTypes.BOOLEAN, defaultValue: true },
-        linkedServiceId: { type: DataTypes.UUID, allowNull: true },
-        isDefault: { type: DataTypes.BOOLEAN, defaultValue: false, allowNull: false }
+        icon: {type: DataTypes.STRING, defaultValue: 'event'},
+        duration: {type: DataTypes.INTEGER, defaultValue: 60, allowNull: false},
+        color: {type: DataTypes.STRING, defaultValue: 'text-green-500'},
+        erasable: {type: DataTypes.BOOLEAN, defaultValue: true},
+        editable: {type: DataTypes.BOOLEAN, defaultValue: true},
+        linkedServiceId: {type: DataTypes.UUID, allowNull: true},
+        isDefault: {type: DataTypes.BOOLEAN, defaultValue: false, allowNull: false},
+        availabilityMode: {type: DataTypes.STRING(16), allowNull: false, defaultValue: 'ALL'}
     },
-    { sequelize, modelName: 'eventType', tableName: 'event_types' }
+    {sequelize, modelName: 'eventType', tableName: 'event_types'}
 );
 
 export default EventType;
-

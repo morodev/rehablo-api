@@ -10,6 +10,9 @@ import InvoiceService from '../models/invoiceService.model.js';
 import InvoicePayment from '../models/invoicePayment.model.js';
 import Product from '../../products-services/models/product.model.js';
 import Service from '../../products-services/models/service.model.js';
+import ProductStructure from '../../products-services/models/productStructure.model.js';
+import ServiceStructure from '../../products-services/models/serviceStructure.model.js';
+import { availabilityWhere } from '../../products-services/services/structureAvailability.service.js';
 import Patient from '../../patients/models/patient.model.js';
 import Tenant from '../../auth/models/tenant.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
@@ -80,6 +83,25 @@ function getScopedModels(schema: string) {
         InvoicePaymentScoped,
         InvoiceAgendaEventScoped
     };
+}
+
+async function unavailableCatalogId(
+    schema: string,
+    ids: string[],
+    catalogModel: any,
+    mappingModel: any,
+    foreignKey: string,
+    structureId: string | null
+): Promise<string | null> {
+    const uniqueIds = [...new Set(ids.filter(Boolean))];
+    if (uniqueIds.length === 0) return null;
+    const scope = await availabilityWhere(mappingModel, schema, foreignKey, structureId);
+    const rows = await catalogModel.findAll({
+        where: {[Op.and]: [{id: {[Op.in]: uniqueIds}, isActive: true}, scope]},
+        attributes: ['id'], raw: true
+    });
+    const available = new Set(rows.map((row: any) => String(row.id)));
+    return uniqueIds.find(id => !available.has(id)) ?? null;
 }
 
 interface ResolvedInvoiceLine {
@@ -622,6 +644,23 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         if (patient.get('stsOppositionToDataSending')) {
             stsExcluded = true;
         }
+    }
+
+    const [unavailableProductId, unavailableServiceId] = await Promise.all([
+        unavailableCatalogId(
+            schema, requestedProducts.map((line: any) => line?.id).filter(Boolean),
+            ProductScoped, ProductStructure, 'productId', invoiceStructureId
+        ),
+        unavailableCatalogId(
+            schema, requestedServices.map((line: any) => line?.id).filter(Boolean),
+            ServiceScoped, ServiceStructure, 'serviceId', invoiceStructureId
+        )
+    ]);
+    if (unavailableProductId) {
+        return sendErrorResponse(res, 409, 'Prodotto non disponibile nella sede selezionata');
+    }
+    if (unavailableServiceId) {
+        return sendErrorResponse(res, 409, 'Servizio non disponibile nella sede selezionata');
     }
 
     // Numerazione progressiva + creazione fattura + creazione righe in un'UNICA transazione:
@@ -1239,6 +1278,31 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
     };
 
     if (shouldReplaceLines) {
+        const [currentProductRows, currentServiceRows] = await Promise.all([
+            InvoiceProductScoped.findAll({where: {InvoiceId: id}, attributes: ['ProductId'], raw: true}),
+            InvoiceServiceScoped.findAll({where: {InvoiceId: id}, attributes: ['ServiceId'], raw: true})
+        ]);
+        const existingProductIds = new Set(currentProductRows.map((row: any) => String(row.ProductId)));
+        const existingServiceIds = new Set(currentServiceRows.map((row: any) => String(row.ServiceId)));
+        const newProductIds = (requestedProducts ?? []).map((line: any) => line?.id)
+            .filter((lineId: string) => lineId && !existingProductIds.has(lineId));
+        const newServiceIds = (requestedServices ?? []).map((line: any) => line?.id)
+            .filter((lineId: string) => lineId && !existingServiceIds.has(lineId));
+        const [unavailableProductId, unavailableServiceId] = await Promise.all([
+            unavailableCatalogId(
+                schema, newProductIds, ProductScoped, ProductStructure, 'productId', existingInvoice.structureId
+            ),
+            unavailableCatalogId(
+                schema, newServiceIds, ServiceScoped, ServiceStructure, 'serviceId', existingInvoice.structureId
+            )
+        ]);
+        if (unavailableProductId) {
+            return sendErrorResponse(res, 409, 'Prodotto non disponibile nella sede della fattura');
+        }
+        if (unavailableServiceId) {
+            return sendErrorResponse(res, 409, 'Servizio non disponibile nella sede della fattura');
+        }
+
         const [resolvedProducts, resolvedServices] = await Promise.all([
             resolveCatalogLines(requestedProducts ?? [], ProductScoped),
             resolveCatalogLines(requestedServices ?? [], ServiceScoped)

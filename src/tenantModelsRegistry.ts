@@ -1,9 +1,10 @@
 import { registerTenantScopedModel } from './utils/tenantSchema.js';
 
 import Patient from './modules/patients/models/patient.model.js';
-import { registerProductsServicesAssociations, Category, Product, Service } from './modules/products-services/models/index.js';
+import { registerProductsServicesAssociations, Category, Product, ProductStructure, Service, ServiceStructure } from './modules/products-services/models/index.js';
 import { registerInvoiceAssociations, Invoice, InvoiceProduct, InvoiceService, InvoicePayment, InvoiceAgendaEvent } from './modules/invoice/models/index.js';
 import EventType from './modules/agenda/models/eventType.model.js';
+import EventTypeStructure from './modules/agenda/models/eventTypeStructure.model.js';
 import AgendaEvent from './modules/agenda/models/agendaEvent.model.js';
 import AgendaEventException from './modules/agenda/models/agendaEventException.model.js';
 import TimeOffRequest from './modules/agenda/models/timeOffRequest.model.js';
@@ -43,6 +44,8 @@ export function registerTenantModels(): void {
     // articularities/strengths/questionnaires/scales/tests associations on top of those models.
     registerEvaluationAssociations();
     registerProductsServicesAssociations();
+    EventType.hasMany(EventTypeStructure, {foreignKey: 'eventTypeId', as: 'structureAvailabilities', onDelete: 'CASCADE'});
+    EventTypeStructure.belongsTo(EventType, {foreignKey: 'eventTypeId'});
     registerInvoiceAssociations();
     registerConfigurationAssociations();
     registerMeasurementAssociations();
@@ -65,13 +68,16 @@ export function registerTenantModels(): void {
     registerTenantScopedModel(PatientPortalAudit);
     registerTenantScopedModel(Category);
     registerTenantScopedModel(Product);
+    registerTenantScopedModel(ProductStructure);
     registerTenantScopedModel(Service);
+    registerTenantScopedModel(ServiceStructure);
     registerTenantScopedModel(Invoice);
     registerTenantScopedModel(InvoiceProduct);
     registerTenantScopedModel(InvoiceService);
     registerTenantScopedModel(InvoicePayment);
     registerTenantScopedModel(InvoiceAgendaEvent);
     registerTenantScopedModel(EventType);
+    registerTenantScopedModel(EventTypeStructure);
     registerTenantScopedModel(AgendaEvent);
     registerTenantScopedModel(AgendaEventException);
     registerTenantScopedModel(TimeOffRequest);

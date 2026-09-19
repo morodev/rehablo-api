@@ -11,6 +11,7 @@ import { sendNewEventMail } from '../../../services/email.service.js';
 import AgendaEvent from '../models/agendaEvent.model.js';
 import AgendaEventException from '../models/agendaEventException.model.js';
 import EventType from '../models/eventType.model.js';
+import EventTypeStructure from '../models/eventTypeStructure.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import { appointmentPricesByEvent, snapshotAppointmentPrice } from '../../invoice/services/appointmentPayment.service.js';
 import { updateAppointmentPaymentCompatibility } from './appointmentPayment.controller.js';
@@ -23,6 +24,7 @@ import { getInvoiceAgendaLinksByEventIds, getLinkedInvoiceId } from '../../invoi
 import { patientPaymentPositionsByReferenceEvents } from '../services/patientPaymentPosition.service.js';
 import { overlayCurrentPatients } from '../services/currentPatientOverlay.service.js';
 import { boundedInteger, normalizeSearchQuery, searchTokens } from '../../../utils/search.js';
+import { itemAvailableInStructure } from '../../products-services/services/structureAvailability.service.js';
 import {agendaDateBoundary, expandAgendaSearchOccurrences} from '../services/agendaSearch.service.js';
 import {
     DeferredOperatorAssignment,
@@ -296,7 +298,9 @@ async function rejectOperatorOutsideStructure(
 
 async function validateAndNormalizeEventType(
     schema: string,
-    event: Record<string, any>
+    event: Record<string, any>,
+    structureId: string | null | undefined,
+    enforceAvailability: boolean
 ): Promise<string | null> {
     if (isLegacyTimeOffEvent(event) || event.eventTypeId === undefined || event.eventTypeId === null) {
         return null;
@@ -309,9 +313,12 @@ async function validateAndNormalizeEventType(
     if (!eventType) {
         return 'Tipo appuntamento non trovato';
     }
+    if (enforceAvailability && !await itemAvailableInStructure(
+        eventType, EventTypeStructure, schema, 'eventTypeId', structureId
+    )) {
+        return 'Il tipo appuntamento non e disponibile nella sede selezionata';
+    }
 
-    // Il titolo resta denormalizzato per la leggibilità dello storico, ma quando
-    // esiste un id il valore autorevole è il tipo salvato nel tenant.
     event.title = eventType.title;
     return null;
 }
@@ -528,7 +535,7 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
     if (await rejectOperatorOutsideStructure(req, res, payload)) return;
     if (await rejectInvalidPatient(res, schema, payload)) return;
 
-    const eventTypeError = await validateAndNormalizeEventType(schema, payload);
+    const eventTypeError = await validateAndNormalizeEventType(schema, payload, payload.structureId, true);
     if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
 
     if (await rejectApprovedTimeOffConflict(res, schema, payload)) return;
@@ -622,7 +629,12 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     }
     event.structureId = req.access?.structureId ?? current.get('structureId');
 
-    const eventTypeError = await validateAndNormalizeEventType(schema, event);
+    const eventTypeChanged = Object.prototype.hasOwnProperty.call(event, 'eventTypeId')
+        && String(event.eventTypeId ?? '') !== String(current.get('eventTypeId') ?? '');
+    const structureChanged = String(event.structureId ?? '') !== String(current.get('structureId') ?? '');
+    const eventTypeError = await validateAndNormalizeEventType(
+        schema, event, event.structureId, eventTypeChanged || structureChanged
+    );
     if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
 
     const candidate = { ...current.get({ plain: true }), ...event };
@@ -1150,11 +1162,16 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
         return sendErrorResponse(res, 409, 'Serie fatturata: modifica non consentita');
     }
 
-    const eventTypeError = await validateAndNormalizeEventType(schema, event);
-    if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
-
     const recurringCandidate = { ...recurringEvent.get({ plain: true }), ...event };
     recurringCandidate.structureId = req.access?.structureId ?? recurringCandidate.structureId;
+    const eventTypeChanged = String(recurringCandidate.eventTypeId ?? '')
+        !== String(recurringEvent.get('eventTypeId') ?? '');
+    const structureChanged = String(recurringCandidate.structureId ?? '')
+        !== String(recurringEvent.get('structureId') ?? '');
+    const eventTypeError = await validateAndNormalizeEventType(
+        schema, event, recurringCandidate.structureId, eventTypeChanged || structureChanged
+    );
+    if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
     if (req.access?.scope === 'own') recurringCandidate.calendarId = req.access.userId;
     if (await rejectOperatorOutsideStructure(req, res, recurringCandidate)) return;
     if (await rejectInvalidPatient(res, schema, recurringCandidate)) return;

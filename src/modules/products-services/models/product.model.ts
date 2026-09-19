@@ -10,20 +10,17 @@ export interface ProductAttributes {
     productVat?: string | null;
     sellingPrice?: number | null;
     purchaseCost?: number | null;
-    /** FK verso `Category` (vedi category.model.ts). UUID, coerente col resto dello schema. */
     categoryId?: string | null;
     description?: string | null;
-    // Soft-delete: un prodotto già usato in fatture emesse non va mai cancellato fisicamente
-    // (le righe storiche in `invoice_products` conservano comunque un proprio snapshot di nome/
-    // prezzo/IVA, ma il riferimento ProductId deve continuare a esistere). "Eliminare" un prodotto
-    // dal catalogo equivale quindi a disattivarlo (`isActive: false`): sparisce dalle liste/ricerche
-    // per le nuove fatture ma resta consultabile per lo storico.
     isActive: boolean;
+    availabilityMode: 'ALL' | 'SELECTED';
 }
 
-export type ProductCreationAttributes = Optional<ProductAttributes, 'id' | 'type' | 'isActive'>;
+export type ProductCreationAttributes = Optional<
+    ProductAttributes,
+    'id' | 'type' | 'isActive' | 'availabilityMode'
+>;
 
-/** Tenant-scoped model: always access through `Product.schema(req.tenantSchema)`. */
 export class Product extends Model<ProductAttributes, ProductCreationAttributes> implements ProductAttributes {
     declare id: string;
     declare type: string;
@@ -36,24 +33,25 @@ export class Product extends Model<ProductAttributes, ProductCreationAttributes>
     declare categoryId: string | null;
     declare description: string | null;
     declare isActive: boolean;
+    declare availabilityMode: 'ALL' | 'SELECTED';
 }
 
 Product.init(
     {
-        id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
-        type: { type: DataTypes.STRING, defaultValue: 'PRODUCT' },
+        id: {type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true},
+        type: {type: DataTypes.STRING, defaultValue: 'PRODUCT'},
         name: DataTypes.STRING,
-        code: { type: DataTypes.STRING, unique: true },
+        code: {type: DataTypes.STRING, unique: true},
         unit: DataTypes.STRING,
         productVat: DataTypes.STRING,
         sellingPrice: DataTypes.DECIMAL(10, 2),
         purchaseCost: DataTypes.DECIMAL(10, 2),
         categoryId: DataTypes.UUID,
         description: DataTypes.STRING,
-        isActive: { type: DataTypes.BOOLEAN, defaultValue: true }
+        isActive: {type: DataTypes.BOOLEAN, defaultValue: true},
+        availabilityMode: {type: DataTypes.STRING(16), allowNull: false, defaultValue: 'ALL'}
     },
-    { sequelize, modelName: 'product', tableName: 'products' }
+    {sequelize, modelName: 'product', tableName: 'products'}
 );
 
 export default Product;
-

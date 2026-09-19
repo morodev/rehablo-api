@@ -8,16 +8,17 @@ export interface ServiceAttributes {
     code?: string | null;
     productVat?: string | null;
     sellingPrice?: number | null;
-    /** FK verso `Category` (vedi category.model.ts). UUID, coerente col resto dello schema. */
     categoryId?: string | null;
     description?: string | null;
-    /** Soft-delete: vedi commento analogo su `product.model.ts`. */
     isActive: boolean;
+    availabilityMode: 'ALL' | 'SELECTED';
 }
 
-export type ServiceCreationAttributes = Optional<ServiceAttributes, 'id' | 'type' | 'isActive'>;
+export type ServiceCreationAttributes = Optional<
+    ServiceAttributes,
+    'id' | 'type' | 'isActive' | 'availabilityMode'
+>;
 
-/** Tenant-scoped model: always access through `Service.schema(req.tenantSchema)`. */
 export class Service extends Model<ServiceAttributes, ServiceCreationAttributes> implements ServiceAttributes {
     declare id: string;
     declare type: string;
@@ -28,22 +29,23 @@ export class Service extends Model<ServiceAttributes, ServiceCreationAttributes>
     declare categoryId: string | null;
     declare description: string | null;
     declare isActive: boolean;
+    declare availabilityMode: 'ALL' | 'SELECTED';
 }
 
 Service.init(
     {
-        id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
-        type: { type: DataTypes.STRING, defaultValue: 'SERVICE' },
+        id: {type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true},
+        type: {type: DataTypes.STRING, defaultValue: 'SERVICE'},
         name: DataTypes.STRING,
-        code: { type: DataTypes.STRING, unique: true },
+        code: {type: DataTypes.STRING, unique: true},
         productVat: DataTypes.STRING,
         sellingPrice: DataTypes.DECIMAL(10, 2),
         categoryId: DataTypes.UUID,
         description: DataTypes.STRING,
-        isActive: { type: DataTypes.BOOLEAN, defaultValue: true }
+        isActive: {type: DataTypes.BOOLEAN, defaultValue: true},
+        availabilityMode: {type: DataTypes.STRING(16), allowNull: false, defaultValue: 'ALL'}
     },
-    { sequelize, modelName: 'service', tableName: 'services' }
+    {sequelize, modelName: 'service', tableName: 'services'}
 );
 
 export default Service;
-
