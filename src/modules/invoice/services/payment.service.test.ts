@@ -10,7 +10,10 @@ import { Op } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import InvoiceAgendaEvent from '../models/invoiceAgendaEvent.model.js';
-import { createAppointmentPayment, updateAppointmentPaymentCompatibility, voidAppointmentPayment, updateAppointmentPricing } from '../../agenda/controllers/appointmentPayment.controller.js';
+import {
+    createAppointmentPayment, createBulkAppointmentPayments, updateAppointmentPaymentCompatibility,
+    validateSequentialAppointmentAllocations, voidAppointmentPayment, updateAppointmentPricing
+} from '../../agenda/controllers/appointmentPayment.controller.js';
 import { resolveAppointmentAdjustment } from '../utils/appointmentAdjustment.js';
 import { saveInvoice, findEligibleAppointments } from '../controllers/invoice.controller.js';
 import Invoice from '../models/invoice.model.js';
@@ -185,7 +188,7 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
         assert.throws(() => resolveAppointmentAdjustment(50, 'COMPLIMENTARY', null, 1, 0), /inferiore agli incassi/);
         assert.equal(resolveAppointmentAdjustment(null, 'COMPLIMENTARY', null, 0, null).amount, 0);
     });
-    it('appends instalments, refuses destructive compatibility edits and voids only the selected movement', async context => {
+    it('requires the full residual, refuses destructive compatibility edits and voids only the selected movement', async context => {
         const eventId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
         const rows: any[] = [];
         const record = (values: any) => ({
@@ -195,15 +198,17 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
         });
         const event = record({ id: eventId, start: '2026-01-05T10:00:00Z', status: 'COMPLETED',
             patientId: 'patient', calendarId: 'owner', appointmentExpectedAmount: 100,
-            appointmentNetAmount: 100, appointmentVatRate: 0, appointmentPaidAmount: 0, invoiceId: null });
+            appointmentNetAmount: 100, appointmentVatRate: 0, appointmentPaidAmount: 0, invoiceId: null,
+            missedArrivalReportedAt: '2026-01-05T10:15:00Z', missedArrivalResolvedAt: null });
         context.mock.method(sequelize, 'transaction', async (callback: any) => callback({ LOCK: { UPDATE: 'UPDATE' } }));
         context.mock.method(AgendaEvent, 'schema', () => ({
             findOne: async (options: any) => {
                 assert.equal(options.lock, 'UPDATE');
                 return options.where.calendarId && options.where.calendarId !== event.calendarId ? null : event;
-            }
+            },
+            findAll: async () => []
         }) as any);
-        context.mock.method(InvoiceAgendaEvent, 'schema', () => ({ findOne: async () => null }) as any);
+        context.mock.method(InvoiceAgendaEvent, 'schema', () => ({ findOne: async () => null, findAll: async () => [] }) as any);
         context.mock.method(InvoicePayment, 'schema', () => ({
             findAll: async () => [...rows],
             findOne: async (options: any) => rows.find(row => row.id === options.where.id) ?? null,
@@ -221,28 +226,35 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
                 user: { sub: 'recorder' }, access: { scope: own ? 'own' : 'tenant', userId: 'someone-else', resource: 'agenda' } },
             response, reject);
         });
-        assert.equal((await invoke(createAppointmentPayment, { amount: 30, paidAt: '2026-01-10', method: 'Contanti' })).code, 201);
-        const second = await invoke(createAppointmentPayment, { amount: 70, paidAt: '2026-02-10', method: 'Bonifico' });
-        assert.equal(second.code, 201);
-        assert.equal(second.data.summary.paymentStatus, 'paid');
+        const partial = await invoke(createAppointmentPayment, { amount: 30, paidAt: '2026-01-10', method: 'Contanti' });
+        assert.equal(partial.code, 409);
+        assert.match(partial.message, /intero residuo/);
+        const settled = await invoke(createAppointmentPayment, {
+            amount: 100,
+            paidAt: '2026-02-10',
+            method: 'Bonifico',
+            markCompleted: true
+        });
+        assert.equal(settled.code, 201);
+        assert.equal(settled.data.summary.paymentStatus, 'paid');
+        assert.ok(event.missedArrivalResolvedAt instanceof Date);
+        assert.equal(event.missedArrivalResolvedBy, 'recorder');
+        assert.equal(event.missedArrivalResolution, 'COMPLETED');
         assert.deepEqual(rows.map(row => [row.amount, row.paidAt, row.method]), [
-            [30, '2026-01-10', 'Contanti'], [70, '2026-02-10', 'Bonifico']
+            [100, '2026-02-10', 'Bonifico']
         ]);
         assert.equal((await invoke(updateAppointmentPaymentCompatibility, { status: 'unpaid' })).code, 409);
         assert.equal((await invoke(createAppointmentPayment, { amount: 1, paidAt: '2026-02-11' })).code, 409);
         assert.equal((await invoke(createAppointmentPayment, { amount: 1, paidAt: '2026-02-11' }, undefined, true)).code, 404);
-        assert.equal(rows.length, 2);
-        const corrected = await invoke(voidAppointmentPayment, { reason: 'Registrazione errata' }, rows[1].id);
+        assert.equal(rows.length, 1);
+        const corrected = await invoke(voidAppointmentPayment, { reason: 'Registrazione errata' }, rows[0].id);
         assert.equal(corrected.code, 200);
-        assert.equal(corrected.data.summary.paidAmount, 30);
-        assert.equal(corrected.data.summary.balance, 70);
-        assert.equal(rows[0].status, 'POSTED');
-        assert.equal(rows[1].status, 'VOID');
-        assert.equal(event.appointmentPaidAmount, 30);
-        const final = await invoke(voidAppointmentPayment, { reason: 'Duplicato' }, rows[0].id);
-        assert.equal(final.data.summary.balance, 100);
+        assert.equal(corrected.data.summary.paidAmount, 0);
+        assert.equal(corrected.data.summary.balance, 100);
+        assert.equal(rows[0].status, 'VOID');
+        assert.equal(event.appointmentPaidAmount, 0);
         assert.equal(event.appointmentPaymentStatus, 'unpaid');
-        assert.equal(rows.length, 2);
+        assert.equal(rows.length, 1);
         const discounted = await invoke(createAppointmentPayment, {amount: 25, paidAt: '2026-03-01',
             pricing: {adjustment: 'DISCOUNT', discountAmount: 75, note: 'Agevolazione'}});
         assert.equal(discounted.code, 201);
@@ -251,16 +263,16 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
         assert.equal(event.appointmentOriginalAmount, 100);
         assert.equal(event.appointmentPriceAdjustment, 'DISCOUNT');
         assert.equal(event.appointmentPriceAdjustmentNote, 'Agevolazione');
-        assert.equal(rows.length, 3);
+        assert.equal(rows.length, 2);
         assert.equal((await invoke(updateAppointmentPricing, {adjustment: 'COMPLIMENTARY'})).code, 400);
-        await invoke(voidAppointmentPayment, {reason: 'Incasso errato'}, rows[2].id);
+        await invoke(voidAppointmentPayment, {reason: 'Incasso errato'}, rows[1].id);
         const gift = await invoke(updateAppointmentPricing, {adjustment: 'COMPLIMENTARY'});
         assert.equal(gift.code, 200);
         assert.equal(gift.data.summary.expectedAmount, 0);
         assert.equal(gift.data.summary.paidAmount, 0);
         assert.equal(gift.data.summary.balance, 0);
         assert.equal(event.appointmentPriceAdjustment, 'COMPLIMENTARY');
-        assert.equal(rows.length, 3);
+        assert.equal(rows.length, 2);
         assert.equal((await invoke(createAppointmentPayment, {amount: 1, paidAt: '2026-03-01'})).code, 409);
         assert.equal((await invoke(updateAppointmentPricing, {adjustment: null})).data.summary.expectedAmount, 100);
         assert.equal(event.appointmentPriceAdjustment, null);
@@ -268,6 +280,96 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
         assert.equal((await invoke(updateAppointmentPricing, {adjustment: 'DISCOUNT', discountAmount: 25})).code, 409);
         event.invoiceId = null;
         assert.equal((await invoke(updateAppointmentPricing, {adjustment: 'DISCOUNT', discountAmount: 25}, undefined, true)).code, 404);
+    });
+
+    it('creates one independent movement per selected appointment in one bulk operation', async context => {
+        const referenceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        const previousId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+        const rows: any[] = [];
+        const record = (values: any) => ({
+            ...values,
+            get() { return Object.fromEntries(Object.entries(this).filter(([, value]) => typeof value !== 'function')); },
+            async update(update: any) { Object.assign(this, update); return this; }
+        });
+        const events = [
+            record({id: previousId, start: '2026-01-05T10:00:00Z', status: 'COMPLETED', title: 'Seduta precedente',
+                patientId: 'patient', calendarId: 'owner', appointmentExpectedAmount: 40,
+                appointmentNetAmount: 40, appointmentVatRate: 0, appointmentPaidAmount: 0,
+                appointmentPaymentHistoryKnown: true, invoiceId: null}),
+            record({id: referenceId, start: '2026-01-12T10:00:00Z', status: 'CONFIRMED', title: 'Seduta corrente',
+                patientId: 'patient', calendarId: 'owner', appointmentExpectedAmount: 40,
+                appointmentNetAmount: 40, appointmentVatRate: 0, appointmentPaidAmount: 0,
+                appointmentPaymentHistoryKnown: true, invoiceId: null,
+                missedArrivalReportedAt: '2026-01-12T10:15:00Z', missedArrivalResolvedAt: null})
+        ];
+        context.mock.method(sequelize, 'transaction', async (callback: any) => callback({LOCK: {UPDATE: 'UPDATE'}}));
+        context.mock.method(AgendaEvent, 'schema', () => ({
+            findAll: async (options: any) => {
+                assert.equal(options.lock, 'UPDATE');
+                const ids = options.where.id?.[Op.in];
+                return (ids ? events.filter(event => ids.includes(event.id)) : events)
+                    .sort((a, b) => a.id.localeCompare(b.id));
+            }
+        }) as any);
+        context.mock.method(InvoiceAgendaEvent, 'schema', () => ({findOne: async () => null, findAll: async () => []}) as any);
+        context.mock.method(InvoicePayment, 'schema', () => ({
+            findAll: async (options: any) => {
+                const requested = options.where.agendaEventId;
+                const ids = requested?.[Op.in];
+                return rows.filter(row => ids ? ids.includes(row.agendaEventId) : row.agendaEventId === requested);
+            },
+            create: async (values: any) => {
+                const row = record({...values, id: `payment-${rows.length + 1}`,
+                    paidAt: values.paidAt?.toISOString().slice(0, 10) ?? null});
+                rows.push(row);
+                return row;
+            }
+        }) as any);
+        const response: any = await new Promise((resolve, reject) => {
+            const res = {code: 0, status(code: number) { this.code = code; return this; },
+                json(payload: any) { resolve({code: this.code, ...payload}); return this; }};
+            createBulkAppointmentPayments({tenantSchema: 'test_tenant', params: {agendaEventId: referenceId},
+                body: {paidAt: '2026-02-01', method: 'Contanti', note: 'Tre sedute', markReferenceCompleted: true,
+                    allocations: [{agendaEventId: previousId, amount: 40}, {agendaEventId: referenceId, amount: 40}]},
+                user: {sub: 'recorder'}, access: {scope: 'tenant', userId: 'recorder', resource: 'agenda'}
+            } as any, res as any, reject);
+        });
+
+        assert.equal(response.code, 201);
+        assert.equal(response.data.allocations.length, 2);
+        assert.deepEqual(rows.map(row => [row.agendaEventId, row.amount, row.method]), [
+            [previousId, 40, 'Contanti'], [referenceId, 40, 'Contanti']
+        ]);
+        assert.ok(events.every(event => event.appointmentPaymentStatus === 'paid'));
+        const reference = events.find(event => event.id === referenceId)!;
+        assert.equal(reference.status, 'COMPLETED');
+        assert.ok(reference.missedArrivalResolvedAt instanceof Date);
+        assert.equal(reference.missedArrivalResolvedBy, 'recorder');
+        assert.equal(reference.missedArrivalResolution, 'COMPLETED');
+    });
+
+    it('validates chronological full settlements and permits a partial final allocation', () => {
+        const sequence = [
+            {id: 'old-1', title: 'Seduta 1', balance: 60},
+            {id: 'old-2', title: 'Seduta 2', balance: 60},
+            {id: 'current', title: 'Seduta corrente', balance: 70}
+        ];
+        assert.deepEqual(validateSequentialAppointmentAllocations(sequence, [
+            {agendaEventId: 'old-2', amount: 40},
+            {agendaEventId: 'old-1', amount: 60}
+        ]), [
+            {agendaEventId: 'old-1', amount: 60},
+            {agendaEventId: 'old-2', amount: 40}
+        ]);
+        assert.throws(() => validateSequentialAppointmentAllocations(sequence, [
+            {agendaEventId: 'old-1', amount: 40}
+        ]), /intero residuo/);
+        assert.throws(() => validateSequentialAppointmentAllocations(sequence, [
+            {agendaEventId: 'current', amount: 70}
+        ]), /seduta precedente più vecchia/);
+        assert.deepEqual(validateSequentialAppointmentAllocations([
+            {id: 'unknown', title: 'Senza prezzo', balance: null}
+        ], [{agendaEventId: 'unknown', amount: 45}]), [{agendaEventId: 'unknown', amount: 45}]);
     });
 });
 

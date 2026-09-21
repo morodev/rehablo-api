@@ -110,7 +110,9 @@ function normalizedStatus(value: unknown): string {
 }
 
 function hasOpenMissedArrival(event: AgendaEvent): boolean {
-    return Boolean(event.get('missedArrivalReportedAt')) && !event.get('missedArrivalResolvedAt');
+    return normalizedStatus(event.get('status')) === 'CONFIRMED'
+        && Boolean(event.get('missedArrivalReportedAt'))
+        && !event.get('missedArrivalResolvedAt');
 }
 
 /**

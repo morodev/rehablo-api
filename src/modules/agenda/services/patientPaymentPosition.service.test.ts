@@ -30,6 +30,8 @@ describe('buildPatientPaymentPositions', () => {
         assert.equal(position.appointmentCount, 2);
         assert.equal(position.invoiceCount, 0);
         assert.equal(position.outstandingAmount, 75);
+        assert.equal(position.appointmentOutstandingAmount, 75);
+        assert.equal(position.invoiceOutstandingAmount, 0);
         assert.deepEqual(position.items.map(item => [item.id, item.balance, item.paymentStatus]), [
             ['unpaid', 50, 'unpaid'], ['partial', 25, 'partial']
         ]);
@@ -51,7 +53,11 @@ describe('buildPatientPaymentPositions', () => {
         assert.equal(position.appointmentCount, 0);
         assert.equal(position.invoiceCount, 1);
         assert.equal(position.outstandingAmount, 60);
+        assert.equal(position.appointmentOutstandingAmount, 0);
+        assert.equal(position.invoiceOutstandingAmount, 60);
         assert.equal(position.items[0].title, 'Fattura 12/2026');
+        assert.equal(position.items[0].selectable, false);
+        assert.equal(position.items[0].blockedReason, 'INVOICE');
     });
 
     it('uses verify instead of regular when a prior session has no reliable payment state', () => {
@@ -69,6 +75,26 @@ describe('buildPatientPaymentPositions', () => {
         assert.equal(position.openItemCount, 0);
         assert.equal(position.unknownCount, 1);
         assert.equal(position.items[0].balance, null);
+        assert.equal(position.items[0].selectable, false);
+        assert.equal(position.items[0].blockedReason, 'UNVERIFIED_HISTORY');
+    });
+
+    it('allows a reliable session without a catalogue price to receive a final allocated price', () => {
+        const position = buildPatientPaymentPositions([reference], {
+            historicalEvents: [{
+                id: 'without-price', patientId: 'patient-1', start: '2026-08-02T10:00:00.000Z',
+                status: 'COMPLETED', title: 'Seduta senza tariffa', appointmentPaymentHistoryKnown: true
+            }],
+            prices: new Map([['without-price', {amount: null}]]), payments: [], invoices: [],
+            invoiceSummaries: new Map(), invoiceIdByEventId: new Map(),
+            now: Date.parse('2026-09-08T12:00:00.000Z')
+        }, {itemLimit: null}).get('current')!;
+
+        assert.equal(position.status, 'VERIFY');
+        assert.equal(position.items[0].selectable, true);
+        assert.equal(position.items[0].expectedAmount, null);
+        assert.equal(position.items[0].paidAmount, 0);
+        assert.equal(position.items[0].blockedReason, null);
     });
 
     it('returns regular when every prior balance is settled', () => {
@@ -85,7 +111,8 @@ describe('buildPatientPaymentPositions', () => {
 
         assert.deepEqual(position, {
             status: 'REGULAR', openItemCount: 0, appointmentCount: 0, invoiceCount: 0,
-            unknownCount: 0, outstandingAmount: 0, items: []
+            unknownCount: 0, outstandingAmount: 0, appointmentOutstandingAmount: 0,
+            invoiceOutstandingAmount: 0, items: []
         });
     });
 });

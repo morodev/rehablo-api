@@ -1,4 +1,4 @@
-import { Op } from 'sequelize';
+import { Op, Transaction } from 'sequelize';
 import InvoiceAgendaEvent from '../models/invoiceAgendaEvent.model.js';
 
 export interface InvoiceAgendaLink {
@@ -9,12 +9,14 @@ export interface InvoiceAgendaLink {
 
 export async function getInvoiceAgendaLinksByEventIds(
     schema: string,
-    agendaEventIds: string[]
+    agendaEventIds: string[],
+    transaction?: Transaction
 ): Promise<InvoiceAgendaLink[]> {
     if (agendaEventIds.length === 0) return [];
     const rows = await InvoiceAgendaEvent.schema(schema).findAll({
         where: { agendaEventId: { [Op.in]: agendaEventIds }, releasedAt: null },
-        attributes: ['invoiceId', 'agendaEventId', 'serviceId']
+        attributes: ['invoiceId', 'agendaEventId', 'serviceId'],
+        transaction
     });
     return rows.map((row) => row.get({ plain: true }) as InvoiceAgendaLink);
 }

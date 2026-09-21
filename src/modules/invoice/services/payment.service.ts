@@ -47,14 +47,16 @@ export function summarizeInvoicePayments(
 
 export async function getPaymentSummaries(
     schema: string,
-    invoices: Array<Record<string, any>>
+    invoices: Array<Record<string, any>>,
+    transaction?: Transaction
 ): Promise<Map<string, InvoicePaymentSummary>> {
     const ids = invoices.map((invoice) => invoice.id).filter(Boolean);
     if (ids.length === 0) return new Map();
 
     const rows = await InvoicePayment.schema(schema).findAll({
         where: { invoiceId: { [Op.in]: ids } },
-        attributes: ['invoiceId', 'amount', 'status', 'paidAt', 'source']
+        attributes: ['invoiceId', 'amount', 'status', 'paidAt', 'source'],
+        transaction
     });
     const paymentsByInvoice = new Map<string, Array<Record<string, any>>>();
     rows.forEach((row) => {

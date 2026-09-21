@@ -1,4 +1,4 @@
-import { Op } from 'sequelize';
+import { Op, Transaction } from 'sequelize';
 import AgendaEvent from '../models/agendaEvent.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
@@ -17,6 +17,10 @@ export interface PatientPaymentPositionItem {
     title: string;
     balance: number | null;
     paymentStatus: 'unpaid' | 'partial' | 'unknown';
+    expectedAmount: number | null;
+    paidAmount: number;
+    selectable: boolean;
+    blockedReason: 'UNVERIFIED_HISTORY' | 'NO_SHOW' | 'INVOICE' | null;
 }
 
 export interface PatientPaymentPosition {
@@ -26,7 +30,19 @@ export interface PatientPaymentPosition {
     invoiceCount: number;
     unknownCount: number;
     outstandingAmount: number;
+    appointmentOutstandingAmount: number;
+    invoiceOutstandingAmount: number;
     items: PatientPaymentPositionItem[];
+}
+
+export interface PatientPaymentPositionOptions {
+    /** Agenda cards only need a preview; the payment panel requests the complete list. */
+    itemLimit?: number | null;
+    /** Invoice debts are visible only to actors with invoice read permission. */
+    includeInvoices?: boolean;
+    /** Internal consistency options used while an incasso transaction is open. */
+    transaction?: Transaction;
+    lockRows?: boolean;
 }
 
 interface PatientPaymentPositionSources {
@@ -41,7 +57,8 @@ interface PatientPaymentPositionSources {
 
 const EMPTY_POSITION: PatientPaymentPosition = {
     status: 'REGULAR', openItemCount: 0, appointmentCount: 0, invoiceCount: 0,
-    unknownCount: 0, outstandingAmount: 0, items: []
+    unknownCount: 0, outstandingAmount: 0, appointmentOutstandingAmount: 0,
+    invoiceOutstandingAmount: 0, items: []
 };
 
 function patientIdOf(event: Record<string, any>): string | null {
@@ -75,7 +92,8 @@ function invoiceTitle(invoice: Record<string, any>): string {
 /** Pure aggregation kept separate from database loading so debt rules remain directly testable. */
 export function buildPatientPaymentPositions(
     referenceEvents: Array<Record<string, any>>,
-    sources: PatientPaymentPositionSources
+    sources: PatientPaymentPositionSources,
+    options: PatientPaymentPositionOptions = {}
 ): Map<string, PatientPaymentPosition> {
     const now = sources.now ?? Date.now();
     const paymentsByEvent = new Map<string, Array<Record<string, any>>>();
@@ -123,7 +141,10 @@ export function buildPatientPaymentPositions(
             const item = {
                 kind: 'APPOINTMENT' as const, id: event.id, agendaEventId: event.id, invoiceId: null,
                 date: dateKey(event.start), title: event.title || 'Seduta', balance: null,
-                paymentStatus: 'unknown' as const
+                expectedAmount: expected, paidAmount: paid, paymentStatus: 'unknown' as const,
+                selectable: status !== 'NO_SHOW' && known,
+                blockedReason: status === 'NO_SHOW' ? 'NO_SHOW' as const
+                    : !known ? 'UNVERIFIED_HISTORY' as const : null
             };
             if (status === 'NO_SHOW' || !known || expected === null) {
                 unknownItems.push(item);
@@ -140,7 +161,9 @@ export function buildPatientPaymentPositions(
             dueItems.push({
                 kind: 'INVOICE', id: invoiceId, agendaEventId: null, invoiceId,
                 date: dateKey(invoice.emissionDate), title: invoiceTitle(invoice), balance: summary.balance,
-                paymentStatus: summary.paymentStatus === 'partial' ? 'partial' : 'unpaid'
+                expectedAmount: null, paidAmount: summary.paidAmount,
+                paymentStatus: summary.paymentStatus === 'partial' ? 'partial' : 'unpaid',
+                selectable: false, blockedReason: 'INVOICE'
             });
         });
 
@@ -149,6 +172,11 @@ export function buildPatientPaymentPositions(
         const outstandingAmount = paymentMoney(dueItems.reduce((sum, item) => sum + Number(item.balance), 0));
         const invoiceCount = dueItems.filter(item => item.kind === 'INVOICE').length;
         const appointmentCount = dueItems.length - invoiceCount;
+        const appointmentOutstandingAmount = paymentMoney(dueItems
+            .filter(item => item.kind === 'APPOINTMENT')
+            .reduce((sum, item) => sum + Number(item.balance), 0));
+        const invoiceOutstandingAmount = paymentMoney(outstandingAmount - appointmentOutstandingAmount);
+        const itemLimit = options.itemLimit === null ? allItems.length : options.itemLimit ?? 5;
         const position: PatientPaymentPosition = {
             status: dueItems.length ? 'DUE' : unknownItems.length ? 'VERIFY' : 'REGULAR',
             openItemCount: dueItems.length,
@@ -156,7 +184,9 @@ export function buildPatientPaymentPositions(
             invoiceCount,
             unknownCount: unknownItems.length,
             outstandingAmount,
-            items: allItems.slice(0, 5)
+            appointmentOutstandingAmount,
+            invoiceOutstandingAmount,
+            items: allItems.slice(0, itemLimit)
         };
         return [reference.id, position];
     }));
@@ -166,7 +196,8 @@ export function buildPatientPaymentPositions(
 export async function patientPaymentPositionsByReferenceEvents(
     schema: string,
     referenceEvents: Array<Record<string, any>>,
-    agendaScope: Record<string | symbol, any>
+    agendaScope: Record<string | symbol, any>,
+    options: PatientPaymentPositionOptions = {}
 ): Promise<Map<string, PatientPaymentPosition>> {
     const references = referenceEvents.filter(event => event.id && patientIdOf(event) && timestamp(event.start) !== null);
     if (!references.length) return new Map();
@@ -176,6 +207,7 @@ export async function patientPaymentPositionsByReferenceEvents(
         { patientId: { [Op.in]: patientIds } },
         ...patientIds.map(id => ({ patient: { id } as any }))
     ];
+    const transaction = options.transaction;
     const eventModels = await AgendaEvent.schema(schema).findAll({
         where: { [Op.and]: [
             { [Op.or]: patientConditions },
@@ -183,16 +215,19 @@ export async function patientPaymentPositionsByReferenceEvents(
             { [Op.or]: [{ recurrence: null }, { recurrence: '' }] },
             { status: { [Op.in]: ['CONFIRMED', 'COMPLETED', 'NO_SHOW', 'confirmed', 'completed', 'no_show'] } },
             agendaScope
-        ] }
+        ] },
+        order: [['id', 'ASC']],
+        transaction,
+        ...(options.lockRows && transaction ? { lock: transaction.LOCK.UPDATE } : {})
     });
     const historicalEvents = eventModels.map(event => event.get({ plain: true }) as Record<string, any>);
     const allEventIds = [...new Set([...historicalEvents, ...references].map(event => event.id).filter(Boolean))] as string[];
     const [links, prices, eventPaymentModels] = await Promise.all([
-        getInvoiceAgendaLinksByEventIds(schema, allEventIds),
-        appointmentPricesByEvent(schema, historicalEvents),
+        getInvoiceAgendaLinksByEventIds(schema, allEventIds, transaction),
+        appointmentPricesByEvent(schema, historicalEvents, transaction),
         historicalEvents.length ? InvoicePayment.schema(schema).findAll({
             where: { agendaEventId: { [Op.in]: historicalEvents.map(event => event.id) } },
-            attributes: ['agendaEventId', 'amount', 'status']
+            attributes: ['agendaEventId', 'amount', 'status'], transaction
         }) : Promise.resolve([])
     ]);
     const invoiceIdByEventId = new Map(links.map(link => [link.agendaEventId, link.invoiceId]));
@@ -202,16 +237,17 @@ export async function patientPaymentPositionsByReferenceEvents(
     references.forEach(event => {
         if (event.invoiceId) invoiceIdByEventId.set(event.id, event.invoiceId);
     });
-    const invoiceIds = [...new Set(invoiceIdByEventId.values())];
+    const invoiceIds = options.includeInvoices === false ? [] : [...new Set(invoiceIdByEventId.values())];
     const invoiceModels = invoiceIds.length ? await Invoice.schema(schema).findAll({
         where: { id: { [Op.in]: invoiceIds } },
-        attributes: ['id', 'emissionDate', 'invoiceTotal', 'invoiceNet', 'status', 'documentType', 'documentNumber', 'documentYear']
+        attributes: ['id', 'emissionDate', 'invoiceTotal', 'invoiceNet', 'status', 'documentType', 'documentNumber', 'documentYear'],
+        transaction
     }) : [];
     const invoices = invoiceModels.map(invoice => invoice.get({ plain: true }) as Record<string, any>);
-    const invoiceSummaries = await getPaymentSummaries(schema, invoices);
+    const invoiceSummaries = await getPaymentSummaries(schema, invoices, transaction);
     return buildPatientPaymentPositions(references, {
         historicalEvents, prices,
         payments: eventPaymentModels.map(payment => payment.get({ plain: true }) as Record<string, any>),
         invoices, invoiceSummaries, invoiceIdByEventId
-    });
+    }, options);
 }
