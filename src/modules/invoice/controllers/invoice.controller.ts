@@ -24,6 +24,7 @@ import { evalTotals, EvalTotalsResult, toPersistedTotals } from '../utils/evalTo
 import { applyAppointmentPriceSnapshot } from '../utils/appointmentInvoicePrice.js';
 import { normalizeSearchQuery } from '../../../utils/search.js';
 import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
+import { getStsFiscalSettings, invoiceStsCodeForSave } from '../utils/stsExpenseType.js';
 import { buildFiscalNotes, FiscalProfile, isStampDutyDue, resolveFiscalProfile } from '../utils/fiscalRegime.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
 import { invoiceEmissionMonth, invoicePaymentMonth, parseInvoiceMonthFilter } from '../utils/invoiceFilters.js';
@@ -600,6 +601,11 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     }
     const issuerData = issuerTenant!.get({ plain: true }) as any;
     const issuer = buildIssuerSnapshot(issuerData);
+    invoiceFields.stsExpenseTypeCode = invoiceStsCodeForSave({
+        ...invoiceFields, issuer, products: productLines, services: serviceLines
+    }, getStsFiscalSettings(issuerData), invoiceFields.stsExpenseTypeCode);
+    delete invoiceFields.stsSent;
+    delete invoiceFields.stsSentAt;
 
     // Il regime fiscale dello studio decide IVA, natura, ritenuta e bollo: va applicato PRIMA di
     // calcolare i totali, non dopo (vedi docs/REGIME_FISCALE_IT.md).
@@ -1210,7 +1216,8 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
     }
     // Derived balances/totals and the debtor/document identity cannot be patched directly.
     for (const field of ['invoiceTotal', 'invoiceNet', 'invoiceVAT', 'sellingPrice', 'discSellingPrice',
-        'paidAmount', 'balance', 'paymentStatus', 'id', 'createdAt', 'updatedAt']) delete invoiceFields[field];
+        'paidAmount', 'balance', 'paymentStatus', 'id', 'createdAt', 'updatedAt', 'issuer',
+        'stsSent', 'stsSentAt', 'documentNumber', 'documentYear']) delete invoiceFields[field];
     if ((invoiceFields.patientID !== undefined && invoiceFields.patientID !== existingInvoice.patientID)
         || (invoiceFields.documentType !== undefined && invoiceFields.documentType !== existingInvoice.documentType)) {
         return sendErrorResponse(res, 409, 'Paziente e tipo documento non sono modificabili dopo l’emissione');
@@ -1275,6 +1282,27 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
     let updateData: Record<string, unknown> = {
         ...invoiceFields,
         ...(String(requestedStatus ?? '').toLowerCase() === 'void' ? { status: 'void' } : {})
+    };
+
+    const resolveStsUpdate = async (locked: Invoice, transaction: any): Promise<Record<string, unknown>> => {
+        if (!Object.hasOwn(invoiceFields, 'stsExpenseTypeCode')) return {};
+        const tenant = await Tenant.findByPk(req.user!.tenants[0].id, { transaction });
+        const tenantData = tenant?.get({ plain: true }) ?? {};
+        const snapshot = locked.get('issuer');
+        const settings = getStsFiscalSettings(tenantData);
+        const issuer = snapshot ? { ...snapshot, stsIssuerType: snapshot.stsIssuerType ?? settings.stsIssuerType }
+            : buildIssuerSnapshot(tenantData);
+        const [products, services] = shouldReplaceLines
+            ? [requestedProducts ?? [], requestedServices ?? []]
+            : await Promise.all([
+                InvoiceProductScoped.findAll({ where: { InvoiceId: id }, transaction }),
+                InvoiceServiceScoped.findAll({ where: { InvoiceId: id }, transaction })
+            ]);
+        const code = invoiceStsCodeForSave({ issuer, products, services, stsExpenseTypeCode: invoiceFields.stsExpenseTypeCode },
+            settings, invoiceFields.stsExpenseTypeCode);
+        // A TS correction must not create an issuer snapshot on a legacy invoice that never had one.
+        // Such documents retain the existing display fallback for identity/address/tax regime.
+        return { stsExpenseTypeCode: code, ...(snapshot ? { issuer } : {}) };
     };
 
     if (shouldReplaceLines) {
@@ -1381,7 +1409,7 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
                 where: { invoiceId: id, status: 'POSTED' }, transaction: t
             })) || 0;
             if (fiscal.totals.invoiceNet + 0.009 < currentPaid) return false;
-            await InvoiceScoped.update(updateData, { where: { id }, transaction: t });
+            await InvoiceScoped.update({ ...updateData, ...await resolveStsUpdate(locked, t) }, { where: { id }, transaction: t });
             await InvoiceProductScoped.destroy({ where: { InvoiceId: id }, transaction: t });
             await InvoiceServiceScoped.destroy({ where: { InvoiceId: id }, transaction: t });
 
@@ -1427,7 +1455,7 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
         const updated = await sequelize.transaction(async transaction => {
             const locked = await InvoiceScoped.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
             if (!locked || locked.status === 'void') return false;
-            await locked.update(updateData, { transaction });
+            await locked.update({ ...updateData, ...await resolveStsUpdate(locked, transaction) }, { transaction });
             return true;
         });
         if (!updated) {
@@ -1492,9 +1520,10 @@ export const deleteInvoice = asyncHandler(async (req: Request, res: Response) =>
  */
 export const exportSistemaTS = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { InvoiceScoped } = getScopedModels(schema);
+    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped } = getScopedModels(schema);
     const year = parseInt((req.query.year as string) ?? `${new Date().getFullYear()}`, 10);
-    const markAsSent = req.query.markAsSent === 'true';
+    if (req.query.markAsSent === 'true') return sendErrorResponse(res, 400,
+        'Un’esportazione di prova non attesta un invio al Sistema Tessera Sanitaria e non può segnare le fatture come trasmesse.');
     const tenantId = req.user!.tenants[0].id;
 
     // Serve solo come ripiego per i documenti emessi prima dell'introduzione di `invoice.issuer`:
@@ -1510,11 +1539,12 @@ export const exportSistemaTS = asyncHandler(async (req: Request, res: Response) 
             stsExcluded: false,
             stsSent: false,
             ...patientScopeWhere(req, schema, 'patientID')
-        }
+        },
+        include: [{ model: InvoiceProductScoped, as: 'products' }, { model: InvoiceServiceScoped, as: 'services' }]
     });
 
     const records: SistemaTSRecord[] = [];
-    const includedInvoiceIds: string[] = [];
+    const errors: string[] = [];
 
     for (const invoice of invoices) {
         const patientID = invoice.get('patientID') as string | null;
@@ -1522,6 +1552,7 @@ export const exportSistemaTS = asyncHandler(async (req: Request, res: Response) 
 
         const patient = await Patient.schema(schema).findByPk(patientID);
         if (!patient || !patient.get('fiscalCode')) continue;
+        if (patient.get('stsOppositionToDataSending')) continue;
 
         try {
             records.push(
@@ -1531,23 +1562,17 @@ export const exportSistemaTS = asyncHandler(async (req: Request, res: Response) 
                     tenant: tenant.get({ plain: true }) as any
                 })
             );
-            includedInvoiceIds.push(invoice.get('id') as string);
+            // The export is a draft only: it never updates the source invoice.
         } catch (err) {
-            console.warn(`[sistemaTS] fattura ${invoice.get('id')} esclusa dall'export:`, (err as Error).message);
+            errors.push(`Fattura ${invoice.get('documentNumber')}/${invoice.get('documentYear')}: ${(err as Error).message}`);
         }
     }
 
+    if (errors.length) return sendErrorResponse(res, 422, errors.join(' '));
     const xml = generateSistemaTSXml(records, year);
 
-    if (markAsSent && includedInvoiceIds.length > 0) {
-        await InvoiceScoped.update(
-            { stsSent: true, stsSentAt: new Date() },
-            { where: { id: { [Op.in]: includedInvoiceIds } } }
-        );
-    }
-
     res.setHeader('Content-Type', 'application/xml; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="sistema-ts-${year}.xml"`);
+    res.setHeader('Content-Disposition', `attachment; filename="bozza-sistema-ts-${year}.xml"`);
     return res.status(200).send(xml);
 });
 

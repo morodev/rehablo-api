@@ -422,6 +422,35 @@ describe('invoicing appointment concessions through the HTTP handlers', () => {
         return {invoke, event, tenant, receipts, lines};
     }
 
+    it('emits appointment invoices with a frozen declared TS profile and SP, without changing collection amounts', async context => {
+        const state = setup(context, 'DISCOUNT');
+        (state.tenant as any).administrationSettings = { fiscal: { stsIssuerType: 'PHYSIOTHERAPIST' } };
+        const response = await state.invoke(saveInvoice, { patientID: patientId, documentType: 'fattura',
+            emissionDate: '2026-01-10', appointments: [{ agendaEventId: eventId, serviceId }] });
+        assert.equal(response.code, 201);
+        assert.equal(response.data.stsExpenseTypeCode, 'SP');
+        assert.equal(response.data.issuer.stsIssuerType, 'PHYSIOTHERAPIST');
+        assert.equal(response.data.paidAmount, 25);
+    });
+    it('keeps an explicit da definire TS selection when issuing an appointment invoice', async context => {
+        const state = setup(context, 'DISCOUNT');
+        (state.tenant as any).administrationSettings = { fiscal: { stsIssuerType: 'PHYSIOTHERAPIST' } };
+        const response = await state.invoke(saveInvoice, { patientID: patientId, documentType: 'fattura',
+            emissionDate: '2026-01-10', stsExpenseTypeCode: null, appointments: [{ agendaEventId: eventId, serviceId }] });
+        assert.equal(response.code, 201);
+        assert.equal(response.data.stsExpenseTypeCode, null);
+        assert.equal(response.data.issuer.stsIssuerType, 'PHYSIOTHERAPIST');
+        assert.equal(response.data.invoiceTotal, 25);
+        assert.equal(response.data.paidAmount, 25);
+    });
+    it('rejects an explicit incompatible TS code before assigning an invoice number', async context => {
+        const state = setup(context, 'DISCOUNT');
+        (state.tenant as any).administrationSettings = { fiscal: { stsIssuerType: 'PHYSIOTHERAPIST' } };
+        await assert.rejects(() => state.invoke(saveInvoice, { patientID: patientId, documentType: 'fattura',
+            emissionDate: '2026-01-10', stsExpenseTypeCode: 'SR', appointments: [{ agendaEventId: eventId, serviceId }] }), /non è previsto/);
+        assert.deepEqual(state.tenant.lastDocumentNumberByYear, {});
+    });
+
     for (const cumulative of [false, true]) {
         it(`keeps the discounted 25 euro price and original 50 euro tariff in a ${cumulative ? 'cumulative' : 'single'} invoice`, async context => {
             const state = setup(context, 'DISCOUNT');

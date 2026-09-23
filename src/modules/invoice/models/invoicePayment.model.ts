@@ -1,5 +1,9 @@
 import { DataTypes, Model, Optional } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
+import {
+    InvoicePaymentCreateOptions, mirrorInvoicePaymentToTreasury,
+    mirrorVoidedInvoicePaymentToTreasury
+} from '../../administration/services/invoicePaymentTreasury.service.js';
 
 export const INVOICE_PAYMENT_STATUSES = ['POSTED', 'VOID'] as const;
 export type InvoicePaymentStatus = (typeof INVOICE_PAYMENT_STATUSES)[number];
@@ -86,5 +90,27 @@ InvoicePayment.init(
         ]
     }
 );
+
+function modelSchema(payment: InvoicePayment): unknown {
+    const table = (payment.constructor as typeof InvoicePayment).getTableName();
+    return typeof table === 'object' ? table.schema : null;
+}
+
+// Mantiene la nuova prima nota allineata a ogni percorso di incasso esistente
+// (fattura, agenda e migrazione appuntamenti) senza duplicare logica nei controller.
+InvoicePayment.addHook('afterCreate', 'mirrorTreasuryMovement', async (payment, options) => {
+    const typed = payment as InvoicePayment;
+    if (typed.status !== 'POSTED') return;
+    await mirrorInvoicePaymentToTreasury(modelSchema(typed), typed.get({ plain: true }) as any, options.transaction ?? undefined,
+        (options as InvoicePaymentCreateOptions).treasuryContext);
+});
+
+InvoicePayment.addHook('afterUpdate', 'mirrorTreasuryVoid', async (payment, options) => {
+    const typed = payment as InvoicePayment;
+    if (!typed.changed('status') || typed.status !== 'VOID' || typed.previous('status') !== 'POSTED') return;
+    await mirrorVoidedInvoicePaymentToTreasury(
+        modelSchema(typed), typed.get({ plain: true }) as any, options.transaction ?? undefined
+    );
+});
 
 export default InvoicePayment;

@@ -35,6 +35,9 @@ import noteRoutes from './modules/notes/routes/note.routes.js';
 import maintenanceRoutes from './modules/maintenance/routes/maintenance.routes.js';
 import reportsRoutes from './modules/reports/routes/reports.routes.js';
 import patientPortalRoutes from './modules/patient-portal/routes/patientPortal.routes.js';
+import administrationRoutes from './modules/administration/routes/administration.routes.js';
+import quoteShareRoutes from './modules/administration/routes/quoteShare.routes.js';
+import { syncQuotePublicModels } from './modules/administration/models/quoteDelivery.model.js';
 
 async function bootstrap() {
     const app = express();
@@ -63,6 +66,7 @@ async function bootstrap() {
 
     // Keep the anonymous share endpoint before root-mounted authenticated routers.
     app.use(invoiceShareRoutes);
+    app.use(quoteShareRoutes);
 
 
     // --- Domain routers (every module owns its own URL prefix-free routes, mounted at root) ---
@@ -80,6 +84,7 @@ async function bootstrap() {
     app.use(noteRoutes);
     app.use(maintenanceRoutes);
     app.use(reportsRoutes);
+    app.use(administrationRoutes);
 
     app.use(notFoundHandler);
     app.use(errorHandler);
@@ -92,6 +97,7 @@ async function bootstrap() {
     // Il link di consegna della fattura vive in `public`: dev'essere risolvibile da una richiesta
     // anonima, che non ha un tenant da cui derivare lo schema.
     await syncInvoicePublicModels();
+    await syncQuotePublicModels();
 
     // RBAC: allinea i ruoli delle membership preesistenti (vedi docs/RBAC_DESIGN.md)
     await assignBootstrapRoles();

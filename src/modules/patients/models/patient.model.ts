@@ -85,6 +85,8 @@ export interface PatientAttributes {
     emailNotificationsConsent?: boolean | null;
     whatsappNotificationsConsent?: boolean | null;
     communicationConsentDate?: Date | null;
+    /** Listino convenzionato/assicurativo prevalente per il paziente. */
+    defaultPriceListId?: string | null;
 }
 
 export type PatientCreationAttributes = Optional<
@@ -139,6 +141,7 @@ export class Patient extends Model<PatientAttributes, PatientCreationAttributes>
     declare emailNotificationsConsent: boolean | null;
     declare whatsappNotificationsConsent: boolean | null;
     declare communicationConsentDate: Date | null;
+    declare defaultPriceListId: string | null;
 }
 
 Patient.init(
@@ -192,7 +195,8 @@ Patient.init(
         fseConsentDate: DataTypes.DATE,
         emailNotificationsConsent: { type: DataTypes.BOOLEAN, allowNull: true, defaultValue: null },
         whatsappNotificationsConsent: { type: DataTypes.BOOLEAN, allowNull: true, defaultValue: null },
-        communicationConsentDate: DataTypes.DATE
+        communicationConsentDate: DataTypes.DATE,
+        defaultPriceListId: { type: DataTypes.UUID, allowNull: true }
     },
     {
         sequelize,

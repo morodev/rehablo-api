@@ -12,13 +12,15 @@ export const APPOINTMENT_LEDGER_VERSION = '20260907-unify-appointment-payment-le
 export const PATIENT_DEFAULT_EVENT_TYPE_VERSION = '20260908-add-patient-default-event-type';
 export const APPOINTMENT_PRICE_ADJUSTMENTS_VERSION = '20260908-add-appointment-price-adjustments';
 export const CATALOG_STRUCTURE_AVAILABILITY_VERSION = '20260919-add-catalog-structure-availability';
+export const ADMINISTRATION_SEED_VERSION = '20260922-seed-administration';
 // Increment this whenever the tenant model registry changes, so existing schemas run model sync.
-export const TENANT_MODEL_BASELINE_VERSION = '20260919-tenant-model-baseline-v4';
+export const TENANT_MODEL_BASELINE_VERSION = '20260922-tenant-model-baseline-v7';
 const tenantMigrations: Array<{version: string; module: MigrationModule}> = [
     {version: APPOINTMENT_LEDGER_VERSION, module: require('../../migrations/20260907-unify-appointment-payment-ledger.js')},
     {version: PATIENT_DEFAULT_EVENT_TYPE_VERSION, module: require('../../migrations/20260908-add-patient-default-event-type.js')},
     {version: APPOINTMENT_PRICE_ADJUSTMENTS_VERSION, module: require('../../migrations/20260908-add-appointment-price-adjustments.js')},
-    {version: CATALOG_STRUCTURE_AVAILABILITY_VERSION, module: require('../../migrations/20260919-add-catalog-structure-availability.js')}
+    {version: CATALOG_STRUCTURE_AVAILABILITY_VERSION, module: require('../../migrations/20260919-add-catalog-structure-availability.js')},
+    {version: ADMINISTRATION_SEED_VERSION, module: require('../../migrations/20260922-seed-administration.js')}
 ];
 
 export function requiredTenantSchemaVersions(): string[] {

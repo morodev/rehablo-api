@@ -20,6 +20,7 @@ export interface StructureAttributes {
     phone?: string | null;
     phone2?: string | null;
     email?: string | null;
+    defaultPriceListId?: string | null;
 }
 
 export type StructureCreationAttributes = Optional<StructureAttributes, 'id'>;
@@ -37,6 +38,7 @@ export class Structure extends Model<StructureAttributes, StructureCreationAttri
     declare phone: string | null;
     declare phone2: string | null;
     declare email: string | null;
+    declare defaultPriceListId: string | null;
 }
 
 Structure.init(
@@ -52,7 +54,8 @@ Structure.init(
         structureCode: { type: DataTypes.STRING, allowNull: true },
         phone: { type: DataTypes.STRING, allowNull: true },
         phone2: { type: DataTypes.STRING, allowNull: true },
-        email: { type: DataTypes.STRING, allowNull: true }
+        email: { type: DataTypes.STRING, allowNull: true },
+        defaultPriceListId: { type: DataTypes.UUID, allowNull: true }
     },
     { sequelize, modelName: 'structure', tableName: 'structures' }
 );

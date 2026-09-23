@@ -1,6 +1,7 @@
 import { TenantAttributes } from '../../auth/models/tenant.model.js';
 import { InvoiceIssuerSnapshot } from '../models/invoice.model.js';
 import { getTaxRegime } from './fiscalRegime.js';
+import { getStsFiscalSettings } from './stsExpenseType.js';
 
 /**
  * Dati del CEDENTE/PRESTATORE richiesti per emettere un documento fiscale valido.
@@ -61,6 +62,7 @@ export function buildIssuerSnapshot(tenant: TenantLike): InvoiceIssuerSnapshot {
     };
 
     return {
+        stsIssuerType: getStsFiscalSettings(tenant).stsIssuerType,
         businessName: asString(tenant.businessName),
         vatNumber: asString(tenant.VATNumber),
         taxCode: asString(tenant.taxCode),

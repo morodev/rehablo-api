@@ -76,6 +76,8 @@ export interface InvoiceAttributes {
 
 /** Dati del soggetto emittente congelati sul documento. */
 export interface InvoiceIssuerSnapshot {
+    /** Profilo TS dichiarato e congelato all’emissione, indipendente dal regime fiscale. */
+    stsIssuerType?: 'PHYSIOTHERAPIST' | 'ACCREDITED_STRUCTURE' | 'AUTHORIZED_STRUCTURE' | null;
     businessName: string | null;
     vatNumber: string | null;
     taxCode: string | null;

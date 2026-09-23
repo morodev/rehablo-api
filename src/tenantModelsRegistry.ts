@@ -32,6 +32,7 @@ import { registerEvaluationAssociations, Evaluation } from './modules/evaluation
 import { registerMeasurementAssociations, Observation, DeviceConnection, RawFile } from './modules/measurements/models/index.js';
 import { Note, NoteImage, Reminder } from './modules/notes/models/index.js';
 import PatientPortalAudit from './modules/patient-portal/models/patientPortalAudit.model.js';
+import { ADMINISTRATION_MODELS } from './modules/administration/models/index.js';
 
 /**
  * Registers every tenant-scoped model (i.e. living in the dynamic "rehablo_<tenantId>" schema)
@@ -66,6 +67,7 @@ export function registerTenantModels(): void {
     registerTenantScopedModel(NoteImage);
     registerTenantScopedModel(Reminder);
     registerTenantScopedModel(PatientPortalAudit);
+    for (const model of ADMINISTRATION_MODELS) registerTenantScopedModel(model);
     registerTenantScopedModel(Category);
     registerTenantScopedModel(Product);
     registerTenantScopedModel(ProductStructure);

@@ -120,7 +120,17 @@ export function requireAnyPermission(...required: Array<[Resource, Action]>) {
         if (req.user.actor === 'patient') {
             return sendErrorResponse(res, 403, 'Questa operazione è riservata allo staff');
         }
-        if (req.user.isSuperAdmin) return next();
+        if (req.user.isSuperAdmin) {
+            const [resource, action] = required[0];
+            req.access = {
+                resource,
+                action,
+                scope: 'tenant',
+                userId: getUserId(req),
+                structureId: getSelectedStructureId(req)
+            };
+            return next();
+        }
 
         const granted = getGrantedPermissions(req);
 

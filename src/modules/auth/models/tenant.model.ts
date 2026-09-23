@@ -51,6 +51,12 @@ export interface TenantAttributes {
     logoSizeBytes?: number | null;
     /** Progressivo dell'ultimo numero fattura/ricevuta emesso per anno fiscale: { "2026": 42 }. */
     lastDocumentNumberByYear: Record<string, number>;
+    /** Moduli a rilascio controllato. I tenant esistenti restano disattivati. */
+    featureFlags: { administration?: boolean; fiscalSandbox?: boolean };
+    /** Listino applicato quando paziente e sede non ne definiscono uno. */
+    defaultPriceListId?: string | null;
+    /** Preferenze del modulo amministrativo (numerazione, scadenze e note predefinite). */
+    administrationSettings: Record<string, unknown>;
 }
 
 export type TenantCreationAttributes = Optional<
@@ -72,6 +78,9 @@ export type TenantCreationAttributes = Optional<
     | 'logoMimeType'
     | 'logoOriginalName'
     | 'logoSizeBytes'
+    | 'featureFlags'
+    | 'defaultPriceListId'
+    | 'administrationSettings'
 >;
 
 export class Tenant extends Model<TenantAttributes, TenantCreationAttributes> implements TenantAttributes {
@@ -107,6 +116,9 @@ export class Tenant extends Model<TenantAttributes, TenantCreationAttributes> im
     declare logoOriginalName: string | null;
     declare logoSizeBytes: number | null;
     declare lastDocumentNumberByYear: Record<string, number>;
+    declare featureFlags: { administration?: boolean; fiscalSandbox?: boolean };
+    declare defaultPriceListId: string | null;
+    declare administrationSettings: Record<string, unknown>;
 }
 
 Tenant.init(
@@ -144,7 +156,10 @@ Tenant.init(
         logoMimeType: { type: DataTypes.STRING(80), allowNull: true },
         logoOriginalName: { type: DataTypes.STRING, allowNull: true },
         logoSizeBytes: { type: DataTypes.INTEGER, allowNull: true },
-        lastDocumentNumberByYear: { type: DataTypes.JSONB, defaultValue: {} }
+        lastDocumentNumberByYear: { type: DataTypes.JSONB, defaultValue: {} },
+        featureFlags: { type: DataTypes.JSONB, allowNull: false, defaultValue: { administration: false, fiscalSandbox: false } },
+        defaultPriceListId: { type: DataTypes.UUID, allowNull: true },
+        administrationSettings: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} }
     },
     { sequelize, modelName: 'tenant', tableName: 'tenants' }
 );

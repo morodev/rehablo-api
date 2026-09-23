@@ -25,18 +25,19 @@
 import { InvoiceAttributes } from '../models/invoice.model.js';
 import { PatientAttributes } from '../../patients/models/patient.model.js';
 import { TenantAttributes } from '../../auth/models/tenant.model.js';
+import { getStsFiscalSettings, resolveStsExpenseType } from './stsExpenseType.js';
 
 export interface SistemaTSRecordInput {
     invoice: Pick<
         InvoiceAttributes,
         'id' | 'documentNumber' | 'documentYear' | 'emissionDate' | 'invoiceTotal' | 'stsExpenseTypeCode' | 'issuer'
-    >;
+    > & { products?: unknown[]; services?: unknown[] };
     patient: Pick<PatientAttributes, 'name' | 'surname' | 'fiscalCode' | 'stsOppositionToDataSending'>;
     /**
      * Dati correnti dello studio, usati SOLO come ripiego per i documenti emessi prima
      * dell'introduzione dello snapshot `invoice.issuer`.
      */
-    tenant: Pick<TenantAttributes, 'VATNumber' | 'taxCode' | 'businessName'>;
+    tenant: Pick<TenantAttributes, 'VATNumber' | 'taxCode' | 'businessName'> & Partial<Pick<TenantAttributes, 'administrationSettings'>>;
 }
 
 export interface SistemaTSRecord {
@@ -49,10 +50,6 @@ export interface SistemaTSRecord {
     tipoSpesa: string;
     flagOpposizione: 0 | 1;
 }
-
-/** Codice di default per la tabella "Tipologia di spesa" del Sistema TS. Deve essere confermato
- *  sull'ultima tabella ufficiale pubblicata (può variare per anno di imposta). */
-export const DEFAULT_STS_EXPENSE_TYPE_CODE = 'PRESTAZIONE_SANITARIA_FISIOTERAPICA';
 
 export function buildSistemaTSRecord({ invoice, patient, tenant }: SistemaTSRecordInput): SistemaTSRecord {
     if (!patient.fiscalCode) {
@@ -76,6 +73,9 @@ export function buildSistemaTSRecord({ invoice, patient, tenant }: SistemaTSReco
         throw new Error('Impossibile generare il record Sistema TS: dati fiscali dello studio/professionista mancanti');
     }
 
+    const sts = resolveStsExpenseType(invoice, getStsFiscalSettings(tenant));
+    if (sts.issue) throw new Error(sts.issue.message);
+
     return {
         partitaIvaErogatore: issuer.vatNumber || issuer.taxCode || '',
         codiceFiscalePaziente: patient.fiscalCode.toUpperCase(),
@@ -83,7 +83,7 @@ export function buildSistemaTSRecord({ invoice, patient, tenant }: SistemaTSReco
         numeroDocumento: `${invoice.documentNumber ?? ''}`,
         annoFiscale: invoice.documentYear ?? new Date().getFullYear(),
         importo: Number(invoice.invoiceTotal ?? 0),
-        tipoSpesa: invoice.stsExpenseTypeCode || DEFAULT_STS_EXPENSE_TYPE_CODE,
+        tipoSpesa: sts.stsExpenseTypeCode!,
         flagOpposizione: patient.stsOppositionToDataSending ? 1 : 0
     };
 }

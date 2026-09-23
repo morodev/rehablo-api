@@ -10,7 +10,7 @@ import {
 import {
     APPOINTMENT_LEDGER_VERSION, prepareTenantPaymentHistory, runTenantMigrations,
     PATIENT_DEFAULT_EVENT_TYPE_VERSION, TENANT_MODEL_BASELINE_VERSION, APPOINTMENT_PRICE_ADJUSTMENTS_VERSION,
-    CATALOG_STRUCTURE_AVAILABILITY_VERSION
+    CATALOG_STRUCTURE_AVAILABILITY_VERSION, ADMINISTRATION_SEED_VERSION
 } from './tenantMigrations.js';
 
 const require = createRequire(import.meta.url);
@@ -30,7 +30,7 @@ let historyExists: boolean, agendaExists: boolean, transactionStarts: number, ba
 let legacyBaselineApplied: boolean;
 let lastSyncOptions: any;
 let pricingApplied: boolean;
-let catalogAvailabilityApplied: boolean;
+let catalogAvailabilityApplied: boolean, administrationApplied: boolean;
 let migrationWork: (options: any) => Promise<void>;
 const transaction = {id: 'test-transaction'};
 
@@ -46,7 +46,7 @@ beforeEach(() => {
     legacyBaselineApplied = false;
     lastSyncOptions = undefined;
     pricingApplied = false;
-    catalogAvailabilityApplied = false;
+    catalogAvailabilityApplied = false; administrationApplied = false;
     migrationWork = async () => {};
     sequelize.createSchema = (async () => {}) as any;
     sequelize.transaction = (async (callback: any) => {
@@ -72,6 +72,7 @@ beforeEach(() => {
             ...(patientDefaultApplied ? [{version: PATIENT_DEFAULT_EVENT_TYPE_VERSION}] : []),
             ...(pricingApplied ? [{version: APPOINTMENT_PRICE_ADJUSTMENTS_VERSION}] : []),
             ...(catalogAvailabilityApplied ? [{version: CATALOG_STRUCTURE_AVAILABILITY_VERSION}] : []),
+            ...(administrationApplied ? [{version: ADMINISTRATION_SEED_VERSION}] : []),
             ...(legacyBaselineApplied ? [{version: '20260907-tenant-model-baseline-v1'}] : []),
             ...(baselineApplied ? [{version: TENANT_MODEL_BASELINE_VERSION}] : [])
         ]];
@@ -89,6 +90,9 @@ beforeEach(() => {
         }
         if (sql.startsWith('INSERT INTO') && options?.replacements?.version === CATALOG_STRUCTURE_AVAILABILITY_VERSION) {
             catalogAvailabilityApplied = true; order.push('record-version');
+        }
+        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === ADMINISTRATION_SEED_VERSION) {
+            administrationApplied = true;
         }
         return [[]];
     }) as any;

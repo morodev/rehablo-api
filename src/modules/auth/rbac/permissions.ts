@@ -30,6 +30,13 @@ export const RESOURCES = [
     'structure',    // strutture / premise
     'tenant',       // dati azienda, licenza, billing
     'clinical_content', // cataloghi configurabili: questionari, test e scale
+    'price_list',   // listini, versioni e regole tariffarie
+    'quote',        // preventivi, pacchetti e crediti
+    'treasury',     // prima nota, incassi, chiusure e riconciliazioni
+    'expense',      // costi e documenti di acquisto
+    'supplier',     // anagrafica fornitori
+    'fiscal_submission', // outbox Sistema TS / SDI
+    'accountant_export',  // esportazioni per commercialista
     'maintenance'   // operazioni di piattaforma
 ] as const;
 
@@ -58,6 +65,13 @@ export const RESOURCE_LABELS: Record<Resource, string> = {
     structure: 'strutture',
     tenant: 'dati azienda',
     clinical_content: 'questionari e test',
+    price_list: 'listini',
+    quote: 'preventivi e pacchetti',
+    treasury: 'prima nota',
+    expense: 'spese',
+    supplier: 'fornitori',
+    fiscal_submission: 'adempimenti fiscali',
+    accountant_export: 'export commercialista',
     maintenance: 'manutenzione piattaforma'
 };
 

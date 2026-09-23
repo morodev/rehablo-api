@@ -1,4 +1,9 @@
 import { Request, Response } from 'express';
+import { InvoicePaymentCreateOptions } from '../../administration/services/invoicePaymentTreasury.service.js';
+import { nullableTreasuryUuid, treasuryError, validateTreasuryAccount, validateTreasuryMethod } from '../../administration/services/treasuryValidation.service.js';
+import { FinancialAccount, TreasuryMovement } from '../../administration/models/index.js';
+import { Structure } from '../../auth/models/index.js';
+import { getCurrentTenantId } from '../../../middleware/auth.js';
 import { sequelize } from '../../../config/database.js';
 import { patientScopeWhere, getUserId } from '../../../middleware/rbac.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -44,6 +49,12 @@ export const listPayments = asyncHandler(async (req: Request, res: Response) => 
 
 export const createPayment = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
+    if (!UUID_REGEX.test(req.params.invoiceId)) return sendErrorResponse(res, 400, 'Fattura non valida');
+    const accountId = nullableTreasuryUuid(req.body?.accountId, 'Conto');
+    const paymentMethodId = nullableTreasuryUuid(req.body?.paymentMethodId, 'Metodo di pagamento');
+    const idempotencyKey = req.header('Idempotency-Key')?.trim() || null;
+    if (idempotencyKey && idempotencyKey.length > 128) return sendErrorResponse(res, 400, 'Identificativo della registrazione non valido');
+    if (!accountId && (paymentMethodId || idempotencyKey)) return sendErrorResponse(res, 400, 'Seleziona il conto su cui registrare l’incasso');
     const amount = Number(req.body?.amount);
     const paidAt = req.body?.paidAt;
     if (!Number.isFinite(amount) || Math.round(amount * 100) < 1) {
@@ -61,6 +72,10 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
     }
 
     const result = await sequelize.transaction(async (transaction) => {
+        // Serialize retries across invoices too: the key is unique within the tenant ledger.
+        if (idempotencyKey) await sequelize.query('SELECT pg_advisory_xact_lock(hashtext(:schema), hashtext(:key))', {
+            replacements: { schema, key: idempotencyKey }, transaction
+        });
         const invoice = await Invoice.schema(schema).findOne({
             where: {
                 id: req.params.invoiceId,
@@ -73,6 +88,44 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
         if (String(invoice.status).toLowerCase() === 'void') return { kind: 'void' } as const;
         if (invoice.documentType === 'nota_di_credito') return { kind: 'credit-note' } as const;
 
+        let structureId = invoice.structureId ?? req.access?.structureId;
+        const method = typeof req.body?.method === 'string' ? req.body.method.trim() || null : null;
+        const note = typeof req.body?.note === 'string' ? req.body.note.trim() || null : null;
+        if (idempotencyKey) {
+            const previous = await TreasuryMovement.schema(schema).findOne({ where: { idempotencyKey }, transaction });
+            if (previous) {
+                const sameMovement = previous.get('sourceType') === 'INVOICE_PAYMENT'
+                    && previous.get('invoiceId') === invoice.id && previous.get('accountId') === accountId
+                    && (previous.get('paymentMethodId') ?? null) === paymentMethodId
+                    && Number(previous.get('amount')) === Math.round(amount * 100) / 100
+                    && new Date(previous.get('occurredAt') as string).toISOString().slice(0, 10) === paidAt;
+                if (!sameMovement) treasuryError('Questa registrazione è già stata usata con dati diversi. Riapri il modulo per registrare un nuovo incasso', 409);
+                const payment = await InvoicePayment.schema(schema).findOne({ where: { id: previous.get('sourceId') as string, invoiceId: invoice.id }, transaction });
+                if (!payment || payment.status !== 'POSTED' || (payment.note ?? null) !== note
+                    || (!paymentMethodId && (payment.method ?? null) !== method)) {
+                    treasuryError('Questa registrazione è già stata usata o annullata. Riapri il modulo per registrare un nuovo incasso', 409);
+                }
+                return { kind: 'replayed', payment, summary: await syncInvoicePaymentStatus(schema, invoice.id, transaction) } as const;
+            }
+        }
+        const selectedMethod = paymentMethodId ? await validateTreasuryMethod(schema, paymentMethodId, transaction) : null;
+        if (accountId) {
+            // A legacy invoice can have no site. Tenant-wide access may use the selected account's site.
+            if (!structureId && req.access?.scope === 'tenant') {
+                const account = await FinancialAccount.schema(schema).findOne({ where: { id: accountId, isActive: true }, transaction });
+                if (!account) treasuryError('Il conto selezionato non è disponibile o non è attivo');
+                structureId = account.get('structureId') as string | undefined;
+            }
+            await validateTreasuryAccount(schema, accountId, structureId, transaction);
+            const structure = await Structure.findOne({
+                where: { id: structureId!, tenantId: getCurrentTenantId(req) }, transaction
+            });
+            if (!structure) treasuryError('La sede selezionata non è disponibile');
+        }
+        const createOptions: InvoicePaymentCreateOptions = { transaction };
+        if (accountId) createOptions.treasuryContext = {
+            accountId, structureId: structureId!, paymentMethodId, idempotencyKey
+        };
         const summary = await syncInvoicePaymentStatus(schema, invoice.id, transaction);
         if (amount > summary.balance + 0.009) {
             return { kind: 'overpayment', balance: summary.balance } as const;
@@ -83,13 +136,13 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
                 invoiceId: invoice.id,
                 amount: Math.round(amount * 100) / 100,
                 paidAt: new Date(`${paidAt}T12:00:00.000Z`),
-                method: typeof req.body?.method === 'string' ? req.body.method.trim() || null : null,
-                note: typeof req.body?.note === 'string' ? req.body.note.trim() || null : null,
+                method: selectedMethod ? String(selectedMethod.get('label')) : method,
+                note,
                 source: 'USER',
                 status: 'POSTED',
                 createdByUserId: getUserId(req)
             },
-            { transaction }
+            createOptions
         );
         const updatedSummary = await syncInvoicePaymentStatus(schema, invoice.id, transaction);
         return { kind: 'created', payment, summary: updatedSummary } as const;
@@ -101,7 +154,7 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
     if (result.kind === 'overpayment') {
         return sendErrorResponse(res, 409, `Il residuo da incassare è € ${result.balance.toFixed(2)}`);
     }
-    return sendSuccessResponse(res, 201, result, 'Pagamento registrato');
+    return sendSuccessResponse(res, result.kind === 'replayed' ? 200 : 201, result, result.kind === 'replayed' ? 'Incasso già registrato' : 'Pagamento registrato');
 });
 
 export const voidPayment = asyncHandler(async (req: Request, res: Response) => {

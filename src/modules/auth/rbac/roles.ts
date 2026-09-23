@@ -48,6 +48,9 @@ export interface RoleDefinition {
 
 /** Risorse cliniche: tutto ciò che costituisce cartella clinica del paziente. */
 const CLINICAL_RESOURCES = ['evaluation', 'protocol', 'note', 'bodymap', 'measurement'] as const;
+const ADMINISTRATION_RESOURCES = [
+    'price_list', 'quote', 'treasury', 'expense', 'supplier', 'fiscal_submission', 'accountant_export'
+] as const;
 
 const clinicalCrud = (scope: 'own' | 'structure' | 'tenant'): Permission[] =>
     CLINICAL_RESOURCES.flatMap((resource) => crud(resource, scope));
@@ -97,7 +100,8 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             perm('user', 'manage', 'tenant'),
             perm('structure', 'manage', 'tenant'),
             perm('tenant', 'manage', 'tenant'),
-            perm('clinical_content', 'manage', 'tenant')
+            perm('clinical_content', 'manage', 'tenant'),
+            ...ADMINISTRATION_RESOURCES.map((resource) => perm(resource, 'manage', 'tenant'))
         ]
     },
 
@@ -121,7 +125,14 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             perm('structure', 'manage', 'tenant'),
             ...perms('tenant', ['read', 'update'], 'tenant'),
             perm('clinical_content', 'manage', 'tenant'),
-            perm('dashboard', 'read', 'structure')
+            perm('dashboard', 'read', 'structure'),
+            perm('price_list', 'manage', 'tenant'),
+            perm('quote', 'manage', 'structure'),
+            perm('treasury', 'manage', 'structure'),
+            perm('expense', 'manage', 'structure'),
+            perm('supplier', 'manage', 'tenant'),
+            ...perms('fiscal_submission', ['read', 'create', 'export'], 'tenant'),
+            ...perms('accountant_export', ['read', 'export'], 'tenant')
         ]
     },
 
@@ -194,7 +205,9 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             perm('product', 'read', 'tenant'),
             perm('user', 'read', 'tenant'),
             perm('structure', 'read', 'tenant'),
-            perm('dashboard', 'read', 'tenant')
+            perm('dashboard', 'read', 'tenant'),
+            ...ADMINISTRATION_RESOURCES.map((resource) => perm(resource, 'read', 'tenant')),
+            perm('accountant_export', 'export', 'tenant')
         ]
     },
 
