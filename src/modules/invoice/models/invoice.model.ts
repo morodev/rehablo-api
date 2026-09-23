@@ -67,11 +67,44 @@ export interface InvoiceAttributes {
      */
     issuer?: InvoiceIssuerSnapshot | null;
     /**
+     * Snapshot dei dati del CESSIONARIO/COMMITTENTE (destinatario) congelati all'emissione.
+     *
+     * Serve per due motivi:
+     *  1. validità del documento (art. 21 DPR 633/72): il destinatario va indicato in fattura;
+     *  2. generazione dei flussi telematici (FatturaPA per lo SDI, spesa sanitaria per il Sistema
+     *     TS) dal documento IMMUTABILE: una modifica all'anagrafica del paziente non deve alterare
+     *     un documento già emesso o un invio già effettuato.
+     *
+     * NULL per le fatture legacy prive di snapshot: in stampa/invio si ricade sui dati correnti del
+     * paziente, ma il dato resta dichiaratamente non congelato.
+     */
+    recipient?: InvoiceRecipientSnapshot | null;
+    /**
      * Diciture obbligatorie congelate all'emissione (regime forfettario, esenzione art. 10 n. 18,
      * assolvimento del bollo...). Stesso motivo di `issuer`: una fattura emessa in forfettario deve
      * continuare a riportare le diciture del forfettario anche dopo il passaggio al regime ordinario.
      */
     fiscalNotes?: string[] | null;
+}
+
+/** Dati del soggetto destinatario (cessionario/committente) congelati sul documento. */
+export interface InvoiceRecipientSnapshot {
+    /** PERSON = persona fisica (B2C); BUSINESS = soggetto con partita IVA (B2B). */
+    kind: 'PERSON' | 'BUSINESS';
+    businessName: string | null;
+    firstName: string | null;
+    lastName: string | null;
+    taxCode: string | null;
+    vatNumber: string | null;
+    address: string | null;
+    city: string | null;
+    province: string | null;
+    zipCode: string | null;
+    country: string;
+    /** Codice destinatario SDI a 7 caratteri (solo B2B/soggetti con canale accreditato). */
+    sdiCode: string | null;
+    pec: string | null;
+    email: string | null;
 }
 
 /** Dati del soggetto emittente congelati sul documento. */
@@ -151,6 +184,7 @@ export class Invoice extends Model<InvoiceAttributes, InvoiceCreationAttributes>
     declare stsSent: boolean;
     declare stsSentAt: Date | null;
     declare issuer: InvoiceIssuerSnapshot | null;
+    declare recipient: InvoiceRecipientSnapshot | null;
     declare fiscalNotes: string[] | null;
 }
 
@@ -195,6 +229,7 @@ Invoice.init(
         stsSent: { type: DataTypes.BOOLEAN, defaultValue: false },
         stsSentAt: DataTypes.DATE,
         issuer: { type: DataTypes.JSONB, allowNull: true },
+        recipient: { type: DataTypes.JSONB, allowNull: true },
         fiscalNotes: { type: DataTypes.JSONB, allowNull: true }
     },
     {

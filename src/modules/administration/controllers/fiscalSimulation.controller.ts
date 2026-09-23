@@ -5,6 +5,7 @@ import { Invoice } from '../../invoice/models/index.js';
 import Patient from '../../patients/models/patient.model.js';
 import { FiscalSubmission } from '../models/index.js';
 import { fiscalInvoiceScope, previewFiscal, simulateFiscal, simulationSummary } from '../services/fiscalSimulation.service.js';
+import { transmitFiscalDocument } from '../services/fiscalTransmissionRun.service.js';
 
 const source = (body: any) => body?.data ?? body ?? {};
 
@@ -16,6 +17,12 @@ export const previewFiscalSubmission = asyncHandler(async (req, res) => {
 export const submitFiscal = asyncHandler(async (req, res) => {
     const result = await simulateFiscal(req, source(req.body));
     return sendSuccessResponse(res, result.status, result.summary, 'Esito della simulazione registrato. Nessun invio reale effettuato.');
+});
+
+/** Trasmissione REALE (gateway pilotato dalla configurazione: MOCK finché non abilitata). */
+export const transmitFiscal = asyncHandler(async (req, res) => {
+    const result = await transmitFiscalDocument(req, source(req.body));
+    return sendSuccessResponse(res, result.status, result.summary, 'Richiesta di trasmissione registrata.');
 });
 
 export const retryFiscalSubmission = asyncHandler(async (req, res) => {

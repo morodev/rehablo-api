@@ -25,7 +25,7 @@ function fixture(t: TestContext) {
 }
 it('returns an unconfigured profile without assuming a profession', async t => {
     fixture(t);
-    assert.deepEqual((await run(getFiscalSettings)).data, { stsIssuerType: null, stsDefaultExpenseTypeCode: null });
+    assert.deepEqual((await run(getFiscalSettings)).data, { stsIssuerType: null, stsDefaultExpenseTypeCode: null, codiceRegione: null });
 });
 it('normalizes physiotherapist SP under a tenant row lock and preserves other administration settings', async t => {
     const f = fixture(t);
@@ -48,6 +48,16 @@ it('rejects incompatible settings without touching the previous stored JSON', as
     const result = await run(updateFiscalSettings, { stsIssuerType: 'AUTHORIZED_STRUCTURE', stsDefaultExpenseTypeCode: 'SP' });
     assert.equal(result.code, 400);
     assert.deepEqual(f.data, before);
+});
+it('stores a zero-padded codice regione and rejects non-numeric values', async t => {
+    const f = fixture(t);
+    const ok = await run(updateFiscalSettings, { stsIssuerType: 'PHYSIOTHERAPIST', codiceRegione: '30' });
+    assert.equal(ok.code, 200);
+    assert.equal(ok.data.codiceRegione, '030');
+    assert.equal(f.data.administrationSettings.fiscal.codiceRegione, '030');
+    const bad = await run(updateFiscalSettings, { codiceRegione: 'AB' });
+    assert.equal(bad.code, 400);
+    assert.equal(f.data.administrationSettings.fiscal.codiceRegione, '030');
 });
 it('concurrent document and fiscal settings saves keep both values under the same tenant lock', async t => {
     const f = fixture(t);

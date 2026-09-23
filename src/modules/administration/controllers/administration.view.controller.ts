@@ -312,6 +312,21 @@ function monthBuckets(from: string, to: string): Array<{ key: string; label: str
     return rows;
 }
 
+/** Bucket giornalieri per l'andamento infra-mensile della panoramica (max ~62 giorni). */
+function dayBuckets(from: string, to: string): Array<{ key: string; label: string }> {
+    const rows: Array<{ key: string; label: string }> = [];
+    const cursor = new Date(`${from.slice(0, 10)}T12:00:00.000Z`);
+    const last = new Date(`${to.slice(0, 10)}T12:00:00.000Z`);
+    while (cursor <= last && rows.length < 62) {
+        rows.push({
+            key: cursor.toISOString().slice(0, 10),
+            label: new Intl.DateTimeFormat('it-IT', { day: '2-digit', month: 'short', timeZone: 'UTC' }).format(cursor),
+        });
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+    return rows;
+}
+
 async function effectiveMovementRows(req: Request, period: AdministrationDateRange): Promise<Plain[]> {
     const rows = (await TreasuryMovement.schema(req.tenantSchema!).findAll({
         where: structureWhere(req), order: [['occurredAt', 'DESC']]
@@ -326,6 +341,9 @@ async function effectiveMovementRows(req: Request, period: AdministrationDateRan
 
 const romeMonth = (value: unknown): string => new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Europe/Rome', year: 'numeric', month: '2-digit'
+}).format(new Date(value as string));
+const romeDay = (value: unknown): string => new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Rome', year: 'numeric', month: '2-digit', day: '2-digit'
 }).format(new Date(value as string));
 async function buildReport(req: Request, requestedPeriod?: AdministrationDateRange): Promise<Plain> {
     const today = romeToday();
@@ -419,11 +437,25 @@ export const overview = asyncHandler(async (req, res) => {
     const flags = (tenant?.get('featureFlags') ?? {}) as Plain;
     const income = money(movements.filter(row => row.direction === 'IN').reduce((sum, row) => sum + Number(row.amount), 0));
     const outcome = money(movements.filter(row => row.direction === 'OUT').reduce((sum, row) => sum + Number(row.amount), 0));
+    // Andamento del grafico: giornaliero per un periodo breve (tipicamente il mese selezionato),
+    // così si vede un vero andamento invece di un singolo punto; mensile per periodi lunghi.
+    const rangeDays = (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) / 86_400_000;
+    const chart = rangeDays >= 0 && rangeDays <= 62
+        ? dayBuckets(from, to).map(bucket => ({
+            label: bucket.label,
+            issued: money(documents
+                .filter(row => String(row.emissionDate).slice(0, 10) === bucket.key)
+                .reduce((sum, row) => sum + (row.documentType === 'nota_di_credito' ? -1 : 1) * Number(row.invoiceTotal ?? 0), 0)),
+            collected: money(movements
+                .filter(row => row.direction === 'IN' && romeDay(row.occurredAt) === bucket.key)
+                .reduce((sum, row) => sum + Number(row.amount), 0)),
+        }))
+        : report.series.map((row: Plain) => ({ label: row.label, issued: row.issued, collected: row.collected }));
     return sendSuccessResponse(res, 200, {
         period: { from, to }, issued: report.issued, collected: report.collected, receivable,
         income, outcome, expenses: report.expenses, cashFlow: money(income - outcome), openQuotes, fiscalPending,
         accounts: accounts.map(account => ({ id: account.id, name: account.name, type: account.type, balance: account.balance })),
-        tasks: [], activities, deadlines: deadlineSource, chart: report.series.map((row: Plain) => ({ label: row.label, issued: row.issued, collected: row.collected })),
+        tasks: [], activities, deadlines: deadlineSource, chart,
         fiscal: [
             { channel: 'STS', label: 'Sistema Tessera Sanitaria', status: flags.fiscalSandbox ? 'warning' : 'setup', detail: flags.fiscalSandbox ? 'Ambiente di prova attivo' : 'Da configurare' },
             { channel: 'SDI', label: 'Fatturazione elettronica', status: flags.fiscalSandbox ? 'warning' : 'setup', detail: flags.fiscalSandbox ? 'Ambiente di prova attivo' : 'Da configurare' }

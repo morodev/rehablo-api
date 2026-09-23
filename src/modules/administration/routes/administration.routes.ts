@@ -8,9 +8,9 @@ import { requireAdministrationFeature } from '../middleware/administrationFeatur
 import * as quoteDelivery from '../controllers/quoteDelivery.controller.js';
 import { getTreasuryExpense } from '../controllers/treasuryView.controller.js';
 import { getDailyClosing, listDailyClosings, previewDailyClosing } from '../controllers/dailyClosing.controller.js';
-import { previewFiscalSubmission } from '../controllers/fiscalSimulation.controller.js';
+import { previewFiscalSubmission, transmitFiscal } from '../controllers/fiscalSimulation.controller.js';
 
-import { getFiscalSettings, updateFiscalSettings } from '../controllers/fiscalSettings.controller.js';
+import { getFiscalSettings, updateFiscalSettings, getStsCredentials, updateStsCredentials } from '../controllers/fiscalSettings.controller.js';
 
 const router = Router();
 router.use(requireAuth, resolveTenantSchema);
@@ -19,6 +19,8 @@ router.get('/administration/capabilities', requireAnyPermission(['tenant', 'read
 router.patch('/administration/capabilities', requirePermission('tenant', 'update', 'tenant'), controller.updateCapabilities);
 router.get('/administration/fiscal-settings', requireAnyPermission(['invoice', 'read'], ['invoice', 'create'], ['invoice', 'update'], ['fiscal_submission', 'create'], ['fiscal_submission', 'read'], ['tenant', 'read']), getFiscalSettings);
 router.patch('/administration/fiscal-settings', requirePermission('tenant', 'update', 'tenant'), updateFiscalSettings);
+router.get('/administration/fiscal-settings/sts-credentials', requireAnyPermission(['fiscal_submission', 'read'], ['fiscal_submission', 'create'], ['tenant', 'read']), getStsCredentials);
+router.patch('/administration/fiscal-settings/sts-credentials', requirePermission('tenant', 'update', 'tenant'), updateStsCredentials);
 router.use('/administration', requireAdministrationFeature);
 
 const crud = (
@@ -81,6 +83,7 @@ router.get('/administration/expenses/:id', requirePermission('expense', 'read'),
 
 router.get('/administration/fiscal-submissions', requirePermission('fiscal_submission', 'read'), views.listFiscalSubmissions);
 router.post('/administration/fiscal-submissions/preview', requirePermission('fiscal_submission', 'create'), previewFiscalSubmission);
+router.post('/administration/fiscal-submissions/transmit', requirePermission('fiscal_submission', 'create'), transmitFiscal);
 router.post('/administration/fiscal-submissions', requirePermission('fiscal_submission', 'create'), controller.submitFiscal);
 router.post('/administration/fiscal-submissions/:id/retry', requirePermission('fiscal_submission', 'create'), views.retryFiscalSubmission);
 

@@ -24,9 +24,14 @@ import { evalTotals, EvalTotalsResult, toPersistedTotals } from '../utils/evalTo
 import { applyAppointmentPriceSnapshot } from '../utils/appointmentInvoicePrice.js';
 import { normalizeSearchQuery } from '../../../utils/search.js';
 import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
+import { buildRecipientSnapshot } from '../utils/recipient.js';
+import { InvoiceIssuerSnapshot, InvoiceRecipientSnapshot } from '../models/invoice.model.js';
 import { getStsFiscalSettings, invoiceStsCodeForSave } from '../utils/stsExpenseType.js';
 import { buildFiscalNotes, FiscalProfile, isStampDutyDue, resolveFiscalProfile } from '../utils/fiscalRegime.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
+import { buildFatturaPaXml } from '../utils/fatturaPa.js';
+import { InvoiceLineLike, invoiceRoutingLines, mapInvoiceToFatturaPa } from '../utils/invoiceFatturaPa.js';
+import { resolveFiscalRouting } from '../../administration/services/fiscalRouting.service.js';
 import { invoiceEmissionMonth, invoicePaymentMonth, parseInvoiceMonthFilter } from '../utils/invoiceFilters.js';
 import { decorateInvoicesWithPayments, syncInvoicePaymentStatus } from '../services/payment.service.js';
 import { appointmentPricesByEvent, ensureAppointmentPaymentHistory, isValidPaymentDate, linkAppointmentPayments } from '../services/appointmentPayment.service.js';
@@ -633,6 +638,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
 
     let stsExcluded = Boolean(invoiceFields.stsExcluded);
     let invoiceStructureId = req.access?.structureId ?? null;
+    let recipient: InvoiceRecipientSnapshot | null = null;
     if (invoiceFields.patientID) {
         // Si può fatturare solo a un paziente che si ha il diritto di vedere.
         const patient = await Patient.schema(schema).findOne({
@@ -650,6 +656,9 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         if (patient.get('stsOppositionToDataSending')) {
             stsExcluded = true;
         }
+        // Congela il destinatario sul documento: la generazione FatturaPA/Sistema TS deve partire
+        // dal documento immutabile, non da un'anagrafica che può cambiare dopo l'emissione.
+        recipient = buildRecipientSnapshot(patient.get({ plain: true }) as any);
     }
 
     const [unavailableProductId, unavailableServiceId] = await Promise.all([
@@ -842,7 +851,8 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                 documentNumber: nextNumber,
                 documentYear: fiscalYear,
                 stsExcluded,
-                issuer
+                issuer,
+                recipient
             },
             { transaction: t }
         );
@@ -1576,6 +1586,129 @@ export const exportSistemaTS = asyncHandler(async (req: Request, res: Response) 
     return res.status(200).send(xml);
 });
 
+interface InvoiceFiscalContext {
+    plain: any;
+    issuer: InvoiceIssuerSnapshot;
+    recipient: InvoiceRecipientSnapshot;
+    lines: InvoiceLineLike[];
+    decision: ReturnType<typeof resolveFiscalRouting>;
+}
+
+/** Carica una fattura e ne risolve snapshot, righe e decisione di instradamento fiscale. */
+async function loadInvoiceFiscalContext(
+    req: Request
+): Promise<{ ok: false; status: number; message: string } | { ok: true; context: InvoiceFiscalContext }> {
+    const schema = req.tenantSchema!;
+    const { InvoiceScoped, InvoiceProductScoped, InvoiceServiceScoped } = getScopedModels(schema);
+
+    const invoice = await InvoiceScoped.findOne({
+        where: { id: req.params.invoiceId, ...patientScopeWhere(req, schema, 'patientID') },
+        include: [
+            { model: InvoiceProductScoped, as: 'products' },
+            { model: InvoiceServiceScoped, as: 'services' }
+        ]
+    });
+    if (!invoice) return { ok: false, status: 404, message: 'Fattura non trovata' };
+
+    const plain = invoice.get({ plain: true }) as any;
+    const tenant = await Tenant.findByPk(req.user!.tenants[0].id);
+    if (!tenant) return { ok: false, status: 404, message: 'Struttura/tenant non trovato' };
+    const tenantData = tenant.get({ plain: true }) as any;
+
+    // Snapshot immutabili con ripiego dichiarato sui dati correnti per i documenti legacy.
+    const issuer: InvoiceIssuerSnapshot = plain.issuer ?? buildIssuerSnapshot(tenantData);
+    let recipient: InvoiceRecipientSnapshot | null = plain.recipient ?? null;
+    let patientOpposesTs = false;
+    if (plain.patientID) {
+        const patient = await Patient.schema(schema).findByPk(plain.patientID);
+        if (patient) {
+            patientOpposesTs = Boolean(patient.get('stsOppositionToDataSending'));
+            if (!recipient) recipient = buildRecipientSnapshot(patient.get({ plain: true }) as any);
+        }
+    }
+    if (!recipient) return { ok: false, status: 422, message: 'Destinatario del documento mancante: impossibile determinare l’instradamento.' };
+
+    const lines: InvoiceLineLike[] = [
+        ...(plain.products ?? []).map((line: any): InvoiceLineLike => ({
+            kind: 'PRODUCT', name: line.productName, vat: line.productVat,
+            quantity: line.quantity, unitPrice: line.productPrice
+        })),
+        ...(plain.services ?? []).map((line: any): InvoiceLineLike => ({
+            kind: 'SERVICE', name: line.serviceName, vat: line.serviceVat,
+            quantity: line.quantity, unitPrice: line.servicePrice
+        }))
+    ];
+
+    const stsSettings = getStsFiscalSettings(tenantData);
+    const decision = resolveFiscalRouting({
+        documentType: String(plain.documentType ?? 'fattura') as any,
+        recipient: {
+            kind: recipient.kind,
+            hasVatNumber: Boolean(recipient.vatNumber),
+            taxCode: recipient.taxCode,
+            sdiCode: recipient.sdiCode,
+            pec: recipient.pec
+        },
+        lines: invoiceRoutingLines(lines),
+        patientOpposesTs,
+        stsIssuerConfigured: Boolean(stsSettings.stsIssuerType),
+        stsExpenseTypeResolved: true
+    });
+
+    return { ok: true, context: { plain, issuer, recipient, lines, decision } };
+}
+
+/** Anteprima dell'instradamento fiscale di un documento (canale, motivo, blocchi). */
+export const getFiscalRouting = asyncHandler(async (req: Request, res: Response) => {
+    const result = await loadInvoiceFiscalContext(req);
+    if (!result.ok) return sendErrorResponse(res, result.status, result.message);
+    const { decision, plain } = result.context;
+    return sendSuccessResponse(res, 200, {
+        documentId: plain.id,
+        documentNumber: plain.documentNumber != null ? `${plain.documentNumber}/${plain.documentYear}` : null,
+        ruleVersion: decision.ruleVersion,
+        channels: decision.channels,
+        sdi: decision.sdi,
+        sts: decision.sts,
+        blocks: decision.blocks,
+        warnings: decision.warnings,
+        needsHealthcareClassification: decision.needsHealthcareClassification,
+        canDownloadFatturaPa: decision.channels.includes('SDI')
+    });
+});
+
+export const exportFatturaPa = asyncHandler(async (req: Request, res: Response) => {
+    const result = await loadInvoiceFiscalContext(req);
+    if (!result.ok) return sendErrorResponse(res, result.status, result.message);
+    const { plain, issuer, recipient, lines, decision } = result.context;
+
+    if (!decision.channels.includes('SDI')) {
+        if (!decision.sdi.required) {
+            return sendErrorResponse(res, 409, `Questo documento non è destinato allo SDI. ${decision.sdi.reason} ${decision.sts.reason}`.trim());
+        }
+        return sendErrorResponse(res, 422, decision.blocks.join(' ') || 'Dati insufficienti per la trasmissione SDI.');
+    }
+
+    const progressivo = `${plain.documentYear ?? new Date().getFullYear()}${String(plain.documentNumber ?? 0).padStart(5, '0')}`.slice(0, 10);
+    let xml: string;
+    try {
+        xml = buildFatturaPaXml(mapInvoiceToFatturaPa({
+            issuer, recipient, lines, progressivo,
+            document: {
+                documentType: plain.documentType, documentNumber: plain.documentNumber, documentYear: plain.documentYear,
+                emissionDate: plain.emissionDate ? new Date(plain.emissionDate).toISOString().slice(0, 10) : null,
+                isStamp: plain.isStamp, stampAmount: plain.stampAmount, stampChargedToPatient: plain.stampChargedToPatient
+            }
+        }));
+    } catch (error) {
+        return sendErrorResponse(res, 422, (error as Error).message);
+    }
+
+    res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="fattura-pa-${plain.documentNumber ?? 'bozza'}-${plain.documentYear ?? ''}.xml"`);
+    return res.status(200).send(xml);
+});
+
 export default {
     saveInvoice,
     findEligibleAppointments,
@@ -1584,6 +1717,8 @@ export default {
     findOneInvoice,
     updateInvoice,
     deleteInvoice,
-    exportSistemaTS
+    exportSistemaTS,
+    exportFatturaPa,
+    getFiscalRouting
 };
 

@@ -31,6 +31,8 @@ router.get('/invoice', requirePermission('invoice', 'read'), invoiceController.f
 router.get('/invoice/search', requirePermission('invoice', 'read'), invoiceController.searchInvoices);
 router.get('/invoice/eligible-appointments', requirePermission('invoice', 'create'), invoiceController.findEligibleAppointments);
 router.get('/invoice/export/sistema-ts', requirePermission('invoice', 'export'), invoiceController.exportSistemaTS);
+router.get('/invoice/:invoiceId/fattura-pa', requirePermission('invoice', 'export'), invoiceController.exportFatturaPa);
+router.get('/invoice/:invoiceId/fiscal-routing', requirePermission('invoice', 'read'), invoiceController.getFiscalRouting);
 router.get('/invoice/:invoiceId', requirePermission('invoice', 'read'), invoiceController.findOneInvoice);
 router.put('/invoice/:invoiceId', requirePermission('invoice', 'update'), invoiceController.updateInvoice);
 router.delete('/invoice/:invoiceId', requirePermission('invoice', 'delete'), invoiceController.deleteInvoice);

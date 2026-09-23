@@ -139,6 +139,30 @@ export const env = {
     corsOrigin: (process.env.CORS_ORIGIN || '*')
         .split(',')
         .map((origin) => origin.trim().replace(/\/+$/, ''))
-        .filter(Boolean)
+        .filter(Boolean),
+
+    /**
+     * Configurazione della trasmissione fiscale (SDI / Sistema TS).
+     *
+     * `transmissionEnabled` è l'interruttore generale: quando è `false` (DEFAULT) il sistema usa
+     * ESCLUSIVAMENTE il gateway MOCK/sandbox e NON invia alcun dato reale a SDI o Sistema TS.
+     * Portarlo a `true` richiede provider/credenziali configurati e i tracciati validati.
+     *
+     * Vedi docs/fiscal-integration-setup.md per la checklist completa di attivazione.
+     */
+    fiscal: {
+        transmissionEnabled: process.env.FISCAL_TRANSMISSION_ENABLED === 'true',
+        // Canale SDI: 'MOCK' (sandbox deterministica) o 'PROVIDER' (richiede endpoint + apiKey).
+        sdiProvider: (process.env.FISCAL_SDI_PROVIDER || 'MOCK').trim().toUpperCase(),
+        sdiEndpoint: process.env.FISCAL_SDI_ENDPOINT || '',
+        sdiApiKey: process.env.FISCAL_SDI_API_KEY || '',
+        // Sistema TS diretto: credenziali dello studio (portale Sistema TS). In multi-tenant vanno
+        // spostate su impostazioni per-tenant cifrate; qui restano globali per un tenant pilota.
+        stsEndpoint: process.env.FISCAL_STS_ENDPOINT || '',
+        stsUsername: process.env.FISCAL_STS_USERNAME || '',
+        stsPassword: process.env.FISCAL_STS_PASSWORD || '',
+        stsPincode: process.env.FISCAL_STS_PINCODE || '',
+        stsLive: process.env.FISCAL_STS_LIVE === 'true'
+    }
 };
 
