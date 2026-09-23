@@ -155,9 +155,16 @@ export const listCarePackages = asyncHandler(async (req, res) =>
     sendSuccessResponse(res, 200, await patientEntityPage(req, CarePackage))
 );
 
-export const listPatientCredits = asyncHandler(async (req, res) =>
-    sendSuccessResponse(res, 200, await patientEntityPage(req, PatientCredit))
-);
+export const listPatientCredits = asyncHandler(async (req, res) => {
+    const result = await patientEntityPage(req, PatientCredit);
+    // patientEntityPage slices after filtering; the balance must cover every matching credit.
+    const balance = await PatientCredit.schema(req.tenantSchema!).sum('remainingAmount', { where: {
+        ...structureWhere(req), ...(req.query.patientId ? { patientId: req.query.patientId } : {}), status: 'ACTIVE',
+        sourceType: { [Op.in]: ['TREASURY_ADVANCE', 'VOID_CREDIT'] }, sourceId: { [Op.not]: null }
+    } });
+    return sendSuccessResponse(res, 200, { ...result,
+        balance: Math.round(Number(balance ?? 0) * 100) / 100 });
+});
 
 export const listPriceLists = asyncHandler(async (req, res) => {
     const lists = (await PriceList.schema(req.tenantSchema!).findAll({ order: [['priority', 'DESC'], ['name', 'ASC']] })).map(plain);
@@ -253,7 +260,8 @@ export const listPurchaseDocuments = asyncHandler(async (req, res) =>
 async function documentRows(req: Request, period = requestPeriod(req)): Promise<Plain[]> {
     const schema = req.tenantSchema!;
     const InvoiceScoped = Invoice.schema(schema);
-    const where: Plain = { [Op.and]: [structureWhere(req), fiscalInvoiceScope(req), rangeFrom(period, 'emissionDate')] };
+    const where: Plain = { [Op.and]: [structureWhere(req), fiscalInvoiceScope(req), rangeFrom(period, 'emissionDate'),
+        ...(req.query.patientId ? [{ patientID: String(req.query.patientId) }] : [])] };
     const rows = await InvoiceScoped.findAll({
         where,
         include: [

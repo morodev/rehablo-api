@@ -9,12 +9,16 @@ services:
   - type: web
     name: rehablo-api
     runtime: node
-    plan: free
+    plan: 0.5c-512mb
     region: frankfurt
     branch: master
     buildCommand: npm ci && npm run build
     startCommand: npm start
     healthCheckPath: /health
+    disk:
+      name: rehablo-private-files
+      mountPath: /var/data/rehablo
+      sizeGB: 1
     envVars:
       - key: NODE_VERSION
         value: 20.14.0
@@ -42,7 +46,7 @@ services:
       - key: DEVICE_CREDENTIALS_SECRET
         generateValue: true
       - key: RAW_FILE_STORAGE_DIR
-        value: ./storage/raw-files
+        value: /var/data/rehablo/raw-files
       - key: MAX_UPLOAD_SIZE_MB
         value: "20"
       - key: CORS_ORIGIN

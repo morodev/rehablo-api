@@ -11,6 +11,7 @@ export interface ProtocolInstanceAttributes {
     startDate: Date;
     endDate?: Date | null;
     status: ProtocolInstanceStatus;
+    publishedToPatient?: boolean;
     notes?: string | null;
 }
 
@@ -34,6 +35,7 @@ export class ProtocolInstance
     declare startDate: Date;
     declare endDate: Date | null;
     declare status: ProtocolInstanceStatus;
+    declare publishedToPatient: boolean;
     declare notes: string | null;
 }
 
@@ -50,7 +52,8 @@ ProtocolInstance.init(
             allowNull: false,
             defaultValue: 'ACTIVE'
         },
-        notes: { type: DataTypes.TEXT, allowNull: true }
+        notes: { type: DataTypes.TEXT, allowNull: true },
+        publishedToPatient: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false }
     },
     { sequelize, modelName: 'protocolInstance', tableName: 'protocol_instances' }
 );

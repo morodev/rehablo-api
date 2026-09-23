@@ -184,6 +184,7 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
         if (!payment) return { kind: 'not-found' } as const;
         if (payment.status !== 'POSTED') return { kind: 'already-void' } as const;
         if (payment.source === 'PACKAGE') return { kind: 'package-coverage' } as const;
+        if (payment.source === 'CREDIT') return { kind: 'credit-application' } as const;
 
         const voidedAmount = Number(payment.get('amount')) || 0;
         const patientId = lockedInvoice.get('patientID') as string | null;
@@ -230,6 +231,7 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
     if (result.kind === 'not-found') return sendErrorResponse(res, 404, 'Pagamento non trovato');
     if (result.kind === 'already-void') return sendErrorResponse(res, 409, 'Movimento già annullato o trasferito a credito');
     if (result.kind === 'package-coverage') return sendErrorResponse(res, 409, 'La copertura da pacchetto non è uno storno di incasso');
+    if (result.kind === 'credit-application') return sendErrorResponse(res, 409, 'La copertura da credito va gestita dal registro crediti');
     if (result.kind === 'credit-unavailable') return sendErrorResponse(res, 409, 'Credito non disponibile: serve un incasso effettivo non rimborsato e una sede associata');
     return sendSuccessResponse(res, 200, result, result.creditCreated ? 'Incasso trasferito a credito del paziente' : 'Pagamento annullato');
 });

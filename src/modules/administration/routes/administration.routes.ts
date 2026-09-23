@@ -11,6 +11,7 @@ import { getDailyClosing, listDailyClosings, previewDailyClosing } from '../cont
 import { previewFiscalSubmission, transmitFiscal } from '../controllers/fiscalSimulation.controller.js';
 
 import { getFiscalSettings, updateFiscalSettings, getStsCredentials, updateStsCredentials } from '../controllers/fiscalSettings.controller.js';
+import { createAdvance, applyCredit, refundCredit, creditMovements, reverseCreditApplication } from '../controllers/patientCredit.controller.js';
 
 const router = Router();
 router.use(requireAuth, resolveTenantSchema);
@@ -61,10 +62,16 @@ router.post('/administration/quotes/:id/deliveries/:deliveryId/revoke', requireP
 router.post('/administration/quotes/:id/accept', requirePermission('quote', 'update'), controller.acceptQuote);
 router.post('/administration/quotes/:id/reject', requirePermission('quote', 'update'), controller.rejectQuote);
 router.post('/administration/quotes/:id/create-package', requirePermission('quote', 'update'), controller.createPackageFromQuote);
-crud('/administration/care-packages', 'carePackages', 'quote', views.listCarePackages);
-crud('/administration/package-consumptions', 'packageConsumptions', 'quote');
+router.get('/administration/care-packages', requirePermission('quote', 'read'), views.listCarePackages);
+router.get('/administration/package-consumptions', requirePermission('quote', 'read'), controller.list('packageConsumptions'));
 router.post('/administration/care-packages/:id/consume', requirePermission('quote', 'update'), controller.consumePackage);
-crud('/administration/patient-credits', 'patientCredits', 'quote', views.listPatientCredits);
+router.get('/administration/patient-credits', requirePermission('quote', 'read'), views.listPatientCredits);
+router.post('/administration/patient-credits/advance', requirePermission('quote', 'create'),
+    requirePermission('treasury', 'create'), createAdvance);
+router.get('/administration/patient-credits/:id/movements', requirePermission('quote', 'read'), creditMovements);
+router.post('/administration/patient-credits/:id/apply', requirePermission('quote', 'update'), applyCredit);
+router.post('/administration/patient-credits/:id/refund', requirePermission('treasury', 'create'), refundCredit);
+router.post('/administration/patient-credits/:id/movements/:movementId/reverse', requirePermission('quote', 'update'), reverseCreditApplication);
 
 crud('/administration/payment-methods', 'paymentMethods', 'treasury');
 crud('/administration/financial-accounts', 'financialAccounts', 'treasury', views.listFinancialAccounts);

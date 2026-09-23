@@ -375,19 +375,34 @@ const assignPriceList = asyncHandler(async (req, res) => {
 
 
 const createPackageFromQuote = asyncHandler(async (req, res) => {
-    const quote = await Quote.schema(req.tenantSchema!).findOne({ where: { id: req.params.id, status: 'ACCEPTED', ...structureWhere(req, SPECS.quotes) } });
-    if (!quote) return sendErrorResponse(res, 404, 'Preventivo accettato non trovato');
-    const existing = await CarePackage.schema(req.tenantSchema!).findOne({ where: { quoteId: quote.get('id') } });
-    if (existing) return sendSuccessResponse(res, 200, existing);
     const source = bodySource(req);
-    const units = Number(source['purchasedUnits'] ?? 1);
-    const carePackage = await CarePackage.schema(req.tenantSchema!).create({
-        quoteId: quote.get('id'), structureId: quote.get('structureId'), patientId: quote.get('patientId'),
-        name: source['name'] ?? `Pacchetto preventivo ${quote.get('number')}`,
-        purchasedUnits: units, remainingUnits: units, totalPrice: quote.get('total'), lines: quote.get('lines'),
-        expiresAt: source['expiresAt'] ?? null, notes: source['notes'] ?? null
+    const result = await sequelize.transaction(async transaction => {
+        // Serializing on the quote also makes concurrent clicks idempotent.
+        const quote = await Quote.schema(req.tenantSchema!).findOne({ where: {
+            id: req.params.id, status: 'ACCEPTED', ...structureWhere(req, SPECS.quotes)
+        }, transaction, lock: transaction.LOCK.UPDATE });
+        if (!quote) return { error: 404, message: 'Preventivo accettato non trovato' };
+        const existing = await CarePackage.schema(req.tenantSchema!).findOne({
+            where: { quoteId: quote.get('id') }, transaction
+        });
+        if (existing) return { carePackage: existing, reused: true };
+        const serviceLines = (Array.isArray(quote.get('lines')) ? quote.get('lines') as Array<Record<string, unknown>> : [])
+            .filter(line => line['itemType'] === 'SERVICE');
+        const units = serviceLines.reduce((sum, line) => sum + Number(line['quantity']), 0);
+        if (!serviceLines.length || !Number.isSafeInteger(units) || units <= 0
+            || serviceLines.some(line => !Number.isSafeInteger(Number(line['quantity'])) || Number(line['quantity']) <= 0)) {
+            return { error: 422, message: 'Il preventivo non contiene un numero di sedute valido' };
+        }
+        const carePackage = await CarePackage.schema(req.tenantSchema!).create({
+            quoteId: quote.get('id'), structureId: quote.get('structureId'), patientId: quote.get('patientId'),
+            name: source['name'] ?? `Pacchetto preventivo ${quote.get('number')}`,
+            purchasedUnits: units, remainingUnits: units, totalPrice: quote.get('total'), lines: quote.get('lines'),
+            expiresAt: null, notes: source['notes'] ?? null
+        }, { transaction });
+        return { carePackage, reused: false };
     });
-    return sendSuccessResponse(res, 201, carePackage, 'Pacchetto attivato');
+    if ('error' in result) return sendErrorResponse(res, result.error ?? 409, result.message ?? 'Pacchetto non disponibile');
+    return sendSuccessResponse(res, result.reused ? 200 : 201, result.carePackage, 'Pacchetto attivato');
 });
 
 const consumePackage = asyncHandler(async (req, res) => {

@@ -32,6 +32,9 @@ import { registerEvaluationAssociations, Evaluation } from './modules/evaluation
 import { registerMeasurementAssociations, Observation, DeviceConnection, RawFile } from './modules/measurements/models/index.js';
 import { Note, NoteImage, Reminder } from './modules/notes/models/index.js';
 import PatientPortalAudit from './modules/patient-portal/models/patientPortalAudit.model.js';
+import PatientAppointmentRequest from './modules/patient-portal/models/patientAppointmentRequest.model.js';
+import PatientSharedDocument from './modules/patient-portal/models/patientSharedDocument.model.js';
+import { PatientCreditMovement } from './modules/administration/models/patientCreditMovement.model.js';
 import { ADMINISTRATION_MODELS } from './modules/administration/models/index.js';
 
 /**
@@ -67,7 +70,10 @@ export function registerTenantModels(): void {
     registerTenantScopedModel(NoteImage);
     registerTenantScopedModel(Reminder);
     registerTenantScopedModel(PatientPortalAudit);
+    registerTenantScopedModel(PatientAppointmentRequest);
+    registerTenantScopedModel(PatientSharedDocument);
     for (const model of ADMINISTRATION_MODELS) registerTenantScopedModel(model);
+    registerTenantScopedModel(PatientCreditMovement);
     registerTenantScopedModel(Category);
     registerTenantScopedModel(Product);
     registerTenantScopedModel(ProductStructure);

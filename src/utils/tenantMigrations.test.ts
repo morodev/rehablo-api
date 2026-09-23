@@ -18,19 +18,20 @@ const migration = require('../../migrations/20260907-unify-appointment-payment-l
 const patientDefaultMigration = require('../../migrations/20260908-add-patient-default-event-type.js');
 const pricingMigration = require('../../migrations/20260908-add-appointment-price-adjustments.js');
 const catalogAvailabilityMigration = require('../../migrations/20260919-add-catalog-structure-availability.js');
+const publicationMigration = require('../../migrations/20260924-backfill-patient-publication.js');
 const tenant = '00000000-0000-4000-8000-000000000001';
 const schema = 'rehablo_' + tenant.replaceAll('-', '');
 const original = {
     query: sequelize.query, transaction: sequelize.transaction, createSchema: sequelize.createSchema,
     migrate: migration.up, patientDefaultMigrate: patientDefaultMigration.up, pricingMigrate: pricingMigration.up,
-    catalogAvailabilityMigrate: catalogAvailabilityMigration.up, mode: env.tenantSchemaSync
+    catalogAvailabilityMigrate: catalogAvailabilityMigration.up, publicationMigrate: publicationMigration.up, mode: env.tenantSchemaSync
 };
 let queries: string[], order: string[], applied: boolean, patientDefaultApplied: boolean, syncs: number, migrations: number;
 let historyExists: boolean, agendaExists: boolean, transactionStarts: number, baselineApplied: boolean;
 let legacyBaselineApplied: boolean;
 let lastSyncOptions: any;
 let pricingApplied: boolean;
-let catalogAvailabilityApplied: boolean, administrationApplied: boolean;
+let catalogAvailabilityApplied: boolean, administrationApplied: boolean, publicationApplied: boolean;
 let migrationWork: (options: any) => Promise<void>;
 const transaction = {id: 'test-transaction'};
 
@@ -46,7 +47,7 @@ beforeEach(() => {
     legacyBaselineApplied = false;
     lastSyncOptions = undefined;
     pricingApplied = false;
-    catalogAvailabilityApplied = false; administrationApplied = false;
+    catalogAvailabilityApplied = false; administrationApplied = false; publicationApplied = false;
     migrationWork = async () => {};
     sequelize.createSchema = (async () => {}) as any;
     sequelize.transaction = (async (callback: any) => {
@@ -73,6 +74,7 @@ beforeEach(() => {
             ...(pricingApplied ? [{version: APPOINTMENT_PRICE_ADJUSTMENTS_VERSION}] : []),
             ...(catalogAvailabilityApplied ? [{version: CATALOG_STRUCTURE_AVAILABILITY_VERSION}] : []),
             ...(administrationApplied ? [{version: ADMINISTRATION_SEED_VERSION}] : []),
+            ...(publicationApplied ? [{version: '20260924-backfill-patient-publication'}] : []),
             ...(legacyBaselineApplied ? [{version: '20260907-tenant-model-baseline-v1'}] : []),
             ...(baselineApplied ? [{version: TENANT_MODEL_BASELINE_VERSION}] : [])
         ]];
@@ -94,6 +96,9 @@ beforeEach(() => {
         if (sql.startsWith('INSERT INTO') && options?.replacements?.version === ADMINISTRATION_SEED_VERSION) {
             administrationApplied = true;
         }
+        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === '20260924-backfill-patient-publication') {
+            publicationApplied = true; order.push('record-version');
+        }
         return [[]];
     }) as any;
     migration.up = async (_queryInterface: any, options: any) => {
@@ -110,6 +115,7 @@ beforeEach(() => {
     };
     pricingMigration.up = patientDefaultMigration.up;
     catalogAvailabilityMigration.up = patientDefaultMigration.up;
+    publicationMigration.up = patientDefaultMigration.up;
 });
 
 after(() => {
@@ -118,6 +124,7 @@ after(() => {
     patientDefaultMigration.up = original.patientDefaultMigrate;
     pricingMigration.up = original.pricingMigrate;
     catalogAvailabilityMigration.up = original.catalogAvailabilityMigrate;
+    publicationMigration.up = original.publicationMigrate;
     env.tenantSchemaSync = original.mode;
     invalidateTenantSchemaCache();
 });
@@ -125,7 +132,7 @@ after(() => {
 describe('tenant schema bootstrap', () => {
     it('preserves old history before model sync and records completion after migration', async () => {
         assert.equal(await ensureTenantSchema(tenant), schema);
-        assert.deepEqual(order, ['preserve-history', 'sync', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version']);
+        assert.deepEqual(order, ['preserve-history', 'sync', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version']);
         assert.equal(applied, true);
         assert.equal(patientDefaultApplied, true);
         assert.equal(lastSyncOptions.transaction, transaction);
@@ -139,7 +146,7 @@ describe('tenant schema bootstrap', () => {
     it('warms each existing tenant once before HTTP startup', async () => {
         assert.equal(await warmTenantSchemas([tenant, tenant], 2), 1);
         assert.equal(syncs, 1);
-        assert.equal(migrations, 4);
+        assert.equal(migrations, 5);
         assert.equal(transactionStarts, 1);
     });
 
@@ -147,7 +154,7 @@ describe('tenant schema bootstrap', () => {
         assert.equal(await provisionTenantSchema(tenant, transaction as any), schema);
         assert.equal(transactionStarts, 0);
         assert.equal(lastSyncOptions.transaction, transaction);
-        assert.deepEqual(order, ['preserve-history', 'sync', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version']);
+        assert.deepEqual(order, ['preserve-history', 'sync', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version']);
     });
 
     it('shares initialization between simultaneous requests and waits for migration completion', async () => {
@@ -163,7 +170,7 @@ describe('tenant schema bootstrap', () => {
         assert.equal(finished, 0);
         assert.equal(syncs, 1); assert.equal(migrations, 1);
         release(); await Promise.all([first, second]);
-        assert.equal(finished, 2); assert.equal(migrations, 4);
+        assert.equal(finished, 2); assert.equal(migrations, 5);
     });
 
     it('retries failed migrations without caching the tenant or saving completion', async () => {
@@ -172,14 +179,14 @@ describe('tenant schema bootstrap', () => {
         assert.equal(applied, false);
         migrationWork = async () => {};
         await ensureTenantSchema(tenant);
-        assert.equal(migrations, 5); assert.equal(applied, true); assert.equal(patientDefaultApplied, true); assert.equal(pricingApplied, true);
+        assert.equal(migrations, 6); assert.equal(applied, true); assert.equal(patientDefaultApplied, true); assert.equal(pricingApplied, true);
     });
 
     it('uses the persisted version after process-cache invalidation instead of importing again', async () => {
         await ensureTenantSchema(tenant);
         invalidateTenantSchemaCache();
         await ensureTenantSchema(tenant);
-        assert.equal(syncs, 1); assert.equal(migrations, 4);
+        assert.equal(syncs, 1); assert.equal(migrations, 5);
         assert.equal(transactionStarts, 1);
     });
 
@@ -188,6 +195,7 @@ describe('tenant schema bootstrap', () => {
         patientDefaultApplied = true;
         pricingApplied = true;
         catalogAvailabilityApplied = true;
+        publicationApplied = true;
         legacyBaselineApplied = true;
 
         await ensureTenantSchema(tenant);

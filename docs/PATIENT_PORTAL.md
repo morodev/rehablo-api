@@ -33,9 +33,9 @@ Ogni richiesta del portale rilegge `patient_portal_accesses`: una revoca è quin
 prima della scadenza dell'access token. Le rotte staff rifiutano sempre un principal paziente,
 indipendentemente dai claim `perms`.
 
-## Visibilità V1
+## Visibilità V1 (base storica)
 
-Il portale è esclusivamente in lettura e pubblica DTO dedicati:
+La prima versione del portale era esclusivamente in lettura e pubblicava DTO dedicati:
 
 - valutazioni con stato `COMPLETED`;
 - protocolli assegnati, senza note operative o di progressione;
@@ -64,3 +64,20 @@ refresh token di quel solo collegamento e non influenza eventuali accessi ad alt
 
 La migration trasferisce le vecchie sospensioni globali da `users.deactivatedAt` alle membership
 `tenant_users.deactivatedAt`: una decisione del centro A non blocca più l'identità nel centro B.
+
+## Estensione del 24 settembre 2026
+
+- Il paziente consulta i preventivi effettivamente inviati, legge la versione consegnata e può accettarla o rifiutarla con il proprio accesso attivo. La decisione verifica che il preventivo corrente coincida ancora con lo snapshot inviato e viene registrata nell'audit. Il pacchetto viene creato dallo staff dopo l'accettazione.
+- Pacchetti, sedute residue e consumi collegati all'agenda sono consultabili dal paziente. Il consumo resta riservato allo staff.
+- Il saldo crediti mostra solo gli importi con origine contabile supportata. Gli anticipi nuovi registrano, in un'unica transazione, prima nota e credito. Applicazione, rimborso e annullamento applicazione hanno un registro separato; applicare credito a una fattura o seduta non genera un secondo incasso. I vecchi crediti manuali privi di origine verificabile restano visibili come storici da riconciliare, ma non sono spendibili o rimborsabili.
+- Il paziente può inviare richieste di nuova seduta, spostamento e disdetta. Lo staff aggiorna l'agenda e solo dopo conferma o rifiuta la richiesta; il paziente legge l'esito nel portale. Non parte una notifica email automatica.
+- Valutazioni concluse e protocolli hanno un flag di pubblicazione gestito dallo staff. Il paziente apre il dettaglio, visualizza l'andamento delle misurazioni e stampa un riepilogo individuale. I documenti caricati per la condivisione si scaricano con autenticazione e controllo sul paziente associato.
+- Il portale espone dettagli, pagamenti e residuo dei documenti fiscali emessi, con stampa/salvataggio PDF dal browser. Elenchi lunghi offrono caricamento progressivo. Con accesso `HISTORICAL` non si possono decidere preventivi o inviare richieste; l'agenda mostra solo appuntamenti passati e i protocolli solo se conclusi.
+
+### Pubblicazione dei dati preesistenti
+
+La migration `20260924-backfill-patient-publication` conserva la visibilità precedente: marca come pubblicate le valutazioni già concluse e i protocolli già assegnati. Dopo il rilascio, lo staff può revocare la pubblicazione di ogni elemento; i nuovi record partono non pubblicati. Verificare prima del rilascio se fra i protocolli preesistenti ci sono elementi che il centro non intende più condividere.
+
+### Archiviazione dei documenti condivisi
+
+`render.yaml` monta un disco persistente su `/var/data/rehablo` e imposta `RAW_FILE_STORAGE_DIR=/var/data/rehablo/raw-files`. Questa configurazione richiede un piano Render con disco e comporta un costo. **Non distribuire il cambio senza verificare e copiare i file preesistenti** dalla precedente directory `RAW_FILE_STORAGE_DIR`: il database contiene percorsi relativi e i file devono restare nello stesso percorso relativo sotto la nuova root. Conservare un backup esterno e verificare i checksum prima di attivare il nuovo servizio. L'implementazione non esegue questa copia automaticamente, perché non ha accesso ai file dell'istanza in produzione.

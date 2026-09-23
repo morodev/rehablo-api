@@ -8,7 +8,7 @@ import {
 export const INVOICE_PAYMENT_STATUSES = ['POSTED', 'VOID', 'CREDIT'] as const;
 export type InvoicePaymentStatus = (typeof INVOICE_PAYMENT_STATUSES)[number];
 
-export const INVOICE_PAYMENT_SOURCES = ['USER', 'LEGACY_IMPORT', 'APPOINTMENT', 'PACKAGE'] as const;
+export const INVOICE_PAYMENT_SOURCES = ['USER', 'LEGACY_IMPORT', 'APPOINTMENT', 'PACKAGE', 'CREDIT'] as const;
 export type InvoicePaymentSource = (typeof INVOICE_PAYMENT_SOURCES)[number];
 
 export interface InvoicePaymentAttributes {
@@ -101,7 +101,7 @@ function modelSchema(payment: InvoicePayment): unknown {
 InvoicePayment.addHook('afterCreate', 'mirrorTreasuryMovement', async (payment, options) => {
     const typed = payment as InvoicePayment;
     // Package coverage settles a visit but is not a new cash receipt.
-    if (typed.status !== 'POSTED' || typed.source === 'PACKAGE') return;
+    if (typed.status !== 'POSTED' || typed.source === 'PACKAGE' || typed.source === 'CREDIT') return;
     await mirrorInvoicePaymentToTreasury(modelSchema(typed), typed.get({ plain: true }) as any, options.transaction ?? undefined,
         (options as InvoicePaymentCreateOptions).treasuryContext);
 });
@@ -109,7 +109,7 @@ InvoicePayment.addHook('afterCreate', 'mirrorTreasuryMovement', async (payment, 
 InvoicePayment.addHook('afterUpdate', 'mirrorTreasuryVoid', async (payment, options) => {
     const typed = payment as InvoicePayment;
     if (!typed.changed('status') || typed.status !== 'VOID' || typed.previous('status') !== 'POSTED') return;
-    if (typed.source === 'PACKAGE') return;
+    if (typed.source === 'PACKAGE' || typed.source === 'CREDIT') return;
     await mirrorVoidedInvoicePaymentToTreasury(
         modelSchema(typed), typed.get({ plain: true }) as any, options.transaction ?? undefined
     );

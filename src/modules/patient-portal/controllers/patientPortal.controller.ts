@@ -34,6 +34,9 @@ import {
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import { Invoice, InvoicePayment, InvoiceProduct, InvoiceService } from '../../invoice/models/index.js';
 import PatientPortalAudit from '../models/patientPortalAudit.model.js';
+import PatientSharedDocument from '../models/patientSharedDocument.model.js';
+import { CarePackage, PatientCredit, Quote } from '../../administration/models/administration.model.js';
+import { QuoteDelivery } from '../../administration/models/quoteDelivery.model.js';
 
 const DEFAULT_LIMIT = 50;
 
@@ -41,6 +44,13 @@ function pageLimit(req: Request): number {
     const requested = Number(req.query.limit ?? DEFAULT_LIMIT);
     return Number.isFinite(requested) ? Math.min(Math.max(requested, 1), 100) : DEFAULT_LIMIT;
 }
+
+function pageOffset(req: Request): number {
+    const requested = Number(req.query.offset ?? 0);
+    return Number.isSafeInteger(requested) && requested >= 0 ? requested : 0;
+}
+
+const historical = (req: Request) => req.patientPortalAccess?.get('status') === 'HISTORICAL';
 
 function context(req: Request) {
     return {
@@ -113,6 +123,23 @@ export const overview = asyncHandler(async (req: Request, res: Response) => {
     const structure = structureId
         ? await Structure.findOne({ where: { id: structureId, tenantId: ctx.tenantId } })
         : null;
+    const [nextAppointment, activePackage, credits, sentQuotes, recentDocument] = await Promise.all([
+          historical(req) ? Promise.resolve(null) : AgendaEvent.schema(req.tenantSchema!).findOne({ where: { patientId: ctx.patientId,
+              start: { [Op.gte]: new Date().toISOString() }, status: { [Op.ne]: 'CANCELLED' } },
+            attributes: ['id', 'title', 'start'], order: [['start', 'ASC']] }),
+          historical(req) ? Promise.resolve(null) : CarePackage.schema(req.tenantSchema!).findOne({ where: { patientId: ctx.patientId, status: 'ACTIVE' },
+            attributes: ['id', 'name', 'remainingUnits'], order: [['createdAt', 'DESC']] }),
+          PatientCredit.schema(req.tenantSchema!).sum('remainingAmount', { where: { patientId: ctx.patientId, status: 'ACTIVE',
+              sourceType: { [Op.in]: ['TREASURY_ADVANCE', 'VOID_CREDIT'] }, sourceId: { [Op.not]: null } } }),
+        QuoteDelivery.schema(req.tenantSchema!).findAll({ where: { patientId: ctx.patientId, status: 'SENT',
+            revokedAt: null, expiresAt: { [Op.gt]: new Date() } }, attributes: ['quoteId'] }),
+        PatientSharedDocument.schema(req.tenantSchema!).findOne({ where: { patientId: ctx.patientId, unpublishedAt: null },
+            attributes: ['id', 'title', 'publishedAt'], order: [['publishedAt', 'DESC']] })
+    ]);
+    const sentQuoteIds = [...new Set(sentQuotes.map(row => String(row.get('quoteId'))))];
+      const pendingQuoteCount = !historical(req) && sentQuoteIds.length ? await Quote.schema(req.tenantSchema!).count({ where: {
+        id: { [Op.in]: sentQuoteIds }, patientId: ctx.patientId, status: 'SENT'
+    } }) : 0;
     await audit(req, 'overview');
 
     return sendSuccessResponse(res, 200, {
@@ -136,16 +163,22 @@ export const overview = asyncHandler(async (req: Request, res: Response) => {
             fiscalCode: patient.get('fiscalCode'),
             gender: patient.get('gender')
         },
-        relationshipStatus: req.patientPortalAccess!.get('status')
+        relationshipStatus: req.patientPortalAccess!.get('status'),
+        summary: {
+            nextAppointment: nextAppointment ? { id: nextAppointment.get('id'), title: nextAppointment.get('title'), start: nextAppointment.get('start') } : null,
+            activePackage: activePackage ? { id: activePackage.get('id'), name: activePackage.get('name'), remainingUnits: activePackage.get('remainingUnits') } : null,
+            creditBalance: Number(credits ?? 0), pendingQuoteCount,
+            recentDocument: recentDocument ? { id: recentDocument.get('id'), title: recentDocument.get('title'), publishedAt: recentDocument.get('publishedAt') } : null
+        }
     }, 'Portale paziente caricato');
 });
 
 export const evaluations = asyncHandler(async (req: Request, res: Response) => {
     const rows = await Evaluation.schema(req.tenantSchema!).findAll({
-        where: { patientId: context(req).patientId, status: 'COMPLETED' },
+        where: { patientId: context(req).patientId, status: 'COMPLETED', publishedToPatient: true },
         attributes: ['id', 'date', 'title', 'status', 'structureId'],
         order: [['date', 'DESC']],
-        limit: pageLimit(req)
+        limit: pageLimit(req), offset: pageOffset(req)
     });
     await audit(req, 'evaluations');
     return sendSuccessResponse(res, 200, rows, 'Valutazioni concluse');
@@ -154,7 +187,7 @@ export const evaluations = asyncHandler(async (req: Request, res: Response) => {
 export const evaluationDetail = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const evaluation = await Evaluation.schema(schema).findOne({
-        where: { id: req.params.evaluationId, patientId: context(req).patientId, status: 'COMPLETED' },
+        where: { id: req.params.evaluationId, patientId: context(req).patientId, status: 'COMPLETED', publishedToPatient: true },
         attributes: { exclude: ['notes', 'userId'] },
         include: [
             { model: HumanBodyPoint.schema(schema) },
@@ -216,11 +249,12 @@ export const evaluationDetail = asyncHandler(async (req: Request, res: Response)
 export const protocols = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const rows = await ProtocolInstance.schema(schema).findAll({
-        where: { patientId: context(req).patientId },
+          where: { patientId: context(req).patientId, publishedToPatient: true,
+              ...(historical(req) ? { status: 'COMPLETED' } : {}) },
         attributes: { exclude: ['notes', 'userId'] },
         include: [{ model: ProtocolTemplate, required: false }],
         order: [['startDate', 'DESC']],
-        limit: pageLimit(req)
+        limit: pageLimit(req), offset: pageOffset(req)
     });
     await audit(req, 'protocols');
     return sendSuccessResponse(res, 200, patientProjection(rows), 'Protocolli assegnati');
@@ -229,7 +263,8 @@ export const protocols = asyncHandler(async (req: Request, res: Response) => {
 export const protocolDetail = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const row = await ProtocolInstance.schema(schema).findOne({
-        where: { id: req.params.protocolId, patientId: context(req).patientId },
+          where: { id: req.params.protocolId, patientId: context(req).patientId, publishedToPatient: true,
+              ...(historical(req) ? { status: 'COMPLETED' } : {}) },
         attributes: { exclude: ['notes', 'userId'] },
         include: [
             { model: ProtocolTemplate, required: false },
@@ -253,7 +288,7 @@ export const measurements = asyncHandler(async (req: Request, res: Response) => 
         where: { patientId: context(req).patientId, quality: 'GOOD' },
         attributes: { exclude: ['metadata', 'rawFileId', 'operatorId'] },
         order: [['effectiveDateTime', 'DESC']],
-        limit: pageLimit(req)
+        limit: pageLimit(req), offset: pageOffset(req)
     });
     await audit(req, 'measurements');
     return sendSuccessResponse(res, 200, patientProjection(rows), 'Misurazioni concluse');
@@ -261,10 +296,12 @@ export const measurements = asyncHandler(async (req: Request, res: Response) => 
 
 export const appointments = asyncHandler(async (req: Request, res: Response) => {
     const rows = await AgendaEvent.schema(req.tenantSchema!).findAll({
-        where: { patientId: context(req).patientId },
-        attributes: ['id', 'title', 'start', 'end', 'allDay', 'status', 'structureId', 'eventTypeId', 'invoiceId'],
+          where: { patientId: context(req).patientId,
+              ...(historical(req) ? { start: { [Op.lt]: new Date().toISOString() } } : {}) },
+        attributes: ['id', 'title', 'start', 'end', 'allDay', 'status', 'structureId', 'eventTypeId', 'invoiceId',
+            'appointmentPaymentStatus', 'appointmentPaymentMethod', 'appointmentPaidAmount', 'appointmentExpectedAmount'],
         order: [['start', 'DESC']],
-        limit: pageLimit(req)
+        limit: pageLimit(req), offset: pageOffset(req)
     });
     await audit(req, 'appointments');
     return sendSuccessResponse(res, 200, rows, 'Appuntamenti del paziente');
@@ -282,7 +319,7 @@ export const invoices = asyncHandler(async (req: Request, res: Response) => {
             'stampAmount', 'stampChargedToPatient'
         ],
         order: [['emissionDate', 'DESC']],
-        limit: pageLimit(req)
+        limit: pageLimit(req), offset: pageOffset(req)
     });
     await audit(req, 'invoices');
     return sendSuccessResponse(res, 200, rows, 'Fatture del paziente');
@@ -310,7 +347,36 @@ export const invoiceDetail = asyncHandler(async (req: Request, res: Response) =>
     });
     if (!row) return sendErrorResponse(res, 404, 'Fattura non disponibile');
     await audit(req, 'invoice', req.params.invoiceId);
-    return sendSuccessResponse(res, 200, patientProjection(row), 'Dettaglio fattura');
+    const value = row.get({ plain: true }) as Record<string, any>;
+    const paid = (value.payments ?? []).reduce((sum: number, payment: any) => sum + Number(payment.amount ?? 0), 0);
+    const [legacyIssuer, legacyRecipient] = await Promise.all([
+        value.issuer ? Promise.resolve(null) : Tenant.findByPk(context(req).tenantId),
+        value.recipient ? Promise.resolve(null) : Patient.schema(schema).findByPk(context(req).patientId)
+    ]);
+    const issuer = value.issuer ?? (legacyIssuer ? legacyIssuer.get({ plain: true }) : null);
+    const recipient = value.recipient ?? (legacyRecipient ? legacyRecipient.get({ plain: true }) : null);
+    return sendSuccessResponse(res, 200, {
+        id: value.id, documentNumber: value.documentNumber, documentYear: value.documentYear,
+        documentType: value.documentType, emissionDate: value.emissionDate, status: value.status,
+        invoiceNet: value.invoiceNet, invoiceVAT: value.invoiceVAT, invoiceTotal: value.invoiceTotal,
+        stampAmount: value.stampAmount, paymentTerms: value.paymentTerms,
+        issuer: issuer ? { businessName: issuer.businessName, vatNumber: issuer.vatNumber ?? issuer.VATNumber,
+            taxCode: issuer.taxCode, address: issuer.address, city: issuer.city,
+            province: issuer.province, zipCode: issuer.zipCode } : null,
+        recipient: recipient ? { businessName: recipient.businessName,
+            firstName: recipient.firstName ?? recipient.name, lastName: recipient.lastName ?? recipient.surname,
+            taxCode: recipient.taxCode ?? recipient.fiscalCode, vatNumber: recipient.vatNumber,
+            address: recipient.address, city: recipient.city,
+            province: recipient.province, zipCode: recipient.zipCode } : null,
+        legacyIdentityFallback: !value.issuer || !value.recipient,
+        fiscalNotes: Array.isArray(value.fiscalNotes) ? value.fiscalNotes : [],
+        products: (value.products ?? []).map((item: any) => ({ name: item.productName, quantity: item.quantity,
+            price: item.productPrice, total: item.totalPrice, vat: item.productVat })),
+        services: (value.services ?? []).map((item: any) => ({ name: item.serviceName, quantity: item.quantity,
+            price: item.servicePrice, total: item.totalPrice, vat: item.serviceVat })),
+        payments: (value.payments ?? []).map((item: any) => ({ amount: item.amount, paidAt: item.paidAt, method: item.method })),
+        paidAmount: paid, remainingAmount: Math.max(0, Number(value.invoiceTotal ?? 0) - paid)
+    }, 'Dettaglio fattura');
 });
 
 export default {

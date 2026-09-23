@@ -17,6 +17,7 @@ export interface EvaluationAttributes {
     title?: string | null;
     notes?: string | null;
     status: EvaluationStatus;
+    publishedToPatient?: boolean;
     /**
      * Valutazione da cui questa è stata DERIVATA (FASE E, "Duplica in nuova valutazione"). Una
      * `COMPLETED` è immutabile: per modificarla si crea una nuova `DRAFT` che copia i suoi dati e ne
@@ -44,6 +45,7 @@ export class Evaluation
     declare title: string | null;
     declare notes: string | null;
     declare status: EvaluationStatus;
+    declare publishedToPatient: boolean;
     declare parentEvaluationId: string | null;
 }
 
@@ -61,7 +63,8 @@ Evaluation.init(
             allowNull: false,
             defaultValue: 'COMPLETED'
         },
-        parentEvaluationId: { type: DataTypes.UUID, allowNull: true }
+        parentEvaluationId: { type: DataTypes.UUID, allowNull: true },
+        publishedToPatient: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false }
     },
     { sequelize, modelName: 'evaluation', tableName: 'evaluations' }
 );
