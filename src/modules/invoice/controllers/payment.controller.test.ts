@@ -5,10 +5,12 @@ import { Op } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 import Invoice from '../models/invoice.model.js';
 import InvoicePayment from '../models/invoicePayment.model.js';
-import { FinancialAccount, PaymentMethod, TreasuryMovement } from '../../administration/models/index.js';
+import { CarePackage, FinancialAccount, PackageConsumption, PatientCredit, PaymentMethod, TreasuryMovement } from '../../administration/models/index.js';
+import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
+import Tenant from '../../auth/models/tenant.model.js';
 import { Structure } from '../../auth/models/index.js';
 import administration from '../../administration/controllers/administration.controller.js';
-import { createPayment } from './payment.controller.js';
+import { createPayment, voidPayment } from './payment.controller.js';
 
 const id = '11111111-1111-4111-8111-111111111111';
 const structureId = '22222222-2222-4222-8222-222222222222';
@@ -29,7 +31,7 @@ function run(handler: (req: Request, res: Response, next: NextFunction) => void,
     return new Promise(resolve => {
         const res: any = { statusCode: 200, status(code: number) { this.statusCode = code; return this; },
             json(body: unknown) { resolve({ status: this.statusCode, body }); return this; } };
-        handler(req, res, (error?: any) => resolve({ status: error?.statusCode ?? 500, body: { message: error?.message } }));
+        handler(req, res, (error?: any) => resolve({ status: error?.statusCode ?? error?.status ?? 500, body: { message: error?.message } }));
     });
 }
 
@@ -38,6 +40,7 @@ function fixture(t: TestContext) {
     const accounts = [record({ id: accountId, structureId, isActive: true })];
     const payments: any[] = [];
     const movements: any[] = [];
+    const credits: any[] = [];
     const queries: Array<{ sql: string; options: any }> = [];
     const invoiceWhere: any[] = [];
     let failMovement = false;
@@ -70,8 +73,14 @@ function fixture(t: TestContext) {
     t.mock.method(PaymentMethod, 'schema', (() => ({ findOne: async ({ where }: any) => where.id === methodId ? record({ id: methodId, label: 'Bonifico', isActive: true }) : null })) as any);
     t.mock.method(Structure, 'findOne', (async ({ where }: any) => where.id === structureId && where.tenantId === tenantId ? record({ id: structureId, tenantId }) : null) as any);
     t.mock.method(TreasuryMovement, 'schema', (() => ({
-        findOne: async ({ where }: any) => movements.find(movement => movement.idempotencyKey === where.idempotencyKey),
+        findOne: async ({ where }: any) => movements.find(movement => where.sourceType
+            ? movement.sourceType === where.sourceType && movement.sourceId === where.sourceId && movement.status === where.status
+            : movement.idempotencyKey === where.idempotencyKey),
+        count: async ({ where }: any) => movements.filter(movement => movement.reversalOfId === where.reversalOfId && movement.status === where.status).length,
         create: async (payload: any) => { const movement = record(payload); movements.push(movement); return movement; }
+    })) as any);
+    t.mock.method(PatientCredit, 'schema', (() => ({
+        create: async (payload: any) => { const credit = record(payload); credits.push(credit); return credit; }
     })) as any);
     t.mock.method(sequelize, 'query', (async (sql: string, options: any) => {
         queries.push({ sql, options });
@@ -81,7 +90,8 @@ function fixture(t: TestContext) {
         if (sql.includes('INSERT INTO') && sql.includes('treasury_movements')) {
             if (failMovement) throw new Error('simulated database failure');
             const values = options.replacements;
-            if (!movements.some(row => row.sourceId === values.sourceId)) movements.push(record({ ...values, sourceType: 'INVOICE_PAYMENT' }));
+            if (sql.includes("'INVOICE_PAYMENT_VOID'")) movements.push(record({ ...values, sourceType: 'INVOICE_PAYMENT_VOID', direction: 'OUT', status: 'POSTED' }));
+            else if (!movements.some(row => row.sourceId === values.sourceId)) movements.push(record({ ...values, sourceType: 'INVOICE_PAYMENT', status: 'POSTED' }));
             return [[], {}];
         }
         throw new Error('Unexpected SQL: ' + sql);
@@ -93,7 +103,7 @@ function fixture(t: TestContext) {
         body: { amount: 60, paidAt: '2025-01-15', accountId, paymentMethodId: methodId, note: 'Acconto' },
         header: () => 'receipt-test-1'
     };
-    return { req, invoice, accounts, payments, movements, queries, invoiceWhere, failMovement: () => { failMovement = true; } };
+    return { req, invoice, accounts, payments, movements, credits, queries, invoiceWhere, failMovement: () => { failMovement = true; } };
 }
 
 describe('invoice receipt controller and treasury hook', () => {
@@ -265,6 +275,113 @@ describe('invoice receipt controller and treasury hook', () => {
         const ownSql = generator.selectQuery({ tableName: 'invoices', schema }, { where: f.invoiceWhere[1] });
         assert.match(ownSql, /WHERE "userId" =/);
         assert.ok(f.invoiceWhere[0].patientID[Op.in]);
+    });
+});
+
+describe('package coverage and retained patient credits', () => {
+    it('settles a visit once without creating a second treasury receipt', async t => {
+        const packageId = '77777777-7777-4777-8777-777777777777';
+        const eventId = '88888888-8888-4888-8888-888888888888';
+        const pack = record({ id: packageId, structureId, patientId: userId, status: 'ACTIVE', remainingUnits: 2, purchasedUnits: 2, totalPrice: 200, expiresAt: null });
+        const event = record({ id: eventId, structureId, patientId: userId, status: 'CONFIRMED', invoiceId: null,
+            recurrence: null, recurringEventId: null, appointmentExpectedAmount: null, appointmentPaymentStatus: 'unpaid', appointmentPaidAmount: 0 });
+        event.get = function (key: string | object) {
+            if (typeof key === 'string') return this[key];
+            const { get, update, ...values } = this;
+            return values;
+        };
+        const consumptions: any[] = [];
+        const payments: any[] = [];
+        const queries: string[] = [];
+        t.mock.method(sequelize, 'transaction', (async (work: any) => work({ LOCK: { UPDATE: 'UPDATE' } })) as any);
+        t.mock.method(sequelize, 'query', (async (sql: string) => { queries.push(sql); return [[], {}]; }) as any);
+        t.mock.method(CarePackage, 'schema', (() => ({ findOne: async () => pack })) as any);
+        t.mock.method(AgendaEvent, 'schema', (() => ({ findByPk: async () => event })) as any);
+        t.mock.method(Tenant, 'findByPk', (async () => null) as any);
+        t.mock.method(PackageConsumption, 'schema', (() => ({
+            count: async () => consumptions.length,
+            create: async (values: any) => { const row = record(values); consumptions.push(row); return row; }
+        })) as any);
+        t.mock.method(InvoicePayment, 'schema', (() => ({
+            count: async () => payments.length,
+            findAll: async () => payments,
+            create: async (values: any, options: any) => {
+                const row = ScopedPayment.build(values);
+                payments.push(row);
+                await (ScopedPayment as any).runHooks('afterCreate', row, options);
+                return row;
+            }
+        })) as any);
+        const req: any = { tenantSchema: schema, params: { id: packageId }, body: { units: 1, agendaEventId: eventId },
+            access: { scope: 'tenant', structureId, userId } };
+        const first = await run(administration.consumePackage, req);
+        assert.equal(first.status, 201);
+        assert.equal(pack.remainingUnits, 1);
+        assert.equal(event.appointmentPaymentStatus, 'paid');
+        assert.equal(event.appointmentExpectedAmount, 100);
+        assert.equal(event.appointmentPaidAmount, 100);
+        assert.equal(payments[0].source, 'PACKAGE');
+        assert.equal(consumptions.length, 1);
+        assert.equal(queries.length, 0);
+        const duplicate = await run(administration.consumePackage, req);
+        assert.equal(duplicate.status, 409);
+        assert.equal(pack.remainingUnits, 1);
+        assert.equal(consumptions.length, 1);
+    });
+
+    it('moves a real receipt to patient credit without refunding it', async t => {
+        const f = fixture(t);
+        f.invoice.structureId = null;
+        assert.equal((await run(createPayment, f.req)).status, 201);
+        const paid = f.payments[0];
+        t.mock.method(paid, 'update', (async (changes: any, options: any) => {
+            paid.set(changes);
+            await (ScopedPayment as any).runHooks('afterUpdate', paid, options);
+            return paid;
+        }) as any);
+        f.req.params.paymentId = paid.id;
+        f.req.body = { reason: 'Acconto non allocato', convertToCredit: true };
+        const result = await run(voidPayment, f.req);
+        assert.equal(result.status, 200);
+        assert.equal(result.body.data.creditCreated, true);
+        assert.equal(f.credits.length, 1);
+        assert.equal(f.credits[0].amount, 60);
+        assert.equal(f.credits[0].structureId, structureId);
+        assert.equal(f.credits[0].sourceId, paid.id);
+        assert.equal(f.movements.length, 1);
+        assert.equal(paid.status, 'CREDIT');
+        assert.equal(f.invoice.status, 'unpaid');
+    });
+
+    it('still reverses treasury cash for an ordinary payment void', async t => {
+        const f = fixture(t);
+        assert.equal((await run(createPayment, f.req)).status, 201);
+        const paid = f.payments[0];
+        t.mock.method(paid, 'update', (async (changes: any, options: any) => {
+            paid.set(changes);
+            await (ScopedPayment as any).runHooks('afterUpdate', paid, options);
+            return paid;
+        }) as any);
+        f.req.params.paymentId = paid.id;
+        f.req.body = { reason: 'Rimborso al paziente', convertToCredit: false };
+        const result = await run(voidPayment, f.req);
+        assert.equal(result.status, 200);
+        assert.equal(paid.status, 'VOID');
+        assert.equal(f.movements.length, 2);
+        assert.equal(f.movements[1].direction, 'OUT');
+        assert.equal(f.credits.length, 0);
+    });
+
+    it('refuses to create a credit without a retained receipt', async t => {
+        const f = fixture(t);
+        assert.equal((await run(createPayment, f.req)).status, 201);
+        f.movements.length = 0;
+        f.req.params.paymentId = f.payments[0].id;
+        f.req.body = { reason: 'Acconto non allocato', convertToCredit: true };
+        const result = await run(voidPayment, f.req);
+        assert.equal(result.status, 409);
+        assert.equal(f.payments[0].status, 'POSTED');
+        assert.equal(f.credits.length, 0);
     });
 });
 

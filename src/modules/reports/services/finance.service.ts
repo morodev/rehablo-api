@@ -193,7 +193,7 @@ export function aggregateFinance(data: FinanceData, query: FinanceQuery) {
         data.invoices.filter((invoice) => invoice.status === 'void' && data.attributableInvoiceIds.has(invoice.id))
             .forEach((invoice) => invoiceIds.add(invoice.id));
     }
-    const payments = index.payments.filter((payment) => payment.status === 'POSTED' &&
+    const payments = index.payments.filter((payment) => ['POSTED', 'CREDIT'].includes(payment.status) && payment.source !== 'PACKAGE' &&
         (!query.paymentMethod || methodKey(payment.method) === query.paymentMethod) &&
         (payment.source === 'APPOINTMENT' && payment.agendaEventId ? eventIds.has(payment.agendaEventId) : invoiceIds.has(payment.invoiceId)));
     const periodPayments = payments.filter((payment) => inPeriod(payment.paidAt, query));
@@ -273,7 +273,7 @@ export function aggregateTherapyPayments(data: FinanceData, query: FinanceQuery,
     }).sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime() || a.id.localeCompare(b.id));
     const selectedEventIds = new Set(rows.map((row) => row.id));
     const selectedInvoiceIds = new Set(rows.map((row) => row.invoiceId).filter((id) => id && data.attributableInvoiceIds.has(id)));
-    const matchingPayments = index.payments.filter((p) => p.status === 'POSTED' && (!query.paymentMethod || methodKey(p.method) === query.paymentMethod));
+    const matchingPayments = index.payments.filter((p) => ['POSTED', 'CREDIT'].includes(p.status) && p.source !== 'PACKAGE' && (!query.paymentMethod || methodKey(p.method) === query.paymentMethod));
     const totals = {
         count: rows.length,
         expectedAmount: money(rows.reduce((sum, row) => sum + (row.expectedAmount ?? 0), 0)),

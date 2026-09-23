@@ -10,6 +10,7 @@ import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import Invoice from '../models/invoice.model.js';
 import InvoicePayment from '../models/invoicePayment.model.js';
+import { PatientCredit } from '../../administration/models/index.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import { syncInvoicePaymentStatus } from '../services/payment.service.js';
 import { syncAppointmentPaymentStatus } from '../services/appointmentPayment.service.js';
@@ -162,6 +163,8 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
     const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
     if (reason.length < 3) return sendErrorResponse(res, 400, 'Indica il motivo dell’annullamento');
     if (!UUID_REGEX.test(req.params.paymentId)) return sendErrorResponse(res, 400, 'Pagamento non valido');
+    // Opzione esplicita: il denaro incassato resta disponibile come credito del paziente.
+    const convertToCredit = req.body?.convertToCredit === true;
 
     const invoice = await findScopedInvoice(req);
     if (!invoice) return sendErrorResponse(res, 404, 'Fattura non trovata');
@@ -179,11 +182,28 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
             lock: transaction.LOCK.UPDATE
         });
         if (!payment) return { kind: 'not-found' } as const;
-        if (payment.status === 'VOID') return { kind: 'already-void' } as const;
+        if (payment.status !== 'POSTED') return { kind: 'already-void' } as const;
+        if (payment.source === 'PACKAGE') return { kind: 'package-coverage' } as const;
 
+        const voidedAmount = Number(payment.get('amount')) || 0;
+        const patientId = lockedInvoice.get('patientID') as string | null;
+        let structureId = lockedInvoice.get('structureId') as string | null;
+        if (convertToCredit) {
+            if (!patientId || voidedAmount <= 0) return { kind: 'credit-unavailable' } as const;
+            // A retained credit needs a real receipt that has not already been refunded.
+            const receipt = await TreasuryMovement.schema(schema).findOne({
+                where: { sourceType: 'INVOICE_PAYMENT', sourceId: payment.id, status: 'POSTED' },
+                transaction, lock: transaction.LOCK.UPDATE
+            });
+            if (!receipt || await TreasuryMovement.schema(schema).count({
+                where: { reversalOfId: receipt.get('id'), status: 'POSTED' }, transaction
+            })) return { kind: 'credit-unavailable' } as const;
+            structureId = structureId ?? receipt.get('structureId') as string | null;
+            if (!structureId) return { kind: 'credit-unavailable' } as const;
+        }
         await payment.update(
             {
-                status: 'VOID',
+                status: convertToCredit ? 'CREDIT' : 'VOID',
                 voidedAt: new Date(),
                 voidedByUserId: getUserId(req),
                 voidReason: reason
@@ -196,12 +216,22 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
             });
             if (event) await syncAppointmentPaymentStatus(schema, event, transaction, getUserId(req));
         }
+        // Il credito è collegato al movimento originale e creato nella stessa transazione.
+        if (convertToCredit) {
+            await PatientCredit.schema(schema).create({
+                structureId, patientId: patientId!, amount: voidedAmount, remainingAmount: voidedAmount, status: 'ACTIVE',
+                sourceType: 'VOID_CREDIT', sourceId: payment.id,
+                note: `Credito da storno incasso: ${reason}`
+            }, { transaction });
+        }
         const summary = await syncInvoicePaymentStatus(schema, invoice.id, transaction);
-        return { kind: 'voided', payment, summary } as const;
+        return { kind: 'voided', payment, summary, creditCreated: convertToCredit } as const;
     });
     if (result.kind === 'not-found') return sendErrorResponse(res, 404, 'Pagamento non trovato');
-    if (result.kind === 'already-void') return sendErrorResponse(res, 409, 'Pagamento già annullato');
-    return sendSuccessResponse(res, 200, result, 'Pagamento annullato');
+    if (result.kind === 'already-void') return sendErrorResponse(res, 409, 'Movimento già annullato o trasferito a credito');
+    if (result.kind === 'package-coverage') return sendErrorResponse(res, 409, 'La copertura da pacchetto non è uno storno di incasso');
+    if (result.kind === 'credit-unavailable') return sendErrorResponse(res, 409, 'Credito non disponibile: serve un incasso effettivo non rimborsato e una sede associata');
+    return sendSuccessResponse(res, 200, result, result.creditCreated ? 'Incasso trasferito a credito del paziente' : 'Pagamento annullato');
 });
 
 export const setLegacyPaymentDate = asyncHandler(async (req: Request, res: Response) => {

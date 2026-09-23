@@ -1092,12 +1092,13 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
     );
     const cashScopeIds = cashScopeInvoices.map(invoice => invoice.id);
     const paymentRows = cashScopeIds.length ? await InvoicePaymentScoped.findAll({
-        where: { invoiceId: { [Op.in]: cashScopeIds }, status: 'POSTED' },
-        attributes: ['invoiceId', 'amount', 'paidAt']
+        where: { invoiceId: { [Op.in]: cashScopeIds }, status: { [Op.in]: ['POSTED', 'CREDIT'] } },
+        attributes: ['invoiceId', 'amount', 'paidAt', 'source']
     }) : [];
     const invoicesWithUndatedMovements = new Set<string>();
     paymentRows.forEach(row => {
         const payment = row.get({ plain: true }) as Record<string, any>;
+        if (payment.source === 'PACKAGE') return;
         const paidAt = payment.paidAt ? String(payment.paidAt).slice(0, 10) : null;
         if (!paidAt) {
             aggregates.undatedPaidAmount += Number(payment.amount) || 0;
@@ -1260,7 +1261,7 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
                     transaction, lock: transaction.LOCK.UPDATE
                 });
                 await InvoicePaymentScoped.update({ invoiceId: null }, {
-                    where: { invoiceId: id, agendaEventId: { [Op.in]: eventIds }, source: 'APPOINTMENT' }, transaction
+                    where: { invoiceId: id, agendaEventId: { [Op.in]: eventIds }, source: { [Op.in]: ['APPOINTMENT', 'PACKAGE'] } }, transaction
                 });
                 await AgendaEvent.schema(schema).update({ invoiceId: null }, {
                     where: { id: { [Op.in]: eventIds }, invoiceId: id }, transaction
@@ -1721,4 +1722,3 @@ export default {
     exportFatturaPa,
     getFiscalRouting
 };
-

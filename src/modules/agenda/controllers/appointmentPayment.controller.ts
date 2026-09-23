@@ -473,7 +473,8 @@ export const voidAppointmentPayment = asyncHandler(async (req, res) => {
                 transaction, lock: transaction.LOCK.UPDATE
             });
             if (!payment) return fail(404, 'Pagamento non trovato');
-            if (payment.status === 'VOID') fail(409, 'Pagamento già annullato');
+            if (payment.status !== 'POSTED') fail(409, 'Pagamento già annullato o trasferito a credito');
+            if (payment.source === 'PACKAGE') fail(409, 'La copertura da pacchetto non è uno storno di incasso');
             await payment.update({ status: 'VOID', voidedAt: new Date(), voidedByUserId: getUserId(req), voidReason: reason }, { transaction });
             const summary = await syncAppointmentPaymentStatus(schema, event, transaction, getUserId(req));
             return { payment, summary, agendaEvent: event };

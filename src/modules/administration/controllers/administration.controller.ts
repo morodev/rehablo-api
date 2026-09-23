@@ -8,6 +8,9 @@ import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.
 import { Structure, Tenant } from '../../auth/models/index.js';
 import Patient from '../../patients/models/patient.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
+import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
+import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
+import { appointmentPricesByEvent, syncAppointmentPaymentStatus } from '../../invoice/services/appointmentPayment.service.js';
 import {
     BillingParty, CarePackage, DailyClosing, Expense, FinancialAccount, FiscalSubmission,
     PackageConsumption, PatientCredit, PaymentAllocation, PaymentMethod, PriceList,
@@ -388,22 +391,72 @@ const createPackageFromQuote = asyncHandler(async (req, res) => {
 });
 
 const consumePackage = asyncHandler(async (req, res) => {
+    const source = bodySource(req);
+    const units = Number(source['units'] ?? 1);
+    const agendaEventId = source['agendaEventId'] ?? null;
+    if (!Number.isInteger(units) || units < 1 || (agendaEventId && units !== 1)) {
+        return sendErrorResponse(res, 400, 'Seleziona una sola seduta valida');
+    }
+    if (agendaEventId && (typeof agendaEventId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(agendaEventId))) {
+        return sendErrorResponse(res, 400, 'Seduta non valida');
+    }
     const result = await sequelize.transaction(async (transaction: Transaction) => {
         const Pack = CarePackage.schema(req.tenantSchema!);
         const pack = await Pack.findOne({ where: { id: req.params.id, ...structureWhere(req, SPECS.carePackages) }, transaction, lock: transaction.LOCK.UPDATE });
         if (!pack || pack.get('status') !== 'ACTIVE') return null;
-        const units = Number(bodySource(req)['units'] ?? 1);
         const remaining = Number(pack.get('remainingUnits'));
-        if (!(units > 0) || units > remaining) throw Object.assign(new Error('Credito insufficiente'), { status: 409 });
+        if (units > remaining) throw Object.assign(new Error('Sedute residue insufficienti'), { status: 409 });
+        const expiry = pack.get('expiresAt');
+        if (expiry && String(expiry).slice(0, 10) < new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Rome' })) {
+            throw Object.assign(new Error('Il pacchetto è scaduto'), { status: 409 });
+        }
+        // Validate and lock the appointment before changing the package balance.
+        const appointment = agendaEventId ? await settleAppointmentWithPackage(req, agendaEventId, pack, transaction) : null;
         const consumption = await PackageConsumption.schema(req.tenantSchema!).create({
-            packageId: pack.get('id'), agendaEventId: bodySource(req)['agendaEventId'] ?? null,
-            units, note: bodySource(req)['note'] ?? null, createdByUserId: req.access?.userId
+            packageId: pack.get('id'), agendaEventId,
+            units, note: source['note'] ?? null, createdByUserId: req.access?.userId
         }, { transaction });
         await pack.update({ remainingUnits: remaining - units, status: remaining === units ? 'EXHAUSTED' : 'ACTIVE' }, { transaction });
-        return { package: pack, consumption };
+        return { package: pack, consumption, appointment };
     });
     return result ? sendSuccessResponse(res, 201, result) : sendErrorResponse(res, 404, 'Pacchetto attivo non trovato');
 });
+
+/**
+ * Package coverage is a non-cash settlement. The payment row makes existing appointment and
+ * invoice balance readers recognize it; source PACKAGE prevents a second treasury receipt.
+ */
+async function settleAppointmentWithPackage(req: Request, agendaEventId: string, pack: Model, transaction: Transaction): Promise<'settled'> {
+    const schema = req.tenantSchema!;
+    const event = await AgendaEvent.schema(schema).findByPk(agendaEventId, { transaction, lock: transaction.LOCK.UPDATE });
+    if (!event || String(event.get('patientId') ?? '') !== String(pack.get('patientId') ?? '')
+        || String(event.get('structureId') ?? '') !== String(pack.get('structureId') ?? '')
+        || !['CONFIRMED', 'COMPLETED'].includes(String(event.get('status') ?? '').toUpperCase())
+        || event.get('recurrence') || event.get('recurringEventId')) {
+        throw Object.assign(new Error('La seduta non appartiene al paziente o alla sede del pacchetto'), { status: 409 });
+    }
+    if (event.get('invoiceId')) throw Object.assign(new Error('La seduta è già fatturata'), { status: 409 });
+    const alreadyConsumed = await PackageConsumption.schema(schema).count({ where: { agendaEventId, status: 'POSTED' }, transaction });
+    if (alreadyConsumed) throw Object.assign(new Error('Questa seduta è già stata usata da un pacchetto'), { status: 409 });
+    const existing = await InvoicePayment.schema(schema).count({ where: { agendaEventId, status: 'POSTED' }, transaction });
+    if (existing > 0) throw Object.assign(new Error('Questa seduta ha già un pagamento registrato'), { status: 409 });
+    const price = (await appointmentPricesByEvent(schema, [event.get({ plain: true })], transaction)).get(String(agendaEventId));
+    const units = Number(pack.get('purchasedUnits'));
+    const unitPrice = units > 0 ? Math.round(Number(pack.get('totalPrice')) / units * 100) / 100 : null;
+    const amount = price?.amount ?? unitPrice;
+    if (!amount || amount <= 0) throw Object.assign(new Error('Impossibile determinare il valore della seduta'), { status: 409 });
+    if (price?.amount == null) {
+        await event.update({ appointmentExpectedAmount: amount, appointmentPriceRecordedAt: new Date() }, { transaction });
+    }
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Rome' });
+    await InvoicePayment.schema(schema).create({
+        agendaEventId, invoiceId: event.get('invoiceId') ?? null, amount,
+        paidAt: new Date(today + 'T12:00:00.000Z'), method: 'Pacchetto', note: 'Seduta coperta da pacchetto',
+        source: 'PACKAGE', status: 'POSTED', createdByUserId: req.access?.userId
+    }, { transaction });
+    await syncAppointmentPaymentStatus(schema, event, transaction, req.access?.userId);
+    return 'settled';
+}
 
 const voidMovement = asyncHandler(async (req, res) => {
     const result = await reverseTreasuryMovement(req, bodySource(req));

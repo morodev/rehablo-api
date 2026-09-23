@@ -33,6 +33,23 @@ const occurrences = (events: Array<Record<string, any>>) => events.map((row) => 
 }));
 
 describe('shared cash and document reporting', () => {
+    it('treats package coverage as settled while leaving cash collection at zero', () => {
+        const input = data({ payments: [payment({ source: 'PACKAGE', method: 'Pacchetto' })] });
+        const summary = aggregateFinance(input, query());
+        const therapies = aggregateTherapyPayments(input, query(), occurrences(input.events));
+        assert.equal(summary.totals.collected, 0);
+        assert.equal(summary.totals.outstanding, 0);
+        assert.equal(therapies.totals.collected, 0);
+        assert.equal(therapies.details[0].paymentStatus, 'paid');
+    });
+    it('keeps retained credit in collected cash while reopening the appointment balance', () => {
+        const input = data({ payments: [payment({ status: 'CREDIT' })] });
+        const summary = aggregateFinance(input, query());
+        const therapies = aggregateTherapyPayments(input, query(), occurrences(input.events));
+        assert.equal(summary.totals.collected, 100);
+        assert.equal(summary.totals.outstanding, 100);
+        assert.equal(therapies.details[0].paymentStatus, 'unpaid');
+    });
     it('excludes complimentary sessions from unbilled work without inventing cash', () => {
         const input = data({events: [event({expectedAmount: 0, appointmentPriceAdjustment: 'COMPLIMENTARY'})], payments: []});
         const result = aggregateFinance(input, query());
