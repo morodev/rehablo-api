@@ -1,3 +1,4 @@
+import { getCalendarPreferences, updateCalendarPreferences } from '../controllers/calendarPreference.controller.js';
 import { Router } from 'express';
 import { requireAuth } from '../../../middleware/auth.js';
 import { requireAnyPermission, requirePermission } from '../../../middleware/rbac.js';
@@ -55,18 +56,22 @@ router.put('/user/reset-password/:resetPasswordToken', userController.resetPassw
 // --- Users (requires auth) ---
 router.post('/user', requireAuth, requirePermission('user', 'create'), userController.createUser);
 router.get('/user', requireAuth, requirePermission('user', 'read'), userController.findAllUsersTenantByTenantId);
-router.patch('/user/:userId/team-profile', requireAuth, requirePermission('user', 'update', 'tenant'), userController.updateTeamMemberProfile);
-router.patch('/user/:userId', requireAuth, requirePermission('user', 'update'), userController.updateUser);
+router.patch('/user/:userId/team-profile', requireAuth, requirePermission('user', 'update', 'tenant'), resolveTenantSchema, userController.updateTeamMemberProfile);
+router.patch('/user/:userId', requireAuth, requirePermission('user', 'update'), resolveTenantSchema, userController.updateUser);
 // SELF-SERVICE: preferenze personali di calendario, modificabili da qualunque utente autenticato.
 // TODO(RBAC): il controller deve verificare che `userId` coincida con `req.user.sub`,
 // oppure che il chiamante abbia `user:update`.
-router.patch('/user/:userId/calendar-visibility', requireAuth, userController.updateUserCalendarVisibility);
+router.patch('/user/:userId/calendar-visibility', requireAuth, requirePermission('agenda', 'read'), userController.updateUserCalendarVisibility);
 router.patch('/user/:userId/calendar-color', requireAuth, userController.updateUserCalendarColor);
 // Attivazione/sospensione dell'account: è l'alternativa alla cancellazione per il titolare
 // dello studio, che non è eliminabile. Riservata a chi amministra l'intero tenant.
 router.get('/user/:userId/deactivation-impact', requireAuth, requirePermission('user', 'update', 'tenant'), resolveTenantSchema, userController.getUserDeactivationImpact);
 router.patch('/user/:userId/status', requireAuth, requirePermission('user', 'update', 'tenant'), resolveTenantSchema, userController.setUserActive);
 router.delete('/user/:userId', requireAuth, requirePermission('user', 'delete'), userController.deleteUser);
+
+router.get('/user/:userId/calendar-deactivation-impact', requireAuth, requirePermission('user', 'update', 'tenant'), resolveTenantSchema, userController.getUserCalendarDeactivationImpact);
+router.get('/agenda/preferences', requireAuth, requirePermission('agenda', 'read'), getCalendarPreferences);
+router.patch('/agenda/preferences', requireAuth, requirePermission('agenda', 'read'), updateCalendarPreferences);
 
 // --- Structures (premises) ---
 router.post('/structure', requireAuth, requirePermission('structure', 'create'), structureController.saveStructureForTenant);

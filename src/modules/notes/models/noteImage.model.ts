@@ -11,6 +11,7 @@ export interface NoteImageAttributes {
     ownerUserId: string;
     structureId: string;
     createdByUserId: string;
+    noteId?: string | null;
 }
 
 export type NoteImageCreationAttributes = Optional<NoteImageAttributes, 'id'>;
@@ -26,6 +27,7 @@ export class NoteImage extends Model<NoteImageAttributes, NoteImageCreationAttri
     declare ownerUserId: string;
     declare structureId: string;
     declare createdByUserId: string;
+    declare noteId: string | null;
 }
 
 NoteImage.init(
@@ -38,7 +40,8 @@ NoteImage.init(
         storagePath: { type: DataTypes.STRING(1024), allowNull: false },
         ownerUserId: { type: DataTypes.UUID, allowNull: false },
         structureId: { type: DataTypes.UUID, allowNull: false },
-        createdByUserId: { type: DataTypes.UUID, allowNull: false }
+        createdByUserId: { type: DataTypes.UUID, allowNull: false },
+        noteId: { type: DataTypes.UUID, allowNull: true }
     },
     {
         sequelize,
@@ -47,7 +50,8 @@ NoteImage.init(
         paranoid: true,
         indexes: [
             { fields: ['ownerUserId'] },
-            { fields: ['structureId'] }
+            { fields: ['structureId'] },
+            { fields: ['noteId'] }
         ]
     }
 );

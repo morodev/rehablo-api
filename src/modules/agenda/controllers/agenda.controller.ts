@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { Op, fn, col, cast, where as sequelizeWhere } from 'sequelize';
+import { Op, Transaction, fn, col, cast, where as sequelizeWhere } from 'sequelize';
 import moment from 'moment';
 import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -29,6 +29,7 @@ import {agendaDateBoundary, expandAgendaSearchOccurrences} from '../services/age
 import {
     DeferredOperatorAssignment,
     InvalidDeferredOperatorReassignmentError,
+    recurrenceBoundary,
     reassignDeferredOperatorAppointments
 } from '../services/operatorReassignment.service.js';
 import {
@@ -259,10 +260,29 @@ async function rejectInvalidPatient(
     return false;
 }
 
+/** Membership locks precede event locks, as in calendar disable/reassignment. */
+async function lockOperatorCalendar(event: Record<string, any>, transaction?: Transaction): Promise<StructureUser | null> {
+    if (isLegacyTimeOffEvent(event) || !UUID_REGEX.test(event.calendarId ?? '') || !UUID_REGEX.test(event.structureId ?? '')) return null;
+    return StructureUser.findOne({where: {userId: event.calendarId, structureId: event.structureId}, transaction,
+        ...(transaction ? {lock: transaction.LOCK.UPDATE} : {})});
+}
+function hasAppointmentScheduleChanges(current: Record<string, any>, incoming: Record<string, any>): boolean {
+    return ['calendarId', 'structureId', 'start', 'end', 'duration', 'recurrence', 'allDay'].some(field => {
+        if (!Object.prototype.hasOwnProperty.call(incoming, field)) return false;
+        const requested = incoming[field] ?? null, existing = current[field] ?? null;
+        if (field === 'start' || field === 'end') {
+            const requestedTime = Date.parse(String(requested)), existingTime = Date.parse(String(existing));
+            if (Number.isFinite(requestedTime) && Number.isFinite(existingTime)) return requestedTime !== existingTime;
+        }
+        return String(requested) !== String(existing);
+    });
+}
 async function rejectOperatorOutsideStructure(
     req: Request,
     res: Response,
-    event: Record<string, any>
+    event: Record<string, any>,
+    transaction?: Transaction,
+    lockedAssignment?: StructureUser | null
 ): Promise<boolean> {
     if (isLegacyTimeOffEvent(event)) return false;
 
@@ -277,12 +297,12 @@ async function rejectOperatorOutsideStructure(
         return true;
     }
 
-    const [membership, identity, assignment] = await Promise.all([
+    const assignment = lockedAssignment === undefined ? await lockOperatorCalendar(event, transaction) : lockedAssignment;
+    const [membership, identity] = await Promise.all([
         TenantUser.findOne({
-            where: { tenantId: getCurrentTenantId(req), userId: calendarId }
+            where: { tenantId: getCurrentTenantId(req), userId: calendarId }, transaction
         }),
-        User.findByPk(calendarId, { attributes: ['id', 'deactivatedAt'] }),
-        StructureUser.findOne({ where: { userId: calendarId, structureId } })
+        User.findByPk(calendarId, { attributes: ['id', 'deactivatedAt'], transaction })
     ]);
     if (!membership) {
         sendErrorResponse(res, 409, 'L\'operatore non appartiene a questo studio');
@@ -292,7 +312,13 @@ async function rejectOperatorOutsideStructure(
         sendErrorResponse(res, 409, 'L\'operatore e\' fuori dal team e non puo\' ricevere nuovi appuntamenti');
         return true;
     }
-    if (assignment) return false;
+    if (assignment) {
+        if (!assignment.calendarEnabled) {
+            sendErrorResponse(res, 409, 'L\'agenda dell\'operatore e\' disabilitata nella sede selezionata');
+            return true;
+        }
+        return false;
+    }
 
     sendErrorResponse(res, 409, 'L\'operatore non è assegnato alla sede selezionata');
     return true;
@@ -534,16 +560,16 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
     // non potrebbe distinguere le sedi.
     payload.structureId = req.access?.structureId ?? null;
 
-    if (await rejectOperatorOutsideStructure(req, res, payload)) return;
-    if (await rejectInvalidPatient(res, schema, payload)) return;
-
-    const eventTypeError = await validateAndNormalizeEventType(schema, payload, payload.structureId, true);
-    if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
-
-    if (await rejectApprovedTimeOffConflict(res, schema, payload)) return;
-
-    Object.assign(payload, await snapshotAppointmentPrice(schema, payload), { appointmentPaymentHistoryKnown: true });
-    const agendaEvent = await AgendaEvent.schema(schema).create(payload);
+    const agendaEvent = await sequelize.transaction(async transaction => {
+        if (await rejectOperatorOutsideStructure(req, res, payload, transaction)) return null;
+        if (await rejectInvalidPatient(res, schema, payload)) return null;
+        const eventTypeError = await validateAndNormalizeEventType(schema, payload, payload.structureId, true);
+        if (eventTypeError) {sendErrorResponse(res, 400, eventTypeError); return null;}
+        if (await rejectApprovedTimeOffConflict(res, schema, payload)) return null;
+        Object.assign(payload, await snapshotAppointmentPrice(schema, payload, transaction), {appointmentPaymentHistoryKnown: true});
+        return AgendaEvent.schema(schema).create(payload, {transaction});
+    });
+    if (!agendaEvent) return;
 
     const patient: any = agendaEvent.get('patient');
     if (patient?.id) {
@@ -644,30 +670,21 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     event.patient = candidate.patient;
     event.patientId = candidate.patientId;
 
-    const scheduleChanged = ['calendarId', 'structureId', 'start', 'end', 'duration', 'recurrence']
-        .some((field) => {
-            if (!Object.prototype.hasOwnProperty.call(event, field)) return false;
-            const incoming = event[field] ?? null;
-            const existing = current.get(field as keyof AgendaEvent) ?? null;
-            if (field === 'start' || field === 'end') {
-                const incomingTime = Date.parse(String(incoming));
-                const existingTime = Date.parse(String(existing));
-                if (Number.isFinite(incomingTime) && Number.isFinite(existingTime)) {
-                    return incomingTime !== existingTime;
-                }
-            }
-            return String(incoming) !== String(existing);
-        });
-    if (scheduleChanged) {
-        if (await rejectOperatorOutsideStructure(req, res, candidate)) return;
-        if (await rejectApprovedTimeOffConflict(res, schema, candidate, id)) return;
-    }
-
     const change = await sequelize.transaction(async transaction => {
+        const assignment = await lockOperatorCalendar(candidate, transaction);
         const locked = await AgendaEvent.schema(schema).findOne({
             where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }, transaction, lock: transaction.LOCK.UPDATE
         });
         if (!locked) return 'missing';
+        const lockedCandidate = {...locked.get({plain: true}), ...event};
+        if (lockedCandidate.calendarId !== candidate.calendarId || lockedCandidate.structureId !== candidate.structureId) {
+            sendErrorResponse(res, 409, 'L\'assegnazione dell\'appuntamento e\' cambiata: ricarica l\'agenda');
+            return 'rejected';
+        }
+        if (hasAppointmentScheduleChanges(locked.get({plain: true}), event)) {
+            if (await rejectOperatorOutsideStructure(req, res, lockedCandidate, transaction, assignment)) return 'rejected';
+            if (await rejectApprovedTimeOffConflict(res, schema, lockedCandidate, id)) return 'rejected';
+        }
         if (await getLinkedInvoiceId(schema, locked.id, locked.invoiceId)) return 'invoiced';
         const financialContextChanged = ['patientId', 'structureId', 'eventTypeId'].some(field =>
             event[field] !== undefined && String(event[field] ?? '') !== String(locked.get(field as any) ?? '')
@@ -687,6 +704,7 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
         await locked.update(event, { transaction });
         return 'updated';
     });
+    if (change === 'rejected') return;
     if (change === 'invoiced') return sendErrorResponse(res, 409, 'Appuntamento fatturato: modifica non consentita');
     if (change === 'history') return sendErrorResponse(res, 409, 'Una seduta con storico incassi non può cambiare paziente, sede o prestazione');
     if (change === 'missing') {
@@ -1136,7 +1154,7 @@ function stringifyRecurrenceRules(rules: Record<string, string>): string {
 
 export const updateRecurringEvent = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const { event: requestedEvent, originalEvent, mode } = req.body;
+    const { event: requestedEvent, originalEvent: requestedOriginalEvent, mode } = req.body;
     const event = { ...requestedEvent };
     delete event.invoiceId;
     removeAttendanceManagedFields(event);
@@ -1149,88 +1167,150 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
         event.status = status;
     }
 
-    // Gate di accesso: se la serie non rientra nello scope, l'operazione si ferma qui.
-    // Le modifiche successive agiscono tutte sullo stesso `recurringEventId`.
-    const recurringEvent = await AgendaEvent.schema(schema).findOne({
-        where: { id: event.recurringEventId, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
+    const preview = await AgendaEvent.schema(schema).findOne({
+        where: {id: event.recurringEventId, ...scopeWhere(req, AGENDA_SCOPE_FIELDS)}
     });
-    if (!recurringEvent) {
-        return sendErrorResponse(res, 404, 'Recurring event not found');
-    }
-    if (!recurringEvent.recurrence) return sendErrorResponse(res, 409, 'Il record non è una serie ricorrente');
-    if (await getLinkedInvoiceId(schema, recurringEvent.id, recurringEvent.invoiceId)
-        || Number(recurringEvent.appointmentPaidAmount) > 0
-        || await InvoicePayment.schema(schema).count({ where: { agendaEventId: recurringEvent.id } }) > 0) {
-        return sendErrorResponse(res, 409, 'Serie fatturata: modifica non consentita');
-    }
-
-    const recurringCandidate = { ...recurringEvent.get({ plain: true }), ...event };
-    recurringCandidate.structureId = req.access?.structureId ?? recurringCandidate.structureId;
-    const eventTypeChanged = String(recurringCandidate.eventTypeId ?? '')
-        !== String(recurringEvent.get('eventTypeId') ?? '');
-    const structureChanged = String(recurringCandidate.structureId ?? '')
-        !== String(recurringEvent.get('structureId') ?? '');
-    const eventTypeError = await validateAndNormalizeEventType(
-        schema, event, recurringCandidate.structureId, eventTypeChanged || structureChanged
-    );
-    if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
-    if (req.access?.scope === 'own') recurringCandidate.calendarId = req.access.userId;
-    if (await rejectOperatorOutsideStructure(req, res, recurringCandidate)) return;
-    if (await rejectInvalidPatient(res, schema, recurringCandidate)) return;
-    event.structureId = recurringCandidate.structureId;
-    event.calendarId = recurringCandidate.calendarId;
-    event.patient = recurringCandidate.patient;
-    event.patientId = recurringCandidate.patientId;
-
-    if (mode === 'single') {
-        const { range, recurringEventId, ...newEvent } = event;
-        newEvent.id = undefined;
-        newEvent.end = moment(newEvent.start).add(newEvent.duration, 'minutes').toISOString();
-        newEvent.duration = null;
-        newEvent.recurrence = null;
-
-        if (await rejectApprovedTimeOffConflict(res, schema, newEvent)) return;
-
-        Object.assign(newEvent, await snapshotAppointmentPrice(schema, newEvent), { appointmentPaymentHistoryKnown: true });
-        await AgendaEvent.schema(schema).create(newEvent);
-        await AgendaEventException.schema(schema).create({
-            eventId: originalEvent.recurringEventId,
-            exdate: moment(originalEvent.start).toISOString()
+    if (!preview) return sendErrorResponse(res, 404, 'Recurring event not found');
+    const planned = {...preview.get({plain: true}), ...event};
+    planned.structureId = req.access?.structureId ?? planned.structureId;
+    if (req.access?.scope === 'own') planned.calendarId = req.access.userId;
+    const savedMode = await sequelize.transaction(async transaction => {
+        const assignment = await lockOperatorCalendar(planned, transaction);
+        const recurringEvent = await AgendaEvent.schema(schema).findOne({
+            where: {id: event.recurringEventId, ...scopeWhere(req, AGENDA_SCOPE_FIELDS)},
+            transaction, lock: transaction.LOCK.UPDATE
         });
+        if (!recurringEvent) {
+            return sendErrorResponse(res, 404, 'Recurring event not found');
+        }
+        if (!recurringEvent.recurrence) return sendErrorResponse(res, 409, 'Il record non è una serie ricorrente');
+        if (await getLinkedInvoiceId(schema, recurringEvent.id, recurringEvent.invoiceId)
+            || Number(recurringEvent.appointmentPaidAmount) > 0
+            || await InvoicePayment.schema(schema).count({ where: { agendaEventId: recurringEvent.id }, transaction }) > 0) {
+            return sendErrorResponse(res, 409, 'Serie fatturata: modifica non consentita');
+        }
 
-        return sendSuccessResponse(res, 201, true, 'Recurring event updated (single)');
+        // The client sends a rendered occurrence, whose end is not the series end.
+        // Resolve its original schedule from the persisted series and exceptions before
+        // deciding whether this edit creates/reassigns an appointment or only changes metadata.
+        const series = recurringEvent.get({ plain: true });
+        const sourceStart = new Date(requestedOriginalEvent?.start ?? series.start);
+        const durationMinutes = Number(series.duration);
+        if (!Number.isFinite(sourceStart.getTime()) || !Number.isFinite(durationMinutes) || durationMinutes <= 0) {
+            return sendErrorResponse(res, 400, 'Occorrenza ricorrente non valida');
+        }
+        const exceptions = await AgendaEventException.schema(schema).findAll({where: {eventId: recurringEvent.id}, transaction, lock: transaction.LOCK.UPDATE});
+        const exceptionDates = exceptions.map(row => new Date(row.exdate!)).filter(date => Number.isFinite(date.getTime()));
+        const sourceBoundary = recurrenceBoundary(series, exceptionDates, sourceStart);
+        if (!sourceBoundary || sourceBoundary.nextStart.getTime() !== sourceStart.getTime()) {
+            return sendErrorResponse(res, 409, 'L\'occorrenza ricorrente selezionata non e\' piu\' disponibile');
+        }
+        const originalEvent = {...series, recurrence: recurringEvent.recurrence, recurringEventId: recurringEvent.id,
+            start: sourceBoundary.nextStart.toISOString()};
+        const occurrence = {...series, start: originalEvent.start,
+            end: new Date(sourceStart.getTime() + durationMinutes * 60_000).toISOString()};
+        const recurringCandidate = {...occurrence, ...event};
+        recurringCandidate.structureId = req.access?.structureId ?? recurringCandidate.structureId;
+        const eventTypeChanged = String(recurringCandidate.eventTypeId ?? '')
+            !== String(recurringEvent.get('eventTypeId') ?? '');
+        const structureChanged = String(recurringCandidate.structureId ?? '')
+            !== String(recurringEvent.get('structureId') ?? '');
+        const eventTypeError = await validateAndNormalizeEventType(
+            schema, event, recurringCandidate.structureId, eventTypeChanged || structureChanged
+        );
+        if (eventTypeError) return sendErrorResponse(res, 400, eventTypeError);
+        if (req.access?.scope === 'own') recurringCandidate.calendarId = req.access.userId;
+        if (recurringCandidate.calendarId !== planned.calendarId || recurringCandidate.structureId !== planned.structureId) {
+            return sendErrorResponse(res, 409, 'L\'assegnazione della serie e\' cambiata: ricarica l\'agenda');
+        }
+        const datesMatch = (left: unknown, right: unknown) => {
+            const leftTime = Date.parse(String(left)), rightTime = Date.parse(String(right));
+            return Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime === rightTime;
+        };
+        const scheduleChanged = ['calendarId', 'structureId', 'allDay', 'duration'].some(field =>
+            String(recurringCandidate[field] ?? null) !== String(occurrence[field] ?? null))
+            || !datesMatch(recurringCandidate.start, occurrence.start)
+            || (mode !== 'single' && (
+                String(recurringCandidate.recurrence ?? '') !== String(series.recurrence ?? '')
+                || (!datesMatch(recurringCandidate.end, occurrence.end) && !datesMatch(recurringCandidate.end, series.end))
+            ));
+        if (scheduleChanged && await rejectOperatorOutsideStructure(req, res, recurringCandidate, transaction, assignment)) return;
+        // Metadata updates retain the existing schedule, including the real series limits.
+        // Splitting an existing occurrence/series for a note does not require receiving new appointments.
+        if (!scheduleChanged) {
+            event.start = mode === 'all' ? series.start : occurrence.start;
+            event.end = mode === 'single' ? occurrence.end : series.end;
+            event.duration = series.duration;
+            event.recurrence = series.recurrence;
+        }
+        event.recurringEventId = recurringEvent.id;
+        if (await rejectInvalidPatient(res, schema, recurringCandidate)) return;
+        event.structureId = recurringCandidate.structureId;
+        event.calendarId = recurringCandidate.calendarId;
+        event.patient = recurringCandidate.patient;
+        event.patientId = recurringCandidate.patientId;
+
+        if (mode === 'single') {
+            const { range, recurringEventId, ...newEvent } = {...series, ...event};
+            removeAttendanceManagedFields(newEvent);
+            removeAppointmentPaymentManagedFields(newEvent);
+            newEvent.id = undefined;
+            delete newEvent.createdAt;
+            delete newEvent.updatedAt;
+            newEvent.end = moment(newEvent.start).add(newEvent.duration, 'minutes').toISOString();
+            newEvent.duration = null;
+            newEvent.recurrence = null;
+
+            if (await rejectApprovedTimeOffConflict(res, schema, newEvent)) return;
+
+            Object.assign(newEvent, await snapshotAppointmentPrice(schema, newEvent, transaction), { appointmentPaymentHistoryKnown: true });
+            await AgendaEvent.schema(schema).create(newEvent, {transaction});
+            await AgendaEventException.schema(schema).create({
+                eventId: originalEvent.recurringEventId,
+                exdate: moment(originalEvent.start).toISOString()
+            }, {transaction});
+
+            return 'single';
+        }
+
+        if (mode === 'future') {
+            if (await rejectApprovedTimeOffConflict(res, schema, event, recurringEvent.id)) return;
+
+            const eventFound: any = recurringEvent.get({ plain: true });
+            eventFound.end = moment(originalEvent.start).subtract(1, 'day').endOf('day').toISOString();
+
+            const parsedRules = parseRecurrenceRules(originalEvent.recurrence);
+            parsedRules['UNTIL'] = moment(eventFound.end).utc().format('YYYYMMDD[T]HHmmss[Z]');
+            eventFound.recurrence = stringifyRecurrenceRules(parsedRules);
+
+            await AgendaEvent.schema(schema).update(eventFound, { where: { id: originalEvent.recurringEventId }, transaction });
+
+            const { recurringEventId, ...newEvent } = {...series, ...event};
+            removeAttendanceManagedFields(newEvent);
+            removeAppointmentPaymentManagedFields(newEvent);
+            newEvent.id = undefined;
+            delete newEvent.createdAt;
+            delete newEvent.updatedAt;
+            Object.assign(newEvent, await snapshotAppointmentPrice(schema, newEvent, transaction), { appointmentPaymentHistoryKnown: true });
+            await AgendaEvent.schema(schema).create(newEvent, {transaction});
+
+            return 'future';
+        }
+
+        if (mode === 'all') {
+            const candidate = { ...recurringEvent.get({ plain: true }), ...event };
+            if (await rejectApprovedTimeOffConflict(res, schema, candidate, recurringEvent.id)) return;
+
+            const { id, recurringEventId, range, ...updateAll } = event;
+            await AgendaEvent.schema(schema).update(updateAll, { where: { id: event.recurringEventId }, transaction });
+            return 'all';
+        }
+
+        sendErrorResponse(res, 400, 'Unsupported recurrence update mode');
+    });
+    if (savedMode === 'single' || savedMode === 'future' || savedMode === 'all') {
+        return sendSuccessResponse(res, 201, true, 'Recurring event updated (' + savedMode + ')');
     }
-
-    if (mode === 'future') {
-        if (await rejectApprovedTimeOffConflict(res, schema, event, recurringEvent.id)) return;
-
-        const eventFound: any = recurringEvent.get({ plain: true });
-        eventFound.end = moment(originalEvent.start).subtract(1, 'day').endOf('day').toISOString();
-
-        const parsedRules = parseRecurrenceRules(originalEvent.recurrence);
-        parsedRules['UNTIL'] = moment(eventFound.end).utc().format('YYYYMMDD[T]HHmmss[Z]');
-        eventFound.recurrence = stringifyRecurrenceRules(parsedRules);
-
-        await AgendaEvent.schema(schema).update(eventFound, { where: { id: originalEvent.recurringEventId } });
-
-        const { recurringEventId, ...newEvent } = event;
-        newEvent.id = undefined;
-        Object.assign(newEvent, await snapshotAppointmentPrice(schema, newEvent), { appointmentPaymentHistoryKnown: true });
-        await AgendaEvent.schema(schema).create(newEvent);
-
-        return sendSuccessResponse(res, 201, true, 'Recurring event updated (future)');
-    }
-
-    if (mode === 'all') {
-        const candidate = { ...recurringEvent.get({ plain: true }), ...event };
-        if (await rejectApprovedTimeOffConflict(res, schema, candidate, recurringEvent.id)) return;
-
-        const { id, recurringEventId, range, ...updateAll } = event;
-        await AgendaEvent.schema(schema).update(updateAll, { where: { id: event.recurringEventId } });
-        return sendSuccessResponse(res, 201, true, 'Recurring event updated (all)');
-    }
-
-    return sendErrorResponse(res, 400, 'Unsupported recurrence update mode');
 });
 
 export const deleteRecurringEvent = asyncHandler(async (req: Request, res: Response) => {

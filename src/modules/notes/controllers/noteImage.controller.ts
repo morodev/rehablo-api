@@ -1,18 +1,14 @@
 import { Request, Response } from 'express';
 import multer from 'multer';
+import {Op} from 'sequelize';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
-import { scopeWhere } from '../../../middleware/rbac.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { localStorageAdapter } from '../../measurements/storage/localStorageAdapter.js';
 import NoteImage from '../models/noteImage.model.js';
+import Note from '../models/note.model.js';
 import { NOTE_IMAGE_MAX_BYTES, validateNoteImageFile } from '../utils/noteImageFile.js';
-
-const NOTE_IMAGE_SCOPE_FIELDS = {
-    ownerField: 'ownerUserId',
-    structureField: 'structureId',
-    includeUnassigned: false
-};
+import {visibleNoteWhere} from '../services/workItemAccess.service.js';
 
 export const noteImageUploadMiddleware = multer({
     storage: multer.memoryStorage(),
@@ -50,7 +46,8 @@ export const uploadNoteImage = asyncHandler(async (req: Request, res: Response) 
             storagePath: saved.storagePath,
             ownerUserId: req.access!.userId,
             structureId,
-            createdByUserId: req.access!.userId
+            createdByUserId: req.access!.userId,
+            noteId: null
         });
     } catch (error) {
         await localStorageAdapter.remove(saved.storagePath).catch(() => undefined);
@@ -70,11 +67,20 @@ export const getNoteImageContent = asyncHandler(async (req: Request, res: Respon
     const image = await NoteImage.schema(req.tenantSchema!).findOne({
         where: {
             id: req.params.imageId,
-            ...scopeWhere(req, NOTE_IMAGE_SCOPE_FIELDS)
+            structureId: req.access!.structureId!
         }
     });
 
-    if (!image) {
+    let allowed = !!image && !image.noteId && image.ownerUserId === req.access!.userId;
+    if (image?.noteId) {
+        const visibility = await visibleNoteWhere(req);
+        allowed = !!await Note.schema(req.tenantSchema!).findOne({
+            where: {[Op.and]: [{id: image.noteId, structureId: req.access!.structureId!}, visibility] as any[]},
+            attributes: ['id']
+        });
+    }
+
+    if (!image || !allowed) {
         return sendErrorResponse(res, 404, 'Immagine della nota non trovata');
     }
 

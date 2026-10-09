@@ -1,3 +1,5 @@
+import { updateCalendarPreferences } from './calendarPreference.controller.js';
+import { defaultCalendarEnabled, hasCalendarFields, projectStructureCalendar, projectStructureCalendars, saveStructureCalendar } from '../services/structureCalendar.service.js';
 import { Request, Response } from 'express';
 import { Op, Transaction } from 'sequelize';
 import jwt from 'jsonwebtoken';
@@ -6,7 +8,7 @@ import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
-import { getGrantedPermissions, getUserId } from '../../../middleware/rbac.js';
+import { getGrantedPermissions, getSelectedStructureId, getUserId } from '../../../middleware/rbac.js';
 import { hasPermission } from '../rbac/permissions.js';
 import { DEFAULT_ROLE, isRoleCode, RoleCode, ROLE_DEFINITIONS } from '../rbac/roles.js';
 import { sendForgotPasswordMail, signUpSendMail } from '../../../services/email.service.js';
@@ -17,9 +19,7 @@ import {
     TenantUser,
     User,
     Structure,
-    StructureAvailability,
     StructureUser,
-    UserAvailability,
     UserEmail
 } from '../models/index.js';
 import { validateUserStructureSelection } from '../services/userStructurePolicy.service.js';
@@ -27,10 +27,13 @@ import { findUserByIdentityEmail } from '../services/identity.service.js';
 import { normalizeIdentityEmail } from '../models/userEmail.model.js';
 import {
     AvailabilityValidationError,
-    emptyAvailabilitySchedule,
-    isAvailabilityMode as isSupportedAvailabilityMode,
-    normalizeAvailabilitySchedule
 } from '../services/userAvailabilityPolicy.service.js';
+import {
+    findTeamMemberEmailConflict,
+    isEmailUniqueConstraintError,
+    registeredEmailConflict,
+    TeamMemberEmailConflict
+} from '../services/teamMemberEmailConflict.service.js';
 import {
     FutureAppointmentsRequireReplacementError,
     getOperatorDeactivationImpact,
@@ -62,10 +65,6 @@ function stripProtectedFields<T extends Record<string, any>>(payload: T): T {
     return sanitized;
 }
 
-function isAvailabilityMode(value: unknown): boolean {
-    return isSupportedAvailabilityMode(value);
-}
-
 /**
  * Carica l'utente bersaglio verificando che appartenga allo studio di chi effettua la
  * richiesta: senza questo controllo un amministratore potrebbe agire, conoscendone l'id,
@@ -80,47 +79,53 @@ async function findTenantMember(req: Request, targetUserId: string) {
     return { tenantId, membership, user };
 }
 
+function validReplacementUserId(value: unknown): boolean {
+    return value === undefined || value === null || (typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value));
+}
+
 class TeamProfileError extends Error {
     constructor(public readonly status: number, message: string) {
         super(message);
     }
 }
 
+function sendTeamMemberEmailConflict(res: Response, conflict: TeamMemberEmailConflict) {
+    return sendErrorResponse(res, 409, conflict.message, {code: conflict.code, field: conflict.field});
+}
+
 const TEAM_PROFILE_FIELDS = [
     'name',
     'surname',
     'email',
-    'calendarColor',
-    'availabilityMode'
+    'calendarColor'
 ] as const;
 
-async function serializeTeamMember(tenantId: string, userId: string) {
-    const [user, membership, availabilities, tenantStructures, assignments] = await Promise.all([
+async function serializeTeamMember(tenantId: string, userId: string, structureId: string | null) {
+    const [user, membership, tenantStructures, assignments] = await Promise.all([
         User.findByPk(userId, { attributes: { exclude: ['password'] } }),
         TenantUser.findOne({ where: {tenantId, userId} }),
-        UserAvailability.findAll({ where: {userId}, order: [['day', 'ASC']] }),
         Structure.findAll({where: {tenantId}, attributes: ['id']}),
         StructureUser.findAll({where: {userId}, attributes: ['structureId']})
     ]);
     if (!user || !membership) return null;
 
     const allowedIds = new Set(tenantStructures.map((structure) => structure.get('id') as string));
-    return {
+    return projectStructureCalendar({
         ...user.get({plain: true}),
         role: membership.get('role'),
         deactivatedAt: membership.get('deactivatedAt') ?? user.get('deactivatedAt') ?? null,
         structureIds: assignments
             .map((assignment) => assignment.get('structureId') as string)
-            .filter((id) => allowedIds.has(id)),
-        userAvailabilities: availabilities.map((availability) => availability.get({plain: true}))
-    };
+            .filter((id) => allowedIds.has(id))
+    }, tenantId, structureId);
 }
 
 async function syncTeamMemberStructures(
     userId: string,
     allowedIds: readonly string[],
     requestedIds: readonly string[],
-    transaction: Transaction
+    transaction: Transaction,
+    role: RoleCode
 ): Promise<void> {
     const current = await StructureUser.findAll({
         where: {userId, structureId: {[Op.in]: [...allowedIds]}},
@@ -140,7 +145,7 @@ async function syncTeamMemberStructures(
     }
     if (toAdd.length) {
         await StructureUser.bulkCreate(
-            toAdd.map((structureId) => ({userId, structureId, role: null})),
+            toAdd.map((structureId) => ({userId, structureId, role: null, calendarEnabled: defaultCalendarEnabled(role)})),
             {transaction}
         );
     }
@@ -150,10 +155,10 @@ async function syncTeamMemberStructures(
 export const createUser = asyncHandler(async (req: Request, res: Response) => {
     const tenantId = getCurrentTenantId(req);
     const newUser = { ...req.body };
-    const requestedAvailabilities = Object.prototype.hasOwnProperty.call(newUser, 'userAvailabilities')
-        ? newUser.userAvailabilities
-        : Array.from({length: 7}, (_, day) => ({day, enabled: false}));
-    delete newUser.userAvailabilities;
+    const calendarPayload = Object.fromEntries(['calendarEnabled', 'availabilityMode', 'userAvailabilities']
+        .filter(key => Object.prototype.hasOwnProperty.call(newUser, key)).map(key => [key, newUser[key]]));
+    for (const key of Object.keys(calendarPayload)) delete newUser[key];
+    const selectedStructureId = getSelectedStructureId(req);
 
     const tenant: any = await Tenant.findByPk(tenantId, { include: Structure });
     if (!tenant) {
@@ -171,6 +176,17 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 400, 'Ruolo non assegnabile');
     }
 
+    const normalizedEmail = normalizeIdentityEmail(newUser.email);
+    if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+        return sendErrorResponse(res, 400, 'Email non valida', {code: 'INVALID_EMAIL', field: 'email'});
+    }
+    newUser.email = normalizedEmail;
+
+    const existingEmailConflict = await findTeamMemberEmailConflict(tenantId, normalizedEmail);
+    if (existingEmailConflict) {
+        return sendTeamMemberEmailConflict(res, existingEmailConflict);
+    }
+
     // Strutture in cui l'utente può operare. Se non specificate, viene assegnato a tutte
     // quelle del tenant (comportamento storico). Va estratto PRIMA della create:
     // non è una colonna di `users`.
@@ -181,15 +197,6 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
 
     // Un utente invitato non è mai il titolare dello studio né un super admin: il titolare
     // nasce esclusivamente dalla registrazione (vedi `createTenant`).
-    const userToCreate = stripProtectedFields(newUser);
-    if (userToCreate.availabilityMode !== undefined && !isAvailabilityMode(userToCreate.availabilityMode)) {
-        return sendErrorResponse(res, 400, 'Modalità disponibilità non valida');
-    }
-    userToCreate.password = await bcrypt.hash(newUser.password, 12);
-    userToCreate.isTenant = false;
-    userToCreate.isSuperAdmin = false;
-    userToCreate.isActive = false;
-
     const structures = await tenant.getStructures();
     const allowedStructureIds = structures.map((structure: any) => structure.id as string);
     const uniqueRequestedIds = requestedStructureIds ? [...new Set(requestedStructureIds)] : undefined;
@@ -211,45 +218,40 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
     const targetStructures = role === RoleCode.OWNER
         ? structures
         : structures.filter((structure: any) => selectedStructureIds.includes(structure.id));
-    const requestedMode = isSupportedAvailabilityMode(userToCreate.availabilityMode)
-        ? userToCreate.availabilityMode
-        : 'INHERIT_STRUCTURE';
-    const isOperationalRole = role !== RoleCode.OWNER && role !== RoleCode.SECRETARY;
-    const mode = isOperationalRole ? requestedMode : 'INHERIT_STRUCTURE';
-    userToCreate.availabilityMode = mode;
-    const structureSchedule = mode === 'CUSTOM' && isOperationalRole
-        ? (await StructureAvailability.findAll({
-            where: {structureId: selectedStructureIds[0]},
-            order: [['day', 'ASC']]
-        })).map((availability) => availability.get({plain: true}))
-        : [];
-    let normalizedSchedule = emptyAvailabilitySchedule();
-    if (mode === 'CUSTOM') {
-        try {
-            normalizedSchedule = normalizeAvailabilitySchedule(
-                requestedAvailabilities,
-                'CUSTOM',
-                structureSchedule
-            );
-        } catch (error) {
-            if (error instanceof AvailabilityValidationError) {
-                return sendErrorResponse(res, 400, error.message);
-            }
-            throw error;
-        }
+    if (hasCalendarFields(calendarPayload) && (!selectedStructureId || !selectedStructureIds.includes(selectedStructureId))) {
+        return sendErrorResponse(res, 400, 'La configurazione agenda richiede una sede selezionata assegnata al membro');
     }
 
-    const user: any = await sequelize.transaction(async (transaction) => {
-        const created = await User.create(userToCreate, {transaction});
-        await UserAvailability.bulkCreate(
-            normalizedSchedule.map((availability) => ({...availability, userId: created.get('id') as string})),
-            {transaction}
-        );
-        // Nessun ruolo sulla struttura: `null` significa "eredita quello del tenant".
-        await Promise.all(targetStructures.map((structure: any) => structure.addUser(created, {transaction})));
-        await tenant.addUser(created, {through: {role}, transaction});
-        return created;
-    });
+    const userToCreate = stripProtectedFields(newUser);
+    userToCreate.password = await bcrypt.hash(newUser.password, 12);
+    userToCreate.isTenant = false;
+    userToCreate.isSuperAdmin = false;
+    userToCreate.isActive = false;
+
+    let user: any;
+    try {
+        user = await sequelize.transaction(async (transaction) => {
+            const created = await User.create(userToCreate, {transaction});
+            await StructureUser.bulkCreate(targetStructures.map((structure: any) => ({
+                userId: created.get('id') as string, structureId: structure.id,
+                role: null, calendarEnabled: defaultCalendarEnabled(role), availabilityMode: 'INHERIT_STRUCTURE'
+            })), {transaction});
+            await tenant.addUser(created, {through: {role}, transaction});
+            if (selectedStructureId && hasCalendarFields(calendarPayload)) {
+                await saveStructureCalendar(created.get('id') as string, selectedStructureId, calendarPayload, transaction);
+            }
+            return created;
+        });
+    } catch (error) {
+        if (error instanceof AvailabilityValidationError) return sendErrorResponse(res, 400, error.message);
+        if (isEmailUniqueConstraintError(error)) {
+            // Copre due richieste concorrenti che superano entrambe il pre-controllo.
+            const conflict = await findTeamMemberEmailConflict(tenantId, normalizedEmail)
+                ?? registeredEmailConflict();
+            return sendTeamMemberEmailConflict(res, conflict);
+        }
+        throw error;
+    }
 
     const verificationToken = jwt.sign({ email: user.get('email') }, licenseSecret, { expiresIn: '12h' });
 
@@ -261,7 +263,7 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
         console.error('[createUser] verification email could not be sent:', err);
     });
 
-    const createdTeamMember = await serializeTeamMember(tenantId, user.get('id') as string);
+    const createdTeamMember = await serializeTeamMember(tenantId, user.get('id') as string, selectedStructureId);
     return sendSuccessResponse(res, 201, createdTeamMember, 'User for tenant created');
 });
 
@@ -276,10 +278,9 @@ export const findAllUsersTenantByTenantId = asyncHandler(async (req: Request, re
                 attributes: { exclude: ['password'] },
                 // Le strutture assegnate servono alla UI di gestione team per mostrare
                 // e modificare dove ciascun utente può operare.
-                include: [{ model: UserAvailability }, { model: Structure }]
+                include: [{ model: Structure }]
             }
-        ],
-        order: [[User, UserAvailability, 'day', 'ASC']]
+        ]
     });
 
     if (!tenant) {
@@ -296,50 +297,18 @@ export const findAllUsersTenantByTenantId = asyncHandler(async (req: Request, re
         // vecchia identita' globale e' ancora presente il blocco: nasconderlo farebbe
         // comparire "Account attivo" anche se l'accesso viene poi rifiutato.
         deactivatedAt: user.tenantUser?.deactivatedAt ?? user.deactivatedAt ?? null,
-        structureIds: (user.structures ?? []).map((structure: any) => structure.id)
+        structureIds: (user.structures ?? []).filter((structure: any) => structure.tenantId === tenantId).map((structure: any) => structure.id)
     }));
 
-    return sendSuccessResponse(res, 200, users, 'All users found');
+    return sendSuccessResponse(res, 200, await projectStructureCalendars(users, tenantId, getSelectedStructureId(req)), 'All users found');
 });
 
-export const updateUser = asyncHandler(async (req: Request, res: Response) => {
-    const userId = req.params.userId;
-    const userToUpdate = stripProtectedFields({ ...req.body.user });
-    const userAvailabilities = Array.isArray(userToUpdate.userAvailabilities)
-        ? userToUpdate.userAvailabilities
-        : null;
-    delete userToUpdate.userAvailabilities;
-    delete userToUpdate.password;
-
-    if (userToUpdate.availabilityMode !== undefined && !isAvailabilityMode(userToUpdate.availabilityMode)) {
-        return sendErrorResponse(res, 400, 'Modalità disponibilità non valida');
-    }
-
-    const { membership } = await findTenantMember(req, userId);
-    if (!membership) {
-        return sendErrorResponse(res, 404, 'Utente non trovato in questo studio');
-    }
-
-    const [rowsUpdated] = await User.update(userToUpdate, { where: { id: userId } });
-    if (rowsUpdated === 0) {
-        return sendErrorResponse(res, 404, 'User not found');
-    }
-
-    const updatedUser = await User.findByPk(userId, { attributes: { exclude: ['password'] } });
-
-    if (userAvailabilities) {
-        for (const availability of userAvailabilities) {
-            const { id, userId: _ignoredUserId, ...availabilityValues } = availability;
-            if (id) {
-                await UserAvailability.update(availabilityValues, { where: { id, userId } });
-            } else {
-                await UserAvailability.create({ ...availabilityValues, userId });
-            }
-        }
-    }
-
-    return sendSuccessResponse(res, 200, updatedUser, 'User updated');
-});
+/** Legacy callers share the transactional Team validation and selected-structure scope. */
+export const updateUser = (req: Request, res: Response, next: import('express').NextFunction): void => {
+    // The legacy profile endpoint never grants role or structure administration.
+    req.body = {user: req.body.user, replacementUserId: req.body.replacementUserId, deferReassignment: req.body.deferReassignment};
+    updateTeamMemberProfile(req, res, next);
+};
 
 /**
  * Le preferenze di calendario sono self-service: ognuno modifica le proprie.
@@ -352,15 +321,11 @@ function canEditUserPreferences(req: Request, targetUserId: string): boolean {
     return hasPermission(getGrantedPermissions(req), 'user', 'update');
 }
 
-export const updateUserCalendarVisibility = asyncHandler(async (req: Request, res: Response) => {
-    const userId = req.params.userId;
-    if (!canEditUserPreferences(req, userId)) {
-        return sendErrorResponse(res, 403, 'forbidden');
-    }
-    await User.update({ calendarVisible: req.body.calendarVisible }, { where: { id: userId } });
-    const updatedUser = await User.findByPk(userId, { attributes: { exclude: ['password'] } });
-    return sendSuccessResponse(res, 200, updatedUser, 'User updated');
-});
+/** Legacy route now stores the viewer's preference without changing the target user. */
+export const updateUserCalendarVisibility = (req: Request, res: Response, next: import('express').NextFunction): void => {
+    req.body = { calendarId: req.params.userId, visible: req.body.calendarVisible };
+    updateCalendarPreferences(req, res, next);
+};
 
 export const updateUserCalendarColor = asyncHandler(async (req: Request, res: Response) => {
     const userId = req.params.userId;
@@ -369,7 +334,8 @@ export const updateUserCalendarColor = asyncHandler(async (req: Request, res: Re
     }
     await User.update({ calendarColor: req.body.calendarColor }, { where: { id: userId } });
     const updatedUser = await User.findByPk(userId, { attributes: { exclude: ['password'] } });
-    return sendSuccessResponse(res, 200, updatedUser, 'User updated');
+    const projected = updatedUser ? await projectStructureCalendar(updatedUser.get({plain: true}), getCurrentTenantId(req), getSelectedStructureId(req)) : null;
+    return sendSuccessResponse(res, 200, projected, 'User updated');
 });
 
 /**
@@ -383,8 +349,17 @@ export const updateTeamMemberProfile = asyncHandler(async (req: Request, res: Re
         user?: Record<string, any>;
         role?: string;
         structureIds?: string[];
+        replacementUserId?: string | null;
+        deferReassignment?: boolean;
     };
+    if (!validReplacementUserId(body.replacementUserId) || (body.deferReassignment !== undefined && typeof body.deferReassignment !== 'boolean')) {
+        return sendErrorResponse(res, 400, 'Scelta di riassegnazione non valida');
+    }
     let roleChanged = false;
+    const selectedStructureId = getSelectedStructureId(req);
+    if (body.replacementUserId && body.deferReassignment) {
+        return sendErrorResponse(res, 400, 'Scegli se riassegnare ora oppure gestire gli appuntamenti in seguito');
+    }
 
     try {
         await sequelize.transaction(async (transaction) => {
@@ -464,41 +439,28 @@ export const updateTeamMemberProfile = asyncHandler(async (req: Request, res: Re
                 profile.email = email;
             }
 
-            const requestedAvailabilityMode = profile.availabilityMode
-                ?? targetUser.get('availabilityMode');
-            if (!isSupportedAvailabilityMode(requestedAvailabilityMode)) {
-                throw new TeamProfileError(400, 'Modalita disponibilita non valida');
-            }
-
-            const hasSchedule = !!rawUser && Object.prototype.hasOwnProperty.call(rawUser, 'userAvailabilities');
-            const isOperationalRole = nextRole !== RoleCode.OWNER && nextRole !== RoleCode.SECRETARY;
-            const nextAvailabilityMode = isOperationalRole
-                ? requestedAvailabilityMode
-                : 'INHERIT_STRUCTURE';
-            const availabilityModeChanged = nextAvailabilityMode !== targetUser.get('availabilityMode');
-            profile.availabilityMode = nextAvailabilityMode;
-            const mustRevalidateExistingSchedule =
-                nextAvailabilityMode === 'CUSTOM' &&
-                (availabilityModeChanged || roleChanged || Array.isArray(body.structureIds));
-            let normalizedSchedule: ReturnType<typeof normalizeAvailabilitySchedule> | null = null;
-            if (nextAvailabilityMode === 'CUSTOM' && (hasSchedule || mustRevalidateExistingSchedule)) {
-                const structureSchedule = (await StructureAvailability.findAll({
-                    where: {structureId: requestedIds[0]},
-                    transaction,
-                    order: [['day', 'ASC']]
-                })).map((availability) => availability.get({plain: true}));
-                const scheduleToValidate = hasSchedule
-                    ? rawUser!.userAvailabilities
-                    : (await UserAvailability.findAll({
-                        where: {userId: targetUserId},
-                        transaction,
-                        order: [['day', 'ASC']]
-                    })).map((availability) => availability.get({plain: true}));
-                normalizedSchedule = normalizeAvailabilitySchedule(
-                    scheduleToValidate,
-                    'CUSTOM',
-                    structureSchedule
-                );
+            if (rawUser && hasCalendarFields(rawUser)) {
+                if (!selectedStructureId || !allowedIds.includes(selectedStructureId) || !requestedIds.includes(selectedStructureId)) {
+                    throw new TeamProfileError(400, 'La configurazione agenda richiede una sede selezionata assegnata al membro');
+                }
+                // Lock both calendars in the same order as appointment writers/reassignment.
+                // Concurrent transfers in opposite directions must not lock source then target.
+                await StructureUser.findAll({
+                    where: {structureId: selectedStructureId, userId: {[Op.in]: [targetUserId, ...(body.replacementUserId ? [body.replacementUserId] : [])]}},
+                    order: [['userId', 'ASC'], ['structureId', 'ASC']], transaction, lock: transaction.LOCK.UPDATE
+                });
+                const agenda = await StructureUser.findOne({
+                    where: {userId: targetUserId, structureId: selectedStructureId}, transaction, lock: transaction.LOCK.UPDATE
+                });
+                if (agenda?.calendarEnabled && rawUser.calendarEnabled === false) {
+                    const cutoff = new Date();
+                    if (body.replacementUserId) {
+                        await reassignFutureAppointments(tenantId, req.tenantSchema!, targetUserId, body.replacementUserId, transaction, cutoff, selectedStructureId);
+                    } else if (body.deferReassignment !== true) {
+                        const impact = await getOperatorDeactivationImpact(tenantId, req.tenantSchema!, targetUserId, cutoff, selectedStructureId);
+                        if (impact.hasFutureAppointments) throw new FutureAppointmentsRequireReplacementError(impact);
+                    }
+                }
             }
 
             if (Object.keys(profile).length) {
@@ -530,17 +492,21 @@ export const updateTeamMemberProfile = asyncHandler(async (req: Request, res: Re
             if (roleChanged) {
                 await membership.update({role: nextRole}, {transaction});
             }
-            await syncTeamMemberStructures(targetUserId, allowedIds, requestedIds, transaction);
+            if (requestedIds.length !== currentIds.length || requestedIds.some(id => !currentIds.includes(id))) {
+                await syncTeamMemberStructures(targetUserId, allowedIds, requestedIds, transaction, nextRole);
+            }
 
-            if (normalizedSchedule) {
-                await UserAvailability.destroy({where: {userId: targetUserId}, transaction});
-                await UserAvailability.bulkCreate(
-                    normalizedSchedule.map((availability) => ({...availability, userId: targetUserId})),
-                    {transaction}
-                );
+            if (rawUser && hasCalendarFields(rawUser) && selectedStructureId) {
+                await saveStructureCalendar(targetUserId, selectedStructureId, rawUser, transaction);
             }
         });
     } catch (error) {
+        if (error instanceof FutureAppointmentsRequireReplacementError) {
+            return sendErrorResponse(res, 409, error.message, {code: 'FUTURE_APPOINTMENTS_REQUIRE_REASSIGNMENT', impact: error.impact});
+        }
+        if (error instanceof InvalidReplacementOperatorError) {
+            return sendErrorResponse(res, 409, error.message, {code: 'INVALID_REPLACEMENT_OPERATOR'});
+        }
         if (error instanceof TeamProfileError || error instanceof AvailabilityValidationError) {
             const status = error instanceof TeamProfileError ? error.status : 400;
             return sendErrorResponse(res, status, error.message);
@@ -551,7 +517,7 @@ export const updateTeamMemberProfile = asyncHandler(async (req: Request, res: Re
     if (roleChanged) {
         await revokeAllForUser(targetUserId, 'role_changed');
     }
-    const updated = await serializeTeamMember(tenantId, targetUserId);
+    const updated = await serializeTeamMember(tenantId, targetUserId, selectedStructureId);
     return sendSuccessResponse(res, 200, updated, 'Membro del team aggiornato');
 });
 
@@ -559,6 +525,17 @@ export const updateTeamMemberProfile = asyncHandler(async (req: Request, res: Re
  * Prepara la disattivazione senza modificare dati: la UI usa il risultato per mostrare
  * la scelta dell'operatore sostitutivo soltanto quando esistono appuntamenti futuri.
  */
+export const getUserCalendarDeactivationImpact = asyncHandler(async (req: Request, res: Response) => {
+    const structureId = getSelectedStructureId(req);
+    const { tenantId, membership } = await findTenantMember(req, req.params.userId);
+    if (!membership) return sendErrorResponse(res, 404, 'Utente non trovato in questo studio');
+    const selected = structureId ? await Structure.findOne({where: {id: structureId, tenantId}}) : null;
+    const assignment = selected ? await StructureUser.findOne({where: {userId: req.params.userId, structureId: structureId!}}) : null;
+    if (!assignment) return sendErrorResponse(res, 400, 'La sede selezionata non assegnata al membro');
+    const impact = await getOperatorDeactivationImpact(tenantId, req.tenantSchema!, req.params.userId, new Date(), structureId!);
+    return sendSuccessResponse(res, 200, impact, 'Impatto disabilitazione agenda');
+});
+
 export const getUserDeactivationImpact = asyncHandler(async (req: Request, res: Response) => {
     const targetUserId = req.params.userId;
     const { tenantId, membership } = await findTenantMember(req, targetUserId);
@@ -589,6 +566,9 @@ export const setUserActive = asyncHandler(async (req: Request, res: Response) =>
         deferReassignment?: boolean;
     };
 
+    if (!validReplacementUserId(replacementUserId) || (deferReassignment !== undefined && typeof deferReassignment !== 'boolean')) {
+        return sendErrorResponse(res, 400, 'Scelta di riassegnazione non valida');
+    }
     if (typeof active !== 'boolean') {
         return sendErrorResponse(res, 400, 'Il campo `active` è obbligatorio (boolean)');
     }
@@ -705,13 +685,7 @@ export const setUserActive = asyncHandler(async (req: Request, res: Response) =>
         await revokeForTenantMembership(targetUserId, tenantId, 'tenant_membership_deactivated');
     }
 
-    const [updatedIdentity, updatedMembership] = await Promise.all([
-        User.findByPk(targetUserId, { attributes: { exclude: ['password'] } }),
-        TenantUser.findOne({ where: { tenantId, userId: targetUserId } })
-    ]);
-    const updatedUser = updatedIdentity
-        ? { ...updatedIdentity.get({ plain: true }), deactivatedAt: updatedMembership?.deactivatedAt ?? null }
-        : null;
+    const updatedUser = await serializeTeamMember(tenantId, targetUserId, getSelectedStructureId(req));
 
     return sendSuccessResponse(
         res,
@@ -850,6 +824,7 @@ export default {
     updateUserCalendarVisibility,
     updateUserCalendarColor,
     getUserDeactivationImpact,
+    getUserCalendarDeactivationImpact,
     setUserActive,
     deleteUser,
     resetPassword,
@@ -857,4 +832,3 @@ export default {
     sendVerificationEmail,
     forgotPassword
 };
-

@@ -30,10 +30,19 @@ import {
 } from './modules/human-body/models/index.js';
 import { registerEvaluationAssociations, Evaluation } from './modules/evaluations/models/index.js';
 import { registerMeasurementAssociations, Observation, DeviceConnection, RawFile } from './modules/measurements/models/index.js';
-import { Note, NoteImage, Reminder } from './modules/notes/models/index.js';
+import {
+    registerNotesAssociations,
+    Note,
+    NoteAssignment,
+    NoteImage,
+    Reminder,
+    ReminderAlertState,
+    ReminderAssignment
+} from './modules/notes/models/index.js';
 import PatientPortalAudit from './modules/patient-portal/models/patientPortalAudit.model.js';
 import PatientAppointmentRequest from './modules/patient-portal/models/patientAppointmentRequest.model.js';
 import PatientSharedDocument from './modules/patient-portal/models/patientSharedDocument.model.js';
+import ReminderExternalDelivery from './modules/notes/models/reminderExternalDelivery.model.js';
 import { PatientCreditMovement } from './modules/administration/models/patientCreditMovement.model.js';
 import { ADMINISTRATION_MODELS } from './modules/administration/models/index.js';
 
@@ -53,6 +62,7 @@ export function registerTenantModels(): void {
     registerInvoiceAssociations();
     registerConfigurationAssociations();
     registerMeasurementAssociations();
+    registerNotesAssociations();
 
     registerTenantScopedModel(Patient);
     // Evaluation references `patients` (FK) and is in turn referenced by the human-body instance
@@ -67,8 +77,12 @@ export function registerTenantModels(): void {
     // in modo logico; nessun vincolo di ordine di sync richiesto (nessuna FK cross-tabella reale).
     registerTenantScopedModel(RawFile);
     registerTenantScopedModel(Note);
+    registerTenantScopedModel(NoteAssignment);
     registerTenantScopedModel(NoteImage);
     registerTenantScopedModel(Reminder);
+    registerTenantScopedModel(ReminderAssignment);
+    registerTenantScopedModel(ReminderAlertState);
+    registerTenantScopedModel(ReminderExternalDelivery);
     registerTenantScopedModel(PatientPortalAudit);
     registerTenantScopedModel(PatientAppointmentRequest);
     registerTenantScopedModel(PatientSharedDocument);

@@ -11,7 +11,7 @@ import { signUpSendMail } from '../../../services/email.service.js';
 import { sequelize } from '../../../config/database.js';
 import { TENANT_OWNER_ROLE } from '../rbac/roles.js';
 import { isTaxRegimeCode } from '../../invoice/utils/fiscalRegime.js';
-import { Tenant, User, Structure, StructureAvailability, UserAvailability } from '../models/index.js';
+import { Tenant, User, Structure, StructureAvailability } from '../models/index.js';
 import { localStorageAdapter } from '../../measurements/storage/localStorageAdapter.js';
 import {markTenantSchemaReady, provisionTenantSchema} from '../../../utils/tenantSchema.js';
 
@@ -103,12 +103,6 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
             { transaction }
         );
 
-        const userAvailabilities = Array.from({ length: 7 }, (_, i) => ({
-            day: i,
-            enabled: false,
-            userId: createdUser.get('id') as string
-        }));
-
         const structureAvailabilities = Array.from({ length: 7 }, (_, i) => ({
             day: i,
             enabled: i < 5,
@@ -118,7 +112,6 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
         }));
 
         await Promise.all([
-            UserAvailability.bulkCreate(userAvailabilities as any, { transaction }),
             StructureAvailability.bulkCreate(structureAvailabilities as any, { transaction }),
             (newStructure as any).addUser(createdUser, { transaction })
         ]);

@@ -1,3 +1,5 @@
+import { projectStructureCalendar } from '../services/structureCalendar.service.js';
+import { compactVerifiedApplicationToken, signApplicationToken } from '../services/applicationToken.service.js';
 import { Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
@@ -67,10 +69,6 @@ async function buildRbacClaims(userId: string, tenantId?: string | null, structu
     };
 }
 
-function signToken(payload: object) {
-    return jwt.sign(payload, env.jwtSecret, { expiresIn: env.jwtExpiresIn } as jwt.SignOptions);
-}
-
 export const login = asyncHandler(async (req: Request, res: Response) => {
     const { email, password } = req.body;
 
@@ -112,7 +110,7 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 403, 'Accesso al centro disattivato');
     }
     Object.assign(payload, await buildRbacClaims(payload.id, tenantId, null));
-    const token = signToken(payload);
+    const token = signApplicationToken(payload);
 
     // Sessione lunga garantita dal refresh token: l'access token dura pochi minuti.
     const refresh = await issueRefreshToken(req, payload.id, { tenantId, structureId: null });
@@ -125,7 +123,7 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
             refreshToken: refresh.token,
             expiresIn: env.jwtExpiresIn,
             userId: payload.id,
-            user: payload
+            user: await projectStructureCalendar(payload, payload.tid ?? null, payload.sid ?? null)
         },
         'Login successful'
     );
@@ -231,11 +229,11 @@ export const refresh = asyncHandler(async (req: Request, res: Response) => {
         res,
         200,
         {
-            accessToken: signToken(payload),
+            accessToken: signApplicationToken(payload),
             refreshToken: result.refresh.token,
             expiresIn: env.jwtExpiresIn,
             userId: payload.id,
-            user: payload
+            user: await projectStructureCalendar(payload, payload.tid ?? null, payload.sid ?? null)
         },
         'Token refreshed'
     );
@@ -299,7 +297,7 @@ export const loginPremise = asyncHandler(async (req: Request, res: Response) => 
     // Il ruolo può essere sovrascritto per struttura: i permessi vanno ricalcolati.
     Object.assign(payload, await buildRbacClaims(payload.id, tenantId, structureId));
 
-    const newToken = signToken(payload);
+    const newToken = signApplicationToken(payload);
 
     // La struttura selezionata cambia i permessi effettivi: il refresh token la memorizza,
     // così anche i rinnovi successivi restano coerenti con il premise scelto.
@@ -320,7 +318,7 @@ export const loginPremise = asyncHandler(async (req: Request, res: Response) => 
             selectedPremises: premise,
             userId: payload.id,
             tenantId,
-            user: payload
+            user: await projectStructureCalendar(payload, payload.tid ?? null, payload.sid ?? null)
         },
         'Login successful'
     );
@@ -329,6 +327,7 @@ export const loginPremise = asyncHandler(async (req: Request, res: Response) => 
 export const loginWithToken = asyncHandler(async (req: Request, res: Response) => {
     const token = req.body.accessToken;
     const decoded = jwt.verify(token, env.jwtSecret) as any;
+    const compactToken = compactVerifiedApplicationToken(decoded);
 
     const base = {
         id: decoded.id,
@@ -345,12 +344,14 @@ export const loginWithToken = asyncHandler(async (req: Request, res: Response) =
         data: decoded
     };
 
+    Object.assign(base, await projectStructureCalendar(base, decoded.tid ?? decoded.tenants?.[0]?.id ?? null, decoded.sid ?? decoded.selectedPremise?.id ?? null));
+
     if (decoded.selectedPremise) {
         const selectedPremise = await findStructureById(decoded.selectedPremise.id);
-        return res.status(200).json({ accessToken: token, user: { ...base, selectedPremise } });
+        return res.status(200).json({ accessToken: compactToken, user: { ...base, selectedPremise } });
     }
 
-    return res.status(200).json({ accessToken: token, user: { ...base, selectedPremise: null } });
+    return res.status(200).json({ accessToken: compactToken, user: { ...base, selectedPremise: null } });
 });
 
 export default { login, logout, loginPremise, loginWithToken, refresh };

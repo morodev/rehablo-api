@@ -198,12 +198,14 @@ async function loadFutureAssignments(
     userId: string,
     cutoff: Date,
     transaction?: Transaction,
-    lock = false
+    lock = false,
+    structureId?: string
 ): Promise<FutureAssignment[]> {
     const cutoffIso = cutoff.toISOString();
     const events = await AgendaEvent.schema(schema).findAll({
         where: {
             calendarId: userId,
+            ...(structureId ? { structureId } : {}),
             [Op.or]: [
                 { start: { [Op.gte]: cutoffIso } },
                 { recurrence: { [Op.not]: null }, end: { [Op.gte]: cutoffIso } }
@@ -296,7 +298,8 @@ async function eligibleReplacementOperators(
         ? await StructureUser.findAll({
             where: {
                 userId: { [Op.in]: users.map((user) => user.id) },
-                structureId: { [Op.in]: structureIds }
+                structureId: { [Op.in]: structureIds },
+                calendarEnabled: true
             },
             attributes: ['userId', 'structureId'],
             transaction
@@ -343,29 +346,43 @@ export async function getOperatorDeactivationImpact(
     tenantId: string,
     schema: string,
     userId: string,
-    cutoff = new Date()
+    cutoff = new Date(),
+    structureId?: string
 ): Promise<OperatorDeactivationImpact> {
-    const assignments = await loadFutureAssignments(schema, userId, cutoff);
+    const assignments = await loadFutureAssignments(schema, userId, cutoff, undefined, false, structureId);
     const replacementOperators = assignments.length > 0
         ? await eligibleReplacementOperators(tenantId, userId, assignments)
         : [];
     return summarize(assignments, replacementOperators);
 }
 
+/** All appointment writers acquire membership rows before event rows in this order. */
+async function lockAssignmentCalendars(userIds: string[], structureIds: string[] | null, transaction: Transaction): Promise<void> {
+    const ids = [...new Set(userIds)];
+    if (!ids.length) return;
+    await StructureUser.findAll({
+        where: {userId: {[Op.in]: ids}, ...(structureIds ? {structureId: {[Op.in]: [...new Set(structureIds)]}} : {})},
+        order: [['userId', 'ASC'], ['structureId', 'ASC']], transaction, lock: transaction.LOCK.UPDATE
+    });
+}
 export async function reassignFutureAppointments(
     tenantId: string,
     schema: string,
     sourceUserId: string,
     replacementUserId: string | null | undefined,
     transaction: Transaction,
-    cutoff = new Date()
+    cutoff = new Date(),
+    structureId?: string
 ): Promise<ReassignmentResult> {
+    await lockAssignmentCalendars([sourceUserId, ...(replacementUserId ? [replacementUserId] : [])],
+        structureId ? [structureId] : null, transaction);
     const assignments = await loadFutureAssignments(
         schema,
         sourceUserId,
         cutoff,
         transaction,
-        true
+        true,
+        structureId
     );
     if (assignments.length === 0) {
         return { reassignedSingleAppointments: 0, reassignedRecurringSeries: 0 };
@@ -383,7 +400,7 @@ export async function reassignFutureAppointments(
     }
     if (!eligible.some((operator) => operator.id === replacementUserId)) {
         throw new InvalidReplacementOperatorError(
-            'Seleziona un operatore attivo e assegnato a tutte le sedi degli appuntamenti futuri'
+            'Seleziona un operatore attivo con agenda abilitata in tutte le sedi degli appuntamenti futuri'
         );
     }
 
@@ -488,7 +505,7 @@ async function operatorIsAvailableForEvent(
         }),
         structureId
             ? StructureUser.findOne({
-                where: { userId: operatorId, structureId },
+                where: { userId: operatorId, structureId, calendarEnabled: true },
                 attributes: ['userId'],
                 transaction
             })
@@ -501,10 +518,11 @@ async function operatorIsAvailableForEvent(
 async function operatorIsUnavailable(
     tenantId: string,
     operatorId: string | null,
+    structureId: string | null,
     transaction: Transaction
 ): Promise<boolean> {
     if (!operatorId) return true;
-    const [membership, identity] = await Promise.all([
+    const [membership, identity, structureAssignment] = await Promise.all([
         TenantUser.findOne({
             where: { tenantId, userId: operatorId },
             attributes: ['deactivatedAt'],
@@ -513,11 +531,18 @@ async function operatorIsUnavailable(
         User.findByPk(operatorId, {
             attributes: ['id', 'isActive', 'deactivatedAt'],
             transaction
-        })
+        }),
+        structureId
+            ? StructureUser.findOne({
+                where: { userId: operatorId, structureId, calendarEnabled: true },
+                attributes: ['userId'],
+                transaction
+            })
+            : Promise.resolve(true)
     ]);
 
     return !membership || !!membership.deactivatedAt || !identity
-        || !identity.isActive || !!identity.deactivatedAt;
+        || !identity.isActive || !!identity.deactivatedAt || !structureAssignment;
 }
 
 function resetOccurrenceManagedFields(event: Record<string, any>): void {
@@ -551,6 +576,15 @@ export async function reassignDeferredOperatorAppointments(
     transaction: Transaction,
     now = new Date()
 ): Promise<DeferredOperatorReassignmentResult> {
+    // Non-locking previews identify the memberships to serialize before any event lock.
+    const previews = await AgendaEvent.schema(schema).findAll({
+        where: {id: {[Op.in]: assignments.map(item => item.eventId)}, ...accessWhere}, transaction
+    });
+    const previewsById = new Map(previews.map(event => [event.id, event]));
+    const structures = [...new Set(previews.map(event => event.structureId).filter((id): id is string => !!id))];
+    const users = [...assignments.map(item => item.replacementUserId),
+        ...previews.map(event => event.calendarId).filter((id): id is string => !!id)];
+    await lockAssignmentCalendars(users, structures, transaction);
     let reassignedAppointments = 0;
     let reassignedRecurringOccurrences = 0;
 
@@ -566,13 +600,17 @@ export async function reassignDeferredOperatorAppointments(
             );
         }
 
+        const preview = previewsById.get(event.id);
+        if (!preview || preview.calendarId !== event.calendarId || preview.structureId !== event.structureId) {
+            throw new InvalidDeferredOperatorReassignmentError('L\'assegnazione dell\'appuntamento e\' cambiata: ricarica l\'agenda');
+        }
         const plain = event.get({ plain: true }) as Record<string, any>;
         if (String(plain.status ?? '').toUpperCase() === 'CANCELLED' || isLegacyTimeOff(plain)) {
             throw new InvalidDeferredOperatorReassignmentError(
                 'Ferie, permessi e appuntamenti cancellati non possono essere riassegnati'
             );
         }
-        if (!await operatorIsUnavailable(tenantId, event.calendarId, transaction)) {
+        if (!await operatorIsUnavailable(tenantId, event.calendarId, event.structureId, transaction)) {
             throw new InvalidDeferredOperatorReassignmentError(
                 'Uno degli appuntamenti selezionati non presenta piu\' un operatore da riassegnare'
             );
@@ -584,7 +622,7 @@ export async function reassignDeferredOperatorAppointments(
             transaction
         )) {
             throw new InvalidDeferredOperatorReassignmentError(
-                'Il nuovo operatore non e\' attivo o non e\' assegnato alla sede dell\'appuntamento'
+                'Il nuovo operatore non e\' attivo o non ha un\'agenda abilitata nella sede dell\'appuntamento'
             );
         }
 

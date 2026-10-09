@@ -1,3 +1,4 @@
+import { migrateStructureCalendars } from './modules/auth/services/structureCalendarMigration.service.js';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -18,6 +19,7 @@ import { registerCatalogAssociations, syncCatalogModels, seedCatalogData } from 
 import { registerProtocolCatalogAssociations, syncProtocolCatalogModels } from './modules/protocols/models/catalog/index.js';
 import { syncMeasurementCatalogModels, seedMeasurementCatalogData } from './modules/measurements/models/catalog/index.js';
 import { startAutomaticAppointmentCompletionSweep } from './modules/agenda/services/missedArrivalAutomation.service.js';
+import {startReminderExternalDeliverySweep} from './modules/notes/services/reminderExternalDelivery.service.js';
 import {warmTenantSchemas} from './utils/tenantSchema.js';
 
 import authRoutes from './modules/auth/routes/auth.routes.js';
@@ -101,6 +103,7 @@ async function bootstrap() {
 
     // RBAC: allinea i ruoli delle membership preesistenti (vedi docs/RBAC_DESIGN.md)
     await assignBootstrapRoles();
+    await migrateStructureCalendars();
 
     // RBAC: assegna la sede ai record che ne sono privi, così lo scope `structure` può
     // diventare stretto. Idempotente e non distruttivo (tocca solo `structureId IS NULL`),
@@ -169,6 +172,9 @@ async function bootstrap() {
     // A fine appuntamento passa a COMPLETED se nessuno ha registrato un esito o
     // una segnalazione esplicita.
     startAutomaticAppointmentCompletionSweep();
+    if (process.env.REMINDER_EXTERNAL_DELIVERY_ENABLED !== 'false') {
+        await startReminderExternalDeliverySweep();
+    }
 
     app.listen(env.port, () => {
         console.log(`[rehablo-api] listening on port ${env.port} (${env.nodeEnv})`);

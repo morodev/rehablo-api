@@ -1,3 +1,5 @@
+import { projectStructureCalendar } from '../services/structureCalendar.service.js';
+import { signApplicationToken } from '../services/applicationToken.service.js';
 import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -41,12 +43,6 @@ function signSelectionToken(user: User): string {
         env.jwtSecret,
         { expiresIn: '10m' }
     );
-}
-
-function signApplicationToken(payload: Record<string, unknown>): string {
-    return jwt.sign({ ...payload, tokenUse: 'application' }, env.jwtSecret, {
-        expiresIn: env.jwtExpiresIn
-    } as jwt.SignOptions);
 }
 
 async function contextsForUser(userId: string): Promise<SessionContextSummary[]> {
@@ -162,7 +158,7 @@ export const selectSessionContext = asyncHandler(async (req: Request, res: Respo
     }
 
     const basePayload: Record<string, unknown> = {
-        ...user.get({ plain: true }),
+        ...await projectStructureCalendar(user.get({ plain: true }), null, null),
         password: undefined,
         sub: user.get('id'),
         id: user.get('id'),

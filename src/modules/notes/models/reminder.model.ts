@@ -9,6 +9,7 @@ export interface ReminderAttributes {
     title: string;
     description?: string | null;
     dueAt?: Date | null;
+    dueAllDay: boolean;
     remindAt?: Date | null;
     status: ReminderStatus;
     priority: ReminderPriority;
@@ -25,7 +26,7 @@ export interface ReminderAttributes {
 
 export type ReminderCreationAttributes = Optional<
     ReminderAttributes,
-    'id' | 'status' | 'priority' | 'description' | 'dueAt' | 'remindAt' | 'completedAt' | 'snoozedUntil'
+    'id' | 'status' | 'priority' | 'description' | 'dueAt' | 'dueAllDay' | 'remindAt' | 'completedAt' | 'snoozedUntil'
 >;
 
 /** Tenant-scoped reminders. Always access through `Reminder.schema(req.tenantSchema)`. */
@@ -36,6 +37,7 @@ export class Reminder
     declare title: string;
     declare description: string | null;
     declare dueAt: Date | null;
+    declare dueAllDay: boolean;
     declare remindAt: Date | null;
     declare status: ReminderStatus;
     declare priority: ReminderPriority;
@@ -56,6 +58,7 @@ Reminder.init(
         title: { type: DataTypes.STRING, allowNull: false, defaultValue: '' },
         description: { type: DataTypes.TEXT, allowNull: true },
         dueAt: { type: DataTypes.DATE, allowNull: true },
+        dueAllDay: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
         remindAt: { type: DataTypes.DATE, allowNull: true },
         status: {
             type: DataTypes.ENUM('OPEN', 'DONE', 'SNOOZED', 'CANCELLED'),

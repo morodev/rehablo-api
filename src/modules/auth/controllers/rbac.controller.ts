@@ -1,9 +1,10 @@
+import { defaultCalendarEnabled, projectStructureCalendar } from '../services/structureCalendar.service.js';
 import { Request, Response } from 'express';
 import { Op } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
-import { getGrantedPermissions, getUserId } from '../../../middleware/rbac.js';
+import { getGrantedPermissions, getSelectedStructureId, getUserId } from '../../../middleware/rbac.js';
 import {
     getAssignableRoles,
     getRolePermissions,
@@ -19,7 +20,8 @@ import { validateUserStructureSelection } from '../services/userStructurePolicy.
 async function syncUserStructureAssignments(
     userId: string,
     tenantStructureIds: readonly string[],
-    requestedStructureIds: readonly string[]
+    requestedStructureIds: readonly string[],
+    role: RoleCode
 ): Promise<{ added: number; removed: number }> {
     const requested = [...new Set(requestedStructureIds)];
     const current = await StructureUser.findAll({ where: { userId } });
@@ -32,7 +34,7 @@ async function syncUserStructureAssignments(
 
     if (toAdd.length > 0) {
         await StructureUser.bulkCreate(
-            toAdd.map((structureId) => ({ structureId, userId, role: null }))
+            toAdd.map((structureId) => ({ structureId, userId, role: null, calendarEnabled: defaultCalendarEnabled(role) }))
         );
     }
     if (toRemove.length > 0) {
@@ -94,7 +96,7 @@ export const me = asyncHandler(async (req: Request, res: Response) => {
     }
 
     const tenantId = (req.user?.tid as string) ?? req.user?.tenants?.[0]?.id ?? null;
-    const structureId = (req.user?.sid as string) ?? null;
+    const structureId = getSelectedStructureId(req);
 
     // Il ruolo viene riletto dal DB: se è cambiato dopo l'emissione del token,
     // la risposta riflette la situazione reale.
@@ -112,7 +114,7 @@ export const me = asyncHandler(async (req: Request, res: Response) => {
         res,
         200,
         {
-            user,
+            user: await projectStructureCalendar(user.get({plain: true}), tenantId, structureId),
             tenantId,
             structureId,
             role,
@@ -215,7 +217,7 @@ export const updateUserRole = asyncHandler(async (req: Request, res: Response) =
     }
 
     await TenantUser.update({ role }, { where: { tenantId, userId: targetUserId } });
-    await syncUserStructureAssignments(targetUserId, allowedIds, requested);
+    await syncUserStructureAssignments(targetUserId, allowedIds, requested, role as RoleCode);
 
     if (role === RoleCode.OWNER) {
         await StructureUser.update(
@@ -339,7 +341,8 @@ export const updateUserStructures = asyncHandler(async (req: Request, res: Respo
     const { added, removed } = await syncUserStructureAssignments(
         targetUserId,
         allowedIds,
-        requested
+        requested,
+        membership.get('role') as RoleCode
     );
 
     // Le strutture determinano cosa l'utente può vedere: la sessione va riallineata.

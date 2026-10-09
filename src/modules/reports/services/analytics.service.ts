@@ -9,7 +9,8 @@ import { getInvoiceAgendaLinksByEventIds } from '../../invoice/services/invoiceA
 import {
     StructureAvailability,
     User,
-    UserAvailability
+    StructureUser,
+    StructureUserAvailability
 } from '../../auth/models/index.js';
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -393,8 +394,8 @@ async function operatorCapacity(
         return new Map(operatorIds.map((id) => [id, null]));
     }
     const [users, customRows, structureRows, approvedTimeOff] = await Promise.all([
-        User.findAll({ where: { id: { [Op.in]: operatorIds } }, attributes: ['id', 'availabilityMode'] }),
-        UserAvailability.findAll({ where: { userId: { [Op.in]: operatorIds } } }),
+        StructureUser.findAll({ where: { userId: { [Op.in]: operatorIds }, structureId: query.structureId }, attributes: ['userId', 'availabilityMode'] }),
+        StructureUserAvailability.findAll({ where: { userId: { [Op.in]: operatorIds }, structureId: query.structureId } }),
         StructureAvailability.findAll({ where: { structureId: query.structureId } }),
         TimeOffRequest.schema(schema).findAll({
             where: {
@@ -406,7 +407,7 @@ async function operatorCapacity(
             }
         })
     ]);
-    const modeByUser = new Map(users.map((user) => [user.id, user.availabilityMode]));
+    const modeByUser = new Map(users.map((user) => [user.userId, user.availabilityMode]));
     const customByUserDay = new Map<string, Record<string, any>>();
     customRows.forEach((row) => customByUserDay.set(`${row.userId}:${row.day}`, row.get({ plain: true })));
     const structureByDay = new Map(structureRows.map((row) => [row.day, row.get({ plain: true })]));

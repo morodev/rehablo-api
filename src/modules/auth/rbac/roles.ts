@@ -113,6 +113,9 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
         permissions: [
             // anagrafica sì, cancellazione no
             ...perms('patient', ['read', 'create', 'update'], 'structure'),
+            // Le note cliniche restano vietate dal controller; l'ACL per elemento consente
+            // alla segreteria di collaborare soltanto su note interne/amministrative assegnate.
+            ...crud('note', 'own'),
             // NESSUN permesso su evaluation / protocol / bodymap / measurement
             ...crud('reminder', 'structure'),
             ...crud('agenda', 'structure'),

@@ -11,12 +11,16 @@ export class StructureUser extends Model {
      * `null` => vale il ruolo base definito su `tenant_users.role`.
      */
     declare role: RoleCode | null;
+    declare calendarEnabled: boolean;
+    declare availabilityMode: 'INHERIT_STRUCTURE' | 'CUSTOM';
 }
 
 StructureUser.init(
     {
         structureId: { type: DataTypes.UUID, allowNull: false, primaryKey: true },
         userId: { type: DataTypes.UUID, allowNull: false, primaryKey: true },
+        calendarEnabled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+        availabilityMode: { type: DataTypes.STRING(32), allowNull: false, defaultValue: 'INHERIT_STRUCTURE', validate: { isIn: [['INHERIT_STRUCTURE', 'CUSTOM']] } },
         role: {
             type: DataTypes.ENUM(...Object.values(RoleCode)),
             allowNull: true,

@@ -7,11 +7,21 @@ export function notFoundHandler(req: Request, res: Response) {
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function errorHandler(err: any, req: Request, res: Response, next: NextFunction) {
-    console.error(err);
-
     if (err?.name === 'SequelizeUniqueConstraintError') {
-        return sendErrorResponse(res, 409, 'Unique constraint violation', err.errors);
+        const fields = [...new Set<string>([
+            ...Object.keys(err?.fields ?? {}),
+            ...(Array.isArray(err?.errors)
+                ? err.errors.map((item: any) => item?.path).filter((path: unknown): path is string => typeof path === 'string')
+                : [])
+        ])];
+        console.warn('[errorHandler] unique constraint violation', {fields});
+        return sendErrorResponse(res, 409, 'Dato già utilizzato.', {
+            code: 'RESOURCE_ALREADY_EXISTS',
+            fields
+        });
     }
+
+    console.error(err);
 
     if (err?.name === 'SequelizeValidationError') {
         return sendErrorResponse(res, 422, 'Validation error', err.errors);

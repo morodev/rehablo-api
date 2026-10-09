@@ -5,10 +5,15 @@ import StructureAvailability from './structureAvailability.model.js';
 import UserAvailability, { syncUserAvailabilitySchema } from './userAvailability.model.js';
 import TenantUser from './tenantUser.model.js';
 import StructureUser from './structureUser.model.js';
+import StructureUserAvailability from './structureUserAvailability.model.js';
+import CalendarPreference from './calendarPreference.model.js';
 import RefreshToken from './refreshToken.model.js';
 import UserEmail, { normalizeIdentityEmail } from './userEmail.model.js';
 import PatientPortalAccess from './patientPortalAccess.model.js';
 import PatientPortalInvitation from './patientPortalInvitation.model.js';
+import ReminderNotificationPreference from '../../notes/models/reminderNotificationPreference.model.js';
+import ReminderPushSubscription from '../../notes/models/reminderPushSubscription.model.js';
+import ReminderNotificationActivation from '../../notes/models/reminderNotificationActivation.model.js';
 
 /** Centralised associations for the auth/tenant domain (mirrors former rehab-authentication.js). */
 export function registerAuthAssociations(): void {
@@ -63,12 +68,17 @@ export async function syncAuthModels(): Promise<void> {
     await UserEmail.sync({ alter: true });
     await syncUserAvailabilitySchema();
     await Structure.sync({ alter: true });
-    await StructureAvailability.sync({ alter: true });
+    // Additive sync avoids Sequelize resolving a constraint from a homonymous tenant table.
+    await StructureAvailability.sync({alter: {drop: false}});
     await TenantUser.sync({ alter: true });
     await StructureUser.sync({ alter: true });
+    // Tables and composite membership FK are created by the versioned public migration.
     await RefreshToken.sync({ alter: true });
-    await PatientPortalAccess.sync({ alter: true });
-    await PatientPortalInvitation.sync({ alter: true });
+    await PatientPortalAccess.sync({alter: {drop: false}});
+    await PatientPortalInvitation.sync({alter: {drop: false}});
+    await ReminderNotificationPreference.sync({alter: {drop: false}});
+    await ReminderPushSubscription.sync({alter: {drop: false}});
+    await ReminderNotificationActivation.sync({alter: {drop: false}});
 
     // Backfill idempotente per gli account creati prima dell'introduzione degli alias.
     const users = await User.findAll({ attributes: ['id', 'email', 'isActive'] });
@@ -99,9 +109,10 @@ export {
     UserAvailability,
     TenantUser,
     StructureUser,
+    StructureUserAvailability,
+    CalendarPreference,
     RefreshToken,
     UserEmail,
     PatientPortalAccess,
     PatientPortalInvitation
 };
-

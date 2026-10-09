@@ -10,7 +10,7 @@ import {
 import {
     APPOINTMENT_LEDGER_VERSION, prepareTenantPaymentHistory, runTenantMigrations,
     PATIENT_DEFAULT_EVENT_TYPE_VERSION, TENANT_MODEL_BASELINE_VERSION, APPOINTMENT_PRICE_ADJUSTMENTS_VERSION,
-    CATALOG_STRUCTURE_AVAILABILITY_VERSION, ADMINISTRATION_SEED_VERSION
+    CATALOG_STRUCTURE_AVAILABILITY_VERSION, ADMINISTRATION_SEED_VERSION, WORK_ITEM_ASSIGNEES_VERSION
 } from './tenantMigrations.js';
 
 const require = createRequire(import.meta.url);
@@ -32,6 +32,7 @@ let legacyBaselineApplied: boolean;
 let lastSyncOptions: any;
 let pricingApplied: boolean;
 let catalogAvailabilityApplied: boolean, administrationApplied: boolean, publicationApplied: boolean;
+let workItemAssignmentsApplied: boolean;
 let migrationWork: (options: any) => Promise<void>;
 const transaction = {id: 'test-transaction'};
 
@@ -48,6 +49,7 @@ beforeEach(() => {
     lastSyncOptions = undefined;
     pricingApplied = false;
     catalogAvailabilityApplied = false; administrationApplied = false; publicationApplied = false;
+    workItemAssignmentsApplied = false;
     migrationWork = async () => {};
     sequelize.createSchema = (async () => {}) as any;
     sequelize.transaction = (async (callback: any) => {
@@ -75,6 +77,7 @@ beforeEach(() => {
             ...(catalogAvailabilityApplied ? [{version: CATALOG_STRUCTURE_AVAILABILITY_VERSION}] : []),
             ...(administrationApplied ? [{version: ADMINISTRATION_SEED_VERSION}] : []),
             ...(publicationApplied ? [{version: '20260924-backfill-patient-publication'}] : []),
+            ...(workItemAssignmentsApplied ? [{version: WORK_ITEM_ASSIGNEES_VERSION}] : []),
             ...(legacyBaselineApplied ? [{version: '20260907-tenant-model-baseline-v1'}] : []),
             ...(baselineApplied ? [{version: TENANT_MODEL_BASELINE_VERSION}] : [])
         ]];
@@ -98,6 +101,9 @@ beforeEach(() => {
         }
         if (sql.startsWith('INSERT INTO') && options?.replacements?.version === '20260924-backfill-patient-publication') {
             publicationApplied = true; order.push('record-version');
+        }
+        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === WORK_ITEM_ASSIGNEES_VERSION) {
+            workItemAssignmentsApplied = true;
         }
         return [[]];
     }) as any;
