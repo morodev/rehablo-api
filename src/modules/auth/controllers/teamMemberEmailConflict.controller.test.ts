@@ -112,6 +112,7 @@ it('createUser translates an email unique race after the pre-check into the stab
     t.mock.method(User, 'findByPk', (async () => record({id: existingUserId})) as any);
     t.mock.method(TenantUser, 'findOne', (async () => record({deactivatedAt: null})) as any);
     t.mock.method(bcrypt, 'hash', (async () => '$2a$12$hash') as any);
+    t.mock.method(sequelize, 'query', (async (sql: string) => {if (!sql.includes('activities-membership-gate')) throw new Error('Unexpected unmocked SQL in unit fixture'); return [[], {}];}) as any);
     t.mock.method(sequelize, 'transaction', (async (callback: any) => callback({})) as any);
     t.mock.method(User, 'create', (async () => {
         throw {name: 'SequelizeUniqueConstraintError', errors: [{path: 'email'}]};

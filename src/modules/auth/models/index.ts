@@ -14,6 +14,7 @@ import PatientPortalInvitation from './patientPortalInvitation.model.js';
 import ReminderNotificationPreference from '../../notes/models/reminderNotificationPreference.model.js';
 import ReminderPushSubscription from '../../notes/models/reminderPushSubscription.model.js';
 import ReminderNotificationActivation from '../../notes/models/reminderNotificationActivation.model.js';
+import {migrateActivityPublicNotifications} from '../../activities/services/activityPublicMigration.service.js';
 
 /** Centralised associations for the auth/tenant domain (mirrors former rehab-authentication.js). */
 export function registerAuthAssociations(): void {
@@ -79,6 +80,7 @@ export async function syncAuthModels(): Promise<void> {
     await ReminderNotificationPreference.sync({alter: {drop: false}});
     await ReminderPushSubscription.sync({alter: {drop: false}});
     await ReminderNotificationActivation.sync({alter: {drop: false}});
+    await migrateActivityPublicNotifications();
 
     // Backfill idempotente per gli account creati prima dell'introduzione degli alias.
     const users = await User.findAll({ attributes: ['id', 'email', 'isActive'] });

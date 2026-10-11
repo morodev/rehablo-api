@@ -5,6 +5,9 @@ import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.
 import { getCurrentTenantId } from '../../../middleware/auth.js';
 import { Structure, StructureAvailability, StructureUser, Tenant, TenantUser } from '../models/index.js';
 import { RoleCode } from '../rbac/roles.js';
+import { sequelize } from '../../../config/database.js';
+import {acquireTenantActivityGate} from '../../../utils/tenantActivityGate.js';
+import { createActivityBoardForStructure } from '../../activities/services/activityBoardBootstrap.service.js';
 
 export const saveStructureForTenant = asyncHandler(async (req: Request, res: Response) => {
     const tenantId = getCurrentTenantId(req);
@@ -21,25 +24,33 @@ export const saveStructureForTenant = asyncHandler(async (req: Request, res: Res
 
     req.body.tenantId = tenantId;
 
-    const newStructure = await Structure.create(req.body, { include: StructureAvailability as any });
-
-    // Una nuova sede non abilita automaticamente tutto il team. Soltanto gli OWNER
-    // devono operare su ogni sede per invariant di dominio; gli altri vengono assegnati
-    // esplicitamente dalla gestione Team.
-    const owners = await TenantUser.findAll({
-        where: { tenantId, role: RoleCode.OWNER },
-        attributes: ['userId']
+    // Sede, disponibilità, membership degli owner e board diventano visibili insieme.
+    const newStructure = await sequelize.transaction(async transaction => {
+        await acquireTenantActivityGate(tenantId, transaction, 'shared');
+        const structure = await Structure.create(req.body, {
+            include: StructureAvailability as any,
+            transaction
+        });
+        // Una nuova sede non abilita automaticamente tutto il team. Gli altri membri
+        // vengono assegnati esplicitamente dalla gestione Team.
+        const owners = await TenantUser.findAll({
+            where: { tenantId, role: RoleCode.OWNER },
+            attributes: ['userId'],
+            transaction
+        });
+        if (owners.length > 0) {
+            await StructureUser.bulkCreate(
+                owners.map(owner => ({
+                    structureId: structure.get('id') as string,
+                    userId: owner.get('userId') as string,
+                    role: null
+                })),
+                { ignoreDuplicates: true, transaction }
+            );
+        }
+        await createActivityBoardForStructure(tenantId, structure.get('id') as string, transaction);
+        return structure;
     });
-    if (owners.length > 0) {
-        await StructureUser.bulkCreate(
-            owners.map((owner) => ({
-                structureId: newStructure.get('id') as string,
-                userId: owner.get('userId') as string,
-                role: null
-            })),
-            { ignoreDuplicates: true }
-        );
-    }
 
     return sendSuccessResponse(res, 201, newStructure, 'Structure created');
 });

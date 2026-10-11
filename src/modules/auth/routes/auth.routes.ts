@@ -65,19 +65,19 @@ router.patch('/user/:userId/calendar-visibility', requireAuth, requirePermission
 router.patch('/user/:userId/calendar-color', requireAuth, userController.updateUserCalendarColor);
 // Attivazione/sospensione dell'account: è l'alternativa alla cancellazione per il titolare
 // dello studio, che non è eliminabile. Riservata a chi amministra l'intero tenant.
+router.post('/user/:userId/offboarding-impact', requireAuth, requirePermission('user', 'update', 'tenant'), resolveTenantSchema, userController.getUserOffboardingImpact);
 router.get('/user/:userId/deactivation-impact', requireAuth, requirePermission('user', 'update', 'tenant'), resolveTenantSchema, userController.getUserDeactivationImpact);
 router.patch('/user/:userId/status', requireAuth, requirePermission('user', 'update', 'tenant'), resolveTenantSchema, userController.setUserActive);
-router.delete('/user/:userId', requireAuth, requirePermission('user', 'delete'), userController.deleteUser);
+router.delete('/user/:userId', requireAuth, requirePermission('user', 'delete'), resolveTenantSchema, userController.deleteUser);
 
 router.get('/user/:userId/calendar-deactivation-impact', requireAuth, requirePermission('user', 'update', 'tenant'), resolveTenantSchema, userController.getUserCalendarDeactivationImpact);
 router.get('/agenda/preferences', requireAuth, requirePermission('agenda', 'read'), getCalendarPreferences);
 router.patch('/agenda/preferences', requireAuth, requirePermission('agenda', 'read'), updateCalendarPreferences);
 
 // --- Structures (premises) ---
-router.post('/structure', requireAuth, requirePermission('structure', 'create'), structureController.saveStructureForTenant);
+router.post('/structure', requireAuth, requirePermission('structure', 'create'), resolveTenantSchema, structureController.saveStructureForTenant);
 router.put('/structure/:structureId', requireAuth, requirePermission('structure', 'update'), structureController.updateStructureForTenant);
 router.get('/structure/accessible', requireAuth, requirePermission('structure', 'read'), structureController.findAccessibleStructures);
 router.get('/structure', requireAuth, requirePermission('structure', 'manage', 'tenant'), structureController.findAllStructuresForTenant);
 
 export default router;
-

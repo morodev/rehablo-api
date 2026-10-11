@@ -20,6 +20,8 @@ import { registerProtocolCatalogAssociations, syncProtocolCatalogModels } from '
 import { syncMeasurementCatalogModels, seedMeasurementCatalogData } from './modules/measurements/models/catalog/index.js';
 import { startAutomaticAppointmentCompletionSweep } from './modules/agenda/services/missedArrivalAutomation.service.js';
 import {startReminderExternalDeliverySweep} from './modules/notes/services/reminderExternalDelivery.service.js';
+import {startActivityDeliverySweep} from './modules/activities/services/activityDelivery.service.js';
+import activityNotificationsRoutes from './modules/activities/routes/activityNotifications.routes.js';
 import {warmTenantSchemas} from './utils/tenantSchema.js';
 
 import authRoutes from './modules/auth/routes/auth.routes.js';
@@ -34,6 +36,7 @@ import protocolRoutes from './modules/protocols/routes/protocol.routes.js';
 import evaluationRoutes from './modules/evaluations/routes/evaluation.routes.js';
 import measurementsRoutes from './modules/measurements/routes/measurements.routes.js';
 import noteRoutes from './modules/notes/routes/note.routes.js';
+import activitiesRoutes from './modules/activities/routes/activities.routes.js';
 import maintenanceRoutes from './modules/maintenance/routes/maintenance.routes.js';
 import reportsRoutes from './modules/reports/routes/reports.routes.js';
 import patientPortalRoutes from './modules/patient-portal/routes/patientPortal.routes.js';
@@ -74,6 +77,9 @@ async function bootstrap() {
     // --- Domain routers (every module owns its own URL prefix-free routes, mounted at root) ---
     app.use(authRoutes);
     app.use(patientPortalRoutes);
+    // Handle Activities before legacy routers whose root middleware performs lazy schema sync.
+    app.use(activityNotificationsRoutes);
+    app.use(activitiesRoutes);
     app.use(patientRoutes);
     app.use(productsServicesRoutes);
     app.use(invoiceRoutes);
@@ -175,6 +181,8 @@ async function bootstrap() {
     if (process.env.REMINDER_EXTERNAL_DELIVERY_ENABLED !== 'false') {
         await startReminderExternalDeliverySweep();
     }
+
+    await startActivityDeliverySweep();
 
     app.listen(env.port, () => {
         console.log(`[rehablo-api] listening on port ${env.port} (${env.nodeEnv})`);

@@ -1,6 +1,7 @@
 import { ModelStatic, SyncOptions, Transaction } from 'sequelize';
 import { sequelize } from '../config/database.js';
 import { env } from '../config/env.js';
+import {ensureActivityDeliveryActivation} from '../modules/activities/services/activityDeliveryActivation.service.js';
 import {
     isTenantSchemaCurrent, lockTenantSchema, prepareTenantPaymentHistory,
     recordTenantModelBaseline, runTenantMigrations
@@ -91,6 +92,7 @@ async function syncTenantSchema(schemaName: string): Promise<string> {
     if (syncOptions && !await isTenantSchemaCurrent(schemaName)) {
         await sequelize.transaction(transaction => initializeTenantSchema(schemaName, syncOptions, transaction, true));
     }
+    await ensureActivityDeliveryActivation(schemaName);
     ensuredSchemas.add(schemaName);
     return schemaName;
 }
@@ -116,6 +118,7 @@ async function initializeTenantSchema(
         console.log(`[tenant-schema] ${schemaName}: migrazioni completate (${completed.join(', ')})`);
     }
     await recordTenantModelBaseline(schemaName, sequelize, transaction);
+    await ensureActivityDeliveryActivation(schemaName, transaction);
 }
 
 /** Provision a tenant in the caller's transaction, used during registration before it is returned. */

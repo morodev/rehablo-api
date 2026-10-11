@@ -107,7 +107,7 @@ async function claimDueBatch(schema: string, now: Date): Promise<ReminderExterna
 
 async function sendPush(userId: string, payload: string): Promise<boolean> {
     if (!PUSH_READY) return false;
-    const subscriptions = await ReminderPushSubscription.findAll({where: {userId}});
+    const subscriptions = await ReminderPushSubscription.findAll({where: {userId, remindersEnabled: true}});
     if (!subscriptions.length) return false;
     if (!vapidConfigured) {
         try {

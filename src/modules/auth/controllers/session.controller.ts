@@ -27,6 +27,7 @@ export interface SessionContextSummary {
     tenantName: string;
     status: 'ACTIVE' | 'HISTORICAL';
     requiresPremise: boolean;
+    accessibleStructureIds?: string[];
 }
 
 function signSelectionToken(user: User): string {
@@ -62,6 +63,10 @@ async function contextsForUser(userId: string): Promise<SessionContextSummary[]>
         : [];
     const tenantById = new Map(tenants.map((tenant) => [tenant.get('id') as string, tenant]));
 
+    const assignedStructures = await StructureUser.findAll({where: {userId}, attributes: ['structureId']});
+    const assignedIds = assignedStructures.map(row => row.get('structureId') as string);
+    const accessibleStructures = assignedIds.length ? await Structure.findAll({where: {id: {[Op.in]: assignedIds}, tenantId: {[Op.in]: staffMemberships.map(row => row.get('tenantId') as string)}}, attributes: ['id', 'tenantId']}) : [];
+
     const staffContexts = staffMemberships
         .flatMap<SessionContextSummary>((membership) => {
             const tenantId = membership.get('tenantId') as string;
@@ -73,7 +78,8 @@ async function contextsForUser(userId: string): Promise<SessionContextSummary[]>
                 tenantId,
                 tenantName: (tenant.get('businessName') as string | null) || 'Centro Rehablo',
                 status: 'ACTIVE' as const,
-                requiresPremise: true
+                requiresPremise: true,
+                accessibleStructureIds: accessibleStructures.filter(row => row.get('tenantId') === tenantId).map(row => row.get('id') as string)
             }];
         });
 

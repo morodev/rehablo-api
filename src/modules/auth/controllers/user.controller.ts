@@ -5,6 +5,8 @@ import { Op, Transaction } from 'sequelize';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { sequelize } from '../../../config/database.js';
+import {applyTeamMembershipChange, getTeamOffboardingImpact, parseTeamChange, runTeamMutation, sendTeamOffboardingError} from '../services/teamOffboarding.service.js';
+import {acquireTenantActivityGate} from '../../../utils/tenantActivityGate.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
@@ -231,6 +233,7 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
     let user: any;
     try {
         user = await sequelize.transaction(async (transaction) => {
+            await acquireTenantActivityGate(tenantId, transaction, 'shared');
             const created = await User.create(userToCreate, {transaction});
             await StructureUser.bulkCreate(targetStructures.map((structure: any) => ({
                 userId: created.get('id') as string, structureId: structure.id,
@@ -362,7 +365,9 @@ export const updateTeamMemberProfile = asyncHandler(async (req: Request, res: Re
     }
 
     try {
-        await sequelize.transaction(async (transaction) => {
+        const change = parseTeamChange({kind: 'profile', ...(body.role !== undefined ? {role: body.role} : {}),
+            ...(body.structureIds !== undefined ? {structureIds: body.structureIds} : {})});
+        await runTeamMutation(req, targetUserId, change, async (transaction, prepared) => {
             const [membership, targetUser, tenantStructures, currentAssignments] = await Promise.all([
                 TenantUser.findOne({
                     where: {tenantId, userId: targetUserId},
@@ -452,12 +457,14 @@ export const updateTeamMemberProfile = asyncHandler(async (req: Request, res: Re
                 const agenda = await StructureUser.findOne({
                     where: {userId: targetUserId, structureId: selectedStructureId}, transaction, lock: transaction.LOCK.UPDATE
                 });
-                if (agenda?.calendarEnabled && rawUser.calendarEnabled === false) {
+                // The membership offboarding already validated and applied its per-site agenda decision.
+                const agendaResolved = prepared.affectedStructureIds.includes(selectedStructureId);
+                if (agenda?.calendarEnabled && rawUser.calendarEnabled === false && !agendaResolved) {
                     const cutoff = new Date();
                     if (body.replacementUserId) {
                         await reassignFutureAppointments(tenantId, req.tenantSchema!, targetUserId, body.replacementUserId, transaction, cutoff, selectedStructureId);
                     } else if (body.deferReassignment !== true) {
-                        const impact = await getOperatorDeactivationImpact(tenantId, req.tenantSchema!, targetUserId, cutoff, selectedStructureId);
+                        const impact = await getOperatorDeactivationImpact(tenantId, req.tenantSchema!, targetUserId, cutoff, selectedStructureId, transaction);
                         if (impact.hasFutureAppointments) throw new FutureAppointmentsRequireReplacementError(impact);
                     }
                 }
@@ -499,8 +506,12 @@ export const updateTeamMemberProfile = asyncHandler(async (req: Request, res: Re
             if (rawUser && hasCalendarFields(rawUser) && selectedStructureId) {
                 await saveStructureCalendar(targetUserId, selectedStructureId, rawUser, transaction);
             }
+            if (roleChanged && nextRole === RoleCode.OWNER) await StructureUser.update({role: null}, {where: {
+                userId: targetUserId, structureId: {[Op.in]: allowedIds}}, transaction});
+            return {userId: targetUserId};
         });
     } catch (error) {
+        if (sendTeamOffboardingError(res, error)) return;
         if (error instanceof FutureAppointmentsRequireReplacementError) {
             return sendErrorResponse(res, 409, error.message, {code: 'FUTURE_APPOINTMENTS_REQUIRE_REASSIGNMENT', impact: error.impact});
         }
@@ -558,179 +569,45 @@ export const getUserDeactivationImpact = asyncHandler(async (req: Request, res: 
  * disattivarlo ne blocca l'accesso preservando lo storico clinico e amministrativo
  * (valutazioni, appuntamenti e fatture restano riferiti al loro autore).
  */
-export const setUserActive = asyncHandler(async (req: Request, res: Response) => {
-    const targetUserId = req.params.userId;
-    const { active, replacementUserId, deferReassignment } = req.body as {
-        active?: boolean;
-        replacementUserId?: string | null;
-        deferReassignment?: boolean;
-    };
-
-    if (!validReplacementUserId(replacementUserId) || (deferReassignment !== undefined && typeof deferReassignment !== 'boolean')) {
-        return sendErrorResponse(res, 400, 'Scelta di riassegnazione non valida');
-    }
-    if (typeof active !== 'boolean') {
-        return sendErrorResponse(res, 400, 'Il campo `active` è obbligatorio (boolean)');
-    }
-    if (replacementUserId && deferReassignment) {
-        return sendErrorResponse(
-            res,
-            400,
-            'Scegli se riassegnare subito oppure gestire gli appuntamenti in seguito'
-        );
-    }
-
-    // Nessuno può disattivare sé stesso: si chiuderebbe fuori dall'applicazione.
-    if (targetUserId === getUserId(req)) {
-        return sendErrorResponse(res, 403, 'Non puoi disattivare il tuo account');
-    }
-
-    const { tenantId, membership, user } = await findTenantMember(req, targetUserId);
-    if (!membership || !user) {
-        return sendErrorResponse(res, 404, 'Utente non trovato in questo studio');
-    }
-
-    // Lo studio deve conservare almeno un titolare operativo, altrimenti nessuno potrebbe
-    // più gestire utenti, fatturazione e dati azienda.
-    if (!active && membership.get('role') === RoleCode.OWNER) {
-        const ownerMemberships = await TenantUser.findAll({
-            where: { tenantId, role: RoleCode.OWNER },
-            attributes: ['userId']
-        });
-        const ownerIds = ownerMemberships.map((row) => row.get('userId') as string);
-        const activeOwners = await TenantUser.count({
-            where: { tenantId, userId: { [Op.in]: ownerIds }, deactivatedAt: null }
-        });
-        if (activeOwners <= 1) {
-            return sendErrorResponse(res, 409, 'Lo studio deve avere almeno un titolare attivo');
-        }
-    }
-
-    if (!active && !replacementUserId) {
-        const impact = await getOperatorDeactivationImpact(
-            tenantId,
-            req.tenantSchema!,
-            targetUserId
-        );
-        if (impact.hasFutureAppointments && deferReassignment !== true) {
-            return sendErrorResponse(
-                res,
-                409,
-                'Scegli se riassegnare subito gli appuntamenti futuri oppure gestirli in seguito',
-                { code: 'FUTURE_APPOINTMENTS_REQUIRE_REASSIGNMENT', impact }
-            );
-        }
-    }
-
+export const getUserOffboardingImpact = asyncHandler(async (req: Request, res: Response) => {
     try {
-        await sequelize.transaction(async (transaction) => {
-            const lockedMembership = await TenantUser.findOne({
-                where: { tenantId, userId: targetUserId },
-                transaction,
-                lock: transaction.LOCK.UPDATE
-            });
-            if (!lockedMembership) {
-                throw new Error('La membership da aggiornare non esiste piu');
-            }
-
-            if (!active && replacementUserId) {
-                await reassignFutureAppointments(
-                    tenantId,
-                    req.tenantSchema!,
-                    targetUserId,
-                    replacementUserId,
-                    transaction
-                );
-            }
-
-            await lockedMembership.update(
-                { deactivatedAt: active ? null : new Date() },
-                { transaction }
-            );
-
-            if (active && user.get('deactivatedAt')) {
-                // Gli account sospesi prima dell'introduzione di TenantUser conservavano
-                // anche il vecchio blocco globale. Senza questa bonifica il rapporto con lo
-                // studio tornava attivo, ma il login continuava a rispondere
-                // "Account non disponibile".
-                await User.update(
-                    { deactivatedAt: null },
-                    { where: { id: targetUserId }, transaction }
-                );
-            }
-        });
+        const impact = await getTeamOffboardingImpact(req, req.params.userId, parseTeamChange(req.body?.change));
+        return sendSuccessResponse(res, 200, impact, 'Impatto modifica team');
     } catch (error) {
-        if (error instanceof FutureAppointmentsRequireReplacementError) {
-            return sendErrorResponse(
-                res,
-                409,
-                error.message,
-                { code: 'FUTURE_APPOINTMENTS_REQUIRE_REASSIGNMENT', impact: error.impact }
-            );
-        }
-        if (error instanceof InvalidReplacementOperatorError) {
-            return sendErrorResponse(
-                res,
-                409,
-                error.message,
-                { code: 'INVALID_REPLACEMENT_OPERATOR' }
-            );
-        }
+        if (sendTeamOffboardingError(res, error)) return;
         throw error;
     }
+});
 
-    // Le sessioni aperte sopravvivrebbero fino alla scadenza dell'access token: revocando
-    // i refresh token la disattivazione diventa effettiva entro pochi minuti.
-    if (!active) {
-        await revokeForTenantMembership(targetUserId, tenantId, 'tenant_membership_deactivated');
+export const setUserActive = asyncHandler(async (req: Request, res: Response) => {
+    const targetUserId = req.params.userId;
+    try {
+        const change = parseTeamChange({kind: 'status', active: req.body.active});
+        const result = await runTeamMutation(req, targetUserId, change, applyTeamMembershipChange);
+        if (result.replayed) res.setHeader('X-Operation-Replayed', 'true');
+        if (!req.body.active) await revokeForTenantMembership(targetUserId, getCurrentTenantId(req), 'tenant_membership_deactivated');
+        const updated = await serializeTeamMember(getCurrentTenantId(req), targetUserId, getSelectedStructureId(req));
+        return sendSuccessResponse(res, 200, updated, req.body.active ? 'Utente riattivato' : 'Utente disattivato');
+    } catch (error) {
+        if (sendTeamOffboardingError(res, error)) return;
+        if (error instanceof FutureAppointmentsRequireReplacementError) return sendErrorResponse(res, 409, error.message, {code: 'FUTURE_APPOINTMENTS_REQUIRE_REASSIGNMENT', impact: error.impact});
+        if (error instanceof InvalidReplacementOperatorError) return sendErrorResponse(res, 409, error.message, {code: 'INVALID_REPLACEMENT_OPERATOR'});
+        throw error;
     }
-
-    const updatedUser = await serializeTeamMember(tenantId, targetUserId, getSelectedStructureId(req));
-
-    return sendSuccessResponse(
-        res,
-        200,
-        updatedUser,
-        active ? 'Utente riattivato' : 'Utente disattivato'
-    );
 });
 
 export const deleteUser = asyncHandler(async (req: Request, res: Response) => {
-    const userId = req.params.userId;
-
-    const { tenantId, membership, user } = await findTenantMember(req, userId);
-    if (!membership || !user) {
-        return sendErrorResponse(res, 404, 'Utente non trovato in questo studio');
+    try {
+        const result = await runTeamMutation(req, req.params.userId, {kind: 'remove'}, applyTeamMembershipChange);
+        if (result.replayed) res.setHeader('X-Operation-Replayed', 'true');
+        await revokeForTenantMembership(req.params.userId, getCurrentTenantId(req), 'tenant_membership_deleted');
+        return sendSuccessResponse(res, 200, {deleted: result.data.deleted}, 'Membro rimosso');
+    } catch (error) {
+        if (sendTeamOffboardingError(res, error)) return;
+        if (error instanceof FutureAppointmentsRequireReplacementError) return sendErrorResponse(res, 409, error.message, {code: 'FUTURE_APPOINTMENTS_REQUIRE_REASSIGNMENT', impact: error.impact});
+        if (error instanceof InvalidReplacementOperatorError) return sendErrorResponse(res, 409, error.message, {code: 'INVALID_REPLACEMENT_OPERATOR'});
+        throw error;
     }
-
-    // Il titolare dello studio non è eliminabile da nessuno, nemmeno da sé stesso:
-    // è l'intestatario dell'abbonamento e il riferimento amministrativo del tenant.
-    // Per revocarne l'accesso si usa la disattivazione (`PATCH /user/:userId/status`).
-    if (membership.get('role') === RoleCode.OWNER) {
-        return sendErrorResponse(
-            res,
-            409,
-            'Il titolare dello studio non può essere eliminato. Puoi disattivarlo.'
-        );
-    }
-
-    // Cancellare il proprio account dalla gestione team è quasi sempre un errore:
-    // lascerebbe lo studio senza l'amministratore che ha avviato l'operazione.
-    if (userId === getUserId(req)) {
-        return sendErrorResponse(res, 403, 'Non puoi eliminare il tuo account');
-    }
-
-    const structures = await Structure.findAll({ where: { tenantId }, attributes: ['id'] });
-    const structureIds = structures.map((structure) => structure.get('id') as string);
-    if (structureIds.length) {
-        await StructureUser.destroy({
-            where: { userId, structureId: { [Op.in]: structureIds } }
-        });
-    }
-    const deleted = await TenantUser.destroy({ where: { tenantId, userId } });
-    await revokeForTenantMembership(userId, tenantId, 'tenant_membership_deleted');
-
-    return sendSuccessResponse(res, 200, { deleted }, 'User removed');
 });
 
 export const resetPassword = asyncHandler(async (req: Request, res: Response) => {
@@ -824,6 +701,7 @@ export default {
     updateUserCalendarVisibility,
     updateUserCalendarColor,
     getUserDeactivationImpact,
+    getUserOffboardingImpact,
     getUserCalendarDeactivationImpact,
     setUserActive,
     deleteUser,

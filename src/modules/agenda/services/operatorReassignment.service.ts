@@ -347,11 +347,12 @@ export async function getOperatorDeactivationImpact(
     schema: string,
     userId: string,
     cutoff = new Date(),
-    structureId?: string
+    structureId?: string,
+    transaction?: Transaction
 ): Promise<OperatorDeactivationImpact> {
-    const assignments = await loadFutureAssignments(schema, userId, cutoff, undefined, false, structureId);
+    const assignments = await loadFutureAssignments(schema, userId, cutoff, transaction, false, structureId);
     const replacementOperators = assignments.length > 0
-        ? await eligibleReplacementOperators(tenantId, userId, assignments)
+        ? await eligibleReplacementOperators(tenantId, userId, assignments, transaction)
         : [];
     return summarize(assignments, replacementOperators);
 }

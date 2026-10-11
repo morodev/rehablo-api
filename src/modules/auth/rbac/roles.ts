@@ -68,6 +68,8 @@ const physicianPermissions = (): Permission[] => [
     ...CLINICAL_RESOURCES.flatMap((resource) => perms(resource, ['create', 'update'], 'own')),
     perm('reminder', 'read', 'structure'),
     ...crud('reminder', 'own'),
+    perm('activity', 'read', 'structure'),
+    ...perms('activity', ['create', 'update'], 'own'),
     perm('agenda', 'read', 'structure'),
     ...crud('agenda', 'own'),
     perm('product', 'read', 'tenant'),
@@ -93,6 +95,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             perm('patient', 'manage', 'structure'),
             ...CLINICAL_RESOURCES.map((resource) => perm(resource, 'manage', 'tenant')),
             perm('reminder', 'manage', 'tenant'),
+            perm('activity', 'manage', 'tenant'),
             perm('agenda', 'manage', 'tenant'),
             perm('invoice', 'manage', 'tenant'),
             perm('product', 'manage', 'tenant'),
@@ -118,6 +121,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             ...crud('note', 'own'),
             // NESSUN permesso su evaluation / protocol / bodymap / measurement
             ...crud('reminder', 'structure'),
+            perm('activity', 'manage', 'structure'),
             ...crud('agenda', 'structure'),
             ...perms('invoice', ['read', 'create', 'update', 'export'], 'structure'),
             // Il front-office gestisce il listino che alimenta fatture e tipi appuntamento.
@@ -148,6 +152,8 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             ...perms('patient', ['read', 'create', 'update'], 'structure'),
             ...clinicalCrud('own'),
             ...crud('reminder', 'own'),
+            perm('activity', 'read', 'structure'),
+            ...perms('activity', ['create', 'update'], 'own'),
             // vede l'agenda della struttura (disponibilità) ma gestisce solo la propria
             perm('agenda', 'read', 'structure'),
             ...crud('agenda', 'own'),
@@ -186,6 +192,8 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
                 perms(resource, ['read', 'create', 'update'], 'own')
             ),
             ...perms('reminder', ['read', 'create', 'update'], 'own'),
+            perm('activity', 'read', 'structure'),
+            ...perms('activity', ['create', 'update'], 'own'),
             ...perms('agenda', ['read', 'create', 'update'], 'own'),
             perm('product', 'read', 'tenant'),
             // Serve almeno la propria dashboard: è la pagina su cui atterra dopo il login.
@@ -203,6 +211,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             perm('patient', 'read', 'structure'),
             ...clinicalRead('tenant'),
             perm('reminder', 'read', 'tenant'),
+            perm('activity', 'read', 'structure'),
             perm('agenda', 'read', 'tenant'),
             perm('invoice', 'read', 'tenant'),
             perm('product', 'read', 'tenant'),

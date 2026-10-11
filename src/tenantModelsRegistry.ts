@@ -45,6 +45,7 @@ import PatientSharedDocument from './modules/patient-portal/models/patientShared
 import ReminderExternalDelivery from './modules/notes/models/reminderExternalDelivery.model.js';
 import { PatientCreditMovement } from './modules/administration/models/patientCreditMovement.model.js';
 import { ADMINISTRATION_MODELS } from './modules/administration/models/index.js';
+import { ACTIVITIES_MODELS, registerActivitiesAssociations } from './modules/activities/models/index.js';
 
 /**
  * Registers every tenant-scoped model (i.e. living in the dynamic "rehablo_<tenantId>" schema)
@@ -63,6 +64,7 @@ export function registerTenantModels(): void {
     registerConfigurationAssociations();
     registerMeasurementAssociations();
     registerNotesAssociations();
+    registerActivitiesAssociations();
 
     registerTenantScopedModel(Patient);
     // Evaluation references `patients` (FK) and is in turn referenced by the human-body instance
@@ -83,6 +85,7 @@ export function registerTenantModels(): void {
     registerTenantScopedModel(ReminderAssignment);
     registerTenantScopedModel(ReminderAlertState);
     registerTenantScopedModel(ReminderExternalDelivery);
+    for (const model of ACTIVITIES_MODELS) registerTenantScopedModel(model);
     registerTenantScopedModel(PatientPortalAudit);
     registerTenantScopedModel(PatientAppointmentRequest);
     registerTenantScopedModel(PatientSharedDocument);

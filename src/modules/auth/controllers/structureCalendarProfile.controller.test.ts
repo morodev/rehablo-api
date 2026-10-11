@@ -5,6 +5,7 @@ import { sequelize } from '../../../config/database.js';
 import { Structure, StructureAvailability, StructureUser, StructureUserAvailability, TenantUser, User } from '../models/index.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import AgendaEventException from '../../agenda/models/agendaEventException.model.js';
+import {ActivityBoard} from '../../activities/models/index.js';
 import { updateTeamMemberProfile, updateUser } from './user.controller.js';
 
 const id=(n:number)=>'bbbbbbbb-bbbb-4bbb-8bbb-'+String(n).padStart(12,'0');
@@ -12,6 +13,8 @@ const target=id(1), tenant=id(2), a=id(3), b=id(4);
 function record(data:any):any{return new Proxy({get:(key:any)=>typeof key==='string'?data[key]:{...data},update:async(patch:any)=>Object.assign(data,patch)}, {get(object:any,key:any){return key in object?object[key]:data[key];}});}
 function run(handler:any,req:any):Promise<any>{return new Promise(resolve=>{const res:any={statusCode:200,status(code:number){this.statusCode=code;return this;},json(body:any){resolve({status:this.statusCode,body});return this;}};handler(req,res,(error:any)=>resolve({status:500,body:{message:error?.message}}));});}
 function fixture(t:TestContext){
+ t.mock.method(sequelize,'query',(async(sql:string)=>{if(!sql.includes('activities-membership-gate'))throw new Error('Unexpected unmocked SQL in unit fixture');return [[],{}];}) as any);
+ t.mock.method(ActivityBoard,'schema',(()=>({findAll:async()=>[]})) as any);
  const identity:any={id:target,name:'Test',surname:'User',email:'test@example.org',isTenant:false,deactivatedAt:null};
  const membership:any={tenantId:tenant,userId:target,role:'OWNER',deactivatedAt:null};
  const agendas:any[]=[{userId:target,structureId:a,calendarEnabled:true,availabilityMode:'CUSTOM'}, {userId:target,structureId:b,calendarEnabled:true,availabilityMode:'INHERIT_STRUCTURE'}];
@@ -19,6 +22,7 @@ function fixture(t:TestContext){
  const future:any[]=[];
  const match=(row:any,where:any)=>Object.entries(where).every(([key,value]:[string,any])=>typeof value==='object' && value!==null ? !value[Op.in]||value[Op.in].includes(row[key]):row[key]===value);
  t.mock.method(sequelize,'transaction',(async(callback:any)=>{const before=JSON.stringify({identity,membership,agendas,rows});try{return await callback({LOCK:{UPDATE:'UPDATE'}});}catch(error){const saved=JSON.parse(before);Object.assign(identity,saved.identity);Object.assign(membership,saved.membership);agendas.forEach((row,i)=>Object.assign(row,saved.agendas[i]));rows=saved.rows;throw error;}}) as any);
+ t.mock.method(User,'findOne',(async()=>record({id:id(9),deactivatedAt:null})) as any);
  t.mock.method(User,'findByPk',(async()=>record(identity)) as any);
  t.mock.method(User,'findAll',(async()=>[]) as any);
  t.mock.method(TenantUser,'findOne',(async()=>record(membership)) as any);
@@ -26,7 +30,7 @@ function fixture(t:TestContext){
  t.mock.method(Structure,'findAll',(async()=>[record({id:a,tenantId:tenant}),record({id:b,tenantId:tenant})]) as any);
  t.mock.method(Structure,'findOne',(async({where}:any)=>where.tenantId===tenant?[a,b].includes(where.id)?record({id:where.id,tenantId:tenant}):null:null) as any);
  t.mock.method(StructureUser,'findAll',(async({where}:any)=>agendas.filter(row=>match(row,where)).map(record)) as any);
- t.mock.method(StructureUser,'findOne',(async({where}:any)=>{const found=agendas.find(row=>match(row,where));return found?record(found):null;}) as any);
+ t.mock.method(StructureUser,'findOne',(async({where}:any)=>{if(where.userId===id(9))return record({userId:id(9),structureId:where.structureId,role:null});const found=agendas.find(row=>match(row,where));return found?record(found):null;}) as any);
  t.mock.method(StructureUserAvailability,'findAll',(async({where}:any)=>rows.filter(row=>match(row,where)).map(record)) as any);
  t.mock.method(StructureUserAvailability,'destroy',(async({where}:any)=>{rows=rows.filter(row=>!match(row,where));return 7;}) as any);
  t.mock.method(StructureUserAvailability,'bulkCreate',(async(input:any[])=>{rows.push(...input);return input;}) as any);

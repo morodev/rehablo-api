@@ -10,7 +10,8 @@ import {
 import {
     APPOINTMENT_LEDGER_VERSION, prepareTenantPaymentHistory, runTenantMigrations,
     PATIENT_DEFAULT_EVENT_TYPE_VERSION, TENANT_MODEL_BASELINE_VERSION, APPOINTMENT_PRICE_ADJUSTMENTS_VERSION,
-    CATALOG_STRUCTURE_AVAILABILITY_VERSION, ADMINISTRATION_SEED_VERSION, WORK_ITEM_ASSIGNEES_VERSION
+    CATALOG_STRUCTURE_AVAILABILITY_VERSION, ADMINISTRATION_SEED_VERSION, WORK_ITEM_ASSIGNEES_VERSION,
+    ACTIVITIES_FOUNDATION_VERSION, ACTIVITIES_DELIVERY_VERSION
 } from './tenantMigrations.js';
 
 const require = createRequire(import.meta.url);
@@ -32,7 +33,7 @@ let legacyBaselineApplied: boolean;
 let lastSyncOptions: any;
 let pricingApplied: boolean;
 let catalogAvailabilityApplied: boolean, administrationApplied: boolean, publicationApplied: boolean;
-let workItemAssignmentsApplied: boolean;
+let workItemAssignmentsApplied: boolean, activitiesApplied: boolean, activitiesDeliveryApplied: boolean;
 let migrationWork: (options: any) => Promise<void>;
 const transaction = {id: 'test-transaction'};
 
@@ -49,7 +50,7 @@ beforeEach(() => {
     lastSyncOptions = undefined;
     pricingApplied = false;
     catalogAvailabilityApplied = false; administrationApplied = false; publicationApplied = false;
-    workItemAssignmentsApplied = false;
+    workItemAssignmentsApplied = false; activitiesApplied = false; activitiesDeliveryApplied = false;
     migrationWork = async () => {};
     sequelize.createSchema = (async () => {}) as any;
     sequelize.transaction = (async (callback: any) => {
@@ -78,6 +79,8 @@ beforeEach(() => {
             ...(administrationApplied ? [{version: ADMINISTRATION_SEED_VERSION}] : []),
             ...(publicationApplied ? [{version: '20260924-backfill-patient-publication'}] : []),
             ...(workItemAssignmentsApplied ? [{version: WORK_ITEM_ASSIGNEES_VERSION}] : []),
+            ...(activitiesApplied ? [{version: ACTIVITIES_FOUNDATION_VERSION}] : []),
+            ...(activitiesDeliveryApplied ? [{version: ACTIVITIES_DELIVERY_VERSION}] : []),
             ...(legacyBaselineApplied ? [{version: '20260907-tenant-model-baseline-v1'}] : []),
             ...(baselineApplied ? [{version: TENANT_MODEL_BASELINE_VERSION}] : [])
         ]];
@@ -104,6 +107,12 @@ beforeEach(() => {
         }
         if (sql.startsWith('INSERT INTO') && options?.replacements?.version === WORK_ITEM_ASSIGNEES_VERSION) {
             workItemAssignmentsApplied = true;
+        }
+        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === ACTIVITIES_FOUNDATION_VERSION) {
+            activitiesApplied = true;
+        }
+        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === ACTIVITIES_DELIVERY_VERSION) {
+            activitiesDeliveryApplied = true;
         }
         return [[]];
     }) as any;

@@ -15,6 +15,8 @@ import {
 } from '../rbac/roles.js';
 import { Structure, StructureUser, TenantUser, User } from '../models/index.js';
 import { revokeAllForUser } from '../services/refreshToken.service.js';
+import {applyTeamMembershipChange, parseTeamChange, runTeamMutation, sendTeamOffboardingError, type TeamChange} from '../services/teamOffboarding.service.js';
+import {FutureAppointmentsRequireReplacementError, InvalidReplacementOperatorError} from '../../agenda/services/operatorReassignment.service.js';
 import { validateUserStructureSelection } from '../services/userStructurePolicy.service.js';
 
 async function syncUserStructureAssignments(
@@ -136,226 +138,32 @@ export const me = asyncHandler(async (req: Request, res: Response) => {
  * Controlli comuni a ogni cambio di ruolo.
  * Restituisce un errore da inoltrare al client, oppure `null` se l'operazione è consentita.
  */
-async function validateRoleChange(
-    req: Request,
-    targetUserId: string,
-    role: unknown
-): Promise<{ status: number; message: string } | null> {
-    if (!isRoleCode(role)) {
-        return { status: 400, message: 'Ruolo non valido' };
+async function writeMembership(req: Request, res: Response, change: TeamChange) {
+    try {
+        const result = await runTeamMutation(req, req.params.userId, change, applyTeamMembershipChange);
+        if (result.replayed) res.setHeader('X-Operation-Replayed', 'true');
+        await revokeAllForUser(req.params.userId, change.kind === 'structures' ? 'structures_changed' : 'role_changed');
+        return sendSuccessResponse(res, 200, result.data, 'Membro del team aggiornato');
+    } catch (error) {
+        if (sendTeamOffboardingError(res, error)) return;
+        if (error instanceof FutureAppointmentsRequireReplacementError) return sendErrorResponse(res, 409, error.message, {code: 'FUTURE_APPOINTMENTS_REQUIRE_REASSIGNMENT', impact: error.impact});
+        if (error instanceof InvalidReplacementOperatorError) return sendErrorResponse(res, 409, error.message, {code: 'INVALID_REPLACEMENT_OPERATOR'});
+        throw error;
     }
-
-    // I ruoli non assegnabili (es. PATIENT) nascono da altri flussi, non dalla UI staff.
-    if (!ROLE_DEFINITIONS[role].assignable) {
-        return { status: 400, message: 'Ruolo non assegnabile' };
-    }
-
-    // Nessuno può modificare il proprio ruolo: eviterebbe sia l'auto-esclusione
-    // sia l'auto-promozione da parte di chi possiede `user:update`.
-    if (targetUserId === getUserId(req)) {
-        return { status: 403, message: 'Non puoi modificare il tuo ruolo' };
-    }
-
-    const tenantId = getCurrentTenantId(req);
-    const membership = await TenantUser.findOne({ where: { tenantId, userId: targetUserId } });
-    if (!membership) {
-        return { status: 404, message: 'Utente non trovato in questo studio' };
-    }
-
-    // Il titolare dello studio resta OWNER: è l'intestatario dell'abbonamento e il
-    // riferimento amministrativo del tenant. Declassarlo lo priverebbe dell'accesso ai
-    // propri dati aziendali senza che nessuno possa più ripristinarlo.
-    const targetUser = await User.findByPk(targetUserId, { attributes: ['isTenant'] });
-    if (targetUser?.get('isTenant') && role !== RoleCode.OWNER) {
-        return { status: 409, message: 'Il ruolo del titolare dello studio non può essere modificato' };
-    }
-
-    return null;
 }
-
-/** Ruolo BASE dell'utente nel tenant corrente. */
 export const updateUserRole = asyncHandler(async (req: Request, res: Response) => {
-    const targetUserId = req.params.userId;
-    const { role, structureIds } = req.body as { role?: string; structureIds?: string[] };
-
-    const error = await validateRoleChange(req, targetUserId, role);
-    if (error) {
-        return sendErrorResponse(res, error.status, error.message);
-    }
-
-    const tenantId = getCurrentTenantId(req);
-    const tenantStructures = await Structure.findAll({ where: { tenantId }, attributes: ['id'] });
-    const allowedIds = tenantStructures.map((structure) => structure.get('id') as string);
-    const currentAssignments = await StructureUser.findAll({ where: { userId: targetUserId } });
-    const currentIds = currentAssignments
-        .map((assignment) => assignment.get('structureId') as string)
-        .filter((id) => allowedIds.includes(id));
-    const requested = role === RoleCode.OWNER
-        ? allowedIds
-        : Array.isArray(structureIds)
-          ? [...new Set(structureIds)]
-          : currentIds;
-    const structureSelectionError = validateUserStructureSelection(
-        role as RoleCode,
-        requested,
-        allowedIds
-    );
-    if (structureSelectionError) {
-        return sendErrorResponse(res, 400, structureSelectionError);
-    }
-
-    // Uno studio deve sempre avere almeno un titolare, altrimenti nessuno potrebbe più
-    // gestire utenti, fatturazione e dati azienda.
-    if (role !== RoleCode.OWNER) {
-        const current = await TenantUser.findOne({ where: { tenantId, userId: targetUserId } });
-        if (current?.get('role') === RoleCode.OWNER) {
-            const owners = await TenantUser.count({ where: { tenantId, role: RoleCode.OWNER } });
-            if (owners <= 1) {
-                return sendErrorResponse(res, 409, 'Lo studio deve avere almeno un titolare');
-            }
-        }
-    }
-
-    await TenantUser.update({ role }, { where: { tenantId, userId: targetUserId } });
-    await syncUserStructureAssignments(targetUserId, allowedIds, requested, role as RoleCode);
-
-    if (role === RoleCode.OWNER) {
-        await StructureUser.update(
-            { role: null },
-            { where: { userId: targetUserId, structureId: { [Op.in]: allowedIds } } }
-        );
-    }
-
-    // I permessi viaggiano nell'access token: senza revocare le sessioni, il vecchio ruolo
-    // resterebbe valido fino alla scadenza. Così il cambio è effettivo al primo refresh.
-    await revokeAllForUser(targetUserId, 'role_changed');
-
-    return sendSuccessResponse(
-        res,
-        200,
-        { userId: targetUserId, tenantId, role, structureIds: requested },
-        'Ruolo aggiornato correttamente'
-    );
+    try {
+        return await writeMembership(req, res, parseTeamChange({kind: 'role', role: req.body.role,
+            ...(req.body.structureIds !== undefined ? {structureIds: req.body.structureIds} : {})}));
+    } catch (error) { if (sendTeamOffboardingError(res, error)) return; throw error; }
 });
-
-/**
- * Override del ruolo per una singola struttura.
- * `role: null` rimuove l'override e fa tornare valido il ruolo del tenant.
- */
 export const updateUserStructureRole = asyncHandler(async (req: Request, res: Response) => {
-    const targetUserId = req.params.userId;
-    const { structureId, role } = req.body as { structureId?: string; role?: string | null };
-
-    if (!structureId) {
-        return sendErrorResponse(res, 400, 'structureId is required');
-    }
-
-    const tenantId = getCurrentTenantId(req);
-
-    // La struttura deve appartenere al tenant di chi effettua la modifica.
-    const structure = await Structure.findOne({ where: { id: structureId, tenantId } });
-    if (!structure) {
-        return sendErrorResponse(res, 404, 'Struttura non trovata');
-    }
-
-    const assignment = await StructureUser.findOne({
-        where: { structureId, userId: targetUserId }
-    });
-    if (!assignment) {
-        return sendErrorResponse(res, 404, 'Utente non assegnato a questa struttura');
-    }
-
-    // Rimozione dell'override: torna a valere il ruolo del tenant.
-    if (role === null) {
-        await StructureUser.update({ role: null }, { where: { structureId, userId: targetUserId } });
-        await revokeAllForUser(targetUserId, 'role_changed');
-        return sendSuccessResponse(
-            res,
-            200,
-            { userId: targetUserId, structureId, role: null },
-            'Override rimosso: vale il ruolo dello studio'
-        );
-    }
-
-    const membership = await TenantUser.findOne({ where: { tenantId, userId: targetUserId } });
-    if (membership?.get('role') === RoleCode.OWNER) {
-        return sendErrorResponse(res, 409, 'Il ruolo proprietario vale in tutte le sedi e non ammette override');
-    }
-
-    // OWNER è un ruolo del tenant e implica l'accesso a tutte le sedi: non può essere
-    // usato come override locale su una singola struttura.
-    if (role === RoleCode.OWNER) {
-        return sendErrorResponse(res, 400, 'Il ruolo proprietario può essere assegnato solo a livello di studio');
-    }
-
-    const error = await validateRoleChange(req, targetUserId, role);
-    if (error) {
-        return sendErrorResponse(res, error.status, error.message);
-    }
-
-    await StructureUser.update({ role }, { where: { structureId, userId: targetUserId } });
-    await revokeAllForUser(targetUserId, 'role_changed');
-
-    return sendSuccessResponse(
-        res,
-        200,
-        { userId: targetUserId, structureId, role },
-        'Ruolo per la struttura aggiornato correttamente'
-    );
+    try { return await writeMembership(req, res, parseTeamChange({kind: 'structureRole', structureId: req.body.structureId, role: req.body.role})); }
+    catch (error) { if (sendTeamOffboardingError(res, error)) return; throw error; }
 });
-
-/**
- * Sincronizza le strutture in cui un utente può operare.
- *
- * Le assegnazioni già esistenti NON vengono ricreate: cancellarle e riscriverle
- * perderebbe gli eventuali override di ruolo per struttura.
- */
 export const updateUserStructures = asyncHandler(async (req: Request, res: Response) => {
-    const targetUserId = req.params.userId;
-    const { structureIds } = req.body as { structureIds?: string[] };
-
-    if (!Array.isArray(structureIds)) {
-        return sendErrorResponse(res, 400, 'structureIds deve essere un array');
-    }
-
-    const tenantId = getCurrentTenantId(req);
-
-    const membership = await TenantUser.findOne({ where: { tenantId, userId: targetUserId } });
-    if (!membership) {
-        return sendErrorResponse(res, 404, 'Utente non trovato in questo studio');
-    }
-
-    // Si possono assegnare solo strutture del proprio tenant.
-    const tenantStructures = await Structure.findAll({ where: { tenantId } });
-    const allowedIds = tenantStructures.map((structure) => structure.get('id') as string);
-    const requested = [...new Set(structureIds)];
-    const structureSelectionError = validateUserStructureSelection(
-        membership.get('role') as RoleCode,
-        requested,
-        allowedIds
-    );
-    if (structureSelectionError) {
-        return sendErrorResponse(res, 400, structureSelectionError);
-    }
-
-    const { added, removed } = await syncUserStructureAssignments(
-        targetUserId,
-        allowedIds,
-        requested,
-        membership.get('role') as RoleCode
-    );
-
-    // Le strutture determinano cosa l'utente può vedere: la sessione va riallineata.
-    if (added > 0 || removed > 0) {
-        await revokeAllForUser(targetUserId, 'structures_changed');
-    }
-
-    return sendSuccessResponse(
-        res,
-        200,
-        { userId: targetUserId, structureIds: requested, added, removed },
-        'Strutture aggiornate correttamente'
-    );
+    try { return await writeMembership(req, res, parseTeamChange({kind: 'structures', structureIds: req.body.structureIds})); }
+    catch (error) { if (sendTeamOffboardingError(res, error)) return; throw error; }
 });
 
 export default {

@@ -20,6 +20,7 @@ export const RESOURCES = [
     'protocol',     // protocolli riabilitativi
     'note',         // note cliniche/operative
     'reminder',     // promemoria e attivitÃ  assegnate
+    'activity',     // lavoro operativo del team nella sede
     'bodymap',      // human-body: aree, sintomi, questionari
     'measurement',  // device, raw files, misurazioni strumentali
     'agenda',       // appuntamenti ed event types
@@ -55,6 +56,7 @@ export const RESOURCE_LABELS: Record<Resource, string> = {
     protocol: 'protocolli',
     note: 'note',
     reminder: 'promemoria',
+    activity: 'attività',
     bodymap: 'mappa corporea',
     measurement: 'misurazioni',
     agenda: 'agenda',

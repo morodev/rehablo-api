@@ -14,8 +14,10 @@ export const APPOINTMENT_PRICE_ADJUSTMENTS_VERSION = '20260908-add-appointment-p
 export const CATALOG_STRUCTURE_AVAILABILITY_VERSION = '20260919-add-catalog-structure-availability';
 export const ADMINISTRATION_SEED_VERSION = '20260922-seed-administration';
 export const WORK_ITEM_ASSIGNEES_VERSION = '20261010-work-item-assignees';
+export const ACTIVITIES_FOUNDATION_VERSION = '20261011-activities-foundation';
 // Increment this whenever the tenant model registry changes, so existing schemas run model sync.
-export const TENANT_MODEL_BASELINE_VERSION = '20261010-tenant-model-baseline-v13';
+export const TENANT_MODEL_BASELINE_VERSION = '20261011-tenant-model-baseline-v15';
+export const ACTIVITIES_DELIVERY_VERSION = '20261011-activities-delivery';
 const tenantMigrations: Array<{version: string; module: MigrationModule}> = [
     {version: APPOINTMENT_LEDGER_VERSION, module: require('../../migrations/20260907-unify-appointment-payment-ledger.js')},
     {version: PATIENT_DEFAULT_EVENT_TYPE_VERSION, module: require('../../migrations/20260908-add-patient-default-event-type.js')},
@@ -23,7 +25,9 @@ const tenantMigrations: Array<{version: string; module: MigrationModule}> = [
     {version: CATALOG_STRUCTURE_AVAILABILITY_VERSION, module: require('../../migrations/20260919-add-catalog-structure-availability.js')},
     {version: ADMINISTRATION_SEED_VERSION, module: require('../../migrations/20260922-seed-administration.js')},
     {version: '20260924-backfill-patient-publication', module: require('../../migrations/20260924-backfill-patient-publication.js')},
-    {version: WORK_ITEM_ASSIGNEES_VERSION, module: require('../../migrations/20261010-work-item-assignees.js')}
+    {version: WORK_ITEM_ASSIGNEES_VERSION, module: require('../../migrations/20261010-work-item-assignees.js')},
+    {version: ACTIVITIES_FOUNDATION_VERSION, module: require('../../migrations/20261011-activities-foundation.js')},
+    {version: ACTIVITIES_DELIVERY_VERSION, module: require('../../migrations/20261011-activities-delivery.js')}
 ];
 
 export function requiredTenantSchemaVersions(): string[] {

@@ -9,6 +9,9 @@ export class ReminderPushSubscription extends Model {
     declare endpoint: string;
     declare p256dh: string;
     declare auth: string;
+    declare remindersEnabled: boolean;
+    declare activitiesEnabled: boolean;
+    declare activitiesEnabledAt: Date | null;
 }
 
 ReminderPushSubscription.init({
@@ -17,7 +20,10 @@ ReminderPushSubscription.init({
     endpointHash: {type: DataTypes.STRING(64), allowNull: false, unique: true},
     endpoint: {type: DataTypes.TEXT, allowNull: false},
     p256dh: {type: DataTypes.TEXT, allowNull: false},
-    auth: {type: DataTypes.TEXT, allowNull: false}
+    auth: {type: DataTypes.TEXT, allowNull: false},
+    remindersEnabled: {type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true},
+    activitiesEnabled: {type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false},
+    activitiesEnabledAt: {type: DataTypes.DATE, allowNull: true}
 }, {
     sequelize,
     modelName: 'reminderPushSubscription',
