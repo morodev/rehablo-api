@@ -14,6 +14,7 @@ import { PatientCredit } from '../../administration/models/index.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import { syncInvoicePaymentStatus } from '../services/payment.service.js';
 import { syncAppointmentPaymentStatus } from '../services/appointmentPayment.service.js';
+import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
@@ -72,11 +73,14 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
         return sendErrorResponse(res, 400, 'Metodo o nota di pagamento non validi');
     }
 
+    const snapshot = await findScopedInvoice(req);
+    if (!snapshot) return sendErrorResponse(res, 404, 'Fattura non trovata');
     const result = await sequelize.transaction(async (transaction) => {
         // Serialize retries across invoices too: the key is unique within the tenant ledger.
         if (idempotencyKey) await sequelize.query('SELECT pg_advisory_xact_lock(hashtext(:schema), hashtext(:key))', {
             replacements: { schema, key: idempotencyKey }, transaction
         });
+        if (snapshot.patientID) await lockPatientSettlement(schema, snapshot.patientID, transaction);
         const invoice = await Invoice.schema(schema).findOne({
             where: {
                 id: req.params.invoiceId,
@@ -86,6 +90,7 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
             lock: transaction.LOCK.UPDATE
         });
         if (!invoice) return { kind: 'not-found' } as const;
+        if (invoice.patientID !== snapshot.patientID) treasuryError('Il paziente del documento è cambiato: ricarica la posizione', 409);
         if (String(invoice.status).toLowerCase() === 'void') return { kind: 'void' } as const;
         if (invoice.documentType === 'nota_di_credito') return { kind: 'credit-note' } as const;
 
@@ -131,6 +136,12 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
         if (amount > summary.balance + 0.009) {
             return { kind: 'overpayment', balance: summary.balance } as const;
         }
+        if (invoice.patientID) {
+            if (!structureId) treasuryError('Verifica la sede del documento prima di registrare il pagamento', 409);
+            await assertPatientSettlementAllocations(schema, {
+                patientId: invoice.patientID, structureId: structureId!, referenceInvoiceId: invoice.id
+            }, [{ kind: 'INVOICE', targetId: invoice.id, amount: Math.round(amount * 100) / 100 }], transaction);
+        }
 
         const payment = await InvoicePayment.schema(schema).create(
             {
@@ -170,12 +181,14 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
     if (!invoice) return sendErrorResponse(res, 404, 'Fattura non trovata');
 
     const result = await sequelize.transaction(async (transaction) => {
-        // Invoice lock always precedes movement/event locks, including fiscal cancellation.
+        // Serialize the patient's position before document, movement and event locks.
+        if (invoice.patientID) await lockPatientSettlement(schema, invoice.patientID, transaction);
         const lockedInvoice = await Invoice.schema(schema).findOne({
             where: { id: invoice.id, ...patientScopeWhere(req, schema, 'patientID') },
             transaction, lock: transaction.LOCK.UPDATE
         });
         if (!lockedInvoice) return { kind: 'not-found' } as const;
+        if (lockedInvoice.patientID !== invoice.patientID) treasuryError('Il paziente del documento è cambiato: ricarica la posizione', 409);
         const payment = await InvoicePayment.schema(schema).findOne({
             where: { id: req.params.paymentId, invoiceId: invoice.id },
             transaction,
@@ -248,6 +261,7 @@ export const setLegacyPaymentDate = asyncHandler(async (req: Request, res: Respo
     if (!invoice) return sendErrorResponse(res, 404, 'Fattura non trovata');
 
     const result = await sequelize.transaction(async transaction => {
+        if (invoice.patientID) await lockPatientSettlement(req.tenantSchema!, invoice.patientID, transaction);
         const lockedInvoice = await Invoice.schema(req.tenantSchema!).findOne({
             where: { id: invoice.id, ...patientScopeWhere(req, req.tenantSchema!, 'patientID') },
             transaction, lock: transaction.LOCK.UPDATE

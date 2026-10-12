@@ -165,10 +165,11 @@ export async function requireActivityLinks(
         const event = scope ? await AgendaEvent.schema(context.schema).findOne({
             where: {id: links.agendaEventId, structureId: context.structureId,
                 ...(scope === 'own' ? {calendarId: context.userId} : {})},
-            attributes: ['id', 'patientId'], transaction
+            attributes: ['id', 'patientId', 'patient'], transaction
         }) : null;
         if (!event) throw new ActivityError('ACTIVITY_NOT_FOUND', 404, "L'appuntamento non è disponibile nella sede selezionata.");
-        if (links.patientId && event.patientId !== links.patientId) {
+        const eventPatientId = event.patientId ?? event.patient?.id ?? null;
+        if (links.patientId && eventPatientId !== links.patientId) {
             throw new ActivityError('ACTIVITY_VALIDATION_FAILED', 422, "L'appuntamento non appartiene al paziente selezionato.",
                 {agendaEventId: "Scegli un appuntamento del paziente selezionato."});
         }
@@ -253,8 +254,11 @@ export async function searchActivityAgendaLinks(
     if (!input.patientId && input.query.length < 2) return {items: [], total: 0, nextOffset: null};
 
     const conditions: WhereOptions[] = [{structureId: context.structureId,
-        ...(scope === 'own' ? {calendarId: context.userId} : {}),
-        ...(input.patientId ? {patientId: input.patientId} : {})}];
+        ...(scope === 'own' ? {calendarId: context.userId} : {})}];
+    if (input.patientId) conditions.push({[Op.or]: [
+        {patientId: input.patientId},
+        {[Op.and]: [{patientId: null}, {patient: {id: input.patientId}}]}
+    ]});
     const search = textSearchWhere(['title', 'start'], input.query);
     if (search) {
         const civilDate = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(input.query);

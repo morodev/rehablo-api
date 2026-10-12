@@ -11,7 +11,7 @@ import {
     APPOINTMENT_LEDGER_VERSION, prepareTenantPaymentHistory, runTenantMigrations,
     PATIENT_DEFAULT_EVENT_TYPE_VERSION, TENANT_MODEL_BASELINE_VERSION, APPOINTMENT_PRICE_ADJUSTMENTS_VERSION,
     CATALOG_STRUCTURE_AVAILABILITY_VERSION, ADMINISTRATION_SEED_VERSION, WORK_ITEM_ASSIGNEES_VERSION,
-    ACTIVITIES_FOUNDATION_VERSION, ACTIVITIES_DELIVERY_VERSION
+    ACTIVITIES_FOUNDATION_VERSION, ACTIVITIES_DELIVERY_VERSION, PATIENT_SETTLEMENTS_VERSION
 } from './tenantMigrations.js';
 
 const require = createRequire(import.meta.url);
@@ -34,6 +34,7 @@ let lastSyncOptions: any;
 let pricingApplied: boolean;
 let catalogAvailabilityApplied: boolean, administrationApplied: boolean, publicationApplied: boolean;
 let workItemAssignmentsApplied: boolean, activitiesApplied: boolean, activitiesDeliveryApplied: boolean;
+let patientSettlementsApplied: boolean;
 let migrationWork: (options: any) => Promise<void>;
 const transaction = {id: 'test-transaction'};
 
@@ -51,13 +52,14 @@ beforeEach(() => {
     pricingApplied = false;
     catalogAvailabilityApplied = false; administrationApplied = false; publicationApplied = false;
     workItemAssignmentsApplied = false; activitiesApplied = false; activitiesDeliveryApplied = false;
+    patientSettlementsApplied = false;
     migrationWork = async () => {};
     sequelize.createSchema = (async () => {}) as any;
     sequelize.transaction = (async (callback: any) => {
         transactionStarts++;
-        const previouslyApplied = applied, previousBaseline = baselineApplied;
+        const previouslyApplied = applied, previousBaseline = baselineApplied, previousSettlements = patientSettlementsApplied;
         try {return await callback(transaction);} catch (error) {
-            applied = previouslyApplied; baselineApplied = previousBaseline; throw error;
+            applied = previouslyApplied; baselineApplied = previousBaseline; patientSettlementsApplied = previousSettlements; throw error;
         }
     }) as any;
     sequelize.query = (async (sql: string, options?: any) => {
@@ -81,6 +83,7 @@ beforeEach(() => {
             ...(workItemAssignmentsApplied ? [{version: WORK_ITEM_ASSIGNEES_VERSION}] : []),
             ...(activitiesApplied ? [{version: ACTIVITIES_FOUNDATION_VERSION}] : []),
             ...(activitiesDeliveryApplied ? [{version: ACTIVITIES_DELIVERY_VERSION}] : []),
+            ...(patientSettlementsApplied ? [{version: PATIENT_SETTLEMENTS_VERSION}] : []),
             ...(legacyBaselineApplied ? [{version: '20260907-tenant-model-baseline-v1'}] : []),
             ...(baselineApplied ? [{version: TENANT_MODEL_BASELINE_VERSION}] : [])
         ]];
@@ -113,6 +116,9 @@ beforeEach(() => {
         }
         if (sql.startsWith('INSERT INTO') && options?.replacements?.version === ACTIVITIES_DELIVERY_VERSION) {
             activitiesDeliveryApplied = true;
+        }
+        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === PATIENT_SETTLEMENTS_VERSION) {
+            patientSettlementsApplied = true;
         }
         return [[]];
     }) as any;
@@ -150,6 +156,8 @@ describe('tenant schema bootstrap', () => {
         assert.deepEqual(order, ['preserve-history', 'sync', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version']);
         assert.equal(applied, true);
         assert.equal(patientDefaultApplied, true);
+        assert.equal(patientSettlementsApplied, true);
+        assert.ok(queries.some(sql => sql.includes('CREATE TABLE IF NOT EXISTS') && sql.includes('patient_settlement_operations')));
         assert.equal(lastSyncOptions.transaction, transaction);
         assert.ok(queries.some(sql => sql.includes('DEFAULT false')));
         assert.ok(queries.some(sql => sql.includes('pg_advisory_xact_lock')));

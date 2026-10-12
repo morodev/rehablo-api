@@ -16,7 +16,8 @@ const run = (handler: any, req: any) => new Promise<any>(resolve => {
     handler(req, res, (error: any) => resolve({ code: error.statusCode ?? 500, message: error.message }));
 });
 function fixture(t: TestContext) {
-    const invoice = record({ id: 'invoice', patientID: 'patient', status: 'paid', documentType: 'fattura', documentNumber: 12, documentYear: 2026,
+    const patientId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    const invoice = record({ id: 'invoice', patientID: patientId, status: 'paid', documentType: 'fattura', documentNumber: 12, documentYear: 2026,
         emissionDate: '2026-09-01', invoiceTotal: 100, invoiceNet: 100, stsSent: false, stsSentAt: null,
         issuer: { businessName: 'Studio storico', vatNumber: 'OLD', stsIssuerType: 'PHYSIOTHERAPIST' },
         stsExpenseTypeCode: null, services: [{ serviceName: 'Trattamento', quantity: 1, servicePrice: 100 }], products: [] });
@@ -24,6 +25,13 @@ function fixture(t: TestContext) {
     const payment = record({ invoiceId: 'invoice', amount: 100, status: 'POSTED', paidAt: '2026-09-10' });
     const mutations: any[] = [], locks: any[] = [];
     t.mock.method(sequelize, 'transaction', (async (work: any) => work({ LOCK: { UPDATE: 'UPDATE' } })) as any);
+    t.mock.method(sequelize, 'query', (async (sql: string, options: any) => {
+        assert.match(sql, /pg_advisory_xact_lock/);
+        assert.equal(options.replacements.lockKey, `rehablo_test:patient-settlement:${patientId}`);
+        assert.ok(options.transaction);
+        assert.equal(locks.length, 0, 'patient lock precedes invoice row lock');
+        return [[], {}];
+    }) as any);
     t.mock.method(Invoice, 'schema', (() => ({ findOne: async () => invoice, findByPk: async (_id: any, options: any) => { if (options?.lock) locks.push(options); return invoice; },
         findAll: async () => [invoice], update: async () => { throw new Error('Export must never write transmission status'); } })) as any);
     t.mock.method(invoice, 'update', async (values: any, options: any) => { assert.ok(options.transaction); mutations.push(values); Object.assign(invoice, values); return invoice; });
@@ -32,7 +40,7 @@ function fixture(t: TestContext) {
     t.mock.method(InvoicePayment, 'schema', (() => ({ sum: async () => 100, findAll: async () => [payment], update: async () => { throw new Error('No payment changes'); } })) as any);
     t.mock.method(Tenant, 'findByPk', (async () => tenant) as any);
     t.mock.method(Patient, 'schema', (() => ({ findByPk: async () => record({ fiscalCode: 'RSSMRA80A01H501U', stsOppositionToDataSending: false }) })) as any);
-    const req: any = { tenantSchema: 'test', params: { invoiceId: 'invoice' }, query: { year: '2026' }, body: { stsExpenseTypeCode: 'SP' },
+    const req: any = { tenantSchema: 'rehablo_test', params: { invoiceId: 'invoice' }, query: { year: '2026' }, body: { stsExpenseTypeCode: 'SP' },
         user: { tenants: [{ id: 'tenant' }] }, access: { scope: 'tenant', resource: 'invoice' } };
     return { invoice, tenant, payment, req, mutations, locks };
 }

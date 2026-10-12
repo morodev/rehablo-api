@@ -36,6 +36,31 @@ import {
     shouldAutoCompleteAppointment,
     shouldOpenAttendanceCorrection
 } from '../services/missedArrivalAutomation.service.js';
+import { lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
+
+async function lockAgendaPatients(schema: string, events: Array<Record<string, any>>, transaction: Transaction): Promise<void> {
+    const ids = [...new Set(events.map(event => event.patientId ?? event.patient?.id).filter(Boolean))] as string[];
+    for (const patientId of ids.sort()) await lockPatientSettlement(schema, patientId, transaction);
+}
+
+async function withLockedAttendanceEvent(req: Request, res: Response, id: string, message: string,
+    operation: (event: AgendaEvent | null, transaction: Transaction) => Promise<unknown>): Promise<unknown> {
+    const schema = req.tenantSchema!;
+    const result = await sequelize.transaction(async transaction => {
+        const where = { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) };
+        const snapshot = await AgendaEvent.schema(schema).findOne({ where, transaction });
+        if (!snapshot) return operation(null, transaction);
+        await lockAgendaPatients(schema, [snapshot.get({ plain: true })], transaction);
+        const event = await AgendaEvent.schema(schema).findOne({ where, transaction, lock: transaction.LOCK.UPDATE });
+        if (event && String(event.patientId ?? event.patient?.id ?? '') !== String(snapshot.patientId ?? snapshot.patient?.id ?? '')) {
+            throw Object.assign(new Error('Il paziente della seduta è cambiato: ricarica la posizione'), { statusCode: 409 });
+        }
+        return operation(event, transaction);
+    });
+    // A successful state must reach the client only once its transaction has committed.
+    if (result && typeof (result as AgendaEvent).get === 'function') return sendSuccessResponse(res, 200, result, message);
+    return result;
+}
 
 /**
  * Campi per il filtro row-level RBAC.
@@ -561,8 +586,9 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
     payload.structureId = req.access?.structureId ?? null;
 
     const agendaEvent = await sequelize.transaction(async transaction => {
-        if (await rejectOperatorOutsideStructure(req, res, payload, transaction)) return null;
         if (await rejectInvalidPatient(res, schema, payload)) return null;
+        await lockAgendaPatients(schema, [payload], transaction);
+        if (await rejectOperatorOutsideStructure(req, res, payload, transaction)) return null;
         const eventTypeError = await validateAndNormalizeEventType(schema, payload, payload.structureId, true);
         if (eventTypeError) {sendErrorResponse(res, 400, eventTypeError); return null;}
         if (await rejectApprovedTimeOffConflict(res, schema, payload)) return null;
@@ -671,11 +697,16 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     event.patientId = candidate.patientId;
 
     const change = await sequelize.transaction(async transaction => {
+        await lockAgendaPatients(schema, [current.get({ plain: true }), candidate], transaction);
         const assignment = await lockOperatorCalendar(candidate, transaction);
         const locked = await AgendaEvent.schema(schema).findOne({
             where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }, transaction, lock: transaction.LOCK.UPDATE
         });
         if (!locked) return 'missing';
+        if (String(locked.patientId ?? locked.patient?.id ?? '') !== String(current.patientId ?? current.patient?.id ?? '')) {
+            sendErrorResponse(res, 409, 'Il paziente della seduta è cambiato: ricarica la posizione');
+            return 'rejected';
+        }
         const lockedCandidate = {...locked.get({plain: true}), ...event};
         if (lockedCandidate.calendarId !== candidate.calendarId || lockedCandidate.structureId !== candidate.structureId) {
             sendErrorResponse(res, 409, 'L\'assegnazione dell\'appuntamento e\' cambiata: ricarica l\'agenda');
@@ -686,6 +717,9 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
             if (await rejectApprovedTimeOffConflict(res, schema, lockedCandidate, id)) return 'rejected';
         }
         if (await getLinkedInvoiceId(schema, locked.id, locked.invoiceId)) return 'invoiced';
+        if (Number(locked.appointmentPaidAmount) > 0.009 || Number(await InvoicePayment.schema(schema).sum('amount', {
+            where: { agendaEventId: id, status: 'POSTED' }, transaction
+        })) > 0.009) return 'paid';
         const financialContextChanged = ['patientId', 'structureId', 'eventTypeId'].some(field =>
             event[field] !== undefined && String(event[field] ?? '') !== String(locked.get(field as any) ?? '')
         );
@@ -706,6 +740,7 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     });
     if (change === 'rejected') return;
     if (change === 'invoiced') return sendErrorResponse(res, 409, 'Appuntamento fatturato: modifica non consentita');
+    if (change === 'paid') return sendErrorResponse(res, 409, 'Annulla tutte le coperture registrate prima di modificare o cambiare lo stato della seduta');
     if (change === 'history') return sendErrorResponse(res, 409, 'Una seduta con storico incassi non può cambiare paziente, sede o prestazione');
     if (change === 'missing') {
         return sendErrorResponse(res, 404, `Error updating agendaEvent with id=${id}`);
@@ -953,48 +988,48 @@ export const reportMissedArrival = asyncHandler(async (req: Request, res: Respon
         return sendErrorResponse(res, 400, 'Appuntamento non valido');
     }
 
-    const event = await AgendaEvent.schema(schema).findOne({
-        where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
-    });
-    if (!event) {
-        return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
-    }
-    if (event.get('recurrence')) {
-        return sendErrorResponse(res, 422, 'Il mancato arrivo va registrato su un appuntamento singolo');
-    }
-    const linkedInvoiceId = await getLinkedInvoiceId(schema, event.id, event.get('invoiceId') as string | null);
-    if (linkedInvoiceId) {
-        return sendErrorResponse(res, 409, 'Appuntamento fatturato: segnalazione non consentita', { invoiceId: linkedInvoiceId });
-    }
-    if (normalizedStatus(event.get('status')) !== 'CONFIRMED') {
-        return sendErrorResponse(res, 409, 'Il mancato arrivo si può segnalare solo su un appuntamento confermato');
-    }
-    const patient = event.get('patient') as Record<string, unknown> | null;
-    if (!event.get('patientId') && !patient?.id) {
-        return sendErrorResponse(res, 422, 'La segnalazione richiede un appuntamento con paziente');
-    }
-    const startAt = Date.parse(String(event.get('start') ?? ''));
-    if (!Number.isFinite(startAt)) {
-        return sendErrorResponse(res, 422, 'Orario di inizio appuntamento non valido');
-    }
-    const availableAt = startAt + MISSED_ARRIVAL_GRACE_MS;
-    if (Date.now() < availableAt) {
-        return sendErrorResponse(res, 409, 'Il mancato arrivo sarà segnalabile 15 minuti dopo l\'inizio', {
-            availableAt: new Date(availableAt).toISOString()
-        });
-    }
+    return withLockedAttendanceEvent(req, res, id, 'Mancato arrivo segnalato', async (event, transaction) => {
+        if (!event) {
+            return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
+        }
+        if (event.get('recurrence')) {
+            return sendErrorResponse(res, 422, 'Il mancato arrivo va registrato su un appuntamento singolo');
+        }
+        if (Number(event.appointmentPaidAmount) > 0.009) return sendErrorResponse(res, 409, 'La seduta ha coperture registrate: correggile prima di registrare un nuovo esito');
+        const linkedInvoiceId = await getLinkedInvoiceId(schema, event.id, event.get('invoiceId') as string | null);
+        if (linkedInvoiceId) {
+            return sendErrorResponse(res, 409, 'Appuntamento fatturato: segnalazione non consentita', { invoiceId: linkedInvoiceId });
+        }
+        if (normalizedStatus(event.get('status')) !== 'CONFIRMED') {
+            return sendErrorResponse(res, 409, 'Il mancato arrivo si può segnalare solo su un appuntamento confermato');
+        }
+        const patient = event.get('patient') as Record<string, unknown> | null;
+        if (!event.get('patientId') && !patient?.id) {
+            return sendErrorResponse(res, 422, 'La segnalazione richiede un appuntamento con paziente');
+        }
+        const startAt = Date.parse(String(event.get('start') ?? ''));
+        if (!Number.isFinite(startAt)) {
+            return sendErrorResponse(res, 422, 'Orario di inizio appuntamento non valido');
+        }
+        const availableAt = startAt + MISSED_ARRIVAL_GRACE_MS;
+        if (Date.now() < availableAt) {
+            return sendErrorResponse(res, 409, 'Il mancato arrivo sarà segnalabile 15 minuti dopo l\'inizio', {
+                availableAt: new Date(availableAt).toISOString()
+            });
+        }
 
-    if (!hasOpenMissedArrival(event)) {
-        await event.update({
-            missedArrivalReportedAt: new Date(),
-            missedArrivalReportedBy: req.access!.userId,
-            missedArrivalResolvedAt: null,
-            missedArrivalResolvedBy: null,
-            missedArrivalResolution: null,
-            noShowBillingDecision: null
-        });
-    }
-    return sendSuccessResponse(res, 200, event, 'Mancato arrivo segnalato');
+        if (!hasOpenMissedArrival(event)) {
+            await event.update({
+                missedArrivalReportedAt: new Date(),
+                missedArrivalReportedBy: req.access!.userId,
+                missedArrivalResolvedAt: null,
+                missedArrivalResolvedBy: null,
+                missedArrivalResolution: null,
+                noShowBillingDecision: null
+            }, { transaction });
+        }
+        return event;
+    });
 });
 
 /** Completa la seduta soltanto se e' terminata ed e' ancora priva di azioni esplicite. */
@@ -1007,32 +1042,33 @@ export const completeAppointmentIfUntouched = asyncHandler(async (req: Request, 
 
     const TenantAgendaEvent = AgendaEvent.schema(schema);
     const scope = scopeWhere(req, AGENDA_SCOPE_FIELDS);
-    const event = await TenantAgendaEvent.findOne({ where: { id, ...scope } });
-    if (!event) {
-        return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
-    }
+    return withLockedAttendanceEvent(req, res, id, 'Stato appuntamento verificato', async (event, transaction) => {
+        if (!event) {
+            return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
+        }
 
-    if (shouldAutoCompleteAppointment(event.get({ plain: true }))) {
-        await TenantAgendaEvent.update(
-            { status: 'COMPLETED' },
-            {
-                where: {
-                    id,
-                    ...scope,
-                    status: { [Op.iLike]: 'CONFIRMED' },
-                    invoiceId: null,
-                    missedArrivalReportedAt: null,
-                    [Op.and]: [
-                        { [Op.or]: [{ recurrence: null }, { recurrence: '' }] },
-                        { [Op.or]: [{ recurringEventId: null }, { recurringEventId: '' }] }
-                    ]
+        if (shouldAutoCompleteAppointment(event.get({ plain: true }))) {
+            await TenantAgendaEvent.update(
+                { status: 'COMPLETED' },
+                {
+                    transaction, where: {
+                        id,
+                        ...scope,
+                        status: { [Op.iLike]: 'CONFIRMED' },
+                        invoiceId: null,
+                        missedArrivalReportedAt: null,
+                        [Op.and]: [
+                            { [Op.or]: [{ recurrence: null }, { recurrence: '' }] },
+                            { [Op.or]: [{ recurringEventId: null }, { recurringEventId: '' }] }
+                        ]
+                    }
                 }
-            }
-        );
-    }
+            );
+        }
 
-    const updated = await TenantAgendaEvent.findOne({ where: { id, ...scope } });
-    return sendSuccessResponse(res, 200, updated, 'Stato appuntamento verificato');
+        const updated = await TenantAgendaEvent.findOne({ where: { id, ...scope }, transaction });
+        return updated;
+    });
 });
 
 /** Chiude l'alert dopo il contatto e applica l'esito scelto dall'operatore. */
@@ -1047,37 +1083,37 @@ export const resolveMissedArrival = asyncHandler(async (req: Request, res: Respo
         return sendErrorResponse(res, 400, 'Esito del contatto non valido');
     }
 
-    const event = await AgendaEvent.schema(schema).findOne({
-        where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
-    });
-    if (!event) {
-        return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
-    }
-    const linkedInvoiceId = await getLinkedInvoiceId(schema, event.id, event.get('invoiceId') as string | null);
-    if (linkedInvoiceId) {
-        return sendErrorResponse(res, 409, 'Appuntamento fatturato: esito non modificabile', { invoiceId: linkedInvoiceId });
-    }
-    if (!hasOpenMissedArrival(event)) {
-        return sendErrorResponse(res, 409, 'Non esiste una segnalazione di mancato arrivo aperta');
-    }
-
-    let noShowBillingDecision: string | null = null;
-    if (resolution === 'NO_SHOW') {
-        noShowBillingDecision = normalizedStatus(req.body.noShowBillingDecision || 'PENDING');
-        if (!NO_SHOW_BILLING_DECISIONS.has(noShowBillingDecision)) {
-            return sendErrorResponse(res, 400, 'Decisione di addebito no-show non valida');
+    return withLockedAttendanceEvent(req, res, id, 'Segnalazione di mancato arrivo chiusa', async (event, transaction) => {
+        if (!event) {
+            return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
         }
-    }
-    const status = resolution === 'ARRIVING' ? 'CONFIRMED' : resolution;
-    await event.update({
-        status,
-        missedArrivalResolvedAt: new Date(),
-        missedArrivalResolvedBy: req.access!.userId,
-        missedArrivalResolution: resolution,
-        noShowBillingDecision
-    });
+        const linkedInvoiceId = await getLinkedInvoiceId(schema, event.id, event.get('invoiceId') as string | null);
+        if (linkedInvoiceId) {
+            return sendErrorResponse(res, 409, 'Appuntamento fatturato: esito non modificabile', { invoiceId: linkedInvoiceId });
+        }
+        if (!hasOpenMissedArrival(event)) {
+            return sendErrorResponse(res, 409, 'Non esiste una segnalazione di mancato arrivo aperta');
+        }
+        if (Number(event.appointmentPaidAmount) > 0.009) return sendErrorResponse(res, 409, 'La seduta ha coperture registrate: correggile prima di cambiare l’esito');
 
-    return sendSuccessResponse(res, 200, event, 'Segnalazione di mancato arrivo chiusa');
+        let noShowBillingDecision: string | null = null;
+        if (resolution === 'NO_SHOW') {
+            noShowBillingDecision = normalizedStatus(req.body.noShowBillingDecision || 'PENDING');
+            if (!NO_SHOW_BILLING_DECISIONS.has(noShowBillingDecision)) {
+                return sendErrorResponse(res, 400, 'Decisione di addebito no-show non valida');
+            }
+        }
+        const status = resolution === 'ARRIVING' ? 'CONFIRMED' : resolution;
+        await event.update({
+            status,
+            missedArrivalResolvedAt: new Date(),
+            missedArrivalResolvedBy: req.access!.userId,
+            missedArrivalResolution: resolution,
+            noShowBillingDecision
+        }, { transaction });
+
+        return event;
+    });
 });
 
 /** Permette di cambiare la sola decisione economica senza alterare lo stato NO_SHOW. */
@@ -1092,22 +1128,21 @@ export const updateNoShowBillingDecision = asyncHandler(async (req: Request, res
         return sendErrorResponse(res, 400, 'Decisione di addebito no-show non valida');
     }
 
-    const event = await AgendaEvent.schema(schema).findOne({
-        where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
-    });
-    if (!event) {
-        return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
-    }
-    if (normalizedStatus(event.get('status')) !== 'NO_SHOW') {
-        return sendErrorResponse(res, 409, 'La decisione economica è disponibile solo per i no-show');
-    }
-    const linkedInvoiceId = await getLinkedInvoiceId(schema, event.id, event.get('invoiceId') as string | null);
-    if (linkedInvoiceId) {
-        return sendErrorResponse(res, 409, 'Il no-show è già stato fatturato', { invoiceId: linkedInvoiceId });
-    }
+    return withLockedAttendanceEvent(req, res, id, 'Decisione economica aggiornata', async (event, transaction) => {
+        if (!event) {
+            return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
+        }
+        if (normalizedStatus(event.get('status')) !== 'NO_SHOW') {
+            return sendErrorResponse(res, 409, 'La decisione economica è disponibile solo per i no-show');
+        }
+        const linkedInvoiceId = await getLinkedInvoiceId(schema, event.id, event.get('invoiceId') as string | null);
+        if (linkedInvoiceId) {
+            return sendErrorResponse(res, 409, 'Il no-show è già stato fatturato', { invoiceId: linkedInvoiceId });
+        }
 
-    await event.update({ noShowBillingDecision: decision });
-    return sendSuccessResponse(res, 200, event, 'Decisione economica aggiornata');
+        await event.update({ noShowBillingDecision: decision }, { transaction });
+        return event;
+    });
 });
 
 export const deleteAgendaEvent = asyncHandler(async (req: Request, res: Response) => {
@@ -1115,10 +1150,16 @@ export const deleteAgendaEvent = asyncHandler(async (req: Request, res: Response
     const id = req.query.id as string;
 
     const result = await sequelize.transaction(async transaction => {
+        const snapshot = await AgendaEvent.schema(schema).findOne({ where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }, transaction });
+        if (!snapshot) return 'missing';
+        await lockAgendaPatients(schema, [snapshot.get({ plain: true })], transaction);
         const current = await AgendaEvent.schema(schema).findOne({
             where: { id, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }, transaction, lock: transaction.LOCK.UPDATE
         });
         if (!current) return 'missing';
+        if (String(current.patientId ?? current.patient?.id ?? '') !== String(snapshot.patientId ?? snapshot.patient?.id ?? '')) {
+            throw Object.assign(new Error('Il paziente della seduta è cambiato: ricarica la posizione'), { statusCode: 409 });
+        }
         if (await getLinkedInvoiceId(schema, current.id, current.invoiceId)) return 'invoiced';
         if (Number(current.appointmentPaidAmount) > 0
             || await InvoicePayment.schema(schema).count({ where: { agendaEventId: id }, transaction }) > 0) return 'history';
@@ -1175,6 +1216,7 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
     planned.structureId = req.access?.structureId ?? planned.structureId;
     if (req.access?.scope === 'own') planned.calendarId = req.access.userId;
     const savedMode = await sequelize.transaction(async transaction => {
+        await lockAgendaPatients(schema, [preview.get({ plain: true }), planned], transaction);
         const assignment = await lockOperatorCalendar(planned, transaction);
         const recurringEvent = await AgendaEvent.schema(schema).findOne({
             where: {id: event.recurringEventId, ...scopeWhere(req, AGENDA_SCOPE_FIELDS)},
@@ -1182,6 +1224,9 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
         });
         if (!recurringEvent) {
             return sendErrorResponse(res, 404, 'Recurring event not found');
+        }
+        if (String(recurringEvent.patientId ?? recurringEvent.patient?.id ?? '') !== String(preview.patientId ?? preview.patient?.id ?? '')) {
+            throw Object.assign(new Error('Il paziente della serie è cambiato: ricarica la posizione'), { statusCode: 409 });
         }
         if (!recurringEvent.recurrence) return sendErrorResponse(res, 409, 'Il record non è una serie ricorrente');
         if (await getLinkedInvoiceId(schema, recurringEvent.id, recurringEvent.invoiceId)
@@ -1320,45 +1365,55 @@ export const deleteRecurringEvent = asyncHandler(async (req: Request, res: Respo
 
     // Gate di accesso valido per tutti i mode: anche la cancellazione di una singola
     // occorrenza (che crea solo un'eccezione) deve agire su una serie visibile.
-    const series = await AgendaEvent.schema(schema).findOne({
+    const snapshot = await AgendaEvent.schema(schema).findOne({
         where: { id: event.recurringEventId, ...scopeWhere(req, AGENDA_SCOPE_FIELDS) }
     });
-    if (!series) {
+    if (!snapshot) {
         return sendErrorResponse(res, 404, 'Recurring event not found');
     }
-    if (!series.recurrence) return sendErrorResponse(res, 409, 'Il record non è una serie ricorrente');
-    if (await getLinkedInvoiceId(schema, series.id, series.invoiceId)
-        || Number(series.appointmentPaidAmount) > 0
-        || await InvoicePayment.schema(schema).count({ where: { agendaEventId: series.id } }) > 0) {
-        return sendErrorResponse(res, 409, 'Serie fatturata: eliminazione non consentita');
-    }
-
-    if (mode === 'single') {
-        await AgendaEventException.schema(schema).create({
-            eventId: event.recurringEventId,
-            exdate: moment(event.start).toISOString()
+    return sequelize.transaction(async transaction => {
+        await lockAgendaPatients(schema, [snapshot.get({plain: true})], transaction);
+        const series = await AgendaEvent.schema(schema).findOne({
+            where: {id: event.recurringEventId, ...scopeWhere(req, AGENDA_SCOPE_FIELDS)}, transaction, lock: transaction.LOCK.UPDATE
         });
-        return sendSuccessResponse(res, 201, true, 'Recurring event deleted (single)');
-    }
+        if (!series) return sendErrorResponse(res, 404, 'Recurring event not found');
+        if (String(series.patientId ?? series.patient?.id ?? '') !== String(snapshot.patientId ?? snapshot.patient?.id ?? '')) {
+            throw Object.assign(new Error('Il paziente della serie è cambiato: ricarica la posizione'), {statusCode: 409});
+        }
+        if (!series.recurrence) return sendErrorResponse(res, 409, 'Il record non è una serie ricorrente');
+        if (await getLinkedInvoiceId(schema, series.id, series.invoiceId)
+            || Number(series.appointmentPaidAmount) > 0
+            || await InvoicePayment.schema(schema).count({ where: { agendaEventId: series.id }, transaction }) > 0) {
+            return sendErrorResponse(res, 409, 'Serie fatturata: eliminazione non consentita');
+        }
 
-    if (mode === 'future') {
-        const eventFound: any = series.get({ plain: true });
-        eventFound.end = moment(event.start).subtract(1, 'day').endOf('day').toISOString();
+        if (mode === 'single') {
+            await AgendaEventException.schema(schema).create({
+                eventId: event.recurringEventId,
+                exdate: moment(event.start).toISOString()
+            }, {transaction});
+            return sendSuccessResponse(res, 201, true, 'Recurring event deleted (single)');
+        }
 
-        const parsedRules = parseRecurrenceRules(eventFound.recurrence);
-        parsedRules['UNTIL'] = moment(event.end).utc().format('YYYYMMDD[T]HHmmss[Z]');
-        eventFound.recurrence = stringifyRecurrenceRules(parsedRules);
+        if (mode === 'future') {
+            const eventFound: any = series.get({ plain: true });
+            eventFound.end = moment(event.start).subtract(1, 'day').endOf('day').toISOString();
 
-        await AgendaEvent.schema(schema).update(eventFound, { where: { id: event.recurringEventId } });
-        return sendSuccessResponse(res, 201, true, 'Recurring event deleted (future)');
-    }
+            const parsedRules = parseRecurrenceRules(eventFound.recurrence);
+            parsedRules['UNTIL'] = moment(event.end).utc().format('YYYYMMDD[T]HHmmss[Z]');
+            eventFound.recurrence = stringifyRecurrenceRules(parsedRules);
 
-    if (mode === 'all') {
-        await AgendaEvent.schema(schema).destroy({ where: { id: event.recurringEventId } });
-        return sendSuccessResponse(res, 201, true, 'Recurring event deleted (all)');
-    }
+            await AgendaEvent.schema(schema).update(eventFound, { where: { id: event.recurringEventId }, transaction });
+            return sendSuccessResponse(res, 201, true, 'Recurring event deleted (future)');
+        }
 
-    return sendErrorResponse(res, 400, 'Unsupported recurrence delete mode');
+        if (mode === 'all') {
+            await AgendaEvent.schema(schema).destroy({ where: { id: event.recurringEventId }, transaction });
+            return sendSuccessResponse(res, 201, true, 'Recurring event deleted (all)');
+        }
+
+        return sendErrorResponse(res, 400, 'Unsupported recurrence delete mode');
+    });
 });
 
 export default {
@@ -1381,4 +1436,3 @@ export default {
     eventDashboardWithFilter,
     findAllHolidays
 };
-

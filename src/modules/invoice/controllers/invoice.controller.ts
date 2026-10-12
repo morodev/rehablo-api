@@ -35,6 +35,7 @@ import { resolveFiscalRouting } from '../../administration/services/fiscalRoutin
 import { invoiceEmissionMonth, invoicePaymentMonth, parseInvoiceMonthFilter } from '../utils/invoiceFilters.js';
 import { decorateInvoicesWithPayments, syncInvoicePaymentStatus } from '../services/payment.service.js';
 import { appointmentPricesByEvent, ensureAppointmentPaymentHistory, isValidPaymentDate, linkAppointmentPayments } from '../services/appointmentPayment.service.js';
+import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AGENDA_SCOPE_FIELDS = {
@@ -682,6 +683,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     // se una qualsiasi parte fallisce, non deve restare un numero "bruciato" senza fattura, né
     // una fattura senza le sue righe.
     const transactionResult = await sequelize.transaction(async (t) => {
+        if (invoiceFields.patientID) await lockPatientSettlement(schema, invoiceFields.patientID, t);
         let agendaEvents: AgendaEvent[] = [];
         let appointmentPayments: InvoicePayment[] = [];
 
@@ -918,6 +920,12 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         // CompatibilitÃ  con i client che emettono direttamente un documento saldato. Se esistono
         // giÃ  incassi delle sedute, viene registrato soltanto l'eventuale residuo e mai un doppione.
         if (residualToRegister > 0) {
+            if (invoiceFields.patientID) {
+                if (!invoiceStructureId) throw Object.assign(new Error('Verifica la sede prima di registrare il saldo della fattura'), { statusCode: 409 });
+                await assertPatientSettlementAllocations(schema, {
+                    patientId: invoiceFields.patientID, structureId: invoiceStructureId, referenceInvoiceId: invoiceId
+                }, [{ kind: 'INVOICE', targetId: invoiceId, amount: residualToRegister }], t);
+            }
             const paidAt = requestedPaymentDate;
             await InvoicePaymentScoped.create(
                 {
@@ -1095,20 +1103,19 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
         where: { invoiceId: { [Op.in]: cashScopeIds }, status: { [Op.in]: ['POSTED', 'CREDIT'] } },
         attributes: ['invoiceId', 'amount', 'paidAt', 'source']
     }) : [];
-    const invoicesWithUndatedMovements = new Set<string>();
+    const invoicesWithMovements = new Set(paymentRows.map(row => row.get('invoiceId') as string));
     paymentRows.forEach(row => {
         const payment = row.get({ plain: true }) as Record<string, any>;
-        if (payment.source === 'PACKAGE') return;
+        if (['PACKAGE', 'CREDIT'].includes(payment.source)) return;
         const paidAt = payment.paidAt ? String(payment.paidAt).slice(0, 10) : null;
         if (!paidAt) {
             aggregates.undatedPaidAmount += Number(payment.amount) || 0;
-            invoicesWithUndatedMovements.add(payment.invoiceId);
         } else if (!month || invoicePaymentMonth(paidAt) === month) {
             aggregates.collectedInPeriod += Number(payment.amount) || 0;
         }
     });
     cashScopeInvoices.forEach(invoice => {
-        if (invoice.hasUndatedLegacyPayments && !invoicesWithUndatedMovements.has(invoice.id)) {
+        if (invoice.hasUndatedLegacyPayments && !invoicesWithMovements.has(invoice.id)) {
             aggregates.undatedPaidAmount += Number(invoice.paidAmount) || 0;
         }
     });
@@ -1241,6 +1248,7 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
     // Fiscal cancellation releases appointments while preserving cash and the document link audit.
     if (String(requestedStatus ?? '').toLowerCase() === 'void') {
         await sequelize.transaction(async transaction => {
+            if (existingInvoice.patientID) await lockPatientSettlement(schema, existingInvoice.patientID, transaction);
             const invoice = await InvoiceScoped.findOne({
                 where: { id, ...patientScopeWhere(req, schema, 'patientID') },
                 transaction, lock: transaction.LOCK.UPDATE
@@ -1261,7 +1269,7 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
                     transaction, lock: transaction.LOCK.UPDATE
                 });
                 await InvoicePaymentScoped.update({ invoiceId: null }, {
-                    where: { invoiceId: id, agendaEventId: { [Op.in]: eventIds }, source: { [Op.in]: ['APPOINTMENT', 'PACKAGE'] } }, transaction
+                    where: { invoiceId: id, agendaEventId: { [Op.in]: eventIds }, source: { [Op.in]: ['APPOINTMENT', 'PACKAGE', 'CREDIT'] } }, transaction
                 });
                 await AgendaEvent.schema(schema).update({ invoiceId: null }, {
                     where: { id: { [Op.in]: eventIds }, invoiceId: id }, transaction
@@ -1414,6 +1422,7 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
         };
 
         const replaced = await sequelize.transaction(async (t) => {
+            if (existingInvoice.patientID) await lockPatientSettlement(schema, existingInvoice.patientID, t);
             const locked = await InvoiceScoped.findByPk(id, { transaction: t, lock: t.LOCK.UPDATE });
             if (!locked || locked.status === 'void') return false;
             const currentPaid = Number(await InvoicePaymentScoped.sum('amount', {
@@ -1464,6 +1473,7 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
         if (!replaced) return sendErrorResponse(res, 409, 'La fattura o i suoi incassi sono cambiati: ricarica il documento');
     } else {
         const updated = await sequelize.transaction(async transaction => {
+            if (existingInvoice.patientID) await lockPatientSettlement(schema, existingInvoice.patientID, transaction);
             const locked = await InvoiceScoped.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
             if (!locked || locked.status === 'void') return false;
             await locked.update({ ...updateData, ...await resolveStsUpdate(locked, transaction) }, { transaction });
@@ -1496,6 +1506,9 @@ export const deleteInvoice = asyncHandler(async (req: Request, res: Response) =>
     const id = req.params.invoiceId;
 
     const result = await sequelize.transaction(async transaction => {
+        const snapshot = await InvoiceScoped.findOne({ where: { id, ...patientScopeWhere(req, schema, 'patientID') }, transaction });
+        if (!snapshot) return { kind: 'missing' } as const;
+        if (snapshot.patientID) await lockPatientSettlement(schema, snapshot.patientID, transaction);
         const removedInvoice = await InvoiceScoped.findOne({
             where: { id, ...patientScopeWhere(req, schema, 'patientID') }, transaction, lock: transaction.LOCK.UPDATE
         });

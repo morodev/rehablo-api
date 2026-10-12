@@ -48,7 +48,46 @@ describe('shared cash and document reporting', () => {
         const therapies = aggregateTherapyPayments(input, query(), occurrences(input.events));
         assert.equal(summary.totals.collected, 100);
         assert.equal(summary.totals.outstanding, 100);
+        assert.equal(therapies.totals.collected, 100);
         assert.equal(therapies.details[0].paymentStatus, 'unpaid');
+    });
+    it('counts only cash when credit and new money settle the same appointment, including after invoice linking', () => {
+        for (const linked of [false, true]) {
+            const input = data({events: [event({expectedAmount: 60, invoiceId: linked ? 'invoice-1' : null})],
+                payments: [payment({amount: 40, invoiceId: linked ? 'invoice-1' : null}),
+                    payment({id: 'coverage-1', amount: 20, source: 'CREDIT', method: 'Credito paziente', invoiceId: linked ? 'invoice-1' : null})],
+                invoices: linked ? [invoice({invoiceTotal: 60, invoiceNet: 60})] : [],
+                attributableInvoiceIds: new Set(linked ? ['invoice-1'] : [])});
+            const summary = aggregateFinance(input, query());
+            const therapies = aggregateTherapyPayments(input, query(), occurrences(input.events));
+            assert.equal(summary.totals.collected, 40);
+            assert.equal(summary.totals.collectedFromAppointments, 40);
+            assert.equal(summary.totals.collectedFromInvoices, 0);
+            assert.equal(summary.totals.collectedUnbilled, linked ? 0 : 40);
+            assert.equal(summary.totals.outstanding, 0);
+            assert.equal(summary.series[0].collected, 40);
+            assert.equal(therapies.totals.collected, 40);
+            assert.equal(therapies.details[0].paidAmount, 60);
+            assert.equal(therapies.details[0].paymentStatus, 'paid');
+            assert.equal(therapies.details[0].balance, 0);
+        }
+    });
+    it('keeps invoice credit coverage in balances without counting it as a second cash receipt', () => {
+        const input = data({events: [event({invoiceId: 'invoice-1'})],
+            invoices: [invoice({invoiceTotal: 60, invoiceNet: 60})], attributableInvoiceIds: new Set(['invoice-1']),
+            payments: [payment({agendaEventId: null, invoiceId: 'invoice-1', amount: 40, source: 'USER'}),
+                payment({id: 'coverage-1', agendaEventId: null, invoiceId: 'invoice-1', amount: 20, source: 'CREDIT'})]});
+        const summary = aggregateFinance(input, query());
+        const therapies = aggregateTherapyPayments(input, query(), occurrences(input.events));
+        assert.equal(summary.totals.collected, 40);
+        assert.equal(summary.totals.collectedFromInvoices, 40);
+        assert.equal(summary.totals.invoiceOutstanding, 0);
+        assert.equal(therapies.totals.invoiceCollected, 40);
+        assert.equal(therapies.totals.invoiceOutstanding, 0);
+        assert.equal(therapies.details[0].invoicePaymentStatus, 'paid');
+        const undated = data({...input, payments: [payment({agendaEventId: null, invoiceId: 'invoice-1', amount: 60, source: 'CREDIT', paidAt: null})]});
+        assert.equal(aggregateFinance(undated, query()).totals.undatedLegacyPaid, 0);
+        assert.equal(aggregateFinance(undated, query()).totals.invoiceOutstanding, 0);
     });
     it('excludes complimentary sessions from unbilled work without inventing cash', () => {
         const input = data({events: [event({expectedAmount: 0, appointmentPriceAdjustment: 'COMPLIMENTARY'})], payments: []});

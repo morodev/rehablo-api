@@ -190,6 +190,8 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
     });
     it('requires the full residual, refuses destructive compatibility edits and voids only the selected movement', async context => {
         const eventId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        const patientId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+        const structureId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
         const rows: any[] = [];
         const record = (values: any) => ({
             ...values,
@@ -197,17 +199,23 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
             async update(update: any) { Object.assign(this, update); return this; }
         });
         const event = record({ id: eventId, start: '2026-01-05T10:00:00Z', status: 'COMPLETED',
-            patientId: 'patient', calendarId: 'owner', appointmentExpectedAmount: 100,
+            patientId, structureId, calendarId: 'owner', appointmentExpectedAmount: 100,
             appointmentNetAmount: 100, appointmentVatRate: 0, appointmentPaidAmount: 0, invoiceId: null,
+            appointmentPaymentHistoryKnown: true,
             missedArrivalReportedAt: '2026-01-05T10:15:00Z', missedArrivalResolvedAt: null });
         context.mock.method(sequelize, 'transaction', async (callback: any) => callback({ LOCK: { UPDATE: 'UPDATE' } }));
+        context.mock.method(sequelize, 'query', async (sql: string) => {
+            assert.match(sql, /pg_advisory_xact_lock/);
+            return [[], {}] as any;
+        });
         context.mock.method(AgendaEvent, 'schema', () => ({
             findOne: async (options: any) => {
-                assert.equal(options.lock, 'UPDATE');
+                if (options.lock) assert.equal(options.lock, 'UPDATE');
                 return options.where.calendarId && options.where.calendarId !== event.calendarId ? null : event;
             },
-            findAll: async () => []
+            findAll: async () => [event]
         }) as any);
+        context.mock.method(Invoice, 'schema', () => ({findAll: async () => []}) as any);
         context.mock.method(InvoiceAgendaEvent, 'schema', () => ({ findOne: async () => null, findAll: async () => [] }) as any);
         context.mock.method(InvoicePayment, 'schema', () => ({
             findAll: async () => [...rows],
@@ -222,13 +230,14 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
         const invoke = (handler: any, body: any, paymentId?: string, own = false): Promise<any> => new Promise((resolve, reject) => {
             const response = { code: 0, status(code: number) { this.code = code; return this; },
                 json(payload: any) { resolve({ code: this.code, ...payload }); return this; } };
-            handler({ tenantSchema: 'test_tenant', params: { agendaEventId: eventId, paymentId }, body,
-                user: { sub: 'recorder' }, access: { scope: own ? 'own' : 'tenant', userId: 'someone-else', resource: 'agenda' } },
-            response, reject);
+            handler({ tenantSchema: 'rehablo_test', params: { agendaEventId: eventId, paymentId }, body,
+                user: { sub: 'recorder' }, access: { scope: own ? 'own' : 'tenant', structureId, userId: 'someone-else', resource: 'agenda' } },
+            response, (error: any) => error?.statusCode
+                ? resolve({code: error.statusCode, message: error.message}) : reject(error));
         });
         const partial = await invoke(createAppointmentPayment, { amount: 30, paidAt: '2026-01-10', method: 'Contanti' });
         assert.equal(partial.code, 409);
-        assert.match(partial.message, /intero residuo/);
+        assert.match(partial.message, /integralmente|intero residuo/);
         const settled = await invoke(createAppointmentPayment, {
             amount: 100,
             paidAt: '2026-02-10',
@@ -285,6 +294,8 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
     it('creates one independent movement per selected appointment in one bulk operation', async context => {
         const referenceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
         const previousId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+        const patientId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+        const structureId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
         const rows: any[] = [];
         const record = (values: any) => ({
             ...values,
@@ -293,30 +304,36 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
         });
         const events = [
             record({id: previousId, start: '2026-01-05T10:00:00Z', status: 'COMPLETED', title: 'Seduta precedente',
-                patientId: 'patient', calendarId: 'owner', appointmentExpectedAmount: 40,
+                patientId, structureId, calendarId: 'owner', appointmentExpectedAmount: 40,
                 appointmentNetAmount: 40, appointmentVatRate: 0, appointmentPaidAmount: 0,
                 appointmentPaymentHistoryKnown: true, invoiceId: null}),
             record({id: referenceId, start: '2026-01-12T10:00:00Z', status: 'CONFIRMED', title: 'Seduta corrente',
-                patientId: 'patient', calendarId: 'owner', appointmentExpectedAmount: 40,
+                patientId, structureId, calendarId: 'owner', appointmentExpectedAmount: 40,
                 appointmentNetAmount: 40, appointmentVatRate: 0, appointmentPaidAmount: 0,
                 appointmentPaymentHistoryKnown: true, invoiceId: null,
                 missedArrivalReportedAt: '2026-01-12T10:15:00Z', missedArrivalResolvedAt: null})
         ];
         context.mock.method(sequelize, 'transaction', async (callback: any) => callback({LOCK: {UPDATE: 'UPDATE'}}));
+        context.mock.method(sequelize, 'query', async (sql: string) => {
+            assert.match(sql, /pg_advisory_xact_lock/);
+            return [[], {}] as any;
+        });
         context.mock.method(AgendaEvent, 'schema', () => ({
+            findOne: async (options: any) => events.find(event => event.id === options.where.id) ?? null,
             findAll: async (options: any) => {
-                assert.equal(options.lock, 'UPDATE');
+                if (options.lock) assert.equal(options.lock, 'UPDATE');
                 const ids = options.where.id?.[Op.in];
                 return (ids ? events.filter(event => ids.includes(event.id)) : events)
                     .sort((a, b) => a.id.localeCompare(b.id));
             }
         }) as any);
+        context.mock.method(Invoice, 'schema', () => ({findAll: async () => []}) as any);
         context.mock.method(InvoiceAgendaEvent, 'schema', () => ({findOne: async () => null, findAll: async () => []}) as any);
         context.mock.method(InvoicePayment, 'schema', () => ({
             findAll: async (options: any) => {
                 const requested = options.where.agendaEventId;
                 const ids = requested?.[Op.in];
-                return rows.filter(row => ids ? ids.includes(row.agendaEventId) : row.agendaEventId === requested);
+                return requested ? rows.filter(row => ids ? ids.includes(row.agendaEventId) : row.agendaEventId === requested) : rows;
             },
             create: async (values: any) => {
                 const row = record({...values, id: `payment-${rows.length + 1}`,
@@ -328,10 +345,10 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
         const response: any = await new Promise((resolve, reject) => {
             const res = {code: 0, status(code: number) { this.code = code; return this; },
                 json(payload: any) { resolve({code: this.code, ...payload}); return this; }};
-            createBulkAppointmentPayments({tenantSchema: 'test_tenant', params: {agendaEventId: referenceId},
+            createBulkAppointmentPayments({tenantSchema: 'rehablo_test', params: {agendaEventId: referenceId},
                 body: {paidAt: '2026-02-01', method: 'Contanti', note: 'Tre sedute', markReferenceCompleted: true,
                     allocations: [{agendaEventId: previousId, amount: 40}, {agendaEventId: referenceId, amount: 40}]},
-                user: {sub: 'recorder'}, access: {scope: 'tenant', userId: 'recorder', resource: 'agenda'}
+                user: {sub: 'recorder'}, access: {scope: 'tenant', structureId, userId: 'recorder', resource: 'agenda'}
             } as any, res as any, reject);
         });
 
@@ -395,6 +412,10 @@ describe('invoicing appointment concessions through the HTTP handlers', () => {
         const lines: any[] = [];
         let created: any = null;
         context.mock.method(sequelize, 'transaction', async (callback: any) => callback({LOCK: {UPDATE: 'UPDATE'}}));
+        context.mock.method(sequelize, 'query', async (sql: string) => {
+            assert.match(sql, /pg_advisory_xact_lock/);
+            return [[], {}] as any;
+        });
         context.mock.method(Tenant, 'findByPk', async () => tenant);
         context.mock.method(AgendaEvent, 'schema', () => ({findAll: async () => [event]}));
         context.mock.method(Patient, 'schema', () => ({findOne: async () => record({id: patientId})}));
@@ -416,7 +437,7 @@ describe('invoicing appointment concessions through the HTTP handlers', () => {
         const invoke = (handler: any, body: any) => new Promise<any>((resolve, reject) => {
             const response = {code: 0, status(code: number) {this.code = code; return this;},
                 json(data: any) {resolve({code: this.code, ...data}); return this;}};
-            handler({tenantSchema: 'test_tenant', body, query: {patientId, through: '2026-01-31'},
+            handler({tenantSchema: 'rehablo_test', body, query: {patientId, through: '2026-01-31'},
                 user: {sub: 'user', tenants: [{id: 'tenant'}]}, access: {scope: 'tenant', resource: 'invoice'}}, response, reject);
         });
         return {invoke, event, tenant, receipts, lines};

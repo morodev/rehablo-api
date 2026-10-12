@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
-import {test} from 'node:test';
+import {test, type TestContext} from 'node:test';
+import {Op, type Transaction} from 'sequelize';
 import type {ActivityContext} from '../activities.types.js';
 import {getRolePermissions, resolveEffectiveRole, RoleCode} from '../../auth/rbac/roles.js';
-import {activityCapabilities, canCreateActivity, isEligibleActivityRole, requireActivityCapability} from './activityAccess.service.js';
+import Patient from '../../patients/models/patient.model.js';
+import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
+import {activityCapabilities, canCreateActivity, isEligibleActivityRole, requireActivityCapability,
+    requireActivityLinks, searchActivityAgendaLinks} from './activityAccess.service.js';
 import {ActivityError} from '../utils/activityErrors.js';
 
 const actor = '00000000-0000-4000-8000-000000000001';
@@ -104,4 +108,152 @@ test('a current operational structure override narrows a tenant owner to creator
     assert.equal(activityCapabilities(context(role), open, []).canEdit, false);
     assert.equal(activityCapabilities(context(role), open, [actor]).canEdit, true);
     assert.equal(activityCapabilities(context(role), {...open, createdByUserId: actor}, []).canEdit, true);
+});
+
+const linkedId = (index: number) => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+type LinkRow = Record<string, any>;
+
+/** Evaluate the actual Sequelize predicate, including nested JSON and typed NULL precedence. */
+function linkedRowMatches(row: LinkRow, where: any): boolean {
+    return Reflect.ownKeys(where ?? {}).every(key => {
+        const condition = where[key];
+        if (key === Op.and) return condition.every((part: any) => linkedRowMatches(row, part));
+        if (key === Op.or) return condition.some((part: any) => linkedRowMatches(row, part));
+        if (typeof key === 'symbol') throw new Error(`Unsupported link predicate ${String(key)}`);
+        const value = row?.[key];
+        if (condition === null) return value == null;
+        if (condition && typeof condition === 'object') return linkedRowMatches(value ?? {}, condition);
+        return value === condition;
+    });
+}
+
+function activityLinksFixture(t: TestContext) {
+    const selected = context(RoleCode.OWNER);
+    const patientId = linkedId(5), agendaEventId = linkedId(6);
+    const patient: LinkRow = {id: patientId, tenantId: selected.tenantId, structureId: selected.structureId,
+        userId: actor, archivedAt: null};
+    const event: LinkRow = {id: agendaEventId, structureId: selected.structureId, calendarId: actor,
+        patientId, patient: null, title: 'Controllo', start: '2026-07-28T07:00:00.000Z',
+        allDay: false, recurrence: null, recurringEventId: null};
+    const patients = [patient], events = [event];
+    const reads: Array<{schema: string; model: string; method: string; options: any}> = [];
+    const project = (row: LinkRow, attributes: string[]) => Object.fromEntries(attributes.map(key => [key, row[key]]));
+    t.mock.method(Patient, 'schema', ((schema: string) => ({
+        findOne: async (options: any) => {
+            reads.push({schema, model: 'patient', method: 'findOne', options});
+            const row = patients.find(item => linkedRowMatches(item, options.where));
+            return row ? project(row, options.attributes) : null;
+        }
+    })) as any);
+    t.mock.method(AgendaEvent, 'schema', ((schema: string) => ({
+        findOne: async (options: any) => {
+            reads.push({schema, model: 'agenda', method: 'findOne', options});
+            const row = events.find(item => linkedRowMatches(item, options.where));
+            return row ? project(row, options.attributes) : null;
+        },
+        findAndCountAll: async (options: any) => {
+            reads.push({schema, model: 'agenda', method: 'findAndCountAll', options});
+            const rows = events.filter(item => linkedRowMatches(item, options.where));
+            return {count: rows.length,
+                rows: rows.slice(options.offset, options.offset + options.limit).map(row => project(row, options.attributes))};
+        }
+    })) as any);
+    return {context: selected, patientId, agendaEventId, patient, event, patients, events, reads};
+}
+
+const associationFailure = (error: unknown) => error instanceof ActivityError
+    && error.statusCode === 422 && error.code === 'ACTIVITY_VALIDATION_FAILED';
+const unavailableLink = (error: unknown) => error instanceof ActivityError
+    && error.statusCode === 404 && error.code === 'ACTIVITY_NOT_FOUND';
+
+test('activity links resolve typed and legacy patient references with the existing scoped transaction', async t => {
+    const f = activityLinksFixture(t);
+    const transaction = {id: 'link-read'} as unknown as Transaction;
+    for (const patientId of [f.patientId, null, undefined]) {
+        f.event.patientId = patientId;
+        f.event.patient = {id: f.patientId, name: 'Storico', notes: 'Private snapshot'};
+        await requireActivityLinks(f.context, {patientId: f.patientId, agendaEventId: f.agendaEventId}, transaction);
+    }
+    assert.equal(f.reads.length, 6);
+    assert.ok(f.reads.every(read => read.schema === f.context.schema && read.options.transaction === transaction));
+    for (const read of f.reads.filter(read => read.model === 'agenda')) {
+        assert.deepEqual(read.options.attributes, ['id', 'patientId', 'patient']);
+        assert.deepEqual(read.options.where, {id: f.agendaEventId, structureId: f.context.structureId});
+    }
+});
+
+test('activity links retain typed precedence and reject mismatched or missing patient associations', async t => {
+    const f = activityLinksFixture(t);
+    f.event.patient = {id: linkedId(7)};
+    await requireActivityLinks(f.context, {patientId: f.patientId, agendaEventId: f.agendaEventId});
+    for (const association of [
+        {patientId: linkedId(7), patient: {id: f.patientId}},
+        {patientId: null, patient: {id: linkedId(7)}},
+        {patientId: null, patient: null},
+        {patientId: undefined, patient: undefined},
+        {patientId: null, patient: {name: 'No identifier'}},
+        {patientId: null, patient: {id: 'invalid-placeholder'}}
+    ]) {
+        Object.assign(f.event, association);
+        await assert.rejects(() => requireActivityLinks(f.context,
+            {patientId: f.patientId, agendaEventId: f.agendaEventId}), associationFailure);
+    }
+});
+
+test('legacy activity links preserve own calendar, patient, tenant, structure and archive checks', async t => {
+    const f = activityLinksFixture(t);
+    f.context.permissions = ['patient:read:own', 'agenda:read:own'];
+    f.event.patientId = null;
+    f.event.patient = {id: f.patientId};
+    const transaction = {id: 'own-link-read'} as unknown as Transaction;
+    const links = {patientId: f.patientId, agendaEventId: f.agendaEventId};
+    await requireActivityLinks(f.context, links, transaction);
+    assert.deepEqual(f.reads[0].options.where, {id: f.patientId, tenantId: f.context.tenantId,
+        structureId: f.context.structureId, archivedAt: null, userId: actor});
+    assert.deepEqual(f.reads[1].options.where, {id: f.agendaEventId, structureId: f.context.structureId, calendarId: actor});
+    assert.ok(f.reads.every(read => read.options.transaction === transaction));
+    for (const field of ['calendarId', 'structureId']) {
+        const original = f.event[field];
+        f.event[field] = linkedId(9);
+        await assert.rejects(() => requireActivityLinks(f.context, links), unavailableLink);
+        f.event[field] = original;
+    }
+    for (const field of ['userId', 'tenantId', 'structureId', 'archivedAt']) {
+        const original = f.patient[field];
+        f.patient[field] = field === 'archivedAt' ? new Date() : linkedId(9);
+        await assert.rejects(() => requireActivityLinks(f.context, links), unavailableLink);
+        f.patient[field] = original;
+    }
+    f.context.permissions = [];
+    const readsBefore = f.reads.length;
+    await assert.rejects(() => requireActivityLinks(f.context, links), unavailableLink);
+    assert.equal(f.reads.length, readsBefore);
+});
+
+test('activity patient agenda lookup evaluates canonical fallback while retaining scope and minimal metadata', async t => {
+    const f = activityLinksFixture(t);
+    f.context.permissions = ['patient:read:own', 'agenda:read:own'];
+    const variant = (index: number, changes: LinkRow) => ({...f.event, id: linkedId(index), ...changes});
+    f.events.push(
+        variant(8, {patientId: null, patient: {id: f.patientId, notes: 'Private snapshot'}}),
+        variant(9, {patientId: undefined, patient: {id: f.patientId}}),
+        variant(10, {patientId: linkedId(7), patient: {id: f.patientId}}),
+        variant(11, {patientId: null, patient: {id: linkedId(7)}}),
+        variant(12, {patientId: null, patient: null}),
+        variant(13, {structureId: linkedId(14)}),
+        variant(15, {calendarId: other})
+    );
+    const snapshot = JSON.stringify(f.events);
+    const transaction = {id: 'lookup-read'} as unknown as Transaction;
+    const result = await searchActivityAgendaLinks(f.context,
+        {patientId: f.patientId, query: '', offset: 0, limit: 50}, transaction);
+    assert.deepEqual(result.items.map(item => item.id), [f.agendaEventId, linkedId(8), linkedId(9)]);
+    assert.equal(result.total, 3);
+    assert.equal(result.nextOffset, null);
+    assert.ok(f.reads.every(read => read.schema === f.context.schema && read.options.transaction === transaction));
+    const lookup = f.reads.find(read => read.method === 'findAndCountAll')!;
+    assert.deepEqual(lookup.options.attributes, ['id', 'title', 'start', 'allDay', 'recurrence', 'recurringEventId']);
+    assert.equal(JSON.stringify(result).includes('patient'), false);
+    assert.equal(JSON.stringify(result).includes('Private snapshot'), false);
+    assert.equal(JSON.stringify(f.events), snapshot);
 });

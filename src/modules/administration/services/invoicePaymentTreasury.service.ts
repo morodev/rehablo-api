@@ -3,7 +3,7 @@ import { Transaction } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 
 export interface InvoicePaymentTreasuryContext {
-    accountId: string;
+    accountId?: string;
     structureId: string;
     paymentMethodId: string | null;
     idempotencyKey?: string | null;

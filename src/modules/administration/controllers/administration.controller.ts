@@ -23,6 +23,7 @@ import { submitFiscal } from './fiscalSimulation.controller.js';
 import { resolvePrice } from '../services/pricing.service.js';
 import { validateQuoteDraft } from '../services/quoteAccess.js';
 import { ensureNoPendingQuoteDelivery, loadScopedQuote, revokeQuoteLinks } from '../services/quoteDelivery.service.js';
+import { lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
 
 type AdminModel = ModelStatic<Model>;
 interface EntitySpec {
@@ -417,13 +418,17 @@ const consumePackage = asyncHandler(async (req, res) => {
     }
     const result = await sequelize.transaction(async (transaction: Transaction) => {
         const Pack = CarePackage.schema(req.tenantSchema!);
+        const snapshot = await Pack.findOne({ where: { id: req.params.id, ...structureWhere(req, SPECS.carePackages) }, transaction });
+        if (!snapshot) return null;
+        await lockPatientSettlement(req.tenantSchema!, String(snapshot.get('patientId')), transaction);
         const pack = await Pack.findOne({ where: { id: req.params.id, ...structureWhere(req, SPECS.carePackages) }, transaction, lock: transaction.LOCK.UPDATE });
         if (!pack || pack.get('status') !== 'ACTIVE') return null;
+        if (String(pack.get('patientId')) !== String(snapshot.get('patientId'))) throw Object.assign(new Error('Il paziente del pacchetto è cambiato: ricarica'), { statusCode: 409 });
         const remaining = Number(pack.get('remainingUnits'));
-        if (units > remaining) throw Object.assign(new Error('Sedute residue insufficienti'), { status: 409 });
+        if (units > remaining) throw Object.assign(new Error('Sedute residue insufficienti'), { statusCode: 409 });
         const expiry = pack.get('expiresAt');
         if (expiry && String(expiry).slice(0, 10) < new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Rome' })) {
-            throw Object.assign(new Error('Il pacchetto è scaduto'), { status: 409 });
+            throw Object.assign(new Error('Il pacchetto è scaduto'), { statusCode: 409 });
         }
         // Validate and lock the appointment before changing the package balance.
         const appointment = agendaEventId ? await settleAppointmentWithPackage(req, agendaEventId, pack, transaction) : null;
@@ -448,18 +453,19 @@ async function settleAppointmentWithPackage(req: Request, agendaEventId: string,
         || String(event.get('structureId') ?? '') !== String(pack.get('structureId') ?? '')
         || !['CONFIRMED', 'COMPLETED'].includes(String(event.get('status') ?? '').toUpperCase())
         || event.get('recurrence') || event.get('recurringEventId')) {
-        throw Object.assign(new Error('La seduta non appartiene al paziente o alla sede del pacchetto'), { status: 409 });
+        throw Object.assign(new Error('La seduta non appartiene al paziente o alla sede del pacchetto'), { statusCode: 409 });
     }
-    if (event.get('invoiceId')) throw Object.assign(new Error('La seduta è già fatturata'), { status: 409 });
+    if (event.get('invoiceId')) throw Object.assign(new Error('La seduta è già fatturata'), { statusCode: 409 });
+    if (Number(event.get('appointmentPaidAmount')) > 0.009) throw Object.assign(new Error('Questa seduta ha già una copertura registrata'), {statusCode: 409});
     const alreadyConsumed = await PackageConsumption.schema(schema).count({ where: { agendaEventId, status: 'POSTED' }, transaction });
-    if (alreadyConsumed) throw Object.assign(new Error('Questa seduta è già stata usata da un pacchetto'), { status: 409 });
+    if (alreadyConsumed) throw Object.assign(new Error('Questa seduta è già stata usata da un pacchetto'), { statusCode: 409 });
     const existing = await InvoicePayment.schema(schema).count({ where: { agendaEventId, status: 'POSTED' }, transaction });
-    if (existing > 0) throw Object.assign(new Error('Questa seduta ha già un pagamento registrato'), { status: 409 });
+    if (existing > 0) throw Object.assign(new Error('Questa seduta ha già un pagamento registrato'), { statusCode: 409 });
     const price = (await appointmentPricesByEvent(schema, [event.get({ plain: true })], transaction)).get(String(agendaEventId));
     const units = Number(pack.get('purchasedUnits'));
     const unitPrice = units > 0 ? Math.round(Number(pack.get('totalPrice')) / units * 100) / 100 : null;
     const amount = price?.amount ?? unitPrice;
-    if (!amount || amount <= 0) throw Object.assign(new Error('Impossibile determinare il valore della seduta'), { status: 409 });
+    if (!amount || amount <= 0) throw Object.assign(new Error('Impossibile determinare il valore della seduta'), { statusCode: 409 });
     if (price?.amount == null) {
         await event.update({ appointmentExpectedAmount: amount, appointmentPriceRecordedAt: new Date() }, { transaction });
     }

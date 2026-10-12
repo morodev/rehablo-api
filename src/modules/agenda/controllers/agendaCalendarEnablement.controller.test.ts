@@ -8,7 +8,7 @@ import Patient from '../../patients/models/patient.model.js';
 import TimeOffRequest from '../models/timeOffRequest.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
-import { saveAgendaEvent, updateAgendaEvent, updateRecurringEvent } from './agenda.controller.js';
+import { reportMissedArrival, saveAgendaEvent, updateAgendaEvent, updateRecurringEvent } from './agenda.controller.js';
 
 const id = (value: number) => 'aaaaaaaa-aaaa-4aaa-8aaa-' + String(value).padStart(12, '0');
 const tenantId = id(1), structureId = id(2), otherStructure = id(3), operatorId = id(4), patientId = id(5), eventId = id(6);
@@ -54,11 +54,15 @@ function fixture(t: TestContext) {
     })) as any);
     t.mock.method(TimeOffRequest, 'schema', (() => ({findOne: async () => null})) as any);
     t.mock.method(InvoiceAgendaEvent, 'schema', (() => ({findOne: async () => null})) as any);
-    t.mock.method(InvoicePayment, 'schema', (() => ({count: async () => 0})) as any);
+    t.mock.method(InvoicePayment, 'schema', (() => ({count: async () => 0, sum: async () => 0})) as any);
+    t.mock.method(sequelize, 'query', (async (sql: string, options: any) => {
+        assert.match(sql, /pg_advisory_xact_lock/);
+        trace.push({kind: 'patient-lock', ...options}); return [[], {}];
+    }) as any);
     t.mock.method(sequelize, 'transaction', (async (callback: any) => {
         trace.push({kind: 'begin'}); const result = await callback(transactionContext); trace.push({kind: 'commit'}); return result;
     }) as any);
-    const req: any = {tenantSchema: 'schema', user: {tid: tenantId},
+    const req: any = {tenantSchema: 'rehablo_test', user: {tid: tenantId},
         access: {scope: 'structure', structureId, userId: id(7)}, body: {}, params: {}, query: {}};
     const newEvent = {calendarId: operatorId, start: '2035-01-02T09:00:00.000Z', end: '2035-01-02T09:30:00.000Z',
         title: 'Seduta', status: 'CONFIRMED', patient: {id: patientId}};
@@ -199,6 +203,8 @@ it('rescheduling locks the membership before the appointment and saves in that s
     assert.equal((await run(updateAgendaEvent, f.req)).status, 200);
     const membership = f.trace.find(row => row.kind === 'membership-lock'), eventLock = f.trace.find(row => row.kind === 'event-lock'),
         saved = f.trace.find(row => row.kind === 'event-save');
+    const patientLock = f.trace.find(row => row.kind === 'patient-lock');
+    assert.ok(f.trace.indexOf(patientLock) < f.trace.indexOf(membership));
     assert.ok(f.trace.indexOf(membership) < f.trace.indexOf(eventLock));
     for (const operation of [membership, eventLock, saved]) assert.equal(operation.transaction, f.transactionContext);
 });
@@ -221,5 +227,17 @@ it('recurring metadata update follows membership-first lock ordering and writes 
         created = f.trace.find(row => row.kind === 'event-create');
     assert.ok(f.trace.indexOf(membership) < f.trace.indexOf(eventLock));
     for (const operation of [membership, eventLock, created]) assert.equal(operation.transaction, f.transactionContext);
+    assert.equal(f.trace.at(-1).kind, 'commit');
+});
+
+it('attendance writes share the patient lock and respond only after the transaction commits', async t => {
+    const f = fixture(t);
+    f.req.params.agendaEventId = eventId;
+    const result = await run(reportMissedArrival, f.req);
+    assert.equal(result.status, 200);
+    assert.ok(f.current.missedArrivalReportedAt);
+    const patientLock = f.trace.find(row => row.kind === 'patient-lock');
+    const eventLock = f.trace.find(row => row.kind === 'event-lock');
+    assert.ok(f.trace.indexOf(patientLock) < f.trace.indexOf(eventLock));
     assert.equal(f.trace.at(-1).kind, 'commit');
 });

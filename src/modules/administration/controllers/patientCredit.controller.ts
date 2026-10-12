@@ -10,7 +10,8 @@ import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import { syncInvoicePaymentStatus } from '../../invoice/services/payment.service.js';
-import { appointmentPricesByEvent, syncAppointmentPaymentStatus } from '../../invoice/services/appointmentPayment.service.js';
+import { appointmentPricesByEvent, ensureAppointmentPaymentHistory, syncAppointmentPaymentStatus } from '../../invoice/services/appointmentPayment.service.js';
+import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
 
 /** Advance is cash received and a liability to the patient, not invoice revenue. */
 export const createAdvance = asyncHandler(async (req: Request, res: Response) => {
@@ -25,6 +26,7 @@ export const createAdvance = asyncHandler(async (req: Request, res: Response) =>
         return sendErrorResponse(res, 422, 'Paziente, importo, conto, metodo e identificativo operazione obbligatori');
     }
     const result = await sequelize.transaction(async transaction => {
+        await lockPatientSettlement(req.tenantSchema!, patientId, transaction);
         const existing = await TreasuryMovement.schema(req.tenantSchema!).findOne({ where: { idempotencyKey: key }, transaction });
         if (existing) {
             if (existing.get('category') !== 'PATIENT_ADVANCE' || Number(existing.get('amount')) !== amount) {
@@ -70,6 +72,19 @@ const validAmount = (value: unknown) => {
 };
 const validKey = (req: Request) => /^[a-zA-Z0-9_-]{8,128}$/.test(String(req.header('Idempotency-Key') ?? ''));
 
+/** Snapshot is read without a row lock; all financial writers then share the patient lock. */
+async function lockCreditPatient(req: Request, transaction: Transaction): Promise<PatientCredit | null> {
+    const snapshot = await PatientCredit.schema(req.tenantSchema!).findByPk(req.params.id, { transaction });
+    if (!snapshot || (req.access?.scope !== 'tenant' && snapshot.get('structureId') !== req.access?.structureId)) return null;
+    const patientId = String(snapshot.get('patientId') ?? '');
+    if (!patientId) return null;
+    await lockPatientSettlement(req.tenantSchema!, patientId, transaction);
+    const credit = await PatientCredit.schema(req.tenantSchema!).findByPk(req.params.id, { transaction, lock: transaction.LOCK.UPDATE });
+    if (!credit || String(credit.get('patientId')) !== patientId
+        || (req.access?.scope !== 'tenant' && credit.get('structureId') !== req.access?.structureId)) return null;
+    return credit;
+}
+
 async function backingReceipt(schema: string, credit: PatientCredit, transaction: Transaction) {
     const sourceType = String(credit.get('sourceType') ?? '');
     const sourceId = String(credit.get('sourceId') ?? '');
@@ -110,7 +125,7 @@ export const applyCredit = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 422, 'Destinazione, importo e identificativo operazione non validi');
     }
     const result = await sequelize.transaction(async transaction => {
-        const credit = await PatientCredit.schema(req.tenantSchema!).findByPk(req.params.id, { transaction, lock: transaction.LOCK.UPDATE });
+        const credit = await lockCreditPatient(req, transaction);
         if (!credit || (req.access?.scope !== 'tenant' && credit.get('structureId') !== req.access?.structureId)) {
             return { error: 404, message: 'Credito non disponibile' };
         }
@@ -128,13 +143,15 @@ export const applyCredit = asyncHandler(async (req: Request, res: Response) => {
             const invoice = await Invoice.schema(req.tenantSchema!).findOne({ where: {
                 id: targetId, patientID: String(credit.get('patientId')), structureId: String(credit.get('structureId'))
             }, transaction, lock: transaction.LOCK.UPDATE });
-            if (!invoice || invoice.get('status') === 'VOID' || invoice.get('documentType') === 'nota_di_credito'
+            if (!invoice || String(invoice.get('status')).toLowerCase() === 'void' || invoice.get('documentType') === 'nota_di_credito'
                 || !invoice.get('documentNumber')) return { error: 404, message: 'Fattura non disponibile' };
-            const paid = Number(await InvoicePayment.schema(req.tenantSchema!).sum('amount', {
-                where: { invoiceId: targetId, status: 'POSTED' }, transaction }) ?? 0);
-            if (amount > Math.round((Number(invoice.get('invoiceTotal')) - paid) * 100) / 100) {
+            const summary = await syncInvoicePaymentStatus(req.tenantSchema!, targetId, transaction);
+            if (amount > summary.balance + 0.009) {
                 return { error: 409, message: 'Importo superiore al residuo della fattura' };
             }
+            await assertPatientSettlementAllocations(req.tenantSchema!, {
+                patientId: String(credit.get('patientId')), structureId: String(credit.get('structureId')), referenceInvoiceId: targetId
+            }, [{ kind: 'INVOICE', targetId, amount }], transaction);
             payment = await InvoicePayment.schema(req.tenantSchema!).create({
                 invoiceId: targetId, amount, paidAt: new Date(), method: 'Credito paziente', source: 'CREDIT',
                 status: 'POSTED', createdByUserId: req.access!.userId
@@ -144,9 +161,14 @@ export const applyCredit = asyncHandler(async (req: Request, res: Response) => {
             const event = await AgendaEvent.schema(req.tenantSchema!).findOne({ where: {
                 id: targetId, patientId: String(credit.get('patientId')), structureId: String(credit.get('structureId'))
             }, transaction, lock: transaction.LOCK.UPDATE });
-            if (!event || event.get('invoiceId') || event.get('status') === 'CANCELLED') return { error: 404, message: 'Seduta non disponibile' };
+            if (!event || event.get('invoiceId') || event.get('recurrence') || event.get('recurringEventId')
+                || !['CONFIRMED', 'COMPLETED'].includes(String(event.get('status')).toUpperCase())
+                || !Number.isFinite(Date.parse(String(event.get('start') ?? ''))) || Date.parse(String(event.get('start'))) > Date.now()) {
+                return { error: 404, message: 'Seduta non disponibile' };
+            }
             const price = (await appointmentPricesByEvent(req.tenantSchema!, [event.get({ plain: true })], transaction))
                 .get(targetId);
+            await ensureAppointmentPaymentHistory(req.tenantSchema!, event, transaction);
             const expected = price?.amount ?? Number(event.get('appointmentExpectedAmount'));
             const paid = Number(await InvoicePayment.schema(req.tenantSchema!).sum('amount', {
                 where: { agendaEventId: targetId, status: 'POSTED' }, transaction }) ?? 0);
@@ -156,6 +178,9 @@ export const applyCredit = asyncHandler(async (req: Request, res: Response) => {
             if (event.get('appointmentExpectedAmount') == null) {
                 await event.update({ appointmentExpectedAmount: expected, appointmentPriceRecordedAt: new Date() }, { transaction });
             }
+            await assertPatientSettlementAllocations(req.tenantSchema!, {
+                patientId: String(credit.get('patientId')), structureId: String(credit.get('structureId')), referenceAgendaEventId: targetId
+            }, [{ kind: 'APPOINTMENT', targetId, amount }], transaction);
             payment = await InvoicePayment.schema(req.tenantSchema!).create({
                 agendaEventId: targetId, amount, paidAt: new Date(), method: 'Credito paziente', source: 'CREDIT',
                 status: 'POSTED', createdByUserId: req.access!.userId
@@ -183,7 +208,7 @@ export const refundCredit = asyncHandler(async (req: Request, res: Response) => 
         return sendErrorResponse(res, 422, 'Importo, conto, metodo e identificativo operazione non validi');
     }
     const result = await sequelize.transaction(async transaction => {
-        const credit = await PatientCredit.schema(req.tenantSchema!).findByPk(req.params.id, { transaction, lock: transaction.LOCK.UPDATE });
+        const credit = await lockCreditPatient(req, transaction);
         if (!credit || (req.access?.scope !== 'tenant' && credit.get('structureId') !== req.access?.structureId)) {
             return { error: 404, message: 'Credito non disponibile' };
         }
@@ -230,7 +255,7 @@ export const reverseCreditApplication = asyncHandler(async (req: Request, res: R
     const key = String(req.header('Idempotency-Key') ?? '');
     if (!validKey(req)) return sendErrorResponse(res, 422, 'Identificativo operazione non valido');
     const result = await sequelize.transaction(async transaction => {
-        const credit = await PatientCredit.schema(req.tenantSchema!).findByPk(req.params.id, { transaction, lock: transaction.LOCK.UPDATE });
+        const credit = await lockCreditPatient(req, transaction);
         if (!credit || (req.access?.scope !== 'tenant' && credit.get('structureId') !== req.access?.structureId)) {
             return { error: 404, message: 'Credito non disponibile' };
         }
@@ -251,10 +276,14 @@ export const reverseCreditApplication = asyncHandler(async (req: Request, res: R
         }
         await payment.update({ status: 'VOID', voidedAt: new Date(), voidedByUserId: req.access!.userId,
             voidReason: 'Correzione applicazione credito' }, { transaction });
-        if (original.get('type') === 'APPLY_INVOICE') {
-            await syncInvoicePaymentStatus(req.tenantSchema!, String(original.get('targetId')), transaction);
-        } else {
-            const event = await AgendaEvent.schema(req.tenantSchema!).findByPk(String(original.get('targetId')),
+        // Event-owned credit may have been linked, released and reissued since application.
+        // Synchronize the live payment destinations, preserving the original movement ID.
+        const linkedInvoiceId = payment.get('invoiceId') as string | null;
+        if (linkedInvoiceId) await syncInvoicePaymentStatus(req.tenantSchema!, linkedInvoiceId, transaction);
+        const agendaEventId = payment.get('agendaEventId') as string | null
+            || (original.get('type') === 'APPLY_APPOINTMENT' ? String(original.get('targetId')) : null);
+        if (agendaEventId) {
+            const event = await AgendaEvent.schema(req.tenantSchema!).findByPk(agendaEventId,
                 { transaction, lock: transaction.LOCK.UPDATE });
             if (event) await syncAppointmentPaymentStatus(req.tenantSchema!, event, transaction, req.access!.userId);
         }

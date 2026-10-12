@@ -85,6 +85,63 @@ test('contextual prefill returns fresh authorized labels and cannot expose anoth
     assert.equal((await h.api(h.actors.ownerA, 'GET', '/activities?agendaEventId=' + randomUUID())).status, 404);
 });
 
+test('legacy snapshot patient links resolve contextual activities without changing the historical appointment', async () => {
+    const {patient, event} = await resourcePair();
+    await event.update({patientId: null, patient: {id: patient.id, name: 'Historical snapshot',
+        notes: 'Private snapshot notes', email: 'legacy-private@example.invalid'}});
+    const suffix = '?patientId=' + patient.id + '&agendaEventId=' + event.id;
+    const links = data(await h.api(h.actors.ownerA, 'GET', '/activities/links' + suffix));
+    assert.deepEqual(links.patient, {id: patient.id, displayName: 'Ada Rossi'});
+    assert.equal(links.agendaEvent.id, event.id);
+    assert.equal(links.capabilities.canCreate, true);
+    assert.ok(!JSON.stringify(links).includes('Historical snapshot'));
+    assert.ok(!JSON.stringify(links).includes('Private snapshot notes'));
+    assert.ok(!JSON.stringify(links).includes('legacy-private@example.invalid'));
+
+    const empty = data(await h.api(h.actors.ownerA, 'GET', '/activities' + suffix + '&view=list'));
+    assert.equal(empty.total, 0);
+    assert.deepEqual(empty.items, []);
+    const linked = await create('Legacy appointment activity', {patientId: patient.id, agendaEventId: event.id});
+    const list = data(await h.api(h.actors.ownerA, 'GET', '/activities' + suffix + '&view=list'));
+    assert.equal(list.total, 1);
+    assert.deepEqual(list.items.map((item: any) => item.id), [linked.id]);
+    assert.equal(list.items[0].patientId, patient.id);
+    assert.equal(list.items[0].agendaEventId, event.id);
+    const lookup = data(await h.api(h.actors.ownerA, 'GET', '/activities/agenda-events?patientId=' + patient.id));
+    assert.deepEqual(lookup.items.map((item: any) => item.id), [event.id]);
+    assert.ok(!JSON.stringify(lookup).includes('Private snapshot notes'));
+    assert.ok(!JSON.stringify(lookup).includes('legacy-private@example.invalid'));
+    for (const actor of [h.actors.ownerA2, h.actors.ownerB]) {
+        assert.equal((await h.api(actor, 'GET', '/activities/links' + suffix)).status, 404);
+        assert.equal((await h.api(actor, 'GET', '/activities' + suffix + '&view=list')).status, 404);
+    }
+    await event.reload();
+    assert.equal(event.patientId, null, 'Read and link validation must not rewrite the historical patient reference');
+});
+
+test('typed appointment patient references take precedence over stale snapshot IDs in links, lists and lookup', async () => {
+    const selected = await resourcePair(), actual = await resourcePair();
+    const query = 'Typed patient reference ' + randomUUID();
+    await selected.event.update({title: query, patientId: actual.patient.id, patient: {id: selected.patient.id}});
+    const mismatch = '?patientId=' + selected.patient.id + '&agendaEventId=' + selected.event.id;
+    for (const path of ['/activities/links' + mismatch, '/activities' + mismatch + '&view=list']) {
+        const result = await h.api(h.actors.ownerA, 'GET', path);
+        assert.equal(result.status, 422, JSON.stringify(result.body));
+        assert.equal(result.body.error.code, 'ACTIVITY_VALIDATION_FAILED');
+    }
+    const staleLookup = data(await h.api(h.actors.ownerA, 'GET',
+        '/activities/agenda-events?patientId=' + selected.patient.id + '&query=' + encodeURIComponent(query)));
+    assert.deepEqual(staleLookup.items, []);
+    assert.equal(staleLookup.total, 0);
+    const actualLookup = data(await h.api(h.actors.ownerA, 'GET',
+        '/activities/agenda-events?patientId=' + actual.patient.id + '&query=' + encodeURIComponent(query)));
+    assert.deepEqual(actualLookup.items.map((item: any) => item.id), [selected.event.id]);
+    const links = data(await h.api(h.actors.ownerA, 'GET',
+        '/activities/links?patientId=' + actual.patient.id + '&agendaEventId=' + selected.event.id));
+    assert.equal(links.patient.id, actual.patient.id);
+    assert.equal(links.agendaEvent.id, selected.event.id);
+});
+
 test('appointment filters use a persisted series UUID and cursors cannot cross resource filters', async () => {
     const first = await resourcePair(), second = await resourcePair();
     const firstA = await create('First linked A', {patientId: first.patient.id, agendaEventId: first.event.id});

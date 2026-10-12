@@ -14,6 +14,7 @@ import {
     snapshotAppointmentPrice, summarizeAppointmentPayments, syncAppointmentPaymentStatus
 } from '../../invoice/services/appointmentPayment.service.js';
 import { patientPaymentPositionsByReferenceEvents } from '../services/patientPaymentPosition.service.js';
+import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
 
 const SCOPE = { ownerField: 'calendarId', structureField: 'structureId', includeUnassigned: false };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -69,6 +70,24 @@ function patientIdOf(event: Record<string, any>): string | null {
     return event.patientId ?? snapshot?.id ?? null;
 }
 
+async function lockAppointmentPatient(req: Request, eventId: string, transaction: any): Promise<string> {
+    const snapshot = await AgendaEvent.schema(req.tenantSchema!).findOne({
+        where: { id: eventId, ...scopeWhere(req, SCOPE) }, transaction
+    });
+    if (!snapshot) return fail(404, 'Appuntamento non trovato o non accessibile');
+    const patientId = patientIdOf(snapshot.get({ plain: true }));
+    if (!patientId) return fail(422, 'La gestione economica richiede una seduta con paziente');
+    await lockPatientSettlement(req.tenantSchema!, patientId, transaction);
+    return patientId;
+}
+
+function settlementContext(req: Request, event: AgendaEvent) {
+    const patientId = patientIdOf(event.get({ plain: true }));
+    const structureId = event.structureId ?? req.access?.structureId;
+    if (!patientId || !structureId) return fail(409, 'Paziente e sede della seduta devono essere verificati prima di registrare');
+    return { patientId, structureId, referenceAgendaEventId: event.id };
+}
+
 async function completeAppointmentAfterPayment(
     event: AgendaEvent,
     userId: string,
@@ -111,11 +130,13 @@ async function writePayment(req: Request, res: Response, cumulative: boolean, pr
     if (!UUID.test(req.params.agendaEventId)) return sendErrorResponse(res, 400, 'Appuntamento non valido');
     try {
         const result = await sequelize.transaction(async transaction => {
+            const lockedPatientId = await lockAppointmentPatient(req, req.params.agendaEventId, transaction);
             const event = await AgendaEvent.schema(schema).findOne({
                 where: { id: req.params.agendaEventId, ...scopeWhere(req, SCOPE) },
                 transaction, lock: transaction.LOCK.UPDATE
             });
             if (!event) return fail(404, 'Appuntamento non trovato o non accessibile');
+            if (patientIdOf(event.get({ plain: true })) !== lockedPatientId) fail(409, 'Il paziente della seduta è cambiato: ricarica la posizione');
             const linkedInvoice = await getLinkedInvoiceId(schema, event.id, event.invoiceId);
             if (linkedInvoice) fail(409, 'Appuntamento fatturato: gestisci i pagamenti dalla fattura');
             if (event.recurrence || event.recurringEventId) fail(422, 'Separa la singola occorrenza dalla serie prima di registrare incassi');
@@ -176,15 +197,8 @@ async function writePayment(req: Request, res: Response, cumulative: boolean, pr
             }
             let payment: InvoicePayment | null = null;
             if (amount > 0) {
-                const position = (await patientPaymentPositionsByReferenceEvents(
-                    schema, [event.get({ plain: true })], scopeWhere(req, SCOPE),
-                    { itemLimit: null, includeInvoices: false, transaction, lockRows: true }
-                )).get(event.id);
-                const oldestDebt = position?.items.find(item => item.kind === 'APPOINTMENT' && item.selectable);
-                if (oldestDebt) fail(409, `Salda prima la seduta precedente del ${oldestDebt.date ?? 'periodo precedente'}`);
-                if (expected.amount !== null && amount < (previous.balance ?? 0) - 0.009) {
-                    fail(409, `Per questa operazione devi saldare l’intero residuo: minimo € ${(previous.balance ?? 0).toFixed(2)}`);
-                }
+                await assertPatientSettlementAllocations(schema, settlementContext(req, event),
+                    [{ kind: 'APPOINTMENT', targetId: event.id, amount }], transaction);
                 if (expected.amount === null) {
                     const finalAmount = paymentMoney(previous.paidAmount + amount);
                     await event.update({
@@ -251,6 +265,7 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
     try {
         validateMovement(req.body);
         const result = await sequelize.transaction(async transaction => {
+            const lockedPatientId = await lockAppointmentPatient(req, req.params.agendaEventId, transaction);
             const requestedIds = [...new Set([
                 req.params.agendaEventId,
                 ...allocations.map(allocation => allocation.agendaEventId)
@@ -264,18 +279,15 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
             const reference = eventById.get(req.params.agendaEventId)!;
             const referencePatientId = patientIdOf(reference.get({ plain: true }));
             if (!referencePatientId) fail(422, 'L’incasso richiede una seduta con paziente');
+            if (referencePatientId !== lockedPatientId) fail(409, 'Il paziente della seduta è cambiato: ricarica la posizione');
             const referenceTime = Date.parse(reference.start ?? '');
             if (!Number.isFinite(referenceTime)) fail(409, 'Data della seduta non valida');
-            const patientPosition = (await patientPaymentPositionsByReferenceEvents(
-                schema, [reference.get({ plain: true })], scopeWhere(req, SCOPE),
-                { itemLimit: null, includeInvoices: false, transaction, lockRows: true }
-            )).get(reference.id);
-
             const histories = new Map<string, InvoicePayment[]>();
             for (const allocation of allocations) {
                 const event = eventById.get(allocation.agendaEventId)!;
                 const plain = event.get({ plain: true }) as Record<string, any>;
                 if (patientIdOf(plain) !== referencePatientId) fail(409, 'Le sedute selezionate devono appartenere allo stesso paziente');
+                if ((event.structureId ?? req.access?.structureId) !== settlementContext(req, reference).structureId) fail(409, 'Le sedute selezionate devono appartenere alla stessa sede');
                 const start = Date.parse(event.start ?? '');
                 if (!Number.isFinite(start) || start > Date.now() || start > referenceTime) {
                     fail(409, 'Sono selezionabili soltanto la seduta corrente e quelle precedenti');
@@ -341,19 +353,9 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
                 prepared.push({ allocation, event, history, price, previous });
             }
             const preparedById = new Map(prepared.map(item => [item.event.id, item]));
-            const priorityRows: SequentialSettlementRow[] = (patientPosition?.items ?? [])
-                .filter(item => item.kind === 'APPOINTMENT' && item.selectable && item.agendaEventId)
-                .map(item => ({ id: item.agendaEventId!, title: item.title, balance: item.balance }));
-            priorityRows.push({
-                id: reference.id,
-                title: reference.title || 'Seduta corrente',
-                balance: preparedById.get(reference.id)?.previous.balance ?? null
-            });
-            prepared.forEach(item => {
-                const row = priorityRows.find(candidate => candidate.id === item.event.id);
-                if (row) row.balance = item.previous.balance;
-            });
-            const orderedAllocations = validateSequentialAppointmentAllocations(priorityRows, allocations);
+            const orderedAllocations = (await assertPatientSettlementAllocations(schema, settlementContext(req, reference),
+                allocations.map(allocation => ({ kind: 'APPOINTMENT' as const, targetId: allocation.agendaEventId, amount: allocation.amount })),
+                transaction)).map(allocation => ({ agendaEventId: allocation.targetId, amount: allocation.amount }));
 
             const created: Array<{payment: InvoicePayment; summary: any; agendaEvent: Record<string, any>}> = [];
             for (const allocation of orderedAllocations) {
@@ -434,7 +436,7 @@ export const listAppointmentPayments = asyncHandler(async (req, res) => {
         })
     ]);
     const price = priceMap.get(event.id)!;
-    return sendSuccessResponse(res, 200, { payments,
+    return sendSuccessResponse(res, 200, { payments, patientId: patientIdOf(plainEvent), structureId: event.structureId ?? req.access?.structureId ?? null,
         pricing: {
             originalAmount: event.appointmentOriginalAmount == null
                 ? event.appointmentPriceAdjustment ? null : price.amount : paymentMoney(event.appointmentOriginalAmount),
@@ -460,11 +462,13 @@ export const voidAppointmentPayment = asyncHandler(async (req, res) => {
     if (reason.length < 3 || reason.length > 2000) return sendErrorResponse(res, 400, 'Indica un motivo di annullamento da 3 a 2000 caratteri');
     try {
         const result = await sequelize.transaction(async transaction => {
+            const lockedPatientId = await lockAppointmentPatient(req, req.params.agendaEventId, transaction);
             const event = await AgendaEvent.schema(schema).findOne({
                 where: { id: req.params.agendaEventId, ...scopeWhere(req, SCOPE) },
                 transaction, lock: transaction.LOCK.UPDATE
             });
             if (!event) return fail(404, 'Appuntamento non trovato o non accessibile');
+            if (patientIdOf(event.get({ plain: true })) !== lockedPatientId) fail(409, 'Il paziente della seduta è cambiato: ricarica la posizione');
             if (await getLinkedInvoiceId(schema, event.id, event.invoiceId)) {
                 fail(409, 'Incasso collegato a fattura: annulla il movimento dalla fattura');
             }
@@ -475,6 +479,7 @@ export const voidAppointmentPayment = asyncHandler(async (req, res) => {
             if (!payment) return fail(404, 'Pagamento non trovato');
             if (payment.status !== 'POSTED') fail(409, 'Pagamento già annullato o trasferito a credito');
             if (payment.source === 'PACKAGE') fail(409, 'La copertura da pacchetto non è uno storno di incasso');
+            if (payment.source === 'CREDIT') fail(409, 'La copertura da credito va annullata dal registro crediti');
             await payment.update({ status: 'VOID', voidedAt: new Date(), voidedByUserId: getUserId(req), voidReason: reason }, { transaction });
             const summary = await syncAppointmentPaymentStatus(schema, event, transaction, getUserId(req));
             return { payment, summary, agendaEvent: event };

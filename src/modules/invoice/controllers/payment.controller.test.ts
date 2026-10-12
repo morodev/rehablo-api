@@ -5,6 +5,8 @@ import { Op } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 import Invoice from '../models/invoice.model.js';
 import InvoicePayment from '../models/invoicePayment.model.js';
+import InvoiceAgendaEvent from '../models/invoiceAgendaEvent.model.js';
+import EventType from '../../agenda/models/eventType.model.js';
 import { CarePackage, FinancialAccount, PackageConsumption, PatientCredit, PaymentMethod, TreasuryMovement } from '../../administration/models/index.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import Tenant from '../../auth/models/tenant.model.js';
@@ -23,7 +25,7 @@ const ScopedPayment = InvoicePayment.schema(schema);
 const generator = (sequelize.getQueryInterface() as any).queryGenerator;
 
 function record(values: Record<string, any>): any {
-    return { ...values, get(key: string | object) { return typeof key === 'string' ? this[key] : { ...values, status: this.status }; },
+    return { ...values, get(key: string | object) { if (typeof key === 'string') return this[key]; const {get, update, ...plain} = this; return plain; },
         async update(changes: object) { Object.assign(this, changes); return this; } };
 }
 
@@ -36,7 +38,10 @@ function run(handler: (req: Request, res: Response, next: NextFunction) => void,
 }
 
 function fixture(t: TestContext) {
-    const invoice = record({ id, structureId, patientID: userId, invoiceTotal: 100, status: 'unpaid', documentType: 'fattura' });
+    const invoice = record({ id, structureId, patientID: userId, invoiceTotal: 100, status: 'unpaid', documentType: 'fattura',
+        documentNumber: 1, emissionDate: '2025-01-01' });
+    const invoices = [invoice];
+    const appointments: any[] = [];
     const accounts = [record({ id: accountId, structureId, isActive: true })];
     const payments: any[] = [];
     const movements: any[] = [];
@@ -57,8 +62,13 @@ function fixture(t: TestContext) {
     }) as any);
     t.mock.method(Invoice, 'schema', (() => ({
         findOne: async ({ where }: any) => { invoiceWhere.push(where); return where.id === invoice.id ? invoice : null; },
-        findByPk: async () => invoice
+        findByPk: async () => invoice,
+        findAll: async () => invoices
     })) as any);
+    t.mock.method(AgendaEvent, 'schema', (() => ({findAll: async () => appointments})) as any);
+    t.mock.method(InvoiceAgendaEvent, 'schema', (() => ({findAll: async () => []})) as any);
+    t.mock.method(EventType, 'schema', (() => ({findAll: async () => []})) as any);
+    t.mock.method(Tenant, 'findByPk', (async () => record({taxRegime: 'forfettario'})) as any);
     t.mock.method(InvoicePayment, 'schema', (() => ({
         findAll: async () => payments,
         findOne: async ({ where }: any) => payments.find(payment => payment.id === where.id && payment.invoiceId === where.invoiceId),
@@ -103,10 +113,32 @@ function fixture(t: TestContext) {
         body: { amount: 60, paidAt: '2025-01-15', accountId, paymentMethodId: methodId, note: 'Acconto' },
         header: () => 'receipt-test-1'
     };
-    return { req, invoice, accounts, payments, movements, credits, queries, invoiceWhere, failMovement: () => { failMovement = true; } };
+    return { req, invoice, invoices, appointments, accounts, payments, movements, credits, queries, invoiceWhere, failMovement: () => { failMovement = true; } };
 }
 
 describe('invoice receipt controller and treasury hook', () => {
+    it('blocks a later invoice while an older autonomous invoice in the same site remains unpaid', async t => {
+        const f = fixture(t);
+        f.invoice.emissionDate = '2025-01-10';
+        f.invoices.push(record({id: accountId, patientID: userId, structureId, documentNumber: 2,
+            emissionDate: '2025-01-02', invoiceTotal: 80, status: 'unpaid', documentType: 'fattura'}));
+        const response = await run(createPayment, f.req);
+        assert.equal(response.status, 409);
+        assert.match(response.body.message, /precedente/);
+        assert.equal(f.payments.length, 0);
+        assert.equal(f.movements.length, 0);
+    });
+    it('includes verified prior appointments in invoice priority but excludes other-site debts', async t => {
+        const f = fixture(t);
+        f.appointments.push(record({id: accountId, patientId: userId, structureId, title: 'Seduta precedente',
+            start: '2024-12-01T10:00:00Z', end: '2024-12-01T11:00:00Z', status: 'COMPLETED',
+            appointmentExpectedAmount: 60, appointmentPaymentHistoryKnown: true}));
+        assert.equal((await run(createPayment, f.req)).status, 409);
+        assert.equal(f.payments.length, 0);
+        f.appointments[0].structureId = tenantId;
+        assert.equal((await run(createPayment, f.req)).status, 201);
+        assert.equal(f.payments.length, 1);
+    });
     it('posts one receipt and one movement to the chosen account, updating the residual in the same transaction', async t => {
         const f = fixture(t);
         const response = await run(createPayment, f.req);
@@ -272,7 +304,7 @@ describe('invoice receipt controller and treasury hook', () => {
         assert.match(sql, /SELECT "id" FROM "rehablo_[a-f0-9]+"."patients" WHERE "structureId"/);
         f.req.access.scope = 'own';
         await run(createPayment, f.req);
-        const ownSql = generator.selectQuery({ tableName: 'invoices', schema }, { where: f.invoiceWhere[1] });
+        const ownSql = generator.selectQuery({ tableName: 'invoices', schema }, { where: f.invoiceWhere.at(-1) });
         assert.match(ownSql, /WHERE "userId" =/);
         assert.ok(f.invoiceWhere[0].patientID[Op.in]);
     });
@@ -314,6 +346,11 @@ describe('package coverage and retained patient credits', () => {
         })) as any);
         const req: any = { tenantSchema: schema, params: { id: packageId }, body: { units: 1, agendaEventId: eventId },
             access: { scope: 'tenant', structureId, userId } };
+        event.appointmentPaidAmount = 20;
+        assert.equal((await run(administration.consumePackage, req)).status, 409);
+        assert.equal(pack.remainingUnits, 2);
+        assert.equal(payments.length, 0);
+        event.appointmentPaidAmount = 0;
         const first = await run(administration.consumePackage, req);
         assert.equal(first.status, 201);
         assert.equal(pack.remainingUnits, 1);
@@ -322,7 +359,8 @@ describe('package coverage and retained patient credits', () => {
         assert.equal(event.appointmentPaidAmount, 100);
         assert.equal(payments[0].source, 'PACKAGE');
         assert.equal(consumptions.length, 1);
-        assert.equal(queries.length, 0);
+        assert.equal(queries.some(sql => /INSERT|UPDATE.*treasury_movements/i.test(sql)), false);
+        assert.equal(queries.some(sql => sql.includes('pg_advisory_xact_lock')), true);
         const duplicate = await run(administration.consumePackage, req);
         assert.equal(duplicate.status, 409);
         assert.equal(pack.remainingUnits, 1);

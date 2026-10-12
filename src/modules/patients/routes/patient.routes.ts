@@ -1,8 +1,9 @@
 import { Router } from 'express';
 import { requireAuth } from '../../../middleware/auth.js';
-import { requirePermission } from '../../../middleware/rbac.js';
+import { requireAnyPermission, requirePermission } from '../../../middleware/rbac.js';
 import { resolveTenantSchema } from '../../../middleware/tenantSchema.js';
 import patientController from '../controllers/patient.controller.js';
+import {createPatientSettlement, getPatientSettlementPosition} from '../controllers/patientSettlement.controller.js';
 
 const router = Router();
 
@@ -13,6 +14,9 @@ router.use(requireAuth, resolveTenantSchema);
 router.post('/patient', requirePermission('patient', 'create'), patientController.savePatient);
 router.get('/patient/search', requirePermission('patient', 'read'), patientController.searchPatients);
 router.get('/patient', requirePermission('patient', 'read'), patientController.findAndCountAll);
+// Core cash collection remains available without enabling the Administration module.
+router.get('/patient/:patientId/settlement-position', requireAnyPermission(['agenda', 'read'], ['invoice', 'read']), getPatientSettlementPosition);
+router.post('/patient/:patientId/settlements', requireAnyPermission(['agenda', 'update'], ['invoice', 'update'], ['quote', 'update']), createPatientSettlement);
 router.post('/patient/:patientId/privacy-document', requirePermission('patient', 'update'), patientController.privacyDocumentUploadMiddleware, patientController.uploadPrivacyDocument);
 router.get('/patient/:patientId/privacy-document', requirePermission('patient', 'read'), patientController.downloadPrivacyDocument);
 router.patch('/patient/:patientId/default-event-type', requirePermission('patient', 'update'), patientController.setDefaultEventType);
