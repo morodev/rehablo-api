@@ -7,7 +7,7 @@ import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 import type {Sequelize} from 'sequelize';
 
-type FixtureActor = {userId: string; tenantId: string; structureId: string | null; actor?: 'staff' | 'patient'};
+type FixtureActor = {userId: string; tenantId: string; structureId: string | null; actor?: 'staff' | 'patient'; patientAccessId?: string};
 export type ApiResult = {status: number; body: any};
 
 export async function createActivitiesHarness() {
@@ -42,6 +42,7 @@ export async function createActivitiesHarness() {
     const viewerA = randomUUID();
     const outsiderA = randomUUID();
     const ownerB = randomUUID();
+    const patientAccessId = randomUUID();
     const userIds = [ownerA, therapistA, viewerA, outsiderA, ownerB];
     const tenantIds = [tenantA, tenantB];
     const structureIds: string[] = [structureA, structureA2, structureB];
@@ -70,6 +71,7 @@ export async function createActivitiesHarness() {
                 assert.match(schema, /^rehablo_[a-f0-9]{32}$/);
                 await sequelize.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
             }
+            await auth.PatientPortalAccess.destroy({where: {id: patientAccessId}});
             await auth.StructureUser.destroy({where: {structureId: structureIds}});
             await auth.TenantUser.destroy({where: {tenantId: tenantIds}});
             await auth.StructureAvailability.destroy({where: {structureId: structureIds}});
@@ -120,6 +122,14 @@ export async function createActivitiesHarness() {
         await tenantSchema.ensureTenantSchema(tenantA);
         await tenantSchema.ensureTenantSchema(tenantB);
 
+        // A patient actor needs a real active portal context. Keep the same identity as
+        // ownerA to exercise switching between staff and patient contexts (including device logout).
+        const {default: Patient} = await import('../../patients/models/patient.model.js');
+        const patient = await Patient.schema(schemaA).create({tenantId: tenantA, structureId: structureA,
+            userId: ownerA, name: 'Portal', surname: `Fixture ${run}`});
+        await auth.PatientPortalAccess.create({id: patientAccessId, userId: ownerA, tenantId: tenantA,
+            patientId: patient.id, status: 'ACTIVE'});
+
         const {default: router} = await import('../routes/activities.routes.js');
         const {default: notificationsRouter} = await import('../routes/activityNotifications.routes.js');
         const {errorHandler, notFoundHandler} = await import('../../../middleware/errorHandler.js');
@@ -151,7 +161,7 @@ export async function createActivitiesHarness() {
         ownerB: {userId: ownerB, tenantId: tenantB, structureId: structureB},
         missingStructure: {userId: ownerA, tenantId: tenantA, structureId: null},
         foreignStructure: {userId: ownerA, tenantId: tenantA, structureId: structureB},
-        patient: {userId: ownerA, tenantId: tenantA, structureId: structureA, actor: 'patient'}
+        patient: {userId: ownerA, tenantId: tenantA, structureId: structureA, actor: 'patient', patientAccessId}
     } satisfies Record<string, FixtureActor>;
 
     const token = (actor: FixtureActor) => jwt.sign({
@@ -159,6 +169,7 @@ export async function createActivitiesHarness() {
         tenants: [{id: actor.tenantId}], tid: actor.tenantId, sid: actor.structureId,
         selectedPremise: actor.structureId ? {id: actor.structureId} : null,
         actor: actor.actor ?? 'staff', tokenUse: 'application',
+        ...(actor.patientAccessId ? {patientAccessId: actor.patientAccessId} : {}),
         // Deliberately stale/overpowered claims: the real Activities context must recheck database policy.
         role: 'OWNER', perms: ['activity:manage:tenant', 'structure:manage:tenant', 'user:manage:tenant']
     }, process.env.JWT_SECRET!, {expiresIn: '1h'});

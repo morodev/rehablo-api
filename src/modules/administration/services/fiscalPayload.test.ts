@@ -19,7 +19,8 @@ describe('buildSdiPayload', () => {
         const result = buildSdiPayload({
             issuer, recipient: businessRecipient, progressivo: '2026000012',
             lines: [{ kind: 'PRODUCT', name: 'Tutore', vat: '22', quantity: 1, unitPrice: 100 }],
-            document: { documentType: 'fattura', documentNumber: 12, documentYear: 2026, emissionDate: '2026-03-15' },
+            document: { documentType: 'fattura', documentNumber: 12, documentYear: 2026, emissionDate: '2026-03-15',
+                discSellingPrice: 100, invoiceVAT: 22, invoiceTotal: 122, invoiceNet: 122 },
         });
         assert.equal(result.channel, 'SDI');
         assert.deepEqual(result.errors, []);
@@ -31,7 +32,8 @@ describe('buildSdiPayload', () => {
         const result = buildSdiPayload({
             issuer, recipient: incomplete as any, progressivo: '2026000013',
             lines: [{ kind: 'PRODUCT', name: 'Tutore', vat: '22', quantity: 1, unitPrice: 100 }],
-            document: { documentType: 'fattura', documentNumber: 13, documentYear: 2026, emissionDate: '2026-03-15' },
+            document: { documentType: 'fattura', documentNumber: 13, documentYear: 2026, emissionDate: '2026-03-15',
+                discSellingPrice: 100, invoiceVAT: 22, invoiceTotal: 122, invoiceNet: 122 },
         });
         assert.equal(result.xml, null);
         assert.ok(result.errors.length > 0);

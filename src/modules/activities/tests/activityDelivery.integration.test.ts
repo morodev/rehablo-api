@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {createHash, randomUUID} from 'node:crypto';
 import {createRequire} from 'node:module';
-import {after, before, test} from 'node:test';
+import {after, afterEach, before, test} from 'node:test';
 import {createActivitiesHarness, type ActivitiesHarness, type ApiResult} from './activitiesTestHarness.js';
 import type {ActivityDeliveryTransport} from '../services/activityDeliveryTransport.service.js';
 
@@ -20,6 +20,10 @@ before(async () => {
     Preference = (await import('../models/activityNotificationPreference.model.js')).default;
     Subscription = (await import('../../notes/models/reminderPushSubscription.model.js')).default;
 }, {timeout: 180_000});
+afterEach(async () => {
+    // A failed assertion must not leave devices enrolled in the next delivery scenario.
+    if (h && Subscription) await Subscription.destroy({where: {userId: [h.ids.ownerA, h.ids.ownerB, h.ids.therapistA]}});
+});
 after(async () => {
     if (!h) return;
     await Preference.destroy({where: {userId: Object.values(h.ids).filter(id => [h.ids.ownerA, h.ids.ownerB, h.ids.therapistA].includes(id))}});

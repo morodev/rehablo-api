@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { sequelize } from '../../../config/database.js';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
@@ -18,30 +19,33 @@ export const saveQuestionnaire = asyncHandler(async (req: Request, res: Response
     const schema = req.tenantSchema!;
     const body = req.body as { title: string; description?: string; questionnaires: QuestionInput[] };
 
-    const questionnaire = await HumanBodyQuestionnaire.schema(schema).create({
-        title: body.title,
-        description: body.description
+    const questionnaire = await sequelize.transaction(async transaction => {
+        const questionnaire = await HumanBodyQuestionnaire.schema(schema).create({
+            title: body.title,
+            description: body.description
+        }, { transaction });
+
+        for (const questionData of body.questionnaires ?? []) {
+            const question = await HumanBodyQuestion.schema(schema).create({
+                text: questionData.text,
+                type: questionData.type,
+                humanBodyQuestionnaireId: questionnaire.get('id') as string
+            }, { transaction });
+
+            const answers = questionData.answers?.length
+                ? questionData.answers
+                : [{ text: '', isCorrect: false }];
+
+            await HumanBodyAnswer.schema(schema).bulkCreate(
+                answers.map((answerData) => ({
+                    text: answerData.text,
+                    isCorrect: answerData.isCorrect,
+                    humanBodyQuestionId: question.get('id') as string
+                })), { transaction }
+            );
+        }
+        return questionnaire;
     });
-
-    for (const questionData of body.questionnaires ?? []) {
-        const question = await HumanBodyQuestion.schema(schema).create({
-            text: questionData.text,
-            type: questionData.type,
-            humanBodyQuestionnaireId: questionnaire.get('id') as string
-        });
-
-        const answers = questionData.answers?.length
-            ? questionData.answers
-            : [{ text: '', isCorrect: false }];
-
-        await HumanBodyAnswer.schema(schema).bulkCreate(
-            answers.map((answerData) => ({
-                text: answerData.text,
-                isCorrect: answerData.isCorrect,
-                humanBodyQuestionId: question.get('id') as string
-            }))
-        );
-    }
 
     return sendSuccessResponse(res, 201, questionnaire, 'Questionnaire created');
 });
@@ -112,45 +116,46 @@ export const updateQuestionnaireById = asyncHandler(async (req: Request, res: Re
     const questionnaireId = req.params.questionnaireId;
     const updatedData = req.body.questionnaire ?? req.body;
 
-    const questionnaire = await HumanBodyQuestionnaire.schema(schema).findByPk(questionnaireId);
-    if (!questionnaire) {
-        return sendErrorResponse(res, 404, 'Questionnaire not found');
-    }
+    const questionnaire = await sequelize.transaction(async transaction => {
+        const questionnaire = await HumanBodyQuestionnaire.schema(schema).findByPk(questionnaireId, { transaction, lock: transaction.LOCK.UPDATE });
+        if (!questionnaire) return null;
+        await questionnaire.update({ title: updatedData.title, description: updatedData.description }, { transaction });
 
-    await questionnaire.update({ title: updatedData.title, description: updatedData.description });
+        for (const questionData of (updatedData.questionnaires ?? []) as QuestionInput[]) {
+            let question;
 
-    for (const questionData of (updatedData.questionnaires ?? []) as QuestionInput[]) {
-        let question;
-
-        if (questionData.id) {
-            question = await HumanBodyQuestion.schema(schema).findByPk(questionData.id);
-            if (question) {
-                await question.update({ text: questionData.text, type: questionData.type });
-            }
-        } else {
-            question = await HumanBodyQuestion.schema(schema).create({
-                text: questionData.text,
-                type: questionData.type,
-                humanBodyQuestionnaireId: questionnaire.get('id') as string
-            });
-        }
-
-        for (const answerData of questionData.answers ?? []) {
-            if (answerData.id) {
-                const answer = await HumanBodyAnswer.schema(schema).findByPk(answerData.id);
-                if (answer) {
-                    await answer.update({ text: answerData.text, isCorrect: answerData.isCorrect });
+            if (questionData.id) {
+                question = await HumanBodyQuestion.schema(schema).findByPk(questionData.id, { transaction });
+                if (question) {
+                    await question.update({ text: questionData.text, type: questionData.type }, { transaction });
                 }
-            } else if (question) {
-                await HumanBodyAnswer.schema(schema).create({
-                    text: answerData.text,
-                    isCorrect: answerData.isCorrect,
-                    humanBodyQuestionId: question.get('id') as string
-                });
+            } else {
+                question = await HumanBodyQuestion.schema(schema).create({
+                    text: questionData.text,
+                    type: questionData.type,
+                    humanBodyQuestionnaireId: questionnaire.get('id') as string
+                }, { transaction });
+            }
+
+            for (const answerData of questionData.answers ?? []) {
+                if (answerData.id) {
+                    const answer = await HumanBodyAnswer.schema(schema).findByPk(answerData.id, { transaction });
+                    if (answer) {
+                        await answer.update({ text: answerData.text, isCorrect: answerData.isCorrect }, { transaction });
+                    }
+                } else if (question) {
+                    await HumanBodyAnswer.schema(schema).create({
+                        text: answerData.text,
+                        isCorrect: answerData.isCorrect,
+                        humanBodyQuestionId: question.get('id') as string
+                    }, { transaction });
+                }
             }
         }
-    }
 
+        return questionnaire;
+    });
+    if (!questionnaire) return sendErrorResponse(res, 404, 'Questionnaire not found');
     return sendSuccessResponse(res, 200, questionnaire, 'Questionnaire updated successfully');
 });
 
@@ -158,19 +163,21 @@ export const deleteQuestionnaireById = asyncHandler(async (req: Request, res: Re
     const schema = req.tenantSchema!;
     const questionnaireId = req.params.questionnaireId;
 
-    const questionnaire = await HumanBodyQuestionnaire.schema(schema).findByPk(questionnaireId);
-    if (!questionnaire) {
-        return sendErrorResponse(res, 404, 'Questionnaire not found');
-    }
+    const removed = await sequelize.transaction(async transaction => {
+        const questionnaire = await HumanBodyQuestionnaire.schema(schema).findByPk(questionnaireId, { transaction, lock: transaction.LOCK.UPDATE });
+        if (!questionnaire) return false;
 
-    const questions = await HumanBodyQuestion.schema(schema).findAll({ where: { humanBodyQuestionnaireId: questionnaireId } });
+        const questions = await HumanBodyQuestion.schema(schema).findAll({ where: { humanBodyQuestionnaireId: questionnaireId }, transaction });
 
-    for (const question of questions) {
-        await HumanBodyAnswer.schema(schema).destroy({ where: { humanBodyQuestionId: question.get('id') } });
-    }
+        for (const question of questions) {
+            await HumanBodyAnswer.schema(schema).destroy({ where: { humanBodyQuestionId: question.get('id') }, transaction });
+        }
 
-    await HumanBodyQuestion.schema(schema).destroy({ where: { humanBodyQuestionnaireId: questionnaireId } });
-    await questionnaire.destroy();
+        await HumanBodyQuestion.schema(schema).destroy({ where: { humanBodyQuestionnaireId: questionnaireId }, transaction });
+        await questionnaire.destroy({ transaction });
+        return true;
+    });
+    if (!removed) return sendErrorResponse(res, 404, 'Questionnaire not found');
 
     return sendSuccessResponse(res, 200, null, 'Questionnaire deleted successfully');
 });

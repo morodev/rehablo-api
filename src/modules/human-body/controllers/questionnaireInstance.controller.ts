@@ -1,6 +1,8 @@
 import { Request, Response } from 'express';
+import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
+import { withScope } from '../../../utils/scopedWhere.js';
 import { sendSuccessResponse } from '../../../utils/response.js';
 import HumanBodyQuestionnaireInstance from '../models/humanBodyQuestionnaireInstance.model.js';
 import HumanBodyAnswerInstance from '../models/humanBodyAnswerInstance.model.js';
@@ -26,35 +28,38 @@ export const saveQuestionnaireInstance = asyncHandler(async (req: Request, res: 
         questions: AnswerInstanceInput[];
     };
 
-    await assertEvaluationEditable(schema, body.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined);
+    const instance = await sequelize.transaction(async transaction => {
+        await assertEvaluationEditable(schema, body.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined, transaction);
 
-    // Same pattern as saveSymptom/saveArticularity: attach the compiled questionnaire to
-    // an existing point (`humanBodyPointId`) or create one on the fly (`pointToCreate`),
-    // so it can be tracked/drawn on the body diagram exactly like symptoms and
-    // articularity already are.
-    const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId);
+        // Same pattern as saveSymptom/saveArticularity: attach the compiled questionnaire to
+        // an existing point (`humanBodyPointId`) or create one on the fly (`pointToCreate`),
+        // so it can be tracked/drawn on the body diagram exactly like symptoms and
+        // articularity already are.
+        const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId, transaction);
 
-    const instance = await HumanBodyQuestionnaireInstance.schema(schema).create({
-        userId: req.access!.userId,
-        patientId: body.patientId,
-        evaluationId: body.evaluationId ?? null,
-        humanBodyPointId,
-        humanBodyQuestionnaireId: body.questionnaireId
+        const instance = await HumanBodyQuestionnaireInstance.schema(schema).create({
+            userId: req.access!.userId,
+            patientId: body.patientId,
+            evaluationId: body.evaluationId ?? null,
+            humanBodyPointId,
+            humanBodyQuestionnaireId: body.questionnaireId
+        }, { transaction });
+
+        // NOTE: the legacy controller bulk-created rows referencing `userScaleInstanceId`/`questionScaleId`/
+        // `answerScaleId` (copy-pasted from the scale module), fields that don't even exist on this model.
+        // Fixed here to use the correct `HumanBodyAnswerInstance` fields.
+        const answersToSave = (body.questions ?? []).map((response) => ({
+            humanBodyQuestionnaireInstanceId: instance.get('id') as string,
+            humanBodyQuestionId: response.questionId,
+            humanBodyAnswerId: response.answerId ?? null,
+            customAnswer: response.customAnswer ?? null
+        }));
+
+        if (answersToSave.length > 0) {
+            await HumanBodyAnswerInstance.schema(schema).bulkCreate(answersToSave, { transaction });
+        }
+        return instance;
     });
-
-    // NOTE: the legacy controller bulk-created rows referencing `userScaleInstanceId`/`questionScaleId`/
-    // `answerScaleId` (copy-pasted from the scale module), fields that don't even exist on this model.
-    // Fixed here to use the correct `HumanBodyAnswerInstance` fields.
-    const answersToSave = (body.questions ?? []).map((response) => ({
-        humanBodyQuestionnaireInstanceId: instance.get('id') as string,
-        humanBodyQuestionId: response.questionId,
-        humanBodyAnswerId: response.answerId ?? null,
-        customAnswer: response.customAnswer ?? null
-    }));
-
-    if (answersToSave.length > 0) {
-        await HumanBodyAnswerInstance.schema(schema).bulkCreate(answersToSave);
-    }
 
     return sendSuccessResponse(res, 201, instance, 'Questionnaire instance saved');
 });
@@ -63,12 +68,12 @@ export const getQuestionnaireInstances = asyncHandler(async (req: Request, res: 
     const schema = req.tenantSchema!;
     const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
 
-    const where: Record<string, unknown> = { ...patientResourceScopeWhere(req, schema) };
+    const where: Record<string, unknown> = {};
     if (patientId) where.patientId = patientId;
     if (evaluationId) where.evaluationId = evaluationId;
 
     const instances = await HumanBodyQuestionnaireInstance.schema(schema).findAll({
-        where,
+        where: withScope(patientResourceScopeWhere(req, schema), where),
         include: [
             { model: HumanBodyQuestionnaire.schema(schema), attributes: ['title', 'description'] },
             {

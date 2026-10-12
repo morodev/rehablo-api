@@ -19,6 +19,7 @@ import {
 import { findUserByIdentityEmail } from '../services/identity.service.js';
 import { getRolePermissions, RoleCode } from '../rbac/roles.js';
 import { issueRefreshToken, revokeRefreshToken } from '../services/refreshToken.service.js';
+import { assertCurrentIdentity, getAuthVersion, isTenantAdministrator } from '../services/authState.service.js';
 
 export interface SessionContextSummary {
     id: string;
@@ -37,7 +38,8 @@ function signSelectionToken(user: User): string {
             id: user.get('id'),
             email: user.get('email'),
             isActive: user.get('isActive'),
-            isSuperAdmin: user.get('isSuperAdmin'),
+            isSuperAdmin: false,
+            authVersion: getAuthVersion(user.get('authVersion')),
             tenants: [],
             tokenUse: 'context_selection'
         },
@@ -139,6 +141,7 @@ export const listSessionContexts = asyncHandler(async (req: Request, res: Respon
     const userId = (req.user?.sub as string | undefined) ?? req.user?.id;
     const user = userId ? await User.findByPk(userId) : null;
     if (!user) return sendErrorResponse(res, 401, 'Utente non trovato');
+    assertCurrentIdentity(user, req.user?.authVersion);
 
     return sendSuccessResponse(res, 200, {
         selectionToken: signSelectionToken(user),
@@ -162,12 +165,14 @@ export const selectSessionContext = asyncHandler(async (req: Request, res: Respo
     if (!user || !user.get('isActive') || user.get('deactivatedAt')) {
         return sendErrorResponse(res, 403, 'Account non disponibile');
     }
+    assertCurrentIdentity(user, decoded.authVersion);
 
     const basePayload: Record<string, unknown> = {
         ...await projectStructureCalendar(user.get({ plain: true }), null, null),
         password: undefined,
         sub: user.get('id'),
         id: user.get('id'),
+        authVersion: getAuthVersion(decoded.authVersion),
         selectedPremise: null
     };
     delete basePayload.password;
@@ -195,6 +200,7 @@ export const selectSessionContext = asyncHandler(async (req: Request, res: Respo
         const role = membership.get('role') as RoleCode;
         const payload = {
             ...basePayload,
+            isSuperAdmin: isTenantAdministrator(user, membership),
             actor: 'staff',
             tid: tenantId,
             sid: null,
@@ -206,7 +212,8 @@ export const selectSessionContext = asyncHandler(async (req: Request, res: Respo
         const refresh = await issueRefreshToken(req, user.get('id') as string, {
             tenantId,
             structureId: null,
-            actor: 'staff'
+            actor: 'staff',
+            authVersion: getAuthVersion(decoded.authVersion)
         });
         if (previousRefreshToken) await revokeRefreshToken(previousRefreshToken, 'context_switch');
 
@@ -252,7 +259,8 @@ export const selectSessionContext = asyncHandler(async (req: Request, res: Respo
             tenantId,
             structureId: null,
             actor: 'patient',
-            patientAccessId: access.get('id') as string
+            patientAccessId: access.get('id') as string,
+            authVersion: getAuthVersion(decoded.authVersion)
         });
         if (previousRefreshToken) await revokeRefreshToken(previousRefreshToken, 'context_switch');
 

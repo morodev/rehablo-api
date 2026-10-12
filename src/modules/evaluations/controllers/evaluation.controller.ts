@@ -1,4 +1,6 @@
 import { Request, Response } from 'express';
+import { Transaction } from 'sequelize';
+import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { scopeWhere } from '../../../middleware/rbac.js';
@@ -245,14 +247,17 @@ export const cloneEvaluationHandler = asyncHandler(async (req: Request, res: Res
     const sourceId = req.params.evaluationId;
 
     // Si può duplicare solo una valutazione che si ha il diritto di vedere.
-    const source = await Evaluation.schema(schema).findOne({
-        where: { id: sourceId, ...scopeWhere(req, EVALUATION_SCOPE_FIELDS) }
+    const created = await sequelize.transaction({ isolationLevel: Transaction.ISOLATION_LEVELS.REPEATABLE_READ }, async transaction => {
+        const source = await Evaluation.schema(schema).findOne({
+            where: { id: sourceId, ...scopeWhere(req, EVALUATION_SCOPE_FIELDS) }, transaction
+        });
+        if (!source) return null;
+        return cloneEvaluation(schema, sourceId, { userId: req.user!.id }, transaction);
     });
-    if (!source) {
+    if (!created) {
         return sendErrorResponse(res, 404, 'Valutazione non trovata');
     }
 
-    const created = await cloneEvaluation(schema, sourceId, { userId: req.user!.id });
     return sendSuccessResponse(res, 201, created, 'Valutazione duplicata correttamente');
 });
 

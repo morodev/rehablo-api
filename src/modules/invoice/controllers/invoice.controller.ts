@@ -29,8 +29,8 @@ import { InvoiceIssuerSnapshot, InvoiceRecipientSnapshot } from '../models/invoi
 import { getStsFiscalSettings, invoiceStsCodeForSave } from '../utils/stsExpenseType.js';
 import { buildFiscalNotes, FiscalProfile, isStampDutyDue, resolveFiscalProfile } from '../utils/fiscalRegime.js';
 import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../utils/sistemaTS.js';
-import { buildFatturaPaXml } from '../utils/fatturaPa.js';
-import { InvoiceLineLike, invoiceRoutingLines, mapInvoiceToFatturaPa } from '../utils/invoiceFatturaPa.js';
+import { InvoiceLineLike, invoiceRoutingLines } from '../utils/invoiceFatturaPa.js';
+import { buildSdiPayloadFromInvoice } from '../../administration/services/fiscalPayload.js';
 import { resolveFiscalRouting } from '../../administration/services/fiscalRouting.service.js';
 import { invoiceEmissionMonth, invoicePaymentMonth, parseInvoiceMonthFilter } from '../utils/invoiceFilters.js';
 import { decorateInvoicesWithPayments, syncInvoicePaymentStatus } from '../services/payment.service.js';
@@ -1677,6 +1677,7 @@ export const getFiscalRouting = asyncHandler(async (req: Request, res: Response)
     const result = await loadInvoiceFiscalContext(req);
     if (!result.ok) return sendErrorResponse(res, result.status, result.message);
     const { decision, plain } = result.context;
+    const sdiPayload = decision.channels.includes('SDI') ? buildSdiPayloadFromInvoice(plain) : null;
     return sendSuccessResponse(res, 200, {
         documentId: plain.id,
         documentNumber: plain.documentNumber != null ? `${plain.documentNumber}/${plain.documentYear}` : null,
@@ -1684,17 +1685,17 @@ export const getFiscalRouting = asyncHandler(async (req: Request, res: Response)
         channels: decision.channels,
         sdi: decision.sdi,
         sts: decision.sts,
-        blocks: decision.blocks,
+        blocks: [...decision.blocks, ...(sdiPayload?.errors ?? [])],
         warnings: decision.warnings,
         needsHealthcareClassification: decision.needsHealthcareClassification,
-        canDownloadFatturaPa: decision.channels.includes('SDI')
+        canDownloadFatturaPa: Boolean(sdiPayload?.xml && sdiPayload.errors.length === 0)
     });
 });
 
 export const exportFatturaPa = asyncHandler(async (req: Request, res: Response) => {
     const result = await loadInvoiceFiscalContext(req);
     if (!result.ok) return sendErrorResponse(res, result.status, result.message);
-    const { plain, issuer, recipient, lines, decision } = result.context;
+    const { plain, decision } = result.context;
 
     if (!decision.channels.includes('SDI')) {
         if (!decision.sdi.required) {
@@ -1703,24 +1704,12 @@ export const exportFatturaPa = asyncHandler(async (req: Request, res: Response) 
         return sendErrorResponse(res, 422, decision.blocks.join(' ') || 'Dati insufficienti per la trasmissione SDI.');
     }
 
-    const progressivo = `${plain.documentYear ?? new Date().getFullYear()}${String(plain.documentNumber ?? 0).padStart(5, '0')}`.slice(0, 10);
-    let xml: string;
-    try {
-        xml = buildFatturaPaXml(mapInvoiceToFatturaPa({
-            issuer, recipient, lines, progressivo,
-            document: {
-                documentType: plain.documentType, documentNumber: plain.documentNumber, documentYear: plain.documentYear,
-                emissionDate: plain.emissionDate ? new Date(plain.emissionDate).toISOString().slice(0, 10) : null,
-                isStamp: plain.isStamp, stampAmount: plain.stampAmount, stampChargedToPatient: plain.stampChargedToPatient
-            }
-        }));
-    } catch (error) {
-        return sendErrorResponse(res, 422, (error as Error).message);
-    }
+    const payload = buildSdiPayloadFromInvoice(plain);
+    if (!payload.xml || payload.errors.length) return sendErrorResponse(res, 422, payload.errors.join(' '));
 
     res.setHeader('Content-Type', 'application/xml; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="fattura-pa-${plain.documentNumber ?? 'bozza'}-${plain.documentYear ?? ''}.xml"`);
-    return res.status(200).send(xml);
+    return res.status(200).send(payload.xml);
 });
 
 export default {

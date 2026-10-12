@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { getUserId, patientScopeWhere } from '../../../middleware/rbac.js';
@@ -21,52 +22,53 @@ export const assignProtocol = asyncHandler(async (req: Request, res: Response) =
     const { protocolTemplateId, patientId, startDate, notes } = req.body;
 
     // Si può assegnare un protocollo solo a un paziente che si ha il diritto di vedere.
-    const patient = await Patient.schema(schema).findOne({
-        where: {
-            id: patientId,
-            structureId: req.access?.structureId ?? null,
-            archivedAt: null
+    const result = await sequelize.transaction(async transaction => {
+        const patient = await Patient.schema(schema).findOne({
+            where: {
+                id: patientId,
+                structureId: req.access?.structureId ?? null,
+                archivedAt: null
+            }, transaction
+        });
+        if (!patient) {
+            return { error: 'Paziente non trovato' } as const;
         }
-    });
-    if (!patient) {
-        return sendErrorResponse(res, 404, 'Paziente non trovato');
-    }
 
-    const phaseTemplates = await ProtocolPhaseTemplate.findAll({
-        where: { protocolTemplateId },
-        order: [['order', 'ASC']]
-    });
+        const phaseTemplates = await ProtocolPhaseTemplate.findAll({
+            where: { protocolTemplateId },
+            order: [['order', 'ASC']], transaction
+        });
 
-    if (phaseTemplates.length === 0) {
-        return sendErrorResponse(res, 404, 'Protocollo non trovato o privo di fasi');
-    }
+        if (phaseTemplates.length === 0) {
+            return { error: 'Protocollo non trovato o privo di fasi' } as const;
+        }
 
-    const instance = await ProtocolInstance.schema(schema).create({
-        patientId,
-        // Se non indicato, il protocollo appartiene a chi lo assegna: senza owner
-        // lo scope `own` non potrebbe mai ritrovarlo.
-        userId: getUserId(req),
-        protocolTemplateId,
-        startDate: startDate ?? new Date(),
-        notes
-    });
+        const instance = await ProtocolInstance.schema(schema).create({
+            patientId,
+            // Se non indicato, il protocollo appartiene a chi lo assegna: senza owner
+            // lo scope `own` non potrebbe mai ritrovarlo.
+            userId: getUserId(req),
+            protocolTemplateId,
+            startDate: startDate ?? new Date(),
+            notes
+        }, { transaction });
 
-    await Promise.all(
-        phaseTemplates.map((phaseTemplate, index) =>
-            ProtocolPhaseInstance.schema(schema).create({
+        for (const [index, phaseTemplate] of phaseTemplates.entries()) {
+            await ProtocolPhaseInstance.schema(schema).create({
                 protocolInstanceId: instance.get('id') as string,
                 protocolPhaseTemplateId: phaseTemplate.get('id') as string,
                 status: index === 0 ? 'IN_PROGRESS' : 'PENDING',
                 startDate: index === 0 ? startDate ?? new Date() : null
-            })
-        )
-    );
+            }, { transaction });
+        }
 
-    const created = await ProtocolInstance.schema(schema).findByPk(instance.get('id') as string, {
-        include: [{ model: ProtocolTemplate, required: false }, { model: ProtocolPhaseInstance.schema(schema) }]
+        const created = await ProtocolInstance.schema(schema).findByPk(instance.get('id') as string, {
+            include: [{ model: ProtocolTemplate, required: false }, { model: ProtocolPhaseInstance.schema(schema) }], transaction
+        });
+        return { created };
     });
-
-    return sendSuccessResponse(res, 201, created, 'Protocollo assegnato al paziente');
+    if (result.error) return sendErrorResponse(res, 404, result.error);
+    return sendSuccessResponse(res, 201, result.created, 'Protocollo assegnato al paziente');
 });
 
 export const findAllProtocolInstances = asyncHandler(async (req: Request, res: Response) => {

@@ -1,4 +1,5 @@
 import Evaluation from '../models/evaluation.model.js';
+import type { Transaction } from 'sequelize';
 
 /** Errore applicativo con statusCode, gestito da errorHandler.ts. */
 function httpError(statusCode: number, message: string): Error {
@@ -35,10 +36,15 @@ export function isEvaluationEditable(evaluation: Evaluation): boolean {
 export async function assertEvaluationEditable(
     schema: string,
     evaluationId?: string | null,
-    ownerUserId?: string
+    ownerUserId?: string,
+    transaction?: Transaction
 ): Promise<void> {
     if (!evaluationId) return;
-    const evaluation = await Evaluation.schema(schema).findByPk(evaluationId);
+    const evaluation = await Evaluation.schema(schema).findByPk(evaluationId, {
+        transaction,
+        // Keep the evaluation editable until all writes in this operation have finished.
+        ...(transaction ? { lock: transaction.LOCK.SHARE } : {})
+    });
     if (!evaluation) {
         throw httpError(404, 'Valutazione non trovata');
     }

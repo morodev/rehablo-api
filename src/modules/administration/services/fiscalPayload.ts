@@ -8,7 +8,7 @@
  */
 
 import { buildFatturaPaXml, validateFatturaPaInput } from '../../invoice/utils/fatturaPa.js';
-import { MapInvoiceParams, mapInvoiceToFatturaPa } from '../../invoice/utils/invoiceFatturaPa.js';
+import { MapInvoiceParams, mapInvoiceToFatturaPa, frozenInvoiceToFatturaPaParams } from '../../invoice/utils/invoiceFatturaPa.js';
 import {
     StsInvoiceMeta,
     StsPaymentSummary,
@@ -27,10 +27,24 @@ export interface FiscalPayloadResult {
 
 /** Costruisce il payload FatturaPA per lo SDI a partire dal documento immutabile. */
 export function buildSdiPayload(params: MapInvoiceParams): FiscalPayloadResult {
-    const input = mapInvoiceToFatturaPa(params);
-    const errors = validateFatturaPaInput(input);
-    if (errors.length > 0) return { channel: 'SDI', format: 'FatturaPA-FPR12', xml: null, errors };
-    return { channel: 'SDI', format: 'FatturaPA-FPR12', xml: buildFatturaPaXml(input), errors: [] };
+    try {
+        const input = mapInvoiceToFatturaPa(params);
+        const errors = validateFatturaPaInput(input);
+        if (errors.length > 0) return { channel: 'SDI', format: 'FatturaPA-FPR12', xml: null, errors };
+        return { channel: 'SDI', format: 'FatturaPA-FPR12', xml: buildFatturaPaXml(input), errors: [] };
+    } catch (error) {
+        return { channel: 'SDI', format: 'FatturaPA-FPR12', xml: null, errors: [(error as Error).message] };
+    }
+}
+
+/** Both HTTP download and provider transmission must use this frozen-data entry point. */
+export function buildSdiPayloadFromInvoice(invoice: Record<string, any>): FiscalPayloadResult {
+    try {
+        return buildSdiPayload(frozenInvoiceToFatturaPaParams(invoice));
+    } catch {
+        return { channel: 'SDI', format: 'FatturaPA-FPR12', xml: null,
+            errors: ['INVALID_FISCAL_SNAPSHOT: documento o righe congelate non validi.'] };
+    }
 }
 
 export interface StsPayloadParams {

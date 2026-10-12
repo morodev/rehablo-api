@@ -1,5 +1,6 @@
 import MetricDefinition from '../models/catalog/metricDefinition.model.js';
 import Observation from '../models/observation.model.js';
+import { withScope } from '../../../utils/scopedWhere.js';
 import type {
     ObservationAggregation,
     ObservationProvenance,
@@ -133,14 +134,14 @@ export interface ListObservationsFilter {
 
 /** Lettura delle Observation di un paziente (o filtrate per metrica/punto/valutazione). */
 export async function listObservations(schema: string, filter: ListObservationsFilter): Promise<Observation[]> {
-    const where: Record<string, unknown> = { ...(filter.scope ?? {}) };
+    const where: Record<string, unknown> = {};
     if (filter.patientId) where.patientId = filter.patientId;
     if (filter.metricCode) where.metricCode = filter.metricCode;
     if (filter.humanBodyPointId) where.humanBodyPointId = filter.humanBodyPointId;
     if (filter.evaluationId) where.evaluationId = filter.evaluationId;
 
     return Observation.schema(schema).findAll({
-        where,
+        where: withScope(filter.scope ?? {}, where),
         order: [
             ['effectiveDateTime', 'DESC'],
             ['metricCode', 'ASC']

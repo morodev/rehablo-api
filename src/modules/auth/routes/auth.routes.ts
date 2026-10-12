@@ -1,6 +1,6 @@
 import { getCalendarPreferences, updateCalendarPreferences } from '../controllers/calendarPreference.controller.js';
 import { Router } from 'express';
-import { requireAuth } from '../../../middleware/auth.js';
+import { requireAuth, requireIdentityAuth } from '../../../middleware/auth.js';
 import { requireAnyPermission, requirePermission } from '../../../middleware/rbac.js';
 import authController from '../controllers/auth.controller.js';
 import rbacController from '../controllers/rbac.controller.js';
@@ -21,7 +21,7 @@ router.post(
     sessionController.createSession
 );
 router.post('/auth/session/context', sessionController.selectSessionContext);
-router.get('/auth/session/contexts', requireAuth, sessionController.listSessionContexts);
+router.get('/auth/session/contexts', requireIdentityAuth, sessionController.listSessionContexts);
 // Refresh e logout si autenticano con il refresh token nel body, non con l'access token:
 // devono funzionare anche quando quest'ultimo è già scaduto (dura pochi minuti).
 router.post('/auth/refresh', authController.refresh);

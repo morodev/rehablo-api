@@ -18,6 +18,7 @@ import { revokeAllForUser } from '../services/refreshToken.service.js';
 import {applyTeamMembershipChange, parseTeamChange, runTeamMutation, sendTeamOffboardingError, type TeamChange} from '../services/teamOffboarding.service.js';
 import {FutureAppointmentsRequireReplacementError, InvalidReplacementOperatorError} from '../../agenda/services/operatorReassignment.service.js';
 import { validateUserStructureSelection } from '../services/userStructurePolicy.service.js';
+import { assertCurrentIdentity } from '../services/authState.service.js';
 
 async function syncUserStructureAssignments(
     userId: string,
@@ -96,27 +97,19 @@ export const me = asyncHandler(async (req: Request, res: Response) => {
     if (!user) {
         return sendErrorResponse(res, 404, 'User not found');
     }
+    assertCurrentIdentity(user, req.user?.authVersion);
 
     const tenantId = (req.user?.tid as string) ?? req.user?.tenants?.[0]?.id ?? null;
     const structureId = getSelectedStructureId(req);
 
-    // Il ruolo viene riletto dal DB: se è cambiato dopo l'emissione del token,
-    // la risposta riflette la situazione reale.
-    const membership = tenantId ? await TenantUser.findOne({ where: { tenantId, userId } }) : null;
-    const assignment = structureId
-        ? await StructureUser.findOne({ where: { structureId, userId } })
-        : null;
-
-    const role = resolveEffectiveRole(
-        (membership?.get('role') as string) ?? null,
-        (assignment?.get('role') as string) ?? null
-    );
+    // requireAuth ha già risolto lo stato corrente, incluso l'eventuale principal paziente.
+    const role = isRoleCode(req.user?.role) ? req.user.role : null;
 
     return sendSuccessResponse(
         res,
         200,
         {
-            user: await projectStructureCalendar(user.get({plain: true}), tenantId, structureId),
+            user: await projectStructureCalendar({ ...user.get({plain: true}), isSuperAdmin: !!req.user?.isSuperAdmin }, tenantId, structureId),
             tenantId,
             structureId,
             role,
@@ -174,6 +167,5 @@ export default {
     updateUserStructureRole,
     updateUserStructures
 };
-
 
 

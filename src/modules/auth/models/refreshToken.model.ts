@@ -13,6 +13,7 @@ import { sequelize } from '../../../config/database.js';
 export interface RefreshTokenAttributes {
     id: string;
     userId: string;
+    authVersion: number;
     /** SHA-256 esadecimale del token consegnato al client. Mai il valore in chiaro. */
     tokenHash: string;
     /** Identifica la catena di rotazioni nata da un singolo login. */
@@ -33,7 +34,7 @@ export interface RefreshTokenAttributes {
 
 export type RefreshTokenCreationAttributes = Optional<
     RefreshTokenAttributes,
-    'id' | 'revokedAt' | 'revokedReason' | 'tenantId' | 'structureId' | 'actor' | 'patientAccessId' | 'userAgent' | 'ipAddress'
+    'id' | 'authVersion' | 'revokedAt' | 'revokedReason' | 'tenantId' | 'structureId' | 'actor' | 'patientAccessId' | 'userAgent' | 'ipAddress'
 >;
 
 export class RefreshToken
@@ -41,6 +42,7 @@ export class RefreshToken
     implements RefreshTokenAttributes {
     declare id: string;
     declare userId: string;
+    declare authVersion: number;
     declare tokenHash: string;
     declare familyId: string;
     declare expiresAt: Date;
@@ -58,6 +60,7 @@ RefreshToken.init(
     {
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
         userId: { type: DataTypes.UUID, allowNull: false },
+        authVersion: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
         tokenHash: { type: DataTypes.STRING(64), allowNull: false, unique: true },
         familyId: { type: DataTypes.UUID, allowNull: false },
         expiresAt: { type: DataTypes.DATE, allowNull: false },

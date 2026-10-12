@@ -1,4 +1,6 @@
 import { Request, Response } from 'express';
+import type { Transaction } from 'sequelize';
+import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { patientScopeWhere } from '../../../middleware/rbac.js';
@@ -10,17 +12,18 @@ import { ProtocolPhaseTemplate } from '../models/catalog/index.js';
  * `protocolInstanceId`. La verifica di accesso passa quindi dal protocollo padre,
  * che eredita l'ampiezza dai pazienti visibili.
  */
-async function canAccessPhase(req: Request, phaseInstanceId: string): Promise<boolean> {
+async function canAccessPhase(req: Request, phaseInstanceId: string, transaction?: Transaction): Promise<boolean> {
     const schema = req.tenantSchema!;
 
-    const phase = await ProtocolPhaseInstance.schema(schema).findByPk(phaseInstanceId);
+    const phase = await ProtocolPhaseInstance.schema(schema).findByPk(phaseInstanceId, { transaction });
     if (!phase) return false;
 
     const parent = await ProtocolInstance.schema(schema).findOne({
         where: {
             id: phase.get('protocolInstanceId') as string,
             ...patientScopeWhere(req, schema)
-        }
+        }, transaction,
+        ...(transaction ? { lock: transaction.LOCK.UPDATE } : {})
     });
 
     return !!parent;
@@ -52,32 +55,34 @@ export const advanceProtocolPhase = asyncHandler(async (req: Request, res: Respo
     const schema = req.tenantSchema!;
     const id = req.params.protocolPhaseInstanceId;
 
-    if (!(await canAccessPhase(req, id))) {
-        return sendErrorResponse(res, 404, 'Fase del protocollo non trovata');
-    }
+    const result = await sequelize.transaction(async transaction => {
+        if (!(await canAccessPhase(req, id, transaction))) return null;
 
-    const currentPhase = await ProtocolPhaseInstance.schema(schema).findByPk(id, {
-        include: [{ model: ProtocolPhaseTemplate }]
+        const currentPhase = await ProtocolPhaseInstance.schema(schema).findByPk(id, {
+            include: [{ model: ProtocolPhaseTemplate }], transaction
+        });
+
+        if (!currentPhase) {
+            return null;
+        }
+
+        await currentPhase.update({ status: 'COMPLETED', endDate: new Date(), progressionNotes: req.body.progressionNotes }, { transaction });
+
+        const currentTemplate = (currentPhase as any).protocolPhaseTemplate;
+
+        const nextPhase = await ProtocolPhaseInstance.schema(schema).findOne({
+            where: { protocolInstanceId: currentPhase.get('protocolInstanceId') as string, status: 'PENDING' },
+            include: [{ model: ProtocolPhaseTemplate, where: { order: (currentTemplate?.order ?? 0) + 1 } }], transaction
+        });
+
+        if (nextPhase) {
+            await nextPhase.update({ status: 'IN_PROGRESS', startDate: new Date() }, { transaction });
+        }
+
+        return { completedPhase: currentPhase, nextPhase };
     });
-
-    if (!currentPhase) {
-        return sendErrorResponse(res, 404, 'Fase del protocollo non trovata');
-    }
-
-    await currentPhase.update({ status: 'COMPLETED', endDate: new Date(), progressionNotes: req.body.progressionNotes });
-
-    const currentTemplate = (currentPhase as any).protocolPhaseTemplate;
-
-    const nextPhase = await ProtocolPhaseInstance.schema(schema).findOne({
-        where: { protocolInstanceId: currentPhase.get('protocolInstanceId') as string, status: 'PENDING' },
-        include: [{ model: ProtocolPhaseTemplate, where: { order: (currentTemplate?.order ?? 0) + 1 } }]
-    });
-
-    if (nextPhase) {
-        await nextPhase.update({ status: 'IN_PROGRESS', startDate: new Date() });
-    }
-
-    return sendSuccessResponse(res, 200, { completedPhase: currentPhase, nextPhase }, 'Fase completata');
+    if (!result) return sendErrorResponse(res, 404, 'Fase del protocollo non trovata');
+    return sendSuccessResponse(res, 200, result, 'Fase completata');
 });
 
 export default {

@@ -359,7 +359,7 @@ test('a replay cannot bypass revocation of the current administrator', async () 
     await harness.auth.TenantUser.update({deactivatedAt: new Date()}, {where: {tenantId: harness.ids.tenantA, userId: harness.ids.ownerA}});
     try {
         const result = await harness.api(harness.actors.ownerA, 'PATCH', `/user/${harness.ids.therapistA}/status`, body);
-        assert.equal(result.status, 403);
+        failure(result, 401, 'AUTH_SESSION_INVALID');
     } finally {
         await harness.auth.TenantUser.update({deactivatedAt: null}, {where: {tenantId: harness.ids.tenantA, userId: harness.ids.ownerA}});
     }

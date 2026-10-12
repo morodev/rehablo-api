@@ -9,7 +9,7 @@
 
 | Requisito | Decisione |
 |---|---|
-| Ruoli operativi | Owner, Segreteria, Fisioterapista, Fisiatra, Ortopedico, Collaboratore esterno, Sola lettura, Paziente (+ SuperAdmin piattaforma) |
+| Ruoli operativi | Owner, Segreteria, Fisioterapista, Fisiatra, Ortopedico, Collaboratore esterno, Sola lettura, Paziente (+ privilegio del titolare nel proprio tenant) |
 | Granularità sui dati (own vs any) | **Sì, requisito** → permessi con *scope* |
 | Ruoli custom per tenant | No, **ruoli fissi di sistema** (seed nel codice) |
 | Scope del ruolo | Tenant **+ override per struttura** (`structure_users.role`) |
@@ -91,7 +91,7 @@ soddisfa anche una richiesta di `patient:read:own`.
 | Dati azienda / billing | tenant manage | tenant RU | — | — | — | — | — |
 
 > La matrice autoritativa è il codice: `src/modules/auth/rbac/roles.ts`.
-> `SUPER_ADMIN` non è un ruolo di tenant: è il flag `users.isSuperAdmin` e **bypassa** ogni check.
+> La registrazione mantiene `users.isSuperAdmin = true` e membership `OWNER`: il titolare conserva il pieno controllo del proprio centro. Il privilegio effettivo è però `flag persistito && actor staff && membership OWNER attiva nel tenant corrente`. `requireAuth` lo ricalcola dal DB, insieme a ruolo e permessi: una seconda membership con ruolo inferiore non eredita il bypass. Non esiste un nuovo ruolo globale né una bonifica degli account. Un OWNER invitato con flag persistito falso mantiene i permessi OWNER ordinari.
 
 ---
 
@@ -102,6 +102,7 @@ soddisfa anche una richiesta di `patient:read:own`.
 {
   "sub": "<userId>", "actor": "staff",
   "email": "...", "isSuperAdmin": false,
+  "authVersion": 0,
   "tid": "<tenantId>",           // tenant attivo
   "sid": "<structureId|null>",   // premise selezionato
   "role": "THERAPIST",
@@ -109,8 +110,15 @@ soddisfa anche una richiesta di `patient:read:own`.
 }
 ```
 
-Durata breve **per necessità**: i permessi viaggiano nei claim, quindi un token longevo
-terrebbe in vita permessi già revocati. Configurabile con `JWT_EXPIRES_IN` (default `15m`).
+Durata configurabile con `JWT_EXPIRES_IN` (default `15m`). La firma/scadenza è verificata insieme
+allo stato corrente dell'utente e alla sua `authVersion`. Per staff si rileggono membership attiva,
+ruolo ed eventuale assegnazione alla sede; per pazienti il collegamento attivo o storico al centro.
+La risoluzione viene condivisa fra middleware della stessa richiesta, senza cache tra richieste.
+Una richiesta staff con sede esegue fino a quattro letture (utente, membership, assegnazione,
+struttura); senza sede ne richiede due. I token precedenti privi di versione valgono come versione 0.
+Una membership revocata non conserva i vecchi permessi del JWT: il contesto è negato.
+`GET /auth/session/contexts` verifica l'identità e la versione senza richiedere la vecchia membership,
+per consentire la selezione di un altro centro. I token `context_selection` non sono access token.
 
 ### Refresh token (opaco, 30 giorni)
 Tabella `public.refresh_tokens`, `REFRESH_TOKEN_TTL_DAYS` (default 30).
@@ -119,9 +127,9 @@ Tabella `public.refresh_tokens`, `REFRESH_TOKEN_TTL_DAYS` (default 30).
 |---|---|
 | **Hashing** | si salva solo lo SHA-256: un dump del DB non permette di impersonare nessuno |
 | **Rotation** | ogni `/auth/refresh` invalida il token presentato ed emette il successivo |
-| **Reuse detection** | un token già ruotato che ricompare = copia in giro → si revoca l'intera `familyId` |
+| **Reuse detection** | fuori dalla tolleranza configurata un token già ruotato revoca l'intera `familyId`; nella grace si verificano comunque scadenza, stato utente e versione prima di emettere |
 | **Contesto** | il record memorizza `tenantId`/`structureId`, così il rinnovo resta coerente col premise |
-| **Purge** | token scaduti e revocati da oltre 30 giorni rimossi all'avvio e ogni 24h |
+| **Purge** | refresh scaduti o revocati da oltre 30 giorni, e link account scaduti, rimossi all'avvio e ogni 24h |
 
 La `familyId` identifica la catena di rotazioni nata da un singolo login. Revocarla chiude
 quella sessione e basta: gli altri dispositivi dell'utente restano attivi.
@@ -132,14 +140,36 @@ quella sessione e basta: gli altri dispositivi dell'utente restano attivi.
 | `POST /auth/login` | emette `accessToken` + `refreshToken` (nuova famiglia) |
 | `POST /auth/login-premise/:id` | riemette entrambi con ruolo e permessi della struttura scelta |
 | `POST /auth/refresh` | ruota il refresh e **ricalcola ruolo e permessi dal DB** |
-| `DELETE /auth/logout` | revoca il refresh token presentato |
+| `DELETE /auth/logout` | revoca la famiglia della sessione presentata, inclusi i predecessori nella grace; mantiene gli altri dispositivi |
 
 > `/auth/refresh` si autentica con il refresh token nel body, non con l'access token
 > (che a quel punto è scaduto per definizione).
 
-**Il refresh rilegge i permessi dal database**: è ciò che rende accettabile un access token
-breve senza penalizzare l'utente, e fa sì che un cambio di ruolo diventi effettivo entro
-15 minuti invece che a fine sessione.
+**Ogni richiesta rilegge i permessi dal database**: un cambio di ruolo diventa effettivo dalla
+richiesta successiva. Le richieste già autorizzate e in corso non vengono annullate retroattivamente.
+
+### Link account e reset password
+
+Verifica email e reset usano token opachi di 32 byte casuali, validi 12 ore e monouso. In
+`public.account_action_tokens` si memorizzano solo hash SHA-256, utente, email normalizzata,
+scopo (`verify_email` oppure `reset_password`), scadenza e stato di consumo. L'email deve
+ancora appartenere all'identità. Un link di verifica non può cambiare la password e un reset
+non verifica l'email né rimuove una sospensione. Registrazione, creazione membro, reinvio
+verifica e password dimenticata emettono questi token; le URL e i payload client restano uguali.
+I precedenti link JWT sono rifiutati con HTTP 400 e `error.code = ACCOUNT_ACTION_TOKEN_INVALID`:
+occorre richiedere un nuovo link. Il segreto e i token di licenza esistenti restano invariati.
+
+Il reset blocca prima la riga User e poi il token; nella stessa transazione consuma il link,
+aggiorna la password, incrementa `users.authVersion`, invalida gli altri link reset e revoca
+le famiglie refresh. Rotazione, logout e revoche condividono l'ordine User → token. Nessun
+refresh della vecchia versione, nemmeno nella grace, può produrre una sessione della nuova.
+Login, selezione contesto e cambio sede conservano la versione della credenziale autorizzante;
+`login-token` verifica lo stato corrente prima di ricompattare il JWT e mantiene iat/exp.
+Un errore DB viene passato all'error handler senza essere convertito in credenziale errata.
+
+La migrazione pubblica additiva `20261012-auth-security-public.js`, invocata da `syncAuthModels`,
+aggiunge versioni default 0 e tabella link con indici nominati. È idempotente e non modifica
+flag titolare, ruoli, abbonamenti o password esistenti. Non entra nel registro migrazioni tenant.
 
 ### Revoca su cambio ruolo
 `PATCH /user/:id/role` e `/structure-role` chiamano `revokeAllForUser()`: l'utente interessato

@@ -21,11 +21,9 @@ import { Invoice, InvoiceProduct, InvoiceService } from '../../invoice/models/in
 import Patient from '../../patients/models/patient.model.js';
 import { getPaymentSummaries } from '../../invoice/services/payment.service.js';
 import { buildIssuerSnapshot } from '../../invoice/utils/issuer.js';
-import { buildRecipientSnapshot } from '../../invoice/utils/recipient.js';
-import { InvoiceLineLike } from '../../invoice/utils/invoiceFatturaPa.js';
 import { getStsFiscalSettings, resolveStsExpenseType } from '../../invoice/utils/stsExpenseType.js';
 import { FiscalSubmission } from '../models/index.js';
-import { buildSdiPayload, buildStsPayload, FiscalPayloadResult } from './fiscalPayload.js';
+import { buildSdiPayloadFromInvoice, buildStsPayload, FiscalPayloadResult } from './fiscalPayload.js';
 import { resolveTransmissionGateway } from './fiscalGatewayFactory.js';
 import { loadStsCredentialsForTenant } from './stsCredentials.service.js';
 import { runTransmission } from './fiscalTransmission.service.js';
@@ -37,37 +35,16 @@ const validUuid = (value: unknown): value is string =>
     typeof value === 'string' && /^[a-f\d]{8}(-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(value);
 const fail = (statusCode: number, message: string): never => { throw Object.assign(new Error(message), { statusCode }); };
 
-function toLines(plain: Plain): InvoiceLineLike[] {
-    return [
-        ...(plain.products ?? []).map((line: Plain): InvoiceLineLike => ({
-            kind: 'PRODUCT', name: line.productName, vat: line.productVat, quantity: line.quantity, unitPrice: line.productPrice,
-        })),
-        ...(plain.services ?? []).map((line: Plain): InvoiceLineLike => ({
-            kind: 'SERVICE', name: line.serviceName, vat: line.serviceVat, quantity: line.quantity, unitPrice: line.servicePrice,
-        })),
-    ];
-}
-
 async function buildPayloadForChannel(
     schema: string, channel: 'SDI' | 'STS', plain: Plain, tenantData: Plain, patient: Plain | null, transaction: any
 ): Promise<FiscalPayloadResult> {
-    const issuer = plain.issuer ?? buildIssuerSnapshot(tenantData);
-    const emissionDate = plain.emissionDate ? new Date(plain.emissionDate).toISOString().slice(0, 10) : null;
-
     if (channel === 'SDI') {
-        const recipient = plain.recipient ?? (patient ? buildRecipientSnapshot(patient) : null);
-        if (!recipient) return { channel: 'SDI', format: 'FatturaPA-FPR12', xml: null, errors: ['Destinatario del documento mancante.'] };
-        const progressivo = `${plain.documentYear ?? new Date().getFullYear()}${String(plain.documentNumber ?? 0).padStart(5, '0')}`.slice(0, 10);
-        return buildSdiPayload({
-            issuer, recipient, lines: toLines(plain), progressivo,
-            document: {
-                documentType: plain.documentType, documentNumber: plain.documentNumber, documentYear: plain.documentYear,
-                emissionDate, isStamp: plain.isStamp, stampAmount: plain.stampAmount, stampChargedToPatient: plain.stampChargedToPatient,
-            },
-        });
+        return buildSdiPayloadFromInvoice(plain);
     }
 
     // Canale Sistema TS.
+    const issuer = plain.issuer ?? buildIssuerSnapshot(tenantData);
+    const emissionDate = plain.emissionDate ? new Date(plain.emissionDate).toISOString().slice(0, 10) : null;
     const settings = getStsFiscalSettings(tenantData);
     const sts = resolveStsExpenseType({ ...plain, issuer }, settings);
     if (sts.issue) return { channel: 'STS', format: 'SistemaTS', xml: null, errors: [sts.issue.message] };

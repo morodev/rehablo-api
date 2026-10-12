@@ -14,6 +14,8 @@
  * assume che il documento vada effettivamente allo SdI.
  */
 
+import { invoiceAmountInCents, roundInvoiceAmount } from './evalTotals.js';
+
 export type TipoDocumento = 'TD01' | 'TD04' | 'TD05' | 'TD24';
 
 export interface FatturaPaTransmission {
@@ -52,12 +54,18 @@ export interface FatturaPaLine {
     vatRate: number;
     /** Codice natura (es. 'N4' esente) — obbligatorio quando l'aliquota è 0. */
     natura?: string | null;
+    /** Frozen discounted line base, reconciled before serialization. */
+    netAmount?: number;
+    /** Document discount allocated to this unit; not an additional discount. */
+    discountUnitAmount?: number;
 }
 
 export interface FatturaPaBollo {
     /** true se sul documento è assolto il bollo virtuale. */
     virtuale: boolean;
     importo: number;
+    /** Declaration of virtual stamp is independent from charging it to the customer. */
+    chargedToCustomer?: boolean;
 }
 
 export interface FatturaPaInput {
@@ -73,11 +81,15 @@ export interface FatturaPaInput {
         bollo?: FatturaPaBollo | null;
     };
     lines: FatturaPaLine[];
+    /** Reconciled persisted total. A disagreement must never produce XML. */
+    expectedTotal?: number;
 }
 
-const money = (value: number): string => (Math.round(value * 100) / 100).toFixed(2);
+const money = (value: number): string => roundInvoiceAmount(value).toFixed(2);
 const rate = (value: number): string => (Math.round(value * 100) / 100).toFixed(2);
 const qty = (value: number): string => (Math.round(value * 100) / 100).toFixed(2);
+const preciseAmount = (value: number): string => value.toFixed(8).replace(/0+$/, '').replace(/\.$/, '.00');
+const lineBase = (line: FatturaPaLine): number => line.netAmount ?? roundInvoiceAmount(line.quantity * line.unitPrice);
 
 function escapeXml(value: string): string {
     return value
@@ -172,7 +184,21 @@ export function validateFatturaPaInput(input: FatturaPaInput): string[] {
         if (line.vatRate > 0 && filled(line.natura)) {
             errors.push(`Riga ${n}: la Natura non va indicata quando l'aliquota è maggiore di zero.`);
         }
+        if (line.netAmount != null) {
+            const discount = line.discountUnitAmount ?? 0;
+            const represented = Number.isFinite(discount)
+                ? invoiceAmountInCents(line.quantity * (line.unitPrice - Number(discount.toFixed(8)))) : Number.NaN;
+            if (!Number.isFinite(line.netAmount) || line.netAmount < 0 || !Number.isFinite(discount) || discount < 0
+                || represented !== invoiceAmountInCents(line.netAmount)) {
+                errors.push(`Riga ${n}: sconto e imponibile non riconciliati.`);
+            }
+        }
     });
+
+    if (input.expectedTotal != null && (!Number.isFinite(input.expectedTotal)
+        || invoiceAmountInCents(fatturaPaTotal(input)) !== invoiceAmountInCents(input.expectedTotal))) {
+        errors.push('FISCAL_TOTAL_MISMATCH: totale XML diverso dal documento congelato.');
+    }
 
     return errors;
 }
@@ -182,15 +208,15 @@ interface RiepilogoRow { aliquota: number; natura: string | null; imponibile: nu
 function summarize(lines: FatturaPaLine[]): RiepilogoRow[] {
     const groups = new Map<string, RiepilogoRow>();
     for (const line of lines) {
-        const imponibile = Math.round(line.quantity * line.unitPrice * 100) / 100;
+        const imponibile = lineBase(line);
         const natura = line.vatRate === 0 ? (line.natura ?? null) : null;
         const key = `${line.vatRate}|${natura ?? ''}`;
         const current = groups.get(key) ?? { aliquota: line.vatRate, natura, imponibile: 0, imposta: 0 };
-        current.imponibile = Math.round((current.imponibile + imponibile) * 100) / 100;
+        current.imponibile = roundInvoiceAmount(current.imponibile + imponibile);
         groups.set(key, current);
     }
     for (const row of groups.values()) {
-        row.imposta = Math.round(row.imponibile * (row.aliquota / 100) * 100) / 100;
+        row.imposta = roundInvoiceAmount((row.aliquota / 100) * row.imponibile);
     }
     return [...groups.values()];
 }
@@ -199,8 +225,9 @@ function summarize(lines: FatturaPaLine[]): RiepilogoRow[] {
 export function fatturaPaTotal(input: FatturaPaInput): number {
     const riepilogo = summarize(input.lines);
     const base = riepilogo.reduce((sum, row) => sum + row.imponibile + row.imposta, 0);
-    const bollo = input.document.bollo?.virtuale ? input.document.bollo.importo : 0;
-    return Math.round((base + bollo) * 100) / 100;
+    const bollo = input.document.bollo?.virtuale && input.document.bollo.chargedToCustomer !== false
+        ? input.document.bollo.importo : 0;
+    return roundInvoiceAmount(base + bollo);
 }
 
 function anagraficaXml(party: FatturaPaParty): string {
@@ -256,12 +283,13 @@ export function buildFatturaPaXml(input: FatturaPaInput): string {
     ].filter(Boolean).join('');
 
     const dettaglioLinee = input.lines.map((line, index) => {
-        const prezzoTotale = Math.round(line.quantity * line.unitPrice * 100) / 100;
+        const prezzoTotale = lineBase(line);
         const naturaXml = line.vatRate === 0 && filled(line.natura) ? `<Natura>${escapeXml(line.natura!.trim().toUpperCase())}</Natura>` : '';
         return `<DettaglioLinee><NumeroLinea>${index + 1}</NumeroLinea>`
             + `<Descrizione>${escapeXml(line.description.trim())}</Descrizione>`
             + `<Quantita>${qty(line.quantity)}</Quantita>`
-            + `<PrezzoUnitario>${money(line.unitPrice)}</PrezzoUnitario>`
+            + `<PrezzoUnitario>${preciseAmount(line.unitPrice)}</PrezzoUnitario>`
+            + (line.discountUnitAmount ? `<ScontoMaggiorazione><Tipo>SC</Tipo><Importo>${preciseAmount(line.discountUnitAmount)}</Importo></ScontoMaggiorazione>` : '')
             + `<PrezzoTotale>${money(prezzoTotale)}</PrezzoTotale>`
             + `<AliquotaIVA>${rate(line.vatRate)}</AliquotaIVA>`
             + naturaXml

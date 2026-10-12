@@ -202,8 +202,9 @@ test('migration DDL and seed rows roll back with the caller transaction on an em
 
 test('API checks authentication, active database context and patient exclusion instead of trusting JWT permissions', async () => {
     failure(await harness.api(null, 'GET', '/activities/board'), 401);
-    for (const actor of [harness.actors.patient, harness.actors.outsiderA, harness.actors.foreignStructure]) {
-        failure(await harness.api(actor, 'GET', '/activities/board'), 403);
+    failure(await harness.api(harness.actors.patient, 'GET', '/activities/board'), 403, 'ACTIVITY_FORBIDDEN');
+    for (const actor of [harness.actors.outsiderA, harness.actors.foreignStructure]) {
+        failure(await harness.api(actor, 'GET', '/activities/board'), 401, 'AUTH_SESSION_INVALID');
     }
     const missing = await harness.api(harness.actors.missingStructure, 'GET', '/activities/board');
     assert.ok([403, 422].includes(missing.status), JSON.stringify(missing.body));
@@ -211,13 +212,21 @@ test('API checks authentication, active database context and patient exclusion i
     assert.equal(viewer.capabilities.canCreate, false);
     failure(await harness.api(harness.actors.viewerA, 'POST', '/activities', {
         operationId: randomUUID(), title: 'JWT says owner, database says viewer'
-    }), 403);
+    }), 403, 'ACTIVITY_FORBIDDEN');
+
+    const portalWhere = {id: harness.actors.patient.patientAccessId};
+    await harness.auth.PatientPortalAccess.update({status: 'REVOKED'}, {where: portalWhere});
+    try {
+        failure(await harness.api(harness.actors.patient, 'GET', '/activities/board'), 401, 'AUTH_SESSION_INVALID');
+    } finally {
+        await harness.auth.PatientPortalAccess.update({status: 'ACTIVE'}, {where: portalWhere});
+    }
 
     await harness.auth.TenantUser.update({deactivatedAt: new Date()}, {
         where: {tenantId: harness.ids.tenantA, userId: harness.ids.therapistA}
     });
     try {
-        failure(await harness.api(harness.actors.therapistA, 'GET', '/activities/board'), 403);
+        failure(await harness.api(harness.actors.therapistA, 'GET', '/activities/board'), 401, 'AUTH_SESSION_INVALID');
     } finally {
         await harness.auth.TenantUser.update({deactivatedAt: null}, {
             where: {tenantId: harness.ids.tenantA, userId: harness.ids.therapistA}
@@ -409,7 +418,7 @@ test('an existing operation receipt does not bypass a membership revoked after t
     success(await harness.api(harness.actors.therapistA, 'POST', '/activities', request), 201);
     await harness.auth.StructureUser.destroy({where: {structureId: harness.ids.structureA, userId: harness.ids.therapistA}});
     try {
-        failure(await harness.api(harness.actors.therapistA, 'POST', '/activities', request), 403);
+        failure(await harness.api(harness.actors.therapistA, 'POST', '/activities', request), 401, 'AUTH_SESSION_INVALID');
     } finally {
         await harness.auth.StructureUser.create({structureId: harness.ids.structureA, userId: harness.ids.therapistA, calendarEnabled: false});
     }
@@ -897,7 +906,7 @@ test('activity agenda lookup rechecks own calendar ACL and suspension instead of
         assert.deepEqual(revoked, {items: [], total: 0, nextOffset: null});
         await harness.auth.TenantUser.update({deactivatedAt: new Date()}, {where: tenantMembership});
         failure(await harness.api(harness.actors.therapistA, 'GET',
-            `/activities/agenda-events?query=${encodeURIComponent(query)}`), 403);
+            `/activities/agenda-events?query=${encodeURIComponent(query)}`), 401, 'AUTH_SESSION_INVALID');
     } finally {
         await harness.auth.TenantUser.update({deactivatedAt: null}, {where: tenantMembership});
         await harness.auth.StructureUser.update({role: null}, {where: membership});

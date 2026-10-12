@@ -11,13 +11,14 @@ import { signUpSendMail } from '../../../services/email.service.js';
 import { sequelize } from '../../../config/database.js';
 import { TENANT_OWNER_ROLE } from '../rbac/roles.js';
 import { isTaxRegimeCode } from '../../invoice/utils/fiscalRegime.js';
-import { Tenant, User, Structure, StructureAvailability } from '../models/index.js';
+import { Tenant, TenantUser, User, Structure, StructureAvailability } from '../models/index.js';
+import { issueAccountActionToken } from '../services/accountActionToken.service.js';
 import { localStorageAdapter } from '../../measurements/storage/localStorageAdapter.js';
 import {markTenantSchemaReady, provisionTenantSchema} from '../../../utils/tenantSchema.js';
 
 export const stripe = env.stripeSecretKey ? new Stripe(env.stripeSecretKey) : (null as unknown as Stripe);
 
-/** Secret used for short-lived tokens (license/verification/reset), separate from the main session JWT secret. */
+/** Existing license secret: account verification/reset use separate opaque grants. */
 export const licenseSecret = env.jwtSecret + '::license';
 
 const ALLOWED_LOGO_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/svg+xml', 'image/webp']);
@@ -64,7 +65,7 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
     // Everything below must be all-or-nothing: if any step fails (including a transient
     // error unrelated to the email itself), nothing should be persisted, otherwise a retry
     // with the same email would incorrectly fail with "Email already registered".
-    const { tenant, createdUser } = await sequelize.transaction(async (transaction) => {
+    const { tenant, createdUser, verificationToken } = await sequelize.transaction(async (transaction) => {
         const tenant: any = await Tenant.create(
             {
                 userQuantity,
@@ -84,6 +85,7 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
                 ...users[0],
                 password: hashedPassword,
                 isActive: false,
+                authVersion: 0,
                 isSuperAdmin: true,
                 // Chi arriva dalla registrazione È il tenant: ha creato lui lo studio.
                 // Il flag lo distingue dagli utenti invitati successivamente e lo rende
@@ -120,7 +122,8 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
         // before its complete schema and versioned migrations are ready.
         await provisionTenantSchema(tenant.id, transaction);
 
-        return { tenant, createdUser };
+        const verificationToken = await issueAccountActionToken(createdUser.get('id'), createdUser.get('email'), 'verify_email', transaction);
+        return { tenant, createdUser, verificationToken };
     });
     markTenantSchemaReady(tenant.id);
 
@@ -128,7 +131,6 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
     // the HTTP response if SMTP is misconfigured or temporarily unavailable/slow (nodemailer can
     // take several seconds to time out). The user can always request a new verification link
     // later (e.g. via a "resend verification email" endpoint).
-    const verificationToken = jwt.sign({ email: createdUser.get('email') }, licenseSecret, { expiresIn: '12h' });
     signUpSendMail(createdUser.get('email') as string, verificationToken).catch((err) => {
         console.error('[createTenant] verification email could not be sent:', err);
     });
@@ -138,11 +140,15 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
 
 export const updateTenant = asyncHandler(async (req: Request, res: Response) => {
     const id = req.params.tenantId;
+    if (!await canAccessTenant(req, id)) return sendErrorResponse(res, 403, 'Tenant non accessibile');
 
     delete req.body.logoStoragePath;
     delete req.body.logoMimeType;
     delete req.body.logoOriginalName;
     delete req.body.logoSizeBytes;
+    // L'identità e i diritti di abbonamento sono gestiti dai rispettivi flussi dedicati.
+    for (const key of ['id', 'license', 'idStripe', 'isPremium', 'isActive', 'userQuantity', 'maxUserQuantity',
+        'structureQuantity', 'maxStructureQuantity', 'MBQuantity', 'createdAt', 'updatedAt']) delete req.body[key];
 
     // Il regime fiscale pilota IVA, ritenuta, natura e diciture di OGNI documento emesso: un codice
     // inventato produrrebbe fatture sbagliate a catena. Si accettano solo i codici della tabella
@@ -159,14 +165,17 @@ export const updateTenant = asyncHandler(async (req: Request, res: Response) => 
     return sendSuccessResponse(res, 200, updated, 'Tenant updated');
 });
 
-function canAccessTenant(req: Request, tenantId: string): boolean {
-    return req.user?.tenants?.some((tenant) => tenant.id === tenantId) ?? false;
+async function canAccessTenant(req: Request, tenantId: string): Promise<boolean> {
+    const currentTenantId = req.user?.tid ?? req.user?.tenants?.[0]?.id;
+    const userId = req.user?.sub ?? req.user?.id;
+    if (!userId || req.user?.actor === 'patient' || currentTenantId !== tenantId) return false;
+    return !!await TenantUser.findOne({ where: { tenantId, userId, deactivatedAt: null } });
 }
 
 export const uploadTenantLogo = asyncHandler(async (req: Request, res: Response) => {
     const id = req.params.tenantId;
 
-    if (!canAccessTenant(req, id)) {
+    if (!await canAccessTenant(req, id)) {
         return sendErrorResponse(res, 403, 'Tenant non accessibile');
     }
 
@@ -197,7 +206,7 @@ export const uploadTenantLogo = asyncHandler(async (req: Request, res: Response)
 export const getTenantLogo = asyncHandler(async (req: Request, res: Response) => {
     const id = req.params.tenantId;
 
-    if (!canAccessTenant(req, id)) {
+    if (!await canAccessTenant(req, id)) {
         return sendErrorResponse(res, 403, 'Tenant non accessibile');
     }
 
@@ -216,7 +225,7 @@ export const getTenantLogo = asyncHandler(async (req: Request, res: Response) =>
 export const removeTenantLogo = asyncHandler(async (req: Request, res: Response) => {
     const id = req.params.tenantId;
 
-    if (!canAccessTenant(req, id)) {
+    if (!await canAccessTenant(req, id)) {
         return sendErrorResponse(res, 403, 'Tenant non accessibile');
     }
 
@@ -237,28 +246,11 @@ export const removeTenantLogo = asyncHandler(async (req: Request, res: Response)
 
 export const findTenantById = asyncHandler(async (req: Request, res: Response) => {
     const id = req.params.tenantId;
-    console.log('=== findTenantById called ===');
-    console.log('Requested tenant ID:', id);
-    console.log('User from JWT:', req.user);
-    
-    let tenant = await Tenant.findByPk(id);
-    console.log('Tenant found:', !!tenant);
-    
+    if (!await canAccessTenant(req, id)) return sendErrorResponse(res, 403, 'Tenant non accessibile');
+    const tenant = await Tenant.findByPk(id);
     if (tenant) {
-        console.log('Tenant data:', { id: tenant.id, businessName: tenant.businessName });
         return sendSuccessResponse(res, 200, tenant, `Tenant with id: ${id} found`);
     }
-    
-    // If not found, log all tenants to debug
-    console.warn(`Tenant ${id} not found. Checking all tenants in database...`);
-    const allTenants = await Tenant.findAll();
-    console.log('All tenants in DB:', allTenants.map(t => ({ id: t.id, businessName: t.businessName })));
-    
-    // Check if user has a tenant association
-    if (req.user?.tenants && req.user.tenants.length > 0) {
-        console.log('User tenants from JWT:', req.user.tenants);
-    }
-    
     return sendErrorResponse(res, 404, `Tenant with id: ${id} not found`);
 });
 
@@ -271,5 +263,4 @@ export default {
     findTenantById,
     logoUploadMiddleware
 };
-
 

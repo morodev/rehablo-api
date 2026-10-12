@@ -12,6 +12,7 @@ import { login, loginPremise, loginWithToken, refresh } from './auth.controller.
 import { selectSessionContext } from './session.controller.js';
 import { PatientPortalAccess, Structure, StructureUser, StructureUserAvailability, Tenant, TenantUser, User } from '../models/index.js';
 import RefreshToken from '../models/refreshToken.model.js';
+import { sequelize } from '../../../config/database.js';
 import { getRolePermissions, RoleCode } from '../rbac/roles.js';
 
 const id = (number: number) => 'cccccccc-cccc-4ccc-8ccc-' + String(number).padStart(12, '0');
@@ -27,6 +28,7 @@ function run(handler: any, req: any): Promise<any> {
     });
 }
 function fixture(t: TestContext) {
+    t.mock.method(sequelize, 'transaction', (async (callback: any) => callback({ LOCK: { UPDATE: 'UPDATE' } })) as any);
     const structure = {id: structureId, tenantId, name: 'Test site'};
     const calendar = {userId, structureId, calendarEnabled: true, availabilityMode: 'CUSTOM', role: null};
     const rows = Array.from({length: 7}, (_, day) => ({id: id(day + 10), userId, structureId, day, enabled: day === 0,
@@ -116,7 +118,7 @@ it('token restoration verifies signature and expiry before returning a replaceme
     for (const token of [jwt.sign(claims, 'wrong-fixture-secret'), jwt.sign({...claims, exp: 1}, env.jwtSecret)]) {
         req.body = {accessToken: token};
         const result = await run(loginWithToken, req);
-        assert.equal(result.status, 500); assert.ok(result.error instanceof jwt.JsonWebTokenError);
+        assert.equal(result.status, 401);
     }
 });
 

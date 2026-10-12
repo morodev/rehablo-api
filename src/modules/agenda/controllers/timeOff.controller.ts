@@ -4,6 +4,7 @@ import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
 import { scopeWhere } from '../../../middleware/rbac.js';
+import { withScope } from '../../../utils/scopedWhere.js';
 import { sequelize } from '../../../config/database.js';
 import { Structure, StructureUser, TenantUser, User } from '../../auth/models/index.js';
 import TimeOffRequest, {
@@ -143,9 +144,7 @@ async function findActiveOverlap(
 export const getTimeOffRequests = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const { start, end, userId, status, type } = req.query as Record<string, string | undefined>;
-    const where: Record<string | symbol, unknown> = {
-        ...scopeWhere(req, TIME_OFF_SCOPE_FIELDS)
-    };
+    const where: Record<string | symbol, unknown> = {};
 
     if (userId) {
         if (!UUID_REGEX.test(userId)) {
@@ -181,7 +180,7 @@ export const getTimeOffRequests = asyncHandler(async (req: Request, res: Respons
     if (overlap.length > 0) where[Op.and] = overlap;
 
     const requests = await TimeOffRequest.schema(schema).findAll({
-        where,
+        where: withScope(scopeWhere(req, TIME_OFF_SCOPE_FIELDS), where),
         order: [
             ['start', 'ASC'],
             ['createdAt', 'ASC']

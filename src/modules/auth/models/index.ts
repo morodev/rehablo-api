@@ -15,6 +15,7 @@ import ReminderNotificationPreference from '../../notes/models/reminderNotificat
 import ReminderPushSubscription from '../../notes/models/reminderPushSubscription.model.js';
 import ReminderNotificationActivation from '../../notes/models/reminderNotificationActivation.model.js';
 import {migrateActivityPublicNotifications} from '../../activities/services/activityPublicMigration.service.js';
+import { migrateAuthSecurity } from '../services/authSecurityMigration.service.js';
 
 /** Centralised associations for the auth/tenant domain (mirrors former rehab-authentication.js). */
 export function registerAuthAssociations(): void {
@@ -75,6 +76,7 @@ export async function syncAuthModels(): Promise<void> {
     await StructureUser.sync({ alter: true });
     // Tables and composite membership FK are created by the versioned public migration.
     await RefreshToken.sync({ alter: true });
+    await migrateAuthSecurity();
     await PatientPortalAccess.sync({alter: {drop: false}});
     await PatientPortalInvitation.sync({alter: {drop: false}});
     await ReminderNotificationPreference.sync({alter: {drop: false}});

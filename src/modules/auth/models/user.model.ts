@@ -10,6 +10,8 @@ export interface UserAttributes {
     surname?: string | null;
     email: string;
     password: string;
+    /** Incrementata al reset password: invalida ogni precedente sessione dell'identità. */
+    authVersion: number;
     calendarVisible: boolean;
     /** `true` una volta verificato l'indirizzo email. NON indica la sospensione dell'account. */
     isActive: boolean;
@@ -38,6 +40,7 @@ export interface UserAttributes {
 export type UserCreationAttributes = Optional<
     UserAttributes,
     | 'id'
+    | 'authVersion'
     | 'calendarVisible'
     | 'calendarColor'
     | 'availabilityMode'
@@ -54,6 +57,7 @@ export class User extends Model<UserAttributes, UserCreationAttributes> implemen
     declare surname: string | null;
     declare email: string;
     declare password: string;
+    declare authVersion: number;
     declare calendarVisible: boolean;
     declare calendarColor: string;
     declare availabilityMode: UserAvailabilityMode;
@@ -74,6 +78,7 @@ User.init(
         surname: { type: DataTypes.STRING, allowNull: true },
         email: { type: DataTypes.STRING, allowNull: false, unique: true },
         password: { type: DataTypes.STRING, allowNull: false },
+        authVersion: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
         calendarVisible: { type: DataTypes.BOOLEAN, defaultValue: true },
         calendarColor: { type: DataTypes.STRING, allowNull: false, defaultValue: 'bg-primary' },
         availabilityMode: {

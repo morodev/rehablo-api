@@ -1,7 +1,9 @@
 import { Request, Response } from 'express';
+import { sequelize } from '../../../config/database.js';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
+import { withScope } from '../../../utils/scopedWhere.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import HumanBodyStrength from '../models/humanBodyStrength.model.js';
 import { resolveHumanBodyPointId } from './humanBodyPoint.helper.js';
@@ -9,18 +11,19 @@ import { assertEvaluationEditable } from '../../evaluations/services/evaluationG
 
 export const saveStrength = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined);
-    const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId);
-
-    if (!humanBodyPointId) {
+    const strength = await sequelize.transaction(async transaction => {
+        await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined, transaction);
+        const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId, transaction);
+        if (!humanBodyPointId) return null;
+        return HumanBodyStrength.schema(schema).create({
+            ...req.body,
+            humanBodyPointId,
+            userId: req.access!.userId
+        }, { transaction });
+    });
+    if (!strength) {
         return sendErrorResponse(res, 400, 'humanBodyPointId or pointToCreate is required');
     }
-
-    const strength = await HumanBodyStrength.schema(schema).create({
-        ...req.body,
-        humanBodyPointId,
-        userId: req.access!.userId
-    });
     return sendSuccessResponse(res, 201, strength, 'Human body strength created');
 });
 
@@ -71,13 +74,15 @@ export const getStrengthByBodyPart = asyncHandler(async (req: Request, res: Resp
     const schema = req.tenantSchema!;
     const { bodyPart, bodySubPart, patientId, evaluationId } = req.query;
 
-    const where: Record<string, unknown> = { ...patientResourceScopeWhere(req, schema) };
+    const where: Record<string, unknown> = {};
     if (bodyPart) where.bodyPart = sequelizeWhere(fn('LOWER', col('bodyPart')), 'LIKE', `%${String(bodyPart).toLowerCase()}%`);
     if (bodySubPart) where.bodySubPart = sequelizeWhere(fn('LOWER', col('bodySubPart')), 'LIKE', `%${String(bodySubPart).toLowerCase()}%`);
     if (patientId) where.patientId = patientId;
     if (evaluationId) where.evaluationId = evaluationId;
 
-    const strength = await HumanBodyStrength.schema(schema).findAll({ where: { [Op.and]: where } });
+    const strength = await HumanBodyStrength.schema(schema).findAll({
+        where: withScope(patientResourceScopeWhere(req, schema), where)
+    });
     return sendSuccessResponse(res, 200, strength, 'Human body strength loaded');
 });
 

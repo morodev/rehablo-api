@@ -13,15 +13,25 @@ export interface SaveRawFileInput {
 export async function saveRawFile(schema: string, input: SaveRawFileInput): Promise<RawFile> {
     const saved = await localStorageAdapter.save(input.tenantId, input.buffer, input.originalName);
 
-    return RawFile.schema(schema).create({
-        tenantId: input.tenantId,
-        originalName: input.originalName,
-        mimeType: input.mimeType,
-        sizeBytes: saved.sizeBytes,
-        checksumSha256: saved.checksumSha256,
-        storagePath: saved.storagePath,
-        uploadedBy: input.uploadedBy ?? null
-    });
+    try {
+        return await RawFile.schema(schema).create({
+            tenantId: input.tenantId,
+            originalName: input.originalName,
+            mimeType: input.mimeType,
+            sizeBytes: saved.sizeBytes,
+            checksumSha256: saved.checksumSha256,
+            storagePath: saved.storagePath,
+            uploadedBy: input.uploadedBy ?? null
+        });
+    } catch (error) {
+        try {
+            await localStorageAdapter.remove(saved.storagePath);
+        } catch {
+            // Do not log filenames, file contents or database errors containing clinical data.
+            console.error('[raw-files] Failed to remove an upload after metadata persistence failed');
+        }
+        throw error;
+    }
 }
 
 export async function getRawFileById(schema: string, id: string): Promise<RawFile | null> {

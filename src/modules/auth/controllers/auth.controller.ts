@@ -17,7 +17,9 @@ import {
     StructureUser
 } from '../models/index.js';
 import { findStructureById } from './structure.controller.js';
-import { getRolePermissions, resolveEffectiveRole } from '../rbac/roles.js';
+import { getRolePermissions } from '../rbac/roles.js';
+import { assertCurrentIdentity, getAuthVersion, resolveApplicationPrincipal } from '../services/authState.service.js';
+import type { AuthTokenPayload } from '../../../middleware/auth.js';
 import {
     issueRefreshToken,
     revokeFamily,
@@ -37,36 +39,8 @@ function buildTokenPayload(userInstance: any, actor: 'staff' | 'patient' = 'staf
     payload.sub = payload.id;
     payload.actor = actor;
     payload.tokenUse = 'application';
+    payload.authVersion = getAuthVersion(userInstance.get('authVersion'));
     return payload;
-}
-
-/**
- * Calcola i claim RBAC della sessione (vedi docs/RBAC_DESIGN.md).
- *
- * Il ruolo effettivo è l'override sulla struttura selezionata, con fallback
- * sul ruolo base che l'utente ha nel tenant.
- */
-async function buildRbacClaims(userId: string, tenantId?: string | null, structureId?: string | null) {
-    let tenantRole: string | null = null;
-    if (tenantId) {
-        const membership = await TenantUser.findOne({ where: { tenantId, userId } });
-        tenantRole = (membership?.get('role') as string) ?? null;
-    }
-
-    let structureRole: string | null = null;
-    if (structureId) {
-        const assignment = await StructureUser.findOne({ where: { structureId, userId } });
-        structureRole = (assignment?.get('role') as string) ?? null;
-    }
-
-    const role = resolveEffectiveRole(tenantRole, structureRole);
-
-    return {
-        tid: tenantId ?? null,
-        sid: structureId ?? null,
-        role,
-        perms: getRolePermissions(role)
-    };
 }
 
 export const login = asyncHandler(async (req: Request, res: Response) => {
@@ -100,7 +74,7 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 403, 'Account disattivato. Contatta il titolare dello studio.');
     }
 
-    const payload = buildTokenPayload(user);
+    let payload = buildTokenPayload(user);
     const activeMembership = await TenantUser.findOne({
         where: { userId: payload.id, deactivatedAt: null },
         order: [['createdAt', 'ASC']]
@@ -109,11 +83,11 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
     if (tenantId && !activeMembership) {
         return sendErrorResponse(res, 403, 'Accesso al centro disattivato');
     }
-    Object.assign(payload, await buildRbacClaims(payload.id, tenantId, null));
+    payload = await resolveApplicationPrincipal({ ...payload, tid: tenantId, sid: null }, { user });
     const token = signApplicationToken(payload);
 
     // Sessione lunga garantita dal refresh token: l'access token dura pochi minuti.
-    const refresh = await issueRefreshToken(req, payload.id, { tenantId, structureId: null });
+    const refresh = await issueRefreshToken(req, payload.id, { tenantId, structureId: null, authVersion: payload.authVersion });
 
     return sendSuccessResponse(
         res,
@@ -132,9 +106,8 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
 /**
  * Scambia un refresh token valido con una nuova coppia access+refresh.
  *
- * Ruolo e permessi vengono RICALCOLATI dal database a ogni refresh: è il motivo per cui
- * l'access token può restare breve senza penalizzare l'esperienza, e per cui una modifica
- * di ruolo diventa effettiva entro pochi minuti invece che a fine sessione.
+ * Ruolo e permessi vengono ricalcolati dal database; requireAuth li rivalida anche sulle
+ * richieste successive. Un reset concorrente non può aggiornare la versione del grant.
  */
 export const refresh = asyncHandler(async (req: Request, res: Response) => {
     const presented = req.body?.refreshToken;
@@ -173,11 +146,13 @@ export const refresh = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 403, 'Account disattivato. Contatta il titolare dello studio.');
     }
 
-    const payload = buildTokenPayload(user);
+    // Non promuovere un refresh autorizzato prima di un reset alla nuova versione dell'utente.
+    assertCurrentIdentity(user, result.authVersion);
+    let payload = buildTokenPayload(user);
 
-    if (result.structureId) {
+    if (result.structureId && result.tenantId) {
         const premise = await Structure.findOne({
-            where: { id: result.structureId },
+            where: { id: result.structureId, tenantId: result.tenantId },
             include: [{ model: StructureAvailability }],
             order: [[StructureAvailability, 'day', 'ASC']]
         });
@@ -222,8 +197,10 @@ export const refresh = asyncHandler(async (req: Request, res: Response) => {
             await revokeFamily(result.familyId, 'tenant_membership_deactivated');
             return sendErrorResponse(res, 403, 'Accesso al centro disattivato');
         }
-        Object.assign(payload, await buildRbacClaims(payload.id, result.tenantId, result.structureId));
+        payload.tid = result.tenantId;
+        payload.sid = result.structureId;
     }
+    payload = await resolveApplicationPrincipal(payload, { user });
 
     return sendSuccessResponse(
         res,
@@ -292,16 +269,17 @@ export const loginPremise = asyncHandler(async (req: Request, res: Response) => 
         return sendErrorResponse(res, 404, 'User not found');
     }
 
-    const payload = buildTokenPayload(user);
+    assertCurrentIdentity(user, req.user?.authVersion);
+    let payload = buildTokenPayload(user);
     payload.selectedPremise = premise.get({ plain: true });
     // Il ruolo può essere sovrascritto per struttura: i permessi vanno ricalcolati.
-    Object.assign(payload, await buildRbacClaims(payload.id, tenantId, structureId));
+    payload = await resolveApplicationPrincipal({ ...payload, tid: tenantId, sid: structureId }, { user });
 
     const newToken = signApplicationToken(payload);
 
     // La struttura selezionata cambia i permessi effettivi: il refresh token la memorizza,
     // così anche i rinnovi successivi restano coerenti con il premise scelto.
-    const refresh = await issueRefreshToken(req, payload.id, { tenantId, structureId });
+    const refresh = await issueRefreshToken(req, payload.id, { tenantId, structureId, authVersion: payload.authVersion });
 
     // Il client sostituisce il refresh token con quello appena emesso: quello precedente
     // resterebbe altrimenti valido per giorni senza che nessuno lo usi più. Revocato DOPO
@@ -326,7 +304,10 @@ export const loginPremise = asyncHandler(async (req: Request, res: Response) => 
 
 export const loginWithToken = asyncHandler(async (req: Request, res: Response) => {
     const token = req.body.accessToken;
-    const decoded = jwt.verify(token, env.jwtSecret) as any;
+    let verified: AuthTokenPayload;
+    try { verified = jwt.verify(token, env.jwtSecret) as AuthTokenPayload; }
+    catch { return sendErrorResponse(res, 401, 'invalid or expired token'); }
+    const decoded = await resolveApplicationPrincipal(verified);
     const compactToken = compactVerifiedApplicationToken(decoded);
 
     const base = {

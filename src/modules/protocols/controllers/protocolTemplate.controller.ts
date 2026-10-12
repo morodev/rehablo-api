@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { sequelize } from '../../../config/database.js';
 import { Op, fn, col, where as sequelizeWhere, Includeable } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
@@ -41,28 +42,28 @@ interface PhaseInput {
 export const saveProtocolTemplate = asyncHandler(async (req: Request, res: Response) => {
     const { phases = [] as PhaseInput[], ...templateFields } = req.body;
 
-    const template = await ProtocolTemplate.create(templateFields);
+    const created = await sequelize.transaction(async transaction => {
+        const template = await ProtocolTemplate.create(templateFields, { transaction });
 
-    for (const [index, phase] of phases.entries()) {
-        const { exercises = [], ...phaseFields } = phase;
-        const phaseTemplate = await ProtocolPhaseTemplate.create({
-            ...phaseFields,
-            order: phaseFields.order ?? index,
-            protocolTemplateId: template.get('id') as string
-        });
+        for (const [index, phase] of phases.entries()) {
+            const { exercises = [], ...phaseFields } = phase;
+            const phaseTemplate = await ProtocolPhaseTemplate.create({
+                ...phaseFields,
+                order: phaseFields.order ?? index,
+                protocolTemplateId: template.get('id') as string
+            }, { transaction });
 
-        await Promise.all(
-            exercises.map((exercise, exerciseIndex) =>
-                ProtocolTemplateExercise.create({
+            for (const [exerciseIndex, exercise] of exercises.entries()) {
+                await ProtocolTemplateExercise.create({
                     ...exercise,
                     order: exercise.order ?? exerciseIndex,
                     protocolPhaseTemplateId: phaseTemplate.get('id') as string
-                })
-            )
-        );
-    }
+                }, { transaction });
+            }
+        }
 
-    const created = await ProtocolTemplate.findByPk(template.get('id') as string, { include: templateInclude });
+        return ProtocolTemplate.findByPk(template.get('id') as string, { include: templateInclude, transaction });
+    });
     return sendSuccessResponse(res, 201, created, 'Protocollo creato');
 });
 

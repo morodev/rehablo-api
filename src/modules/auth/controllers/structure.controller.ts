@@ -58,32 +58,51 @@ export const saveStructureForTenant = asyncHandler(async (req: Request, res: Res
 export const updateStructureForTenant = asyncHandler(async (req: Request, res: Response) => {
     const tenantId = getCurrentTenantId(req);
     const structureId = req.params.structureId;
-    const structureToUpdate = req.body.premise;
-
-    const [rowsUpdated] = await Structure.update(structureToUpdate, {
-        where: { id: structureId, tenantId }
-    });
-
-    if (rowsUpdated === 0) {
-        return sendErrorResponse(res, 404, 'Structure not found');
+    const premise = req.body?.premise;
+    if (!premise || typeof premise !== 'object' || Array.isArray(premise)) {
+        return sendErrorResponse(res, 400, 'Structure payload not valid');
     }
+    // The route and authenticated tenant own the identities. Never turn a scoped UPDATE
+    // into a transfer by allowing those same keys in its SET values.
+    const { id: _id, tenantId: _tenantId, createdAt: _createdAt, updatedAt: _updatedAt,
+        premiseAvailabilities, ...structureToUpdate } = premise;
 
-    if (Array.isArray(structureToUpdate.premiseAvailabilities)) {
-        for (const availability of structureToUpdate.premiseAvailabilities) {
-            if (availability.id) {
-                await StructureAvailability.update(availability, {
-                    where: { id: availability.id, structureId }
-                });
-            } else {
-                await StructureAvailability.create({ ...availability, structureId: structureId });
+    const updatedStructure = await sequelize.transaction(async transaction => {
+        if (Object.keys(structureToUpdate).length > 0) {
+            const [rowsUpdated] = await Structure.update(structureToUpdate, {
+                where: { id: structureId, tenantId }, transaction
+            });
+            if (rowsUpdated === 0) return null;
+        } else {
+            // An availability-only edit still needs to prove and lock the parent scope.
+            const structure = await Structure.findOne({
+                where: { id: structureId, tenantId }, attributes: ['id'],
+                transaction, lock: transaction.LOCK.UPDATE
+            });
+            if (!structure) return null;
+        }
+
+        if (Array.isArray(premiseAvailabilities)) {
+            for (const availability of premiseAvailabilities) {
+                const { id: availabilityId, structureId: _structureId,
+                    createdAt: _availabilityCreatedAt, updatedAt: _availabilityUpdatedAt,
+                    ...availabilityToUpdate } = availability;
+                if (availabilityId) {
+                    await StructureAvailability.update(availabilityToUpdate, {
+                        where: { id: availabilityId, structureId }, transaction
+                    });
+                } else {
+                    await StructureAvailability.create({ ...availabilityToUpdate, structureId }, { transaction });
+                }
             }
         }
-    }
 
-    const updatedStructure = await Structure.findOne({
-        where: { id: structureId, tenantId },
-        include: [{ model: StructureAvailability }]
+        return Structure.findOne({
+            where: { id: structureId, tenantId },
+            include: [{ model: StructureAvailability }], transaction
+        });
     });
+    if (!updatedStructure) return sendErrorResponse(res, 404, 'Structure not found');
 
     return sendSuccessResponse(res, 200, updatedStructure, 'Structure updated');
 });

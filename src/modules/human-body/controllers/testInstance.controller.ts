@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
+import { withScope } from '../../../utils/scopedWhere.js';
 import { sendSuccessResponse } from '../../../utils/response.js';
 import { Test } from '../models/catalog/index.js';
 import TestInstance from '../models/testInstance.model.js';
@@ -20,12 +21,12 @@ export const getUserTestInstances = asyncHandler(async (req: Request, res: Respo
     const schema = req.tenantSchema!;
     const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
 
-    const where: Record<string, unknown> = { ...patientResourceScopeWhere(req, schema) };
+    const where: Record<string, unknown> = {};
     if (patientId) where.patientId = patientId;
     if (evaluationId) where.evaluationId = evaluationId;
 
     const instances = await TestInstance.schema(schema).findAll({
-        where,
+        where: withScope(patientResourceScopeWhere(req, schema), where),
         include: [{ model: Test, required: false }]
     });
 

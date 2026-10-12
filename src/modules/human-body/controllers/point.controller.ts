@@ -1,7 +1,9 @@
 import { Request, Response } from 'express';
+import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
+import { withScope } from '../../../utils/scopedWhere.js';
 import HumanBodyPoint from '../models/humanBodyPoint.model.js';
 import HumanBodyEvent from '../models/humanBodyEvent.model.js';
 import { assertEvaluationEditable } from '../../evaluations/services/evaluationGuard.js';
@@ -16,19 +18,21 @@ interface HumanBodyEventInput {
 
 export const createHumanBodyPoint = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined);
     const events: HumanBodyEventInput[] = req.body.humanBodyEvents ?? [];
-
-    const point = await HumanBodyPoint.schema(schema).create({
-        ...req.body,
-        userId: req.access!.userId
+    const point = await sequelize.transaction(async transaction => {
+        await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined, transaction);
+        const point = await HumanBodyPoint.schema(schema).create({
+            ...req.body,
+            userId: req.access!.userId
+        }, { transaction });
+        if (events.length > 0) {
+            await HumanBodyEvent.schema(schema).bulkCreate(
+                events.map((event) => ({ humanBodyPointId: point.get('id') as string, eventType: event.eventType })),
+                { transaction }
+            );
+        }
+        return point;
     });
-
-    if (events.length > 0) {
-        await HumanBodyEvent.schema(schema).bulkCreate(
-            events.map((event) => ({ humanBodyPointId: point.get('id') as string, eventType: event.eventType }))
-        );
-    }
 
     return sendSuccessResponse(res, 201, point, 'Human body point created');
 });
@@ -40,7 +44,7 @@ export const getAllHumanBodyPointsWithEvents = asyncHandler(async (req: Request,
 
     // Con evaluationId si filtra la singola valutazione; patientResourceScopeWhere mantiene
     // comunque lo scope autore per gli operatori con permesso `own`.
-    const where: Record<string, unknown> = { patientId, ...patientResourceScopeWhere(req, schema) };
+    const where: Record<string, unknown> = { patientId };
     if (evaluationId) {
         where.evaluationId = evaluationId;
     } else {
@@ -48,7 +52,7 @@ export const getAllHumanBodyPointsWithEvents = asyncHandler(async (req: Request,
     }
 
     const points = await HumanBodyPoint.schema(schema).findAll({
-        where,
+        where: withScope(patientResourceScopeWhere(req, schema), where),
         include: { model: HumanBodyEvent.schema(schema), required: false },
         raw: true
     });
@@ -74,14 +78,16 @@ export const getAllHumanBodyPoints = asyncHandler(async (req: Request, res: Resp
     const userId = req.user!.id;
     const { patientId, evaluationId } = req.query as { patientId?: string; evaluationId?: string };
 
-    const where: Record<string, unknown> = { patientId, ...patientResourceScopeWhere(req, schema) };
+    const where: Record<string, unknown> = { patientId };
     if (evaluationId) {
         where.evaluationId = evaluationId;
     } else {
         where.userId = userId;
     }
 
-    const points = await HumanBodyPoint.schema(schema).findAll({ where });
+    const points = await HumanBodyPoint.schema(schema).findAll({
+        where: withScope(patientResourceScopeWhere(req, schema), where)
+    });
 
     return sendSuccessResponse(res, 200, { points }, 'Human body points loaded');
 });

@@ -77,7 +77,7 @@ export function requirePermission(
             return sendErrorResponse(res, 403, 'Questa operazione è riservata allo staff');
         }
 
-        // Il super admin di piattaforma bypassa il controllo.
+        // requireAuth ha verificato il privilegio del titolare nel tenant corrente.
         if (req.user.isSuperAdmin) {
             req.access = {
                 resource,

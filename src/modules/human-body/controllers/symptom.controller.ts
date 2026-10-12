@@ -1,8 +1,10 @@
 import { Request, Response } from 'express';
+import { sequelize } from '../../../config/database.js';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
+import { withScope } from '../../../utils/scopedWhere.js';
 import HumanBodySymptom from '../models/humanBodySymptom.model.js';
 import { resolveHumanBodyPointId } from './humanBodyPoint.helper.js';
 import { assertEvaluationEditable } from '../../evaluations/services/evaluationGuard.js';
@@ -12,18 +14,19 @@ import { assertEvaluationEditable } from '../../evaluations/services/evaluationG
 
 export const saveSymptom = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined);
-    const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId);
-
-    if (!humanBodyPointId) {
+    const symptom = await sequelize.transaction(async transaction => {
+        await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined, transaction);
+        const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId, transaction);
+        if (!humanBodyPointId) return null;
+        return HumanBodySymptom.schema(schema).create({
+            ...req.body,
+            humanBodyPointId,
+            userId: req.access!.userId
+        }, { transaction });
+    });
+    if (!symptom) {
         return sendErrorResponse(res, 400, 'humanBodyPointId or pointToCreate is required');
     }
-
-    const symptom = await HumanBodySymptom.schema(schema).create({
-        ...req.body,
-        humanBodyPointId,
-        userId: req.access!.userId
-    });
     return sendSuccessResponse(res, 201, symptom, 'Human body symptom created');
 });
 
@@ -96,13 +99,15 @@ export const getSymptomsByBodyPart = asyncHandler(async (req: Request, res: Resp
     const schema = req.tenantSchema!;
     const { bodyPart, bodySubPart, patientId, evaluationId } = req.query;
 
-    const where: Record<string, unknown> = { ...patientResourceScopeWhere(req, schema) };
+    const where: Record<string, unknown> = {};
     if (bodyPart) where.bodyPart = sequelizeWhere(fn('LOWER', col('bodyPart')), 'LIKE', `%${String(bodyPart).toLowerCase()}%`);
     if (bodySubPart) where.bodySubPart = sequelizeWhere(fn('LOWER', col('bodySubPart')), 'LIKE', `%${String(bodySubPart).toLowerCase()}%`);
     if (patientId) where.patientId = patientId;
     if (evaluationId) where.evaluationId = evaluationId;
 
-    const symptoms = await HumanBodySymptom.schema(schema).findAll({ where: { [Op.and]: where } });
+    const symptoms = await HumanBodySymptom.schema(schema).findAll({
+        where: withScope(patientResourceScopeWhere(req, schema), where)
+    });
     return sendSuccessResponse(res, 200, symptoms, 'Human body symptoms loaded');
 });
 

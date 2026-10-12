@@ -20,6 +20,10 @@
  *  "0", assente) viene trattato come operazione esente/non imponibile (0%). */
 const STANDARD_VAT_RATES = ['4', '5', '10', '22'];
 
+/** One rounding contract for persisted totals and their fiscal representation. */
+export const invoiceAmountInCents = (value: number): number => Math.round((value + Number.EPSILON) * 100);
+export const roundInvoiceAmount = (value: number): number => invoiceAmountInCents(value) / 100;
+
 export interface InvoiceLineInput {
     /** Prezzo UNITARIO di riga (dal catalogo Product/Service, non dal client: vedi invoice.controller.ts). */
     sellingPrice: number;
@@ -105,10 +109,23 @@ function evalVat(isRivals: boolean, rivals: number, vatRate: number, sellingPric
     return (vatRate / 100) * sellingPrice;
 }
 
-export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
+export interface EvaluatedInvoiceLine {
+    totalLinePrice: number;
+    /** Proportional document discount is kept precise until aggregation. */
+    discountedPrice: number;
+    vatRate: number;
+    vatAmount: number;
+    rivalsAmount: number;
+}
+
+/** Shared calculation, including the details needed to reconcile a fiscal export. */
+export function evalTotalsDetailed(invoiceFields: EvalTotalsInput): {
+    totals: EvalTotalsResult;
+    lines: EvaluatedInvoiceLine[];
+} {
     // Invoice lines are currency amounts. Round each line's VAT before aggregation so
     // ten individually agreed/paid appointments retain the sum of their customer amounts.
-    const money = (value: number): number => Math.round((value + Number.EPSILON) * 100) / 100;
+    const money = roundInvoiceAmount;
     const rivals = invoiceFields.rivals || 0;
     const isRivals = !!invoiceFields.isRivals;
     // Il regime dell'emittente ha la precedenza sull'aliquota di catalogo: un forfettario non
@@ -123,6 +140,7 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
     }));
 
     let totalSellingPrice = 0;
+    const evaluatedLines: EvaluatedInvoiceLine[] = [];
     lines.forEach((line) => {
         totalSellingPrice += line.totalLinePrice;
     });
@@ -139,15 +157,21 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
         // Keep the proportional discount precise until the total; rounding it on every line
         // would change a fixed document discount (e.g. 1 euro spread over three equal lines).
         const discountedPrice = line.totalLinePrice - applyDiscount(discount, line.totalLinePrice);
+        const lineRivals = isRivals ? (rivals * discountedPrice) / 100 : 0;
+        const lineVat = line.vatKey === 'ESENTE' ? 0
+            : money(evalVat(isRivals, rivals, Number(line.vatKey), discountedPrice));
+        evaluatedLines.push({ totalLinePrice: line.totalLinePrice, discountedPrice,
+            vatRate: line.vatKey === 'ESENTE' ? 0 : Number(line.vatKey),
+            vatAmount: lineVat, rivalsAmount: lineRivals });
         if (isRivals) {
-            totalRivals += (rivals * discountedPrice) / 100;
+            totalRivals += lineRivals;
         }
 
         if (line.vatKey === 'ESENTE') {
             vatBuckets.ESENTE += 0; // operazione esente/non imponibile: nessuna IVA dovuta.
             vatFreeAmount += discountedPrice; // ...ma concorre alla soglia della marca da bollo.
         } else {
-            vatBuckets[line.vatKey] += money(evalVat(isRivals, rivals, Number(line.vatKey), discountedPrice));
+            vatBuckets[line.vatKey] += lineVat;
         }
     });
 
@@ -174,7 +198,7 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
     taxWithholdingValue = money(taxWithholdingValue);
     const netAmountDue = money(invoiceTotal - taxWithholdingValue);
 
-    return {
+    return { lines: evaluatedLines, totals: {
         invoiceTotal,
         sellingPrice: money([...(invoiceFields.products ?? []), ...(invoiceFields.services ?? [])]
             .reduce((sum, line) => sum + money((line.originalSellingPrice ?? line.sellingPrice) * (line.quantity ?? 1)), 0)),
@@ -185,7 +209,12 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
         rivalsAmount: totalRivals,
         taxWithholdingAmount: taxWithholdingValue,
         stampChargedAmount
-    };
+    } };
+}
+
+/** Compatibility wrapper: preserves the existing persistence/payment calculation exactly. */
+export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
+    return evalTotalsDetailed(invoiceFields).totals;
 }
 
 /**

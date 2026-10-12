@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import {after, before, test} from 'node:test';
-import {createActivitiesHarness, type ActivitiesHarness} from './activitiesTestHarness.js';
+import {createActivitiesHarness, type ActivitiesHarness, type ApiResult} from './activitiesTestHarness.js';
 
 let h: ActivitiesHarness;
 before(async () => {h = await createActivitiesHarness();}, {timeout: 180_000});
 after(async () => {if (h) await h.cleanup();});
 function data(result: {status: number; body: any}, status = 200) {assert.equal(result.status, status, JSON.stringify(result.body)); return result.body.data;}
+function invalidSession(result: ApiResult) {
+    assert.equal(result.status, 401, JSON.stringify(result.body));
+    assert.equal(result.body.error?.code, 'AUTH_SESSION_INVALID');
+}
 async function delivered(actor = h.actors.ownerA, recipientUserId = actor.userId) {
     const created = data(await h.api(actor, 'POST', '/activities', {operationId: randomUUID(), title: 'Titolo corrente ' + randomUUID()}), 201);
     const activity = created.activity;
@@ -24,7 +28,7 @@ test('feed include soltanto avvisi in app consegnati al destinatario nella sede 
     assert.equal(page.items.length, 1); assert.equal(page.unreadCount, 1);
     await own.delivery.reload(); assert.equal(own.delivery.readAt, null);
     assert.equal((await h.api(h.actors.patient, 'GET', '/activities/alerts')).status, 403);
-    assert.equal((await h.api(h.actors.outsiderA, 'GET', '/activities/alerts')).status, 403);
+    invalidSession(await h.api(h.actors.outsiderA, 'GET', '/activities/alerts'));
 });
 test('gli avvisi già consegnati conservano il titolo corrente di attività completate e archiviate', async () => {
     const {activity, delivery, schema} = await delivered();
@@ -63,8 +67,8 @@ test('revoca della sede elimina accesso anche a ricevute storiche già lette', a
     data(await h.api(h.actors.ownerA2, 'POST', `/activities/alerts/${delivery.id}/read`, {operationId}));
     await h.auth.StructureUser.destroy({where: {structureId: h.ids.structureA2, userId: h.ids.ownerA}});
     try {
-        assert.equal((await h.api(h.actors.ownerA2, 'GET', '/activities/alerts')).status, 403);
-        assert.equal((await h.api(h.actors.ownerA2, 'POST', `/activities/alerts/${delivery.id}/read`, {operationId})).status, 403);
+        invalidSession(await h.api(h.actors.ownerA2, 'GET', '/activities/alerts'));
+        invalidSession(await h.api(h.actors.ownerA2, 'POST', `/activities/alerts/${delivery.id}/read`, {operationId}));
     } finally {await h.auth.StructureUser.create({structureId: h.ids.structureA2, userId: h.ids.ownerA});}
 });
 test('riepilogo contesti staff elenca soltanto sedi assegnate nel relativo tenant', async () => {

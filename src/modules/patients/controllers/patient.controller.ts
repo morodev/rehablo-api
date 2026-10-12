@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { sequelize } from '../../../config/database.js';
 import multer from 'multer';
 import { Op, fn, col, cast, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -491,22 +492,25 @@ export const deletePatient = asyncHandler(async (req: Request, res: Response) =>
     const id = req.params.patientId;
     const scope = activePatientWhere(req);
 
-    const removedPatient = await Patient.schema(schema).findOne({ where: { id, ...scope } });
-    if (!removedPatient) {
-        return sendErrorResponse(res, 404, 'Paziente non trovato');
-    }
+    const removedPatient = await sequelize.transaction(async transaction => {
+        const removedPatient = await Patient.schema(schema).findOne({ where: { id, ...scope }, transaction, lock: transaction.LOCK.UPDATE });
+        if (!removedPatient) return null;
+        const archivedAt = new Date();
 
-    await Patient.schema(schema).update(
-        { archivedAt: new Date() },
-        { where: { id, ...scope } }
-    );
+        await Patient.schema(schema).update(
+            { archivedAt },
+            { where: { id, ...scope }, transaction }
+        );
 
-    // L'archiviazione rimuove il paziente dalle liste operative ma conserva il suo accesso
-    // storico in sola lettura. La revoca del portale resta un'azione esplicita e separata.
-    await PatientPortalAccess.update(
-        { status: 'HISTORICAL', historicalAt: new Date(), revokedAt: null, revokedByUserId: null },
-        { where: { tenantId: req.user!.tid ?? req.user!.tenants[0].id, patientId: id, status: 'ACTIVE' } }
-    );
+        // L'archiviazione rimuove il paziente dalle liste operative ma conserva il suo accesso
+        // storico in sola lettura. La revoca del portale resta un'azione esplicita e separata.
+        await PatientPortalAccess.update(
+            { status: 'HISTORICAL', historicalAt: archivedAt, revokedAt: null, revokedByUserId: null },
+            { where: { tenantId: req.user!.tid ?? req.user!.tenants[0].id, patientId: id, status: 'ACTIVE' }, transaction }
+        );
+        return removedPatient;
+    });
+    if (!removedPatient) return sendErrorResponse(res, 404, 'Paziente non trovato');
 
     return sendSuccessResponse(res, 200, removedPatient, 'Paziente archiviato correttamente');
 });

@@ -45,11 +45,12 @@ describe('invoiceRoutingLines', () => {
 
 describe('mapInvoiceToFatturaPa', () => {
     const products: InvoiceLineLike[] = [{ kind: 'PRODUCT', name: 'Tutore', vat: '22', quantity: 2, unitPrice: 30 }];
+    const totals = { discSellingPrice: 60, invoiceVAT: 13.2, invoiceTotal: 73.2, invoiceNet: 73.2 };
 
     it('produce un input B2B valido dallo snapshot', () => {
         const input = mapInvoiceToFatturaPa({
             issuer, recipient: businessRecipient, lines: products, progressivo: '2026000012',
-            document: { documentType: 'fattura', documentNumber: 12, documentYear: 2026, emissionDate: '2026-03-15' },
+            document: { ...totals, documentType: 'fattura', documentNumber: 12, documentYear: 2026, emissionDate: '2026-03-15' },
         });
         assert.deepEqual(validateFatturaPaInput(input), []);
         assert.equal(input.transmission.senderCode, '01234567890');
@@ -69,7 +70,7 @@ describe('mapInvoiceToFatturaPa', () => {
         };
         const input = mapInvoiceToFatturaPa({
             issuer, recipient, lines: products, progressivo: '2026000013',
-            document: { documentType: 'fattura', documentNumber: 13, documentYear: 2026, emissionDate: '2026-03-16' },
+            document: { ...totals, documentType: 'fattura', documentNumber: 13, documentYear: 2026, emissionDate: '2026-03-16' },
         });
         assert.equal(input.transmission.codiceDestinatario, '0000000');
         assert.equal(input.cessionario.nome, 'Mario');
@@ -80,28 +81,30 @@ describe('mapInvoiceToFatturaPa', () => {
     it('mappa la nota di credito su TD04', () => {
         const input = mapInvoiceToFatturaPa({
             issuer, recipient: businessRecipient, lines: products, progressivo: '2026000014',
-            document: { documentType: 'nota_di_credito', documentNumber: 14, documentYear: 2026, emissionDate: '2026-03-17' },
+            document: { ...totals, documentType: 'nota_di_credito', documentNumber: 14, documentYear: 2026, emissionDate: '2026-03-17' },
         });
         assert.equal(input.document.tipoDocumento, 'TD04');
     });
 
-    it('riporta il bollo solo se riaddebitato al paziente', () => {
+    it('dichiara il bollo anche se non riaddebitato, distinguendolo dal totale a pagare', () => {
         const withStamp = mapInvoiceToFatturaPa({
             issuer, recipient: businessRecipient, lines: products, progressivo: '2026000015',
             document: {
+                ...totals, invoiceTotal: 75.2, invoiceNet: 75.2,
                 documentType: 'fattura', documentNumber: 15, documentYear: 2026, emissionDate: '2026-03-18',
                 isStamp: true, stampAmount: 2, stampChargedToPatient: true,
             },
         });
-        assert.deepEqual(withStamp.document.bollo, { virtuale: true, importo: 2 });
+        assert.deepEqual(withStamp.document.bollo, { virtuale: true, importo: 2, chargedToCustomer: true });
 
         const notCharged = mapInvoiceToFatturaPa({
             issuer, recipient: businessRecipient, lines: products, progressivo: '2026000016',
             document: {
+                ...totals,
                 documentType: 'fattura', documentNumber: 16, documentYear: 2026, emissionDate: '2026-03-18',
                 isStamp: true, stampAmount: 2, stampChargedToPatient: false,
             },
         });
-        assert.equal(notCharged.document.bollo, null);
+        assert.deepEqual(notCharged.document.bollo, { virtuale: true, importo: 2, chargedToCustomer: false });
     });
 });

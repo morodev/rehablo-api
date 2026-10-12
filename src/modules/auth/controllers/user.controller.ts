@@ -2,7 +2,6 @@ import { updateCalendarPreferences } from './calendarPreference.controller.js';
 import { defaultCalendarEnabled, hasCalendarFields, projectStructureCalendar, projectStructureCalendars, saveStructureCalendar } from '../services/structureCalendar.service.js';
 import { Request, Response } from 'express';
 import { Op, Transaction } from 'sequelize';
-import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { sequelize } from '../../../config/database.js';
 import {applyTeamMembershipChange, getTeamOffboardingImpact, parseTeamChange, runTeamMutation, sendTeamOffboardingError} from '../services/teamOffboarding.service.js';
@@ -14,7 +13,7 @@ import { getGrantedPermissions, getSelectedStructureId, getUserId } from '../../
 import { hasPermission } from '../rbac/permissions.js';
 import { DEFAULT_ROLE, isRoleCode, RoleCode, ROLE_DEFINITIONS } from '../rbac/roles.js';
 import { sendForgotPasswordMail, signUpSendMail } from '../../../services/email.service.js';
-import { licenseSecret } from './tenant.controller.js';
+import { AccountActionTokenError, consumeAccountActionToken, issueAccountActionToken } from '../services/accountActionToken.service.js';
 import { revokeAllForUser, revokeForTenantMembership } from '../services/refreshToken.service.js';
 import {
     Tenant,
@@ -50,6 +49,7 @@ import {
  */
 const PROTECTED_USER_FIELDS = [
     'id',
+    'authVersion',
     'isSuperAdmin',
     'isTenant',
     'isActive',
@@ -229,8 +229,10 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
     userToCreate.isTenant = false;
     userToCreate.isSuperAdmin = false;
     userToCreate.isActive = false;
+    userToCreate.authVersion = 0;
 
     let user: any;
+    let verificationToken: string;
     try {
         user = await sequelize.transaction(async (transaction) => {
             await acquireTenantActivityGate(tenantId, transaction, 'shared');
@@ -243,6 +245,7 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
             if (selectedStructureId && hasCalendarFields(calendarPayload)) {
                 await saveStructureCalendar(created.get('id') as string, selectedStructureId, calendarPayload, transaction);
             }
+            verificationToken = await issueAccountActionToken(created.get('id'), created.get('email'), 'verify_email', transaction);
             return created;
         });
     } catch (error) {
@@ -256,13 +259,12 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
         throw error;
     }
 
-    const verificationToken = jwt.sign({ email: user.get('email') }, licenseSecret, { expiresIn: '12h' });
 
     // Fire-and-forget, consistent with createTenant: a misconfigured/unreachable SMTP must NOT
     // roll back user creation NOR slow down the HTTP response (nodemailer can take several
     // seconds to time out against a bad/unreachable host). The verification link is also logged
     // to the console in non-production environments (see email.service.ts) as a fallback.
-    signUpSendMail(user.get('email'), verificationToken).catch((err) => {
+    signUpSendMail(user.get('email'), verificationToken!).catch((err) => {
         console.error('[createUser] verification email could not be sent:', err);
     });
 
@@ -332,9 +334,12 @@ export const updateUserCalendarVisibility = (req: Request, res: Response, next: 
 
 export const updateUserCalendarColor = asyncHandler(async (req: Request, res: Response) => {
     const userId = req.params.userId;
-    if (!canEditUserPreferences(req, userId)) {
+    const tenantId = req.user?.tid ?? req.user?.tenants?.[0]?.id;
+    if (!tenantId || req.user?.actor === 'patient' || !canEditUserPreferences(req, userId)) {
         return sendErrorResponse(res, 403, 'forbidden');
     }
+    const targetMembership = await TenantUser.findOne({ where: { tenantId, userId, deactivatedAt: null } });
+    if (!targetMembership) return sendErrorResponse(res, 403, 'Utente non accessibile nel centro corrente');
     await User.update({ calendarColor: req.body.calendarColor }, { where: { id: userId } });
     const updatedUser = await User.findByPk(userId, { attributes: { exclude: ['password'] } });
     const projected = updatedUser ? await projectStructureCalendar(updatedUser.get({plain: true}), getCurrentTenantId(req), getSelectedStructureId(req)) : null;
@@ -611,42 +616,22 @@ export const deleteUser = asyncHandler(async (req: Request, res: Response) => {
 });
 
 export const resetPassword = asyncHandler(async (req: Request, res: Response) => {
-    const resetPasswordToken = req.params.resetPasswordToken;
-
-    let decoded: any;
-    try {
-        decoded = jwt.verify(resetPasswordToken, licenseSecret);
-    } catch {
-        return sendErrorResponse(res, 400, 'Invalid or expired token');
-    }
-
+    if (typeof req.body?.password !== 'string' || !req.body.password) return sendErrorResponse(res, 400, 'Password richiesta');
     const hashedPassword = await bcrypt.hash(req.body.password, 12);
-    const user = decoded.sub
-        ? await User.findByPk(decoded.sub)
-        : await findUserByIdentityEmail(decoded.email);
-    if (!user) return sendErrorResponse(res, 400, 'Invalid or expired token');
-
-    await user.update({ password: hashedPassword });
-    await revokeAllForUser(user.get('id') as string, 'password_changed');
-
+    try { await consumeAccountActionToken(req.params.resetPasswordToken, 'reset_password', hashedPassword); }
+    catch (error) {
+        if (error instanceof AccountActionTokenError) return sendErrorResponse(res, 400, error.message, { code: error.code });
+        throw error;
+    }
     return sendSuccessResponse(res, 204, {}, 'Password changed');
 });
 
 export const verificationAccount = asyncHandler(async (req: Request, res: Response) => {
-    const verificationToken = req.params.verificationToken;
-
-    let decoded: any;
-    try {
-        decoded = jwt.verify(verificationToken, licenseSecret);
-    } catch {
-        return sendErrorResponse(res, 400, 'Invalid or expired token');
+    try { await consumeAccountActionToken(req.params.verificationToken, 'verify_email'); }
+    catch (error) {
+        if (error instanceof AccountActionTokenError) return sendErrorResponse(res, 400, error.message, { code: error.code });
+        throw error;
     }
-
-    const user = decoded.sub
-        ? await User.findByPk(decoded.sub)
-        : await findUserByIdentityEmail(decoded.email);
-    if (!user) return sendErrorResponse(res, 400, 'Invalid or expired token');
-    await user.update({ isActive: true });
     return sendSuccessResponse(res, 200, {}, 'User activated');
 });
 
@@ -663,7 +648,7 @@ export const sendVerificationEmail = asyncHandler(async (req: Request, res: Resp
         return sendErrorResponse(res, 409, 'Email non trovata.');
     }
 
-    const verificationToken = jwt.sign({ sub: user.get('id'), email }, licenseSecret, { expiresIn: '12h' });
+    const verificationToken = await issueAccountActionToken(user.get('id'), email, 'verify_email');
 
     // Fire-and-forget, same reasoning as forgotPassword/signup: don't let a slow/unreachable SMTP
     // delay the HTTP response.
@@ -682,7 +667,7 @@ export const forgotPassword = asyncHandler(async (req: Request, res: Response) =
         return sendErrorResponse(res, 409, 'Email non trovata.');
     }
 
-    const resetPasswordToken = jwt.sign({ sub: user.get('id'), email }, licenseSecret, { expiresIn: '12h' });
+    const resetPasswordToken = await issueAccountActionToken(user.get('id'), email, 'reset_password');
 
     // Fire-and-forget, same reasoning as signup: don't let a slow/unreachable SMTP delay the
     // HTTP response (nodemailer can take several seconds to time out).

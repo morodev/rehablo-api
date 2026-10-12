@@ -1,7 +1,9 @@
 import { Request, Response } from 'express';
+import { sequelize } from '../../../config/database.js';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
+import { withScope } from '../../../utils/scopedWhere.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import HumanBodyArticularity from '../models/humanBodyArticularity.model.js';
 import { resolveHumanBodyPointId } from './humanBodyPoint.helper.js';
@@ -9,21 +11,21 @@ import { assertEvaluationEditable } from '../../evaluations/services/evaluationG
 
 export const saveArticularity = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined);
-    const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId);
-
-    if (!humanBodyPointId) {
+    const created = await sequelize.transaction(async transaction => {
+        await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined, transaction);
+        const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId, transaction);
+        if (!humanBodyPointId) return null;
+        const articularities = (req.body.articularities ?? []).map((art: Record<string, unknown>) => ({
+            evaluationId: req.body.evaluationId ?? null,
+            ...art,
+            humanBodyPointId,
+            userId: req.access!.userId
+        }));
+        return HumanBodyArticularity.schema(schema).bulkCreate(articularities, { transaction });
+    });
+    if (!created) {
         return sendErrorResponse(res, 400, 'humanBodyPointId or pointToCreate is required');
     }
-
-    const articularities = (req.body.articularities ?? []).map((art: Record<string, unknown>) => ({
-        evaluationId: req.body.evaluationId ?? null,
-        ...art,
-        humanBodyPointId,
-        userId: req.access!.userId
-    }));
-
-    const created = await HumanBodyArticularity.schema(schema).bulkCreate(articularities);
     return sendSuccessResponse(res, 201, created, 'Human body articularity created');
 });
 
@@ -76,13 +78,15 @@ export const getArticularityByBodyPart = asyncHandler(async (req: Request, res: 
     const schema = req.tenantSchema!;
     const { bodyPart, bodySubPart, patientId, evaluationId } = req.query;
 
-    const where: Record<string, unknown> = { ...patientResourceScopeWhere(req, schema) };
+    const where: Record<string, unknown> = {};
     if (bodyPart) where.bodyPart = sequelizeWhere(fn('LOWER', col('bodyPart')), 'LIKE', `%${String(bodyPart).toLowerCase()}%`);
     if (bodySubPart) where.bodySubPart = sequelizeWhere(fn('LOWER', col('bodySubPart')), 'LIKE', `%${String(bodySubPart).toLowerCase()}%`);
     if (patientId) where.patientId = patientId;
     if (evaluationId) where.evaluationId = evaluationId;
 
-    const articularity = await HumanBodyArticularity.schema(schema).findAll({ where: { [Op.and]: where } });
+    const articularity = await HumanBodyArticularity.schema(schema).findAll({
+        where: withScope(patientResourceScopeWhere(req, schema), where)
+    });
     return sendSuccessResponse(res, 200, articularity, 'Human body articularity loaded');
 });
 

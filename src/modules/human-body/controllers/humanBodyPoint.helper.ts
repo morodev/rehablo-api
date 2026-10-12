@@ -1,4 +1,5 @@
 import HumanBodyPoint from '../models/humanBodyPoint.model.js';
+import type { Transaction } from 'sequelize';
 
 /**
  * Many human-body sub-resources (symptom/articularity/strength) can either be attached to an
@@ -8,13 +9,14 @@ import HumanBodyPoint from '../models/humanBodyPoint.model.js';
 export async function resolveHumanBodyPointId(
     schema: string,
     body: Record<string, unknown>,
-    userId: string
+    userId: string,
+    transaction?: Transaction
 ): Promise<string | null> {
     const humanBodyPointId = body.humanBodyPointId as string | undefined;
 
     if (humanBodyPointId) {
         const point = await HumanBodyPoint.schema(schema).findOne({
-            where: { id: humanBodyPointId, userId }
+            where: { id: humanBodyPointId, userId }, transaction
         });
         return point ? (point.get('id') as string) : null;
     }
@@ -24,7 +26,7 @@ export async function resolveHumanBodyPointId(
         return null;
     }
 
-    const point = await HumanBodyPoint.schema(schema).create({ ...pointToCreate, userId } as any);
+    const point = await HumanBodyPoint.schema(schema).create({ ...pointToCreate, userId } as any, { transaction });
     return point.get('id') as string;
 }
 
