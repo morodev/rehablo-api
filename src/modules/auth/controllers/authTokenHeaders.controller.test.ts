@@ -1,3 +1,4 @@
+import {BillingAccount} from '../../billing/models/billing.model.js';
 import assert from 'node:assert/strict';
 import { it, TestContext } from 'node:test';
 import { createServer, request } from 'node:http';
@@ -28,6 +29,7 @@ function run(handler: any, req: any): Promise<any> {
     });
 }
 function fixture(t: TestContext) {
+    t.mock.method(BillingAccount, 'findByPk', (async () => null) as any);
     t.mock.method(sequelize, 'transaction', (async (callback: any) => callback({ LOCK: { UPDATE: 'UPDATE' } })) as any);
     const structure = {id: structureId, tenantId, name: 'Test site'};
     const calendar = {userId, structureId, calendarEnabled: true, availabilityMode: 'CUSTOM', role: null};

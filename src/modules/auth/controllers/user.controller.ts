@@ -1,3 +1,4 @@
+import {assertBillingCapacity} from '../../billing/services/billingAccess.service.js';
 import { updateCalendarPreferences } from './calendarPreference.controller.js';
 import { defaultCalendarEnabled, hasCalendarFields, projectStructureCalendar, projectStructureCalendars, saveStructureCalendar } from '../services/structureCalendar.service.js';
 import { Request, Response } from 'express';
@@ -236,6 +237,7 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
     try {
         user = await sequelize.transaction(async (transaction) => {
             await acquireTenantActivityGate(tenantId, transaction, 'shared');
+            await assertBillingCapacity(tenantId, 'users', transaction);
             const created = await User.create(userToCreate, {transaction});
             await StructureUser.bulkCreate(targetStructures.map((structure: any) => ({
                 userId: created.get('id') as string, structureId: structure.id,

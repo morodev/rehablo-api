@@ -1,3 +1,5 @@
+import {BillingAccount} from '../../billing/models/billing.model.js';
+import {billingEnabled, billingConfigured} from '../../billing/services/billingConfig.service.js';
 import { Request, Response } from 'express';
 import multer from 'multer';
 import jwt from 'jsonwebtoken';
@@ -29,6 +31,10 @@ export const logoUploadMiddleware = multer({
 }).single('file');
 
 export const createTenant = asyncHandler(async (req: Request, res: Response) => {
+    const paidRegistration = billingEnabled();
+    if (paidRegistration && !billingConfigured()) {
+        return sendErrorResponse(res, 503, 'Registrazione temporaneamente non disponibile. Riprova tra poco.', {code: 'BILLING_NOT_CONFIGURED'});
+    }
     req.body = {
         ...req.body,
         userQuantity: 1,
@@ -79,6 +85,11 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
             } as any,
             { transaction }
         );
+
+        // Absence of this row keeps pre-existing customers on their original conditions.
+        if (paidRegistration) await BillingAccount.create({
+            tenantId: tenant.id, customerId: stripeCustomerId === 'no-stripe' ? null : stripeCustomerId
+        }, {transaction});
 
         const createdUser = await User.create(
             {

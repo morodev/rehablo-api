@@ -1,3 +1,4 @@
+import {assertBillingAccess} from '../modules/billing/services/billingAccess.service.js';
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { env } from '../config/env.js';
@@ -78,7 +79,16 @@ function authenticate(identityOnly: boolean) {
             entries.set(identityOnly, pending);
             principalByRequest.set(req, entries);
         }
-        return pending.then(principal => { req.user = principal; next(); }).catch(error => {
+        return pending.then(async principal => {
+            req.user = principal;
+            // Billing recovery and context selection remain reachable after expiration.
+            // Patients retain their portal access; an unpaid staff account cannot call operational APIs.
+            if (!identityOnly && principal.actor !== 'patient' && !isBillingRecoveryRequest(req)) {
+                const tenantId = principal.tid ?? principal.tenants?.[0]?.id;
+                if (tenantId) await assertBillingAccess(tenantId);
+            }
+            next();
+        }).catch(error => {
             if (error instanceof AuthStateError) return sendErrorResponse(res, 401, error.message, { code: error.code });
             // Un guasto del DB non è una credenziale errata: passa al normale error handler.
             return next(error);
@@ -106,3 +116,12 @@ export function getCurrentTenantId(req: Request): string {
     return tenantId;
 }
 
+
+/** Exact routes needed to authenticate, select a center and pay an outstanding subscription. */
+export function isBillingRecoveryRequest(req: Pick<Request, 'path' | 'method'>): boolean {
+    const routePath = req.path ?? '';
+    if (routePath === '/billing' || routePath.startsWith('/billing/')) return true;
+    if (req.method === 'GET' && ['/auth/me', '/auth/me/permissions', '/auth/session/contexts',
+        '/structure', '/structure/accessible'].includes(routePath)) return true;
+    return req.method === 'POST' && /^\/auth\/login-premise\/[^/]+$/.test(routePath);
+}

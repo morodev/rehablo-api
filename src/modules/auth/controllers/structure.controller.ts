@@ -1,3 +1,4 @@
+import {assertBillingCapacity} from '../../billing/services/billingAccess.service.js';
 import { Request, Response } from 'express';
 import { Op } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -17,16 +18,12 @@ export const saveStructureForTenant = asyncHandler(async (req: Request, res: Res
         return sendErrorResponse(res, 404, 'Tenant not found');
     }
 
-    // TODO: re-enable the structure quantity limit once subscription plans are wired in.
-    // if (tenant.get('structureQuantity') >= tenant.get('maxStructureQuantity')) {
-    //     return sendErrorResponse(res, 403, 'Maximum limit for structures');
-    // }
-
     req.body.tenantId = tenantId;
 
     // Sede, disponibilità, membership degli owner e board diventano visibili insieme.
     const newStructure = await sequelize.transaction(async transaction => {
         await acquireTenantActivityGate(tenantId, transaction, 'shared');
+        await assertBillingCapacity(tenantId, 'structures', transaction);
         const structure = await Structure.create(req.body, {
             include: StructureAvailability as any,
             transaction

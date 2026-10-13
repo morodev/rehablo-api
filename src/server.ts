@@ -1,3 +1,6 @@
+import billingRoutes from './modules/billing/routes/billing.routes.js';
+import {billingWebhook} from './modules/billing/controllers/billing.controller.js';
+import {syncBillingModels} from './modules/billing/models/billing.model.js';
 import { migrateStructureCalendars } from './modules/auth/services/structureCalendarMigration.service.js';
 import express from 'express';
 import cors from 'cors';
@@ -64,6 +67,8 @@ async function bootstrap() {
         })
     );
     app.use(morgan(env.isProduction ? 'combined' : 'dev'));
+    // Stripe signatures must be verified against the original bytes, before JSON parsing.
+    app.post('/billing/webhook', express.raw({type: 'application/json', limit: '1mb'}), billingWebhook);
     app.use(bodyParser.urlencoded({ extended: false }));
     app.use(bodyParser.json());
 
@@ -75,6 +80,7 @@ async function bootstrap() {
 
 
     // --- Domain routers (every module owns its own URL prefix-free routes, mounted at root) ---
+    app.use(billingRoutes);
     app.use(authRoutes);
     app.use(patientPortalRoutes);
     // Handle Activities before legacy routers whose root middleware performs lazy schema sync.
@@ -102,6 +108,7 @@ async function bootstrap() {
     // Public-schema models (tenants/users/structures/availabilities)
     registerAuthAssociations();
     await syncAuthModels();
+    await syncBillingModels();
     // Il link di consegna della fattura vive in `public`: dev'essere risolvibile da una richiesta
     // anonima, che non ha un tenant da cui derivare lo schema.
     await syncInvoicePublicModels();

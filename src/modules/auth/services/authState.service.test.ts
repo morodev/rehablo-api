@@ -1,3 +1,5 @@
+import {BillingAccount} from '../../billing/models/billing.model.js';
+import {isBillingRecoveryRequest} from '../../../middleware/auth.js';
 import assert from 'node:assert/strict';
 import { it, TestContext } from 'node:test';
 import jwt from 'jsonwebtoken';
@@ -16,6 +18,7 @@ const claims = (patch: any = {}): AuthTokenPayload => ({ id: 'user', sub: 'user'
     isActive: true, isSuperAdmin: true, tenants: [{ id: 'tenant' }], tid: 'tenant', role: 'OWNER',
     actor: 'staff', perms: ['patient:manage:tenant'], ...patch });
 function fixture(t: TestContext) {
+    t.mock.method(BillingAccount, 'findByPk', (async () => null) as any);
     const user = { id: 'user', email: 'user@example.invalid', isActive: true, isSuperAdmin: true, authVersion: 0 };
     const membership: any = { userId: 'user', tenantId: 'tenant', role: 'OWNER', deactivatedAt: null };
     const lookups = t.mock.method(User, 'findByPk', (async () => row(user)) as any);
@@ -107,4 +110,47 @@ it('identity-only authentication never bypasses reset revocation and DB faults r
     let received: unknown;
     await requireAuth({ ...req } as any, res, error => { received = error; });
     assert.equal(received, failure);
+});
+
+it('blocks operational staff access after payment expiry but keeps billing and context recovery reachable', async t => {
+    fixture(t);
+    t.mock.method(BillingAccount, 'findByPk', (async () => ({status: 'active', paidThrough: new Date(0)})) as any);
+    const token = jwt.sign(claims(), env.jwtSecret);
+    const res: any = {status() {return this;}, json() {return this;}};
+    const check = async (path: string, method = 'GET') => {
+        let failure: any; let allowed = false;
+        await requireAuth({path, method, header: () => token} as any, res, error => {failure = error; allowed = !error;});
+        return {failure, allowed};
+    };
+    const denied = await check('/patients');
+    assert.equal(denied.allowed, false);
+    assert.equal(denied.failure.code, 'BILLING_ACCESS_REQUIRED');
+    assert.equal(denied.failure.statusCode, 402);
+    for (const route of ['/billing', '/billing/portal', '/auth/me', '/structure/accessible']) {
+        assert.equal((await check(route)).allowed, true, route);
+    }
+    assert.equal((await check('/structure', 'POST')).allowed, false);
+    assert.equal((await check('/auth/login-premise/site', 'POST')).allowed, true);
+});
+
+it('never interprets operational route prefixes as a billing recovery route', () => {
+    for (const path of ['/billing-export', '/auth/me/anything', '/structure/other', '/auth/login-premise']) {
+        assert.equal(isBillingRecoveryRequest({path, method: 'GET'}), false, path);
+    }
+});
+
+it('billing database failures fail closed for staff but do not interrupt patient portal access', async t => {
+    fixture(t);
+    const failure = new Error('billing database unavailable');
+    t.mock.method(BillingAccount, 'findByPk', (async () => {throw failure;}) as any);
+    const res: any = {status() {return this;}, json() {return this;}};
+    let received: any;
+    await requireAuth({path: '/patients', method: 'GET', header: () => jwt.sign(claims(), env.jwtSecret)} as any,
+        res, error => {received = error;});
+    assert.equal(received, failure);
+    let patientAllowed = false;
+    await requireAuth({path: '/patient-portal/profile', method: 'GET',
+        header: () => jwt.sign(claims({actor: 'patient', patientAccessId: 'access'}), env.jwtSecret)} as any,
+        res, error => {assert.equal(error, undefined); patientAllowed = true;});
+    assert.equal(patientAllowed, true);
 });

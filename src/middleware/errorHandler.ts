@@ -7,6 +7,9 @@ export function notFoundHandler(req: Request, res: Response) {
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function errorHandler(err: any, req: Request, res: Response, next: NextFunction) {
+    if (typeof err?.code === 'string' && err.code.startsWith('BILLING_') && Number.isInteger(err.statusCode)) {
+        return sendErrorResponse(res, err.statusCode, err.message, {code: err.code});
+    }
     if (err?.name === 'SequelizeUniqueConstraintError') {
         const fields = [...new Set<string>([
             ...Object.keys(err?.fields ?? {}),

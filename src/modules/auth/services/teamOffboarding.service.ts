@@ -1,3 +1,4 @@
+import {assertBillingCapacity} from '../../billing/services/billingAccess.service.js';
 import {createHash} from 'node:crypto';
 import type {Request, Response} from 'express';
 import {Op, Transaction} from 'sequelize';
@@ -341,6 +342,12 @@ export async function runTeamMutation<T extends Record<string, any>>(
     const tenantId = getCurrentTenantId(req);
     return sequelize.transaction(async transaction => {
         await acquireTenantActivityGate(tenantId, transaction, 'exclusive');
+        // Take the billing lock before membership locks, matching the creation flow.
+        // An already-active member has already occupied a seat, including unverified emails.
+        if (change.kind === 'status' && change.active) {
+            const member = await TenantUser.findOne({where: {tenantId, userId: targetUserId}, transaction});
+            if (member?.deactivatedAt) await assertBillingCapacity(tenantId, 'users', transaction);
+        }
         const actor = await actorContext(req, transaction);
         const boards = await allBoards(actor, transaction, true);
         const body = record(req.body);
