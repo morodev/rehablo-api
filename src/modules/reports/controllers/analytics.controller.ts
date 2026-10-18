@@ -5,6 +5,7 @@ import { patientScopeWhere } from '../../../middleware/rbac.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import Patient from '../../patients/models/patient.model.js';
+import {User} from '../../auth/models/index.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoiceProduct from '../../invoice/models/invoiceProduct.model.js';
 import InvoiceService from '../../invoice/models/invoiceService.model.js';
@@ -25,6 +26,7 @@ import {
 } from '../services/analytics.service.js';
 
 import { aggregateFinance, loadFinanceData, parseFinanceFilters, therapyPaymentsPayload } from '../services/finance.service.js';
+import {validIssuedDocument} from '../services/financialFacts.service.js';
 
 const money = (value: unknown): number => Math.round((Number(value) || 0) * 100) / 100;
 
@@ -45,9 +47,10 @@ function queryOr400(req: Request, res: Response): AnalyticsQuery | null {
 function invoiceWhere(req: Request, query: AnalyticsQuery, extra: Record<string | symbol, any> = {}) {
     const where: Record<string | symbol, any> = {
         ...extra,
-        ...patientScopeWhere(req, req.tenantSchema!, 'patientID')
+        ...((req as any).reportScope ? {} : patientScopeWhere(req, req.tenantSchema!, 'patientID'))
     };
-    if (query.structureId) where.structureId = query.structureId;
+    if (query.structureIds) where.structureId = {[Op.in]: query.structureIds};
+    else if (query.structureId) where.structureId = query.structureId;
     return where;
 }
 
@@ -101,8 +104,9 @@ export const getSummary = asyncHandler(async (req: Request, res: Response) => {
 async function patientPayload(req: Request, query: AnalyticsQuery) {
     const schema = req.tenantSchema!;
     const where: Record<string | symbol, any> = { archivedAt: null };
-    if (query.structureId) where.structureId = query.structureId;
-    if (req.access?.scope === 'own') where.userId = req.access.userId;
+    if (query.structureIds) where.structureId = {[Op.in]: query.structureIds};
+    else if (query.structureId) where.structureId = query.structureId;
+    // Patient ownership is audit information; clinical cohorts follow scoped appointments.
 
     const patients = await Patient.schema(schema).findAll({
         where,
@@ -120,7 +124,8 @@ async function patientPayload(req: Request, query: AnalyticsQuery) {
         start: { [Op.lte]: new Date(Date.parse(`${query.to}T23:59:59.999Z`) + 3 * 3_600_000).toISOString() },
         patientId: { [Op.ne]: null }
     };
-    if (query.structureId) completedWhere.structureId = query.structureId;
+    if (query.structureIds) completedWhere.structureId = {[Op.in]: query.structureIds};
+    else if (query.structureId) completedWhere.structureId = query.structureId;
     if (query.operatorId) completedWhere.calendarId = query.operatorId;
     const completedHistory = await AgendaEvent.schema(schema).findAll({
         where: completedWhere,
@@ -140,7 +145,7 @@ async function patientPayload(req: Request, query: AnalyticsQuery) {
         const key = createdAt ? localDateKey(new Date(createdAt)) : '';
         return key >= query.from && key <= query.to;
     }).length;
-    const newClinical = [...firstByPatient.values()].filter((date) => date >= query.from && date <= query.to).length;
+    const newClinical = [...firstByPatient.entries()].filter(([id, date]) => activeIds.has(id) && date >= query.from && date <= query.to).length;
     return {
         registeredTotal: patients.length,
         registeredNew,
@@ -206,13 +211,14 @@ export const getOperators = asyncHandler(async (req: Request, res: Response) => 
     const query = queryOr400(req, res);
     if (!query) return;
     const activity = await aggregateActivity(req.tenantSchema!, query);
-    const invoices = await Invoice.schema(req.tenantSchema!).findAll({
+    const invoiceRows = await Invoice.schema(req.tenantSchema!).findAll({
         where: invoiceWhere(req, query, {
             emissionDate: { [Op.between]: [query.from, query.to] },
             status: { [Op.ne]: 'void' }
         }),
-        attributes: ['id', 'agendaEventId', 'invoiceTotal', 'documentType']
+        attributes: ['id', 'agendaEventId', 'invoiceTotal', 'documentType', 'status', 'emissionDate']
     });
+    const invoices = invoiceRows.filter(row => validIssuedDocument(row.get({plain: true})));
     const invoiceIds = invoices.map((row) => row.id);
     const appointmentLinks = await getInvoiceAgendaLinksByInvoiceIds(req.tenantSchema!, invoiceIds);
     const eventIds = [...new Set([
@@ -221,7 +227,7 @@ export const getOperators = asyncHandler(async (req: Request, res: Response) => 
     ])] as string[];
     const events = eventIds.length ? await AgendaEvent.schema(req.tenantSchema!).findAll({
         where: { id: { [Op.in]: eventIds } },
-        attributes: ['id', 'calendarId', 'eventTypeId']
+        attributes: ['id', 'calendarId', 'eventTypeId', 'structureId']
     }) : [];
     const eventById = new Map(events.map((event) => [event.id, event]));
     const eventIdsByInvoice = new Map<string, string[]>();
@@ -240,10 +246,13 @@ export const getOperators = asyncHandler(async (req: Request, res: Response) => 
     let unassignedRevenue = 0;
     invoices.forEach((row) => {
         const value = (row.documentType === 'nota_di_credito' ? -1 : 1) * (Number(row.invoiceTotal) || 0);
-        const linkedEvents = (eventIdsByInvoice.get(row.id) ?? [])
+        const linkedIds = eventIdsByInvoice.get(row.id) ?? [];
+        const linkedEvents = linkedIds
             .map((eventId) => eventById.get(eventId))
             .filter(Boolean);
-        if (linkedEvents.length === 0) {
+        const selectedSites = query.structureIds ?? (query.structureId ? [query.structureId] : []);
+        if (linkedEvents.length === 0 || linkedEvents.length !== linkedIds.length ||
+            (selectedSites.length && linkedEvents.some(event => !event!.structureId || !selectedSites.includes(event!.structureId)))) {
             if (!query.operatorId && !query.eventTypeId) unassignedRevenue += value;
             return;
         }
@@ -259,6 +268,12 @@ export const getOperators = asyncHandler(async (req: Request, res: Response) => 
         if (query.operatorId && operatorId !== query.operatorId) return;
         if (!operatorId) unassignedRevenue += value;
         else revenueByOperator.set(operatorId, (revenueByOperator.get(operatorId) ?? 0) + value);
+    });
+    const missingIds = [...revenueByOperator.keys()].filter(id => !activity.operators.some(row => row.operatorId === id));
+    const missingUsers = missingIds.length ? await User.findAll({where: {id: {[Op.in]: missingIds}}, attributes: ['id', 'name', 'surname']}) : [];
+    for (const user of missingUsers) activity.operators.push({
+        ...Object.fromEntries(Object.keys(activity.totals).map(key => [key, 0])) as typeof activity.totals,
+        operatorId: user.id, operatorName: [user.name, user.surname].filter(Boolean).join(' '), availableMinutes: null, utilizationRate: null
     });
     return sendSuccessResponse(res, 200, {
         period: query,
@@ -283,9 +298,9 @@ export const getCatalog = asyncHandler(async (req: Request, res: Response) => {
             emissionDate: { [Op.between]: [query.from, query.to] },
             status: { [Op.ne]: 'void' }
         }),
-        attributes: ['id', 'sellingPrice', 'discSellingPrice', 'documentType']
+        attributes: ['id', 'sellingPrice', 'discSellingPrice', 'documentType', 'status', 'emissionDate']
     });
-    const invoices = invoiceRows.map((row) => row.get({ plain: true }) as Record<string, any>);
+    const invoices = invoiceRows.map((row) => row.get({ plain: true }) as Record<string, any>).filter(validIssuedDocument);
     const ids = invoices.map((invoice) => invoice.id);
     const [products, services] = ids.length ? await Promise.all([
         InvoiceProduct.schema(schema).findAll({ where: { InvoiceId: { [Op.in]: ids } } }),
@@ -348,7 +363,7 @@ export const getReceivables = asyncHandler(async (req: Request, res: Response) =
         }),
         attributes: ['id', 'patientID', 'documentNumber', 'documentYear', 'documentType', 'emissionDate', 'paymentTerms', 'invoiceTotal', 'invoiceNet', 'status']
     });
-    const invoices = rows.map((row) => row.get({ plain: true }) as Record<string, any>);
+    const invoices = rows.map((row) => row.get({ plain: true }) as Record<string, any>).filter(validIssuedDocument);
     const summaries = await getPaymentSummaries(req.tenantSchema!, invoices);
     const patientIds = [...new Set(invoices.map((invoice) => invoice.patientID).filter(Boolean))];
     const patients = patientIds.length ? await Patient.schema(req.tenantSchema!).findAll({

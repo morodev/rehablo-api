@@ -22,6 +22,8 @@ import { createTreasuryClosing, reverseTreasuryMovement } from '../services/trea
 import { submitFiscal } from './fiscalSimulation.controller.js';
 import { resolvePrice } from '../services/pricing.service.js';
 import { validateQuoteDraft } from '../services/quoteAccess.js';
+import { reportStructureWhere, resolveReportScope } from '../../reports/services/reportScope.service.js';
+import { resolveAdministrationDateRange, romeToday } from '../services/administrationQuery.service.js';
 import { ensureNoPendingQuoteDelivery, loadScopedQuote, revokeQuoteLinks } from '../services/quoteDelivery.service.js';
 import { lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
 
@@ -500,14 +502,18 @@ const overview = asyncHandler(async (req, res) => {
 });
 
 const accountantExport = asyncHandler(async (req, res) => {
-    const from = String(req.query.from ?? `${new Date().getFullYear()}-01-01`);
-    const to = String(req.query.to ?? new Date().toISOString().slice(0, 10));
+    const scope = await resolveReportScope(req, { resource: 'accountant_export', action: 'export' });
+    const today = romeToday();
+    const period = resolveAdministrationDateRange(req.query.from ?? `${today.slice(0, 4)}-01-01`, req.query.to ?? today);
+    const { from, to } = period;
+    const visible = reportStructureWhere(scope);
     const [movements, expenses, invoices] = await Promise.all([
-        TreasuryMovement.schema(req.tenantSchema!).findAll({ where: { occurredAt: { [Op.between]: [from, `${to}T23:59:59`] }, ...structureWhere(req, SPECS.treasuryMovements) }, order: [['occurredAt','ASC']] }),
-        Expense.schema(req.tenantSchema!).findAll({ where: { incurredAt: { [Op.between]: [from, to] }, ...structureWhere(req, SPECS.expenses) }, order: [['incurredAt','ASC']] }),
-        Invoice.schema(req.tenantSchema!).findAll({ where: { emissionDate: { [Op.between]: [from, to] } }, order: [['emissionDate','ASC']] })
+        TreasuryMovement.schema(req.tenantSchema!).findAll({ where: { occurredAt: { [Op.between]: [period.fromInstant!, period.toInstant!] }, ...visible }, order: [['occurredAt','ASC'], ['id', 'ASC']] }),
+        Expense.schema(req.tenantSchema!).findAll({ where: { incurredAt: { [Op.between]: [from!, to!] }, ...visible }, order: [['incurredAt','ASC'], ['id', 'ASC']] }),
+        Invoice.schema(req.tenantSchema!).findAll({ where: { emissionDate: { [Op.between]: [from!, to!] }, ...visible }, order: [['emissionDate','ASC'], ['id', 'ASC']] })
     ]);
-    return sendSuccessResponse(res, 200, { period: { from, to }, generatedAt: new Date(), movements, expenses, invoices });
+    return sendSuccessResponse(res, 200, { period: { from, to }, effectiveFilters: { structureIds: scope.selectedStructureIds },
+        generatedAt: new Date(), movements, expenses, invoices });
 });
 
 export default {

@@ -3,6 +3,7 @@ import {Request} from 'express';
 import {Op, Transaction} from 'sequelize';
 import {sequelize} from '../../../config/database.js';
 import {getUserId} from '../../../middleware/rbac.js';
+import {canAccessAppointmentFinance} from '../../agenda/services/appointmentFinancialAccess.service.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
@@ -114,7 +115,7 @@ async function applyPricing(req: Request, context: AuthorizedSettlementContext, 
     events: Map<string, AgendaEvent>, transaction: Transaction): Promise<void> {
     if (!request.pricing) return;
     const event = events.get(context.referenceAgendaEventId ?? '');
-    if (!event || !settlementRecordAccess(req, context, 'APPOINTMENT', event.get({plain: true}), 'update')) settlementFail(403, 'Non puoi modificare il prezzo della seduta');
+    if (!event || !canAccessAppointmentFinance(req, event.get({plain: true}), 'appointment_pricing', 'update')) settlementFail(403, 'Non puoi modificare il prezzo della seduta');
     if (event.invoiceId || event.recurrence || event.recurringEventId || !['CONFIRMED', 'COMPLETED'].includes(String(event.status).toUpperCase())
         || !Number.isFinite(Date.parse(event.start ?? '')) || Date.parse(event.start!) > Date.now()) settlementFail(409, 'Il prezzo della seduta non è modificabile');
     const price = (await appointmentPricesByEvent(req.tenantSchema!, [event.get({plain: true})], transaction)).get(event.id)!;
@@ -171,7 +172,9 @@ export async function executePatientSettlement(req: Request) {
             for (const allocation of request.allocations) {
                 const model = allocation.kind === 'APPOINTMENT' ? await AgendaEvent.schema(schema).findByPk(allocation.targetId, {transaction})
                     : await Invoice.schema(schema).findByPk(allocation.targetId, {transaction});
-                if (!model || !settlementRecordAccess(req, context, allocation.kind, model.get({plain: true}), 'read')) settlementFail(403, 'La registrazione non è più accessibile');
+                if (!model || !settlementRecordAccess(req, context, allocation.kind, model.get({plain: true}), 'read')
+                    || (request.cash.amount > 0 && !settlementRecordAccess(req, context, allocation.kind, model.get({plain: true}), 'update'))
+                    || (request.pricing && allocation.kind === 'APPOINTMENT' && !canAccessAppointmentFinance(req, model.get({plain: true}), 'appointment_pricing', 'update'))) settlementFail(403, 'La registrazione non è più accessibile');
             }
             if (request.credits.length && (!administrationEnabled || !settlementRecordAccess(req, context, 'CREDIT', {structureId: context.structureId}, 'update'))) settlementFail(403, 'La registrazione non è più accessibile');
             void raw;
@@ -233,6 +236,7 @@ export async function executePatientSettlement(req: Request) {
             const split = plan.get(row.key)!;
             const entry = {kind: allocation.kind, targetId: allocation.targetId, paymentIds: [] as string[], creditMovementIds: [] as string[]};
             if (row.kind === 'APPOINTMENT' && row.expectedAmount === null) {
+                if (!canAccessAppointmentFinance(req, row.record, 'appointment_pricing', 'update')) settlementFail(403, 'Il prezzo deve essere definito da un operatore autorizzato');
                 const finalAmount = paymentMoney(row.paidAmount + allocation.amount);
                 await events.get(row.targetId)!.update({appointmentExpectedAmount: finalAmount, appointmentOriginalAmount: finalAmount,
                     appointmentNetAmount: null, appointmentVatRate: null, appointmentPriceRecordedAt: new Date(), appointmentPaymentHistoryKnown: true}, {transaction});
@@ -266,6 +270,7 @@ export async function executePatientSettlement(req: Request) {
             if (row.kind === 'APPOINTMENT') {
                 const event = events.get(row.targetId)!;
                 if (split.cash > 0 && request.completeReference && row.targetId === context.referenceAgendaEventId) {
+                    if (!canAccessAppointmentFinance(req, event.get({plain: true}), 'agenda', 'update')) settlementFail(403, 'Non puoi modificare la presenza della seduta');
                     const patch: Record<string, any> = {};
                     if (String(event.status).toUpperCase() === 'CONFIRMED') patch.status = 'COMPLETED';
                     if (event.missedArrivalReportedAt && !event.missedArrivalResolvedAt) Object.assign(patch,

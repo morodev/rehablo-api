@@ -206,7 +206,7 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
     const selectedStructureIds = role === RoleCode.OWNER
         ? allowedStructureIds
         : uniqueRequestedIds
-          ?? (role === RoleCode.SECRETARY || allowedStructureIds.length === 1
+          ?? ((role === RoleCode.SECRETARY || role === RoleCode.ADMIN_SECRETARY) || allowedStructureIds.length === 1
               ? allowedStructureIds
               : []);
     const structureSelectionError = validateUserStructureSelection(

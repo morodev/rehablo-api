@@ -309,11 +309,21 @@ export const loginWithToken = asyncHandler(async (req: Request, res: Response) =
     catch { return sendErrorResponse(res, 401, 'invalid or expired token'); }
     const decoded = await resolveApplicationPrincipal(verified);
     const compactToken = compactVerifiedApplicationToken(decoded);
+    // Tokens contain only authentication claims; restore current profile data for F5/login-token.
+    const user = await User.findByPk(decoded.id, {
+        attributes: { exclude: ['password'] },
+        include: [{ model: Structure, include: [{ model: StructureAvailability }] }, Tenant],
+        order: [[Structure, StructureAvailability, 'day', 'ASC']]
+    });
+    assertCurrentIdentity(user, decoded.authVersion);
+    const profile = buildTokenPayload(user, decoded.actor);
+    const structures = decoded.actor === 'staff' && decoded.tid && Array.isArray(profile.structures)
+        ? profile.structures : [];
 
     const base = {
         id: decoded.id,
-        name: decoded.name,
-        surname: decoded.surname,
+        name: profile.name,
+        surname: profile.surname,
         email: decoded.email,
         isActive: decoded.isActive,
         isSuperAdmin: decoded.isSuperAdmin,
@@ -321,8 +331,8 @@ export const loginWithToken = asyncHandler(async (req: Request, res: Response) =
         perms: decoded.perms ?? [],
         // Necessario per ripristinare il selettore sedi anche con F5 mentre
         // l'access token è ancora valido (quindi senza passare dal refresh).
-        structures: Array.isArray(decoded.structures) ? decoded.structures : [],
-        data: decoded
+        structures,
+        data: { ...profile, ...decoded, name: profile.name, surname: profile.surname, structures }
     };
 
     Object.assign(base, await projectStructureCalendar(base, decoded.tid ?? decoded.tenants?.[0]?.id ?? null, decoded.sid ?? decoded.selectedPremise?.id ?? null));

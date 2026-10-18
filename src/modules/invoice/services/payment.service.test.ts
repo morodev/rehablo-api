@@ -24,6 +24,7 @@ import Product from '../../products-services/models/product.model.js';
 import Patient from '../../patients/models/patient.model.js';
 import Tenant from '../../auth/models/tenant.model.js';
 import EventType from '../../agenda/models/eventType.model.js';
+import { getRolePermissions, RoleCode } from '../../auth/rbac/roles.js';
 
 describe('summarizeInvoicePayments', () => {
     it('derives unpaid, partial and paid states only from posted movements', () => {
@@ -231,7 +232,7 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
             const response = { code: 0, status(code: number) { this.code = code; return this; },
                 json(payload: any) { resolve({ code: this.code, ...payload }); return this; } };
             handler({ tenantSchema: 'rehablo_test', params: { agendaEventId: eventId, paymentId }, body,
-                user: { sub: 'recorder' }, access: { scope: own ? 'own' : 'tenant', structureId, userId: 'someone-else', resource: 'agenda' } },
+                user: { sub: 'recorder', role: RoleCode.OWNER, perms: getRolePermissions(RoleCode.OWNER) }, access: { scope: own ? 'own' : 'tenant', structureId, userId: 'someone-else', resource: 'agenda' } },
             response, (error: any) => error?.statusCode
                 ? resolve({code: error.statusCode, message: error.message}) : reject(error));
         });
@@ -348,7 +349,7 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
             createBulkAppointmentPayments({tenantSchema: 'rehablo_test', params: {agendaEventId: referenceId},
                 body: {paidAt: '2026-02-01', method: 'Contanti', note: 'Tre sedute', markReferenceCompleted: true,
                     allocations: [{agendaEventId: previousId, amount: 40}, {agendaEventId: referenceId, amount: 40}]},
-                user: {sub: 'recorder'}, access: {scope: 'tenant', structureId, userId: 'recorder', resource: 'agenda'}
+                user: {sub: 'recorder', role: RoleCode.OWNER, perms: getRolePermissions(RoleCode.OWNER)}, access: {scope: 'tenant', structureId, userId: 'recorder', resource: 'agenda'}
             } as any, res as any, reject);
         });
 

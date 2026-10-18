@@ -15,6 +15,7 @@ import { PatientPortalAccess, Structure, StructureUser, StructureUserAvailabilit
 import RefreshToken from '../models/refreshToken.model.js';
 import { sequelize } from '../../../config/database.js';
 import { getRolePermissions, RoleCode } from '../rbac/roles.js';
+import { signApplicationToken } from '../services/applicationToken.service.js';
 
 const id = (number: number) => 'cccccccc-cccc-4ccc-8ccc-' + String(number).padStart(12, '0');
 const userId = id(1), tenantId = id(2), structureId = id(3);
@@ -154,4 +155,20 @@ it('recovers an oversized JWT through the body and restores normal HTTP header a
         assert.equal((await send('GET', '/protected', compact)).status, 200);
         assert.equal(restored.body.user.userAvailabilities.length, 7);
     } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+it('restores the profile and site selector from a compact token without profile claims', async t => {
+    const {req, claims} = fixture(t);
+    req.body = {accessToken: signApplicationToken(claims)};
+    const tokenClaims = jwt.verify(req.body.accessToken, env.jwtSecret) as any;
+    assert.equal(Object.hasOwn(tokenClaims, 'name'), false);
+    assert.equal(Object.hasOwn(tokenClaims, 'structures'), false);
+    const result = await run(loginWithToken, req);
+    assertCalendarOutsideJwt(result, true);
+    assert.equal(result.body.user.name, 'Fixture');
+    assert.equal(result.body.user.surname, 'User');
+    assert.equal(result.body.user.selectedPremise.name, 'Test site');
+    assert.equal(result.body.user.structures[0].id, structureId);
+    assert.equal(result.body.user.data.structures[0].name, 'Test site');
+    assert.equal(Object.hasOwn(result.body.user.data, 'password'), false);
 });

@@ -7,7 +7,7 @@ import { resolveEffectiveRole, RoleCode } from '../rbac/roles.js';
 import { AvailabilityValidationError, emptyAvailabilitySchedule, isAvailabilityMode, normalizeAvailabilitySchedule } from './userAvailabilityPolicy.service.js';
 
 export function defaultCalendarEnabled(role: RoleCode): boolean {
-    return role !== RoleCode.OWNER && role !== RoleCode.SECRETARY;
+    return role !== RoleCode.OWNER && role !== RoleCode.SECRETARY && role !== RoleCode.ADMIN_SECRETARY;
 }
 export function hasCalendarFields(value: Record<string, any>): boolean {
     return ['calendarEnabled', 'availabilityMode', 'userAvailabilities'].some(key => Object.prototype.hasOwnProperty.call(value, key));

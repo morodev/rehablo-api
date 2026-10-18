@@ -11,7 +11,7 @@ import {sendErrorResponse} from '../../../utils/response.js';
 import {Structure, StructureUser, TenantUser, User} from '../models/index.js';
 import {getRolePermissions, isRoleCode, resolveEffectiveRole, RoleCode, ROLE_DEFINITIONS} from '../rbac/roles.js';
 import {hasPermission} from '../rbac/permissions.js';
-import {validateUserStructureSelection} from './userStructurePolicy.service.js';
+import {canChangeAssignedStructures, validateUserStructureSelection} from './userStructurePolicy.service.js';
 import {defaultCalendarEnabled} from './structureCalendar.service.js';
 import {Activity, ActivityAlert, ActivityAssignment, ActivityBoard, ActivityDelivery, ActivityHistory, ActivityOperation} from '../../activities/models/index.js';
 import {assignableActivityUsers, isEligibleActivityRole} from '../../activities/services/activityAccess.service.js';
@@ -167,6 +167,9 @@ async function prepare(
             throw new TeamOffboardingError(404, 'TEAM_MEMBER_NOT_FOUND', 'Il membro non è assegnato a questa sede.');
         }
         if (change.role === RoleCode.OWNER || (membership.role === RoleCode.OWNER && change.role !== null)) fail('Il ruolo proprietario non ammette override nella sede.');
+    }
+    if (!canChangeAssignedStructures(actor.userId, targetUserId, currentIds, nextStructureIds)) {
+        throw new TeamOffboardingError(403, 'TEAM_FORBIDDEN', 'Non puoi ampliare le sedi assegnate al tuo account.');
     }
     const changesRole = nextRole !== membership.role || change.kind === 'structureRole';
     if ((changesRole || change.kind === 'remove' || (change.kind === 'status' && !change.active)) && targetUserId === actor.userId) {

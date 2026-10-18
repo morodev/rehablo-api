@@ -15,8 +15,8 @@ router.post('/patient', requirePermission('patient', 'create'), patientControlle
 router.get('/patient/search', requirePermission('patient', 'read'), patientController.searchPatients);
 router.get('/patient', requirePermission('patient', 'read'), patientController.findAndCountAll);
 // Core cash collection remains available without enabling the Administration module.
-router.get('/patient/:patientId/settlement-position', requireAnyPermission(['agenda', 'read'], ['invoice', 'read']), getPatientSettlementPosition);
-router.post('/patient/:patientId/settlements', requireAnyPermission(['agenda', 'update'], ['invoice', 'update'], ['quote', 'update']), createPatientSettlement);
+router.get('/patient/:patientId/settlement-position', requirePermission('patient_balance', 'read'), getPatientSettlementPosition);
+router.post('/patient/:patientId/settlements', requireAnyPermission(['payment', 'create'], ['quote', 'update']), createPatientSettlement);
 router.post('/patient/:patientId/privacy-document', requirePermission('patient', 'update'), patientController.privacyDocumentUploadMiddleware, patientController.uploadPrivacyDocument);
 router.get('/patient/:patientId/privacy-document', requirePermission('patient', 'read'), patientController.downloadPrivacyDocument);
 router.patch('/patient/:patientId/default-event-type', requirePermission('patient', 'update'), patientController.setDefaultEventType);

@@ -44,3 +44,19 @@ it('preserves the token purpose and legacy claims when compacting', () => {
     const decoded = jwt.verify(token, env.jwtSecret) as any;
     assert.deepEqual(jwt.verify(compactVerifiedApplicationToken(decoded), env.jwtSecret), decoded);
 });
+
+it('excludes arbitrary profile data and keeps only minimal legacy references', () => {
+    const payload = {...identity, actor: 'staff', name: 'Profile name', metadata: 'x'.repeat(9000),
+        structures: [{id: 'site', metadata: 'x'.repeat(9000)}],
+        tenants: [{id: 'tenant', name: 'Tenant', metadata: 'x'.repeat(9000)}],
+        selectedPremise: {id: 'site', name: 'Site', metadata: 'x'.repeat(9000)}};
+    const original = JSON.stringify(payload);
+    const token = signApplicationToken(payload);
+    const decoded = jwt.verify(token, env.jwtSecret) as any;
+    assert.equal(JSON.stringify(payload), original);
+    for (const field of ['name', 'metadata', 'structures']) assert.equal(Object.hasOwn(decoded, field), false);
+    assert.deepEqual(decoded.tenants, [{id: 'tenant'}]);
+    assert.deepEqual(decoded.selectedPremise, {id: 'site'});
+    assert.deepEqual(decoded.perms, identity.perms);
+    assert.ok(Buffer.byteLength(token) < 2000);
+});

@@ -11,6 +11,7 @@ import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js
 import {CarePackage, PatientCredit, TreasuryMovement} from '../../administration/models/index.js';
 import {PatientSettlementContext, PatientSettlementObligation, RawPatientSettlementPosition,
     loadPatientSettlementPosition, settlementFail, settlementPatientId} from './patientSettlementPolicy.service.js';
+import {canAccessAppointmentFinance} from '../../agenda/services/appointmentFinancialAccess.service.js';
 import {paymentMoney} from '../../invoice/services/appointmentPayment.service.js';
 
 export const SETTLEMENT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -36,7 +37,7 @@ export interface SettlementPositionView {
         operatorName: string | null; title: string; reason: 'UNVERIFIED_HISTORY' | 'NO_SHOW'}>;
     totals: {knownOutstandingAmount: number; priorKnownOutstandingAmount: number; unknownPriceCount: number; priorUnknownPriceCount: number; priorCount: number};
     blocker: {kind: 'INACCESSIBLE_PRIOR' | 'READ_ONLY'; message: string} | null;
-    capabilities: {cash: boolean; credit: boolean; packages: boolean};
+    capabilities: {cash: boolean; credit: boolean; packages: boolean; canOpenInvoice: boolean; canAdjustPrice: boolean; canReverse: boolean};
     creditsSummary: {verifiedRemaining: number; unverifiedCount: number} | null;
     packagesSummary: {activeCount: number; remainingUnits: number} | null;
 }
@@ -48,13 +49,15 @@ export function settlementScope(req: Request, resource: Resource, action: Action
 /** Invoice visibility follows the existing patient-derived scope; agenda ownership follows calendarId. */
 export function settlementRecordAccess(req: Request, context: AuthorizedSettlementContext,
     kind: 'APPOINTMENT' | 'INVOICE' | 'CREDIT', record: Record<string, any>, action: Action): boolean {
-    const scope = settlementScope(req, kind === 'APPOINTMENT' ? 'agenda' : kind === 'INVOICE' ? 'invoice' : 'quote', action);
+    const resource = kind === 'CREDIT' ? 'quote' : action === 'read' ? 'patient_balance' : 'payment';
+    const scope = settlementScope(req, resource, kind !== 'CREDIT' && action === 'update' ? 'create' : action);
     if (!scope) return false;
     if (scope === 'tenant') return true;
-    if (scope === 'own') return kind === 'APPOINTMENT' ? record.calendarId === getUserId(req) : context.patient.userId === getUserId(req);
+    if (scope === 'own') return kind === 'APPOINTMENT' && record.calendarId === getUserId(req)
+        && (record.structureId ?? context.structureId) === getSelectedStructureId(req);
     const selected = getSelectedStructureId(req);
     if (!selected) return false;
-    if (kind === 'INVOICE') return context.patient.structureId === selected;
+    if (kind === 'INVOICE') return (record.structureId ?? context.structureId) === selected && context.structureId === selected;
     return (record.structureId ?? context.structureId) === selected;
 }
 
@@ -122,7 +125,7 @@ export async function resolvePatientSettlementContext(req: Request, source: Reco
     if (event && !settlementRecordAccess(req, context, 'APPOINTMENT', event, 'read')) settlementFail(404, 'Appuntamento non trovato o non accessibile');
     if (explicitInvoiceReference && invoice && !settlementRecordAccess(req, context, 'INVOICE', invoice, 'read')) settlementFail(404, 'Fattura non trovata o non accessibile');
     if (!event && !invoice) {
-        const agendaScope = settlementScope(req, 'agenda', 'read');
+        const agendaScope = settlementScope(req, 'patient_balance', 'read');
         const invoiceAccess = settlementRecordAccess(req, context, 'INVOICE', {}, 'read');
         const agendaAccess = agendaScope === 'tenant' || (agendaScope === 'structure' && getSelectedStructureId(req) === structureId
             && patient.structureId === structureId) || (agendaScope === 'own' && patient.userId === getUserId(req));
@@ -153,7 +156,8 @@ export function settlementCanRead(req: Request, context: AuthorizedSettlementCon
     return settlementRecordAccess(req, context, row.kind, row.record, 'read');
 }
 export function settlementCanCash(req: Request, context: AuthorizedSettlementContext, row: PatientSettlementObligation): boolean {
-    return row.eligible && settlementCanRead(req, context, row) && settlementRecordAccess(req, context, row.kind, row.record, 'update');
+    return row.eligible && settlementCanRead(req, context, row) && settlementRecordAccess(req, context, row.kind, row.record, 'update')
+        && (row.kind !== 'APPOINTMENT' || row.expectedAmount !== null || canAccessAppointmentFinance(req, row.record, 'appointment_pricing', 'update'));
 }
 export function settlementCanUseCredit(req: Request, context: AuthorizedSettlementContext,
     row: PatientSettlementObligation, administrationEnabled: boolean): boolean {
@@ -210,7 +214,7 @@ export async function patientSettlementPositionView(req: Request, context: Autho
     const pricingEditable = !!event && !event.invoiceId && current?.kind !== 'INVOICE'
         && !event.recurrence && !event.recurringEventId && ['CONFIRMED', 'COMPLETED'].includes(String(event.status).toUpperCase())
         && Number.isFinite(Date.parse(event.start)) && Date.parse(event.start) <= Date.now()
-        && settlementRecordAccess(req, context, 'APPOINTMENT', event, 'update');
+        && canAccessAppointmentFinance(req, event, 'appointment_pricing', 'update');
     const visibleVerification = raw.verification.filter(row => Date.parse(row.record.start) <= cutoff
         && settlementRecordAccess(req, context, 'APPOINTMENT', row.record, 'read'));
     const calendarIds = [...new Set(visibleVerification.map(row => row.record.calendarId)
@@ -246,6 +250,8 @@ export async function patientSettlementPositionView(req: Request, context: Autho
             unknownPriceCount: open.filter(row => row.balance === null).length,
             priorUnknownPriceCount: prior.filter(row => row.balance === null).length, priorCount: prior.length},
         blocker, capabilities: {cash: obligations.some(row => row.canCash), credit: obligations.some(row => row.canUseCredit),
-            packages: creditVisible && settlementRecordAccess(req, context, 'CREDIT', {structureId: context.structureId}, 'update')},
+            packages: creditVisible && settlementRecordAccess(req, context, 'CREDIT', {structureId: context.structureId}, 'update'),
+            canOpenInvoice: !!settlementScope(req, 'invoice', 'read'), canAdjustPrice: pricingEditable,
+            canReverse: !!event && canAccessAppointmentFinance(req, event, 'payment_reversal', 'create')},
         creditsSummary, packagesSummary};
 }

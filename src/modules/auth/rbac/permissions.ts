@@ -26,6 +26,11 @@ export const RESOURCES = [
     'agenda',       // appuntamenti ed event types
     'invoice',      // fatturazione
     'product',      // listino prodotti e servizi
+    'analytics',
+    'patient_balance',
+    'payment',
+    'appointment_pricing',
+    'payment_reversal',
     'dashboard',    // dashboard e widget configurabili
     'user',         // utenti del tenant
     'structure',    // strutture / premise
@@ -62,6 +67,11 @@ export const RESOURCE_LABELS: Record<Resource, string> = {
     agenda: 'agenda',
     invoice: 'fatturazione',
     product: 'listino prodotti e servizi',
+    analytics: 'analisi e statistiche',
+    patient_balance: 'saldo paziente',
+    payment: 'incassi operativi',
+    appointment_pricing: 'prezzi delle sedute',
+    payment_reversal: 'storni degli incassi',
     dashboard: 'dashboard',
     user: 'utenti',
     structure: 'strutture',

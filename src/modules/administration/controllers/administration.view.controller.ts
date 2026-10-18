@@ -20,6 +20,9 @@ import {
 } from '../services/administrationQuery.service.js';
 import { fiscalDocumentState, fiscalInvoiceScope, visibleRealFiscalSubmissions } from '../services/fiscalSimulation.service.js';
 import { balanceEffectiveMovements } from '../services/treasuryLedger.service.js';
+import { administrationFinancialProjection, unassignedFinancialWarnings } from '../../reports/services/financialReporting.service.js';
+import { validIssuedDocument } from '../../reports/services/financialFacts.service.js';
+import { reportStructureWhere, resolveReportScope, ReportScope } from '../../reports/services/reportScope.service.js';
 export { listFiscalSubmissions, retryFiscalSubmission } from './fiscalSimulation.controller.js';
 
 type Plain = Record<string, any>;
@@ -39,6 +42,8 @@ function structureSelection(req: Request) {
 }
 
 function structureWhere(req: Request, includeUnassigned = false): Plain {
+    const reportScope: ReportScope | undefined = (req as any).reportScope;
+    if (reportScope) return includeUnassigned ? { [Op.or]: [reportStructureWhere(reportScope), { structureId: null }] } : reportStructureWhere(reportScope);
     const selection = structureSelection(req);
     if (selection.kind === 'all') return {};
     if (selection.kind === 'none') return { [Op.and]: literal('1=0') };
@@ -206,16 +211,19 @@ export const listPriceListItems = asyncHandler(async (req, res) => {
 async function accountRows(req: Request): Promise<Plain[]> {
     const where = structureWhere(req, true);
     const accounts = (await FinancialAccount.schema(req.tenantSchema!).findAll({ where, order: [['name', 'ASC']] })).map(plain);
-    const ids = accounts.filter(account => account.structureId || req.access?.scope === 'tenant').map(account => account.id);
+    const reportScope: ReportScope | undefined = (req as any).reportScope;
+    // A shared opening balance has no defensible allocation to a report's selected sites.
+    const available = (account: Plain) => Boolean(account.structureId) || (!reportScope && req.access?.scope === 'tenant');
+    const ids = accounts.filter(available).map(account => account.id);
     const movements = ids.length ? (await TreasuryMovement.schema(req.tenantSchema!).findAll({
-        where: { accountId: { [Op.in]: ids } }, attributes: ['id', 'accountId', 'direction', 'amount', 'status', 'reversalOfId']
+        where: { accountId: { [Op.in]: ids }, ...(reportScope ? reportStructureWhere(reportScope) : {}) }, attributes: ['id', 'accountId', 'direction', 'amount', 'status', 'reversalOfId']
     })).map(plain) : [];
     const balances = new Map<string, number>();
     balanceEffectiveMovements(movements).forEach(movement => balances.set(String(movement.accountId), money(
         (balances.get(String(movement.accountId)) ?? 0) + (movement.direction === 'IN' ? Number(movement.amount) : -Number(movement.amount))
     )));
     return accounts.map(account => {
-        const balanceAvailable = Boolean(account.structureId) || req.access?.scope === 'tenant';
+        const balanceAvailable = available(account);
         return {
             ...account, balanceAvailable, canClose: balanceAvailable && account.isActive && account.type === 'CASH',
             balance: balanceAvailable ? money(Number(account.openingBalance) + (balances.get(String(account.id)) ?? 0)) : null
@@ -260,7 +268,7 @@ export const listPurchaseDocuments = asyncHandler(async (req, res) =>
 async function documentRows(req: Request, period = requestPeriod(req)): Promise<Plain[]> {
     const schema = req.tenantSchema!;
     const InvoiceScoped = Invoice.schema(schema);
-    const where: Plain = { [Op.and]: [structureWhere(req), fiscalInvoiceScope(req), rangeFrom(period, 'emissionDate'),
+    const where: Plain = { [Op.and]: [structureWhere(req), ...((req as any).reportScope ? [] : [fiscalInvoiceScope(req)]), rangeFrom(period, 'emissionDate'),
         ...(req.query.patientId ? [{ patientID: String(req.query.patientId) }] : [])] };
     const rows = await InvoiceScoped.findAll({
         where,
@@ -363,52 +371,36 @@ async function buildReport(req: Request, requestedPeriod?: AdministrationDateRan
     const to = period.to!;
     const [documents, movements, expenses, structures] = await Promise.all([
         documentRows(req, period),
-        effectiveMovementRows(req, period),
+        TreasuryMovement.schema(req.tenantSchema!).findAll({ where: structureWhere(req) }).then(rows => rows.map(plain)),
         Expense.schema(req.tenantSchema!).findAll({ where: { ...structureWhere(req), ...rangeFrom(period, 'incurredAt') } }),
         Structure.findAll({ where: { tenantId: getCurrentTenantId(req) }, attributes: ['id', 'name'] })
     ]);
-    const movementRows = movements;
-    const expenseRows = expenses.map(plain);
-    const issued = money(documents.reduce((sum, row) => sum + (row.documentType === 'nota_di_credito' ? -1 : 1) * Number(row.invoiceTotal ?? 0), 0));
-    const collected = money(movementRows.filter(row => row.direction === 'IN').reduce((sum, row) => sum + Number(row.amount), 0));
-    const expenseTotal = money(expenseRows.reduce((sum, row) => sum + Number(row.amount), 0));
-    const buckets = monthBuckets(from, to).map(bucket => ({
-        ...bucket,
-        issued: money(documents.filter(row => String(row.emissionDate).startsWith(bucket.key)).reduce((sum, row) => sum + (row.documentType === 'nota_di_credito' ? -1 : 1) * Number(row.invoiceTotal ?? 0), 0)),
-        collected: money(movementRows.filter(row => row.direction === 'IN' && romeMonth(row.occurredAt) === bucket.key).reduce((sum, row) => sum + Number(row.amount), 0)),
-        expenses: money(expenseRows.filter(row => String(row.incurredAt).startsWith(bucket.key)).reduce((sum, row) => sum + Number(row.amount), 0))
-    }));
-    const categoryTotals = new Map<string, number>();
-    documents.forEach(row => {
-        const label = row.documentType === 'nota_di_credito' ? 'Note di credito' : row.documentType === 'ricevuta' ? 'Ricevute' : 'Fatture';
-        categoryTotals.set(label, money((categoryTotals.get(label) ?? 0) + Math.abs(Number(row.invoiceTotal ?? 0))));
-    });
-    const categorySum = [...categoryTotals.values()].reduce((sum, value) => sum + value, 0);
     const selection = structureSelection(req);
-    const structureRows = structures.map(plain).filter(item => selection.kind === 'all'
+    const reportScope: ReportScope | undefined = (req as any).reportScope;
+    const visibleStructures = structures.map(plain).filter(item => reportScope ? reportScope.selectedStructureIds.includes(String(item.id)) : selection.kind === 'all'
         || (selection.kind === 'structure' && String(item.id) === selection.structureId)
-    ).map(item => {
-        const docs = documents.filter(row => String(row.structureId) === String(item.id));
-        const structureIssued = money(docs.reduce((sum, row) => sum + (row.documentType === 'nota_di_credito' ? -1 : 1) * Number(row.invoiceTotal ?? 0), 0));
-        const structureCollected = money(movementRows.filter(row => String(row.structureId) === String(item.id) && row.direction === 'IN').reduce((sum, row) => sum + Number(row.amount), 0));
-        const structureExpenses = money(expenseRows.filter(row => String(row.structureId) === String(item.id)).reduce((sum, row) => sum + Number(row.amount), 0));
-        const receivable = money(docs.reduce((sum, row) => sum + Number(row.residualAmount ?? 0), 0));
-        return { name: item.name || 'Sede', issued: structureIssued, collected: structureCollected, expenses: structureExpenses, receivable, marginPercentage: structureCollected ? money((structureCollected - structureExpenses) / structureCollected * 100) : 0 };
-    });
-    return {
-        period: { from, to }, issued, collected, expenses: expenseTotal, margin: money(collected - expenseTotal),
-        series: buckets.map(({ label, issued: bucketIssued, collected: bucketCollected, expenses: bucketExpenses }) => ({ label, issued: bucketIssued, collected: bucketCollected, expenses: bucketExpenses })),
-        categories: [...categoryTotals.entries()].map(([label, value]) => ({ label, value, percentage: categorySum ? money(value / categorySum * 100) : 0 })),
-        structures: structureRows
-    };
+    );
+    return { ...administrationFinancialProjection(documents, movements, expenses.map(plain), visibleStructures, from, to),
+        warnings: reportScope ? await unassignedFinancialWarnings(req, reportScope, from, to) : [] };
 }
 
 export const reports = asyncHandler(async (req, res) => {
+    (req as any).reportScope ??= await resolveReportScope(req, { resource: 'analytics', action: 'read' });
     await validateRequestedStructure(req);
     return sendSuccessResponse(res, 200, await buildReport(req));
 });
 
+async function reportFiscalSubmissions(req: Request) {
+    const scope: ReportScope | undefined = (req as any).reportScope;
+    if (!scope) return visibleRealFiscalSubmissions(req);
+    const documents = await Invoice.schema(req.tenantSchema!).findAll({ where: reportStructureWhere(scope), attributes: ['id'] });
+    return FiscalSubmission.schema(req.tenantSchema!).findAll({ where: {
+        documentId: { [Op.in]: documents.map(row => row.get('id')) }, provider: { [Op.ne]: 'MOCK' }
+    }, order: [['createdAt', 'DESC']] });
+}
+
 export const overview = asyncHandler(async (req, res) => {
+    (req as any).reportScope ??= await resolveReportScope(req, { resource: req.access?.resource ?? 'treasury', action: 'read' });
     await validateRequestedStructure(req);
     const today = romeToday();
     const period = resolveAdministrationDateRange(
@@ -419,7 +411,7 @@ export const overview = asyncHandler(async (req, res) => {
     const to = period.to!;
     const [report, documents, accounts, quoteRows, fiscalRows, expenseRows, movementRows, tenant] = await Promise.all([
         buildReport(req, period), documentRows(req, period), accountRows(req), enrichedQuotes(req, period),
-        visibleRealFiscalSubmissions(req),
+        reportFiscalSubmissions(req),
         Expense.schema(req.tenantSchema!).findAll({ where: { ...structureWhere(req), ...rangeFrom(period, 'incurredAt') }, order: [['incurredAt', 'DESC']], limit: 25 }),
         effectiveMovementRows(req, period),
         Tenant.findByPk(getCurrentTenantId(req), { attributes: ['featureFlags'] })
@@ -429,7 +421,8 @@ export const overview = asyncHandler(async (req, res) => {
     const movements = movementRows;
     const openQuotes = quoteRows.filter(row => ['DRAFT', 'SENT'].includes(row.status)).length;
     const fiscalPending = fiscal.filter(row => ['QUEUED', 'PROCESSING', 'REJECTED', 'ERROR', 'FAILED'].includes(row.status)).length;
-    const receivable = money(documents.reduce((sum, row) => sum + Number(row.residualAmount ?? 0), 0));
+    const validDocuments = documents.filter(validIssuedDocument);
+    const receivable = money(validDocuments.reduce((sum, row) => sum + Number(row.residualAmount ?? 0), 0));
     const activities = [
         ...movements.map(row => ({ id: `movement-${row.id}`, kind: row.direction === 'IN' ? 'income' : 'expense', title: row.description || row.category, subtitle: row.counterparty || 'Movimento di prima nota', occurredAt: row.occurredAt, amount: row.direction === 'IN' ? Number(row.amount) : -Number(row.amount) })),
         ...documents.slice(0, 10).map(row => ({ id: `document-${row.id}`, kind: 'document', title: `Documento ${row.documentNumber}`, subtitle: row.patientName || 'Documento emesso', occurredAt: row.emissionDate, amount: Number(row.invoiceTotal ?? 0) })),
@@ -451,7 +444,7 @@ export const overview = asyncHandler(async (req, res) => {
     const chart = rangeDays >= 0 && rangeDays <= 62
         ? dayBuckets(from, to).map(bucket => ({
             label: bucket.label,
-            issued: money(documents
+            issued: money(validDocuments
                 .filter(row => String(row.emissionDate).slice(0, 10) === bucket.key)
                 .reduce((sum, row) => sum + (row.documentType === 'nota_di_credito' ? -1 : 1) * Number(row.invoiceTotal ?? 0), 0)),
             collected: money(movements
@@ -460,7 +453,10 @@ export const overview = asyncHandler(async (req, res) => {
         }))
         : report.series.map((row: Plain) => ({ label: row.label, issued: row.issued, collected: row.collected }));
     return sendSuccessResponse(res, 200, {
-        period: { from, to }, issued: report.issued, collected: report.collected, receivable,
+        period: { from, to }, generatedAt: report.generatedAt, balanceAsOf: report.balanceAsOf,
+        warnings: [...report.warnings, ...(accounts.some(account => !account.balanceAvailable) ? [{ code: 'shared-account-balances',
+            message: 'I saldi dei conti condivisi non sono attribuibili alle sedi del report. Consulta il saldo completo nella gestione conti.' }] : [])],
+        issued: report.issued, collected: report.collected, receivable,
         income, outcome, expenses: report.expenses, cashFlow: money(income - outcome), openQuotes, fiscalPending,
         accounts: accounts.map(account => ({ id: account.id, name: account.name, type: account.type, balance: account.balance })),
         tasks: [], activities, deadlines: deadlineSource, chart,

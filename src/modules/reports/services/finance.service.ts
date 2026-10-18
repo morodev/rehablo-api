@@ -9,6 +9,10 @@ import { getInvoiceAgendaLinksByEventIds } from '../../invoice/services/invoiceA
 import { summarizeInvoicePayments } from '../../invoice/services/payment.service.js';
 import { appointmentPricesByEvent } from '../../invoice/services/appointmentPayment.service.js';
 import { AnalyticsQuery, AnalyticsQueryError, bucketKey, localDateKey, loadOccurrences } from './analytics.service.js';
+import { PatientCredit, TreasuryMovement } from '../../administration/models/index.js';
+import { PatientCreditMovement } from '../../administration/models/patientCreditMovement.model.js';
+import { clinicalCashFacts, ClinicalCashFact, dateOnly, FinancialWarning, validIssuedDocument } from './financialFacts.service.js';
+import { reportStructureWhere, ReportScope } from './reportScope.service.js';
 
 export interface FinanceFilters {
     paymentStatus: 'all' | 'paid' | 'partial' | 'unpaid' | 'unknown';
@@ -26,10 +30,12 @@ export const methodKey = (method: unknown): string => {
     return !value || value.toLowerCase() === 'dashboard' ? '__unspecified__' : value;
 };
 const plain = (row: any): Record<string, any> => typeof row.get === 'function' ? row.get({ plain: true }) : row;
-const dateKey = (date: unknown): string => date instanceof Date ? localDateKey(date) : String(date ?? '').slice(0, 10);
+const dateKey = dateOnly;
 const inPeriod = (date: unknown, query: AnalyticsQuery): boolean => !!date && dateKey(date) >= query.from && dateKey(date) <= query.to;
 
 export function parseFinanceFilters(req: Request): FinanceFilters {
+    if (['paymentStatus', 'documentStatus', 'status', 'eventTypeIds', 'agendaEventIds', 'patientId']
+        .some(key => req.query[key] != null && typeof req.query[key] !== 'string')) throw new AnalyticsQueryError('Filtro finanziario non valido');
     const paymentStatus = String(req.query.paymentStatus ?? 'all') as FinanceFilters['paymentStatus'];
     const documentStatus = String(req.query.documentStatus ?? 'all') as FinanceFilters['documentStatus'];
     if (!['all', 'paid', 'partial', 'unpaid', 'unknown'].includes(paymentStatus)) throw new AnalyticsQueryError('Filtro pagamento non valido');
@@ -52,7 +58,11 @@ export interface FinanceData {
     payments: Array<Record<string, any>>;
     /** Documents whose complete set of linked therapies satisfies the context filter. */
     attributableInvoiceIds: Set<string>;
+    /** Safe whole-document attribution requires every linked therapy inside the selected sites. */
+    scopeCompleteInvoiceIds?: Set<string>;
     excludedMixedInvoiceCount: number;
+    cashFacts?: ClinicalCashFact[];
+    warnings?: FinancialWarning[];
 }
 
 /** No proportional allocation: a mixed document cannot be assigned to one operator/type. */
@@ -65,18 +75,25 @@ export function invoiceMatchesContext(events: Array<Record<string, any>>, query:
     );
 }
 
-export async function loadFinanceData(req: Request, query: FinanceQuery): Promise<FinanceData> {
+export async function loadFinanceData(req: Request, query: FinanceQuery, scope: ReportScope | undefined = (req as any).reportScope): Promise<FinanceData> {
     const schema = req.tenantSchema!;
-    const eventWhere: Record<string | symbol, any> = { ...patientScopeWhere(req, schema, 'patientId') };
-    const invoiceWhere: Record<string | symbol, any> = { ...patientScopeWhere(req, schema, 'patientID') };
-    if (query.structureId) { eventWhere.structureId = query.structureId; invoiceWhere.structureId = query.structureId; }
+    const eventWhere: Record<string | symbol, any> = scope ? reportStructureWhere(scope) : { ...patientScopeWhere(req, schema, 'patientId') };
+    const invoiceWhere: Record<string | symbol, any> = scope ? reportStructureWhere(scope) : { ...patientScopeWhere(req, schema, 'patientID') };
+    if (!scope && query.structureId) { eventWhere.structureId = query.structureId; invoiceWhere.structureId = query.structureId; }
+    if (req.query?.patientId) {
+        if (typeof req.query.patientId !== 'string') throw new AnalyticsQueryError('Paziente non valido');
+        const patientId = String(req.query.patientId);
+        if (!/^[\da-f]{8}(-[\da-f]{4}){3}-[\da-f]{12}$/i.test(patientId)) throw new AnalyticsQueryError('Paziente non valido');
+        eventWhere[Op.and] = [eventWhere[Op.and] ?? {}, { patientId }];
+        invoiceWhere[Op.and] = [invoiceWhere[Op.and] ?? {}, { patientID: patientId }];
+    }
     if (query.operatorId) eventWhere.calendarId = query.operatorId;
     if (query.eventTypeId) eventWhere.eventTypeId = query.eventTypeId;
     if (query.eventTypeIds?.length) eventWhere.eventTypeId = { [Op.in]: query.eventTypeIds };
     const [eventModels, invoiceModels] = await Promise.all([
         AgendaEvent.schema(schema).findAll({ where: eventWhere }),
         Invoice.schema(schema).findAll({ where: invoiceWhere,
-            attributes: ['id', 'agendaEventId', 'emissionDate', 'invoiceTotal', 'invoiceNet', 'sellingPrice', 'discSellingPrice', 'status', 'documentType', 'paymentTerms'] })
+            attributes: ['id', 'patientID', 'structureId', 'documentNumber', 'documentYear', 'agendaEventId', 'emissionDate', 'invoiceTotal', 'invoiceNet', 'sellingPrice', 'discSellingPrice', 'status', 'documentType', 'paymentTerms'] })
     ]);
     const events = eventModels.map(plain);
     const invoices = invoiceModels.map(plain);
@@ -100,7 +117,7 @@ export async function loadFinanceData(req: Request, query: FinanceQuery): Promis
     // mixed invoice could falsely look like a document belonging entirely to one operator.
     const linkedModels = invoiceIds.length ? await AgendaEvent.schema(schema).findAll({
         where: { [Op.or]: [{ id: { [Op.in]: linkedEventIds } }, { invoiceId: { [Op.in]: invoiceIds } }] },
-        attributes: ['id', 'calendarId', 'eventTypeId', 'invoiceId']
+        attributes: ['id', 'calendarId', 'eventTypeId', 'invoiceId', 'structureId']
     }) : [];
     const linkedEvents = linkedModels.map(plain);
     const eventById = new Map(linkedEvents.map((event) => [event.id, event]));
@@ -111,7 +128,11 @@ export async function loadFinanceData(req: Request, query: FinanceQuery): Promis
     invoiceLinks.forEach((link) => addLink(link.invoiceId, link.agendaEventId));
     invoices.forEach((invoice) => { if (invoice.agendaEventId) addLink(invoice.id, invoice.agendaEventId); });
     linkedEvents.forEach((event) => { if (event.invoiceId) addLink(event.invoiceId, event.id); });
-    const attributableInvoiceIds = new Set(invoices.filter((invoice) => invoiceMatchesContext(
+    const scopeCompleteInvoiceIds = new Set(invoices.filter(invoice => !scope || [...(idsByInvoice.get(invoice.id) ?? [])]
+        .every(id => { const linked = eventById.get(id); return !!linked && scope.selectedStructureIds.includes(linked.structureId); }))
+        .map(invoice => invoice.id));
+    const hasContext = !!(query.operatorId || query.eventTypeId || query.eventTypeIds?.length);
+    const attributableInvoiceIds = new Set(invoices.filter((invoice) => (!hasContext || scopeCompleteInvoiceIds.has(invoice.id)) && invoiceMatchesContext(
         [...(idsByInvoice.get(invoice.id) ?? [])].map((id) => eventById.get(id) ?? {}), query
     )).map((invoice) => invoice.id));
     events.forEach((event) => {
@@ -123,9 +144,25 @@ export async function loadFinanceData(req: Request, query: FinanceQuery): Promis
         where: { [Op.or]: [{ invoiceId: { [Op.in]: invoiceIds } }, { agendaEventId: { [Op.in]: eventIds } }] }
     }) : [];
     const selectedEventIds = new Set(eventIds);
-    return { events, invoices, payments: paymentModels.map(plain), attributableInvoiceIds,
+    const payments = paymentModels.map(plain);
+    const cash = await loadClinicalCash(schema, payments);
+    return { events, invoices, payments, cashFacts: cash.facts, warnings: cash.warnings, attributableInvoiceIds, scopeCompleteInvoiceIds,
         excludedMixedInvoiceCount: invoices.filter((invoice) => !attributableInvoiceIds.has(invoice.id) && invoice.status !== 'void' &&
             [...(idsByInvoice.get(invoice.id) ?? [])].some((id) => selectedEventIds.has(id))).length };
+}
+
+async function loadClinicalCash(schema: string, payments: Array<Record<string, any>>) {
+    const ids = payments.filter(row => !['PACKAGE', 'CREDIT'].includes(row.source)).map(row => row.id);
+    if (!ids.length) return clinicalCashFacts(payments);
+    const credits = (await PatientCredit.schema(schema).findAll({ where: { sourceType: 'VOID_CREDIT', sourceId: { [Op.in]: ids } } })).map(plain);
+    const refunds = credits.length ? (await PatientCreditMovement.schema(schema).findAll({
+        where: { creditId: { [Op.in]: credits.map(row => row.id) }, type: 'REFUND' }
+    })).map(plain) : [];
+    const movements = (await TreasuryMovement.schema(schema).findAll({ where: { [Op.or]: [
+        { sourceType: { [Op.in]: ['INVOICE_PAYMENT', 'INVOICE_PAYMENT_VOID'] }, sourceId: { [Op.in]: ids } },
+        ...(refunds.length ? [{ id: { [Op.in]: refunds.map(row => row.treasuryMovementId).filter(Boolean) } }] : [])
+    ] } })).map(plain);
+    return clinicalCashFacts(payments, movements, credits, refunds);
 }
 
 function financialIndex(data: FinanceData) {
@@ -174,7 +211,7 @@ function matchesEvent(event: Record<string, any>, financial: ReturnType<typeof e
 }
 
 /** Cash follows paidAt; issued revenue follows emissionDate; balances are current snapshots. */
-export function aggregateFinance(data: FinanceData, query: FinanceQuery) {
+export function financialSelection(data: FinanceData, query: FinanceQuery) {
     const index = financialIndex(data);
     const eventById = new Map(data.events.map((event) => [event.id, event]));
     const financialByEvent = new Map(data.events.map((event) => [event.id, eventFinance(event, index)]));
@@ -182,7 +219,7 @@ export function aggregateFinance(data: FinanceData, query: FinanceQuery) {
     const eventIds = new Set(events.map((event) => event.id));
     const invoices = data.invoices.filter((invoice) => {
         const summary = index.summaries.get(invoice.id)!;
-        return invoice.status !== 'void' && data.attributableInvoiceIds.has(invoice.id) && query.documentStatus !== 'unbilled' &&
+        return validIssuedDocument(invoice) && data.attributableInvoiceIds.has(invoice.id) && query.documentStatus !== 'unbilled' &&
             (query.paymentStatus === 'all' || summary.paymentStatus === query.paymentStatus) &&
             (!query.paymentMethod || (index.byInvoice.get(invoice.id) ?? []).some((p) => p.status === 'POSTED' && methodKey(p.method) === query.paymentMethod));
     });
@@ -193,11 +230,16 @@ export function aggregateFinance(data: FinanceData, query: FinanceQuery) {
         data.invoices.filter((invoice) => invoice.status === 'void' && data.attributableInvoiceIds.has(invoice.id))
             .forEach((invoice) => invoiceIds.add(invoice.id));
     }
-    const payments = index.payments.filter((payment) => ['POSTED', 'CREDIT'].includes(payment.status) && !['PACKAGE', 'CREDIT'].includes(payment.source) &&
+    const payments = (data.cashFacts ?? clinicalCashFacts(index.payments).facts).filter((payment) =>
         (!query.paymentMethod || methodKey(payment.method) === query.paymentMethod) &&
         (payment.source === 'APPOINTMENT' && payment.agendaEventId ? eventIds.has(payment.agendaEventId) : invoiceIds.has(payment.invoiceId)));
     const periodPayments = payments.filter((payment) => inPeriod(payment.paidAt, query));
     const issued = invoices.filter((invoice) => inPeriod(invoice.emissionDate, query));
+    return { index, eventById, financialByEvent, events, invoices, payments, periodPayments, issued };
+}
+
+export function aggregateFinance(data: FinanceData, query: FinanceQuery) {
+    const { index, eventById, financialByEvent, events, invoices, payments, periodPayments, issued } = financialSelection(data, query);
     const sign = (invoice: Record<string, any>) => invoice.documentType === 'nota_di_credito' ? -1 : 1;
     const today = localDateKey(new Date());
     const totals = {
@@ -205,6 +247,9 @@ export function aggregateFinance(data: FinanceData, query: FinanceQuery) {
         billedNet: money(issued.reduce((sum, invoice) => sum + sign(invoice) * Number(invoice.invoiceNet || 0), 0)),
         discounts: money(issued.reduce((sum, invoice) => sum + sign(invoice) * Math.max(Number(invoice.sellingPrice || 0) - Number(invoice.discSellingPrice || 0), 0), 0)),
         collected: money(periodPayments.reduce((sum, payment) => sum + Number(payment.amount), 0)),
+        collectedGross: money(periodPayments.filter(row => row.kind === 'receipt').reduce((sum, row) => sum + Number(row.amount), 0)),
+        collectionReversals: money(-periodPayments.filter(row => row.kind === 'reversal').reduce((sum, row) => sum + Number(row.amount), 0)),
+        collectionRefunds: money(-periodPayments.filter(row => row.kind === 'refund').reduce((sum, row) => sum + Number(row.amount), 0)),
         collectedFromAppointments: money(periodPayments.filter((p) => p.source === 'APPOINTMENT').reduce((sum, p) => sum + Number(p.amount), 0)),
         collectedFromInvoices: money(periodPayments.filter((p) => p.source !== 'APPOINTMENT').reduce((sum, p) => sum + Number(p.amount), 0)),
         collectedUnbilled: money(payments.filter((p) => !p.invoiceId && !eventById.get(p.agendaEventId)?.invoiceId).reduce((sum, p) => sum + Number(p.amount), 0)),
@@ -247,9 +292,10 @@ export function aggregateFinance(data: FinanceData, query: FinanceQuery) {
         if (!series.has(bucket)) series.set(bucket, { bucket, billedTotal: 0, billedNet: 0, collected: 0, collectedFromAppointments: 0, collectedFromInvoices: 0 });
         return series.get(bucket)!;
     };
+    for (let day = new Date(`${query.from}T12:00:00Z`); day <= new Date(`${query.to}T12:00:00Z`); day.setUTCDate(day.getUTCDate() + 1)) bucketFor(day);
     issued.forEach((invoice) => { const bucket = bucketFor(invoice.emissionDate); bucket.billedTotal += sign(invoice) * Number(invoice.invoiceTotal || 0); bucket.billedNet += sign(invoice) * Number(invoice.invoiceNet || 0); });
     periodPayments.forEach((payment) => { const bucket = bucketFor(payment.paidAt); bucket.collected += Number(payment.amount); bucket[payment.source === 'APPOINTMENT' ? 'collectedFromAppointments' : 'collectedFromInvoices'] += Number(payment.amount); });
-    return { period: query, totals, balanceAsOf: today, attributionPolicy: 'whole_document_when_all_linked_therapies_match',
+    return { period: query, totals, warnings: data.warnings ?? [], balanceAsOf: today, attributionPolicy: 'whole_document_when_all_linked_therapies_match',
         series: [...series.values()].sort((a, b) => a.bucket.localeCompare(b.bucket)).map((row) => ({ ...row,
             billedTotal: money(row.billedTotal), billedNet: money(row.billedNet), collected: money(row.collected), collectedFromAppointments: money(row.collectedFromAppointments), collectedFromInvoices: money(row.collectedFromInvoices) })) };
 }
@@ -273,7 +319,7 @@ export function aggregateTherapyPayments(data: FinanceData, query: FinanceQuery,
     }).sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime() || a.id.localeCompare(b.id));
     const selectedEventIds = new Set(rows.map((row) => row.id));
     const selectedInvoiceIds = new Set(rows.map((row) => row.invoiceId).filter((id) => id && data.attributableInvoiceIds.has(id)));
-    const matchingPayments = index.payments.filter((p) => ['POSTED', 'CREDIT'].includes(p.status) && !['PACKAGE', 'CREDIT'].includes(p.source) && (!query.paymentMethod || methodKey(p.method) === query.paymentMethod));
+    const matchingPayments = (data.cashFacts ?? clinicalCashFacts(index.payments).facts).filter((p) => (!query.paymentMethod || methodKey(p.method) === query.paymentMethod));
     const totals = {
         count: rows.length,
         expectedAmount: money(rows.reduce((sum, row) => sum + (row.expectedAmount ?? 0), 0)),

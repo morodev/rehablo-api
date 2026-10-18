@@ -4,6 +4,7 @@ import moment from 'moment';
 import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
+import {canAccessAppointmentFinance} from '../services/appointmentFinancialAccess.service.js';
 import { getGrantedPermissions, scopeWhere } from '../../../middleware/rbac.js';
 import { hasPermission } from '../../auth/rbac/permissions.js';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
@@ -464,7 +465,7 @@ export const findAllAgendaEvents = asyncHandler(async (req: Request, res: Respon
 
     let decoratedEvents = await withInvoiceStatus(schema, agendaEvents);
     const canReadFinance = Boolean(req.user?.isSuperAdmin)
-        || hasPermission(getGrantedPermissions(req), 'invoice', 'read');
+        || hasPermission(getGrantedPermissions(req), 'patient_balance', 'read', 'structure');
     if (req.query.includePatientPaymentPosition === 'true' && canReadFinance) {
         const positions = await patientPaymentPositionsByReferenceEvents(
             schema,
@@ -1099,6 +1100,9 @@ export const resolveMissedArrival = asyncHandler(async (req: Request, res: Respo
         let noShowBillingDecision: string | null = null;
         if (resolution === 'NO_SHOW') {
             noShowBillingDecision = normalizedStatus(req.body.noShowBillingDecision || 'PENDING');
+            if (noShowBillingDecision === 'WAIVED' && !canAccessAppointmentFinance(req, event.get({plain: true}), 'appointment_pricing', 'update')) {
+                return sendErrorResponse(res, 403, 'Non puoi modificare la decisione economica della seduta');
+            }
             if (!NO_SHOW_BILLING_DECISIONS.has(noShowBillingDecision)) {
                 return sendErrorResponse(res, 400, 'Decisione di addebito no-show non valida');
             }

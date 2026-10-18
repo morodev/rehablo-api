@@ -21,7 +21,7 @@ import {ActivityError} from '../utils/activityErrors.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const OPERATIONAL_ROLES = new Set<RoleCode>([
-    RoleCode.OWNER, RoleCode.SECRETARY, RoleCode.THERAPIST,
+    RoleCode.OWNER, RoleCode.SECRETARY, RoleCode.ADMIN_SECRETARY, RoleCode.THERAPIST,
     RoleCode.PHYSIATRIST, RoleCode.ORTHOPEDIST, RoleCode.EXTERNAL_COLLABORATOR
 ]);
 

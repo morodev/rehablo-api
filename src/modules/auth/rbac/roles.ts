@@ -15,6 +15,7 @@ export enum RoleCode {
     OWNER = 'OWNER',
     /** Front-office: agenda, anagrafiche e fatturazione. NESSUN accesso ai dati clinici. */
     SECRETARY = 'SECRETARY',
+    ADMIN_SECRETARY = 'ADMIN_SECRETARY',
     /** Fisioterapista: cartella clinica e agenda dei propri pazienti. */
     THERAPIST = 'THERAPIST',
     /** Medico fisiatra. */
@@ -59,7 +60,15 @@ const clinicalRead = (scope: 'own' | 'structure' | 'tenant'): Permission[] =>
     CLINICAL_RESOURCES.map((resource) => perm(resource, 'read', scope));
 
 /** Preset condiviso dai medici specialisti (fisiatra / ortopedico). */
+const ownPaymentPermissions = (): Permission[] => [
+    perm('patient_balance', 'read', 'own'),
+    ...perms('payment', ['read', 'create'], 'own'),
+    perm('appointment_pricing', 'update', 'own'),
+    perm('payment_reversal', 'create', 'own')
+];
+
 const physicianPermissions = (): Permission[] => [
+    ...ownPaymentPermissions(),
     // vede tutti i pazienti della struttura, ma non li cancella
     ...perms('patient', ['read'], 'structure'),
     ...perms('patient', ['create', 'update'], 'structure'),
@@ -100,6 +109,11 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             perm('invoice', 'manage', 'tenant'),
             perm('product', 'manage', 'tenant'),
             perm('dashboard', 'manage', 'tenant'),
+            perm('analytics', 'manage', 'tenant'),
+            perm('patient_balance', 'read', 'tenant'),
+            perm('payment', 'manage', 'tenant'),
+            perm('appointment_pricing', 'update', 'tenant'),
+            perm('payment_reversal', 'create', 'tenant'),
             perm('user', 'manage', 'tenant'),
             perm('structure', 'manage', 'tenant'),
             perm('tenant', 'manage', 'tenant'),
@@ -111,6 +125,25 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
     [RoleCode.SECRETARY]: {
         code: RoleCode.SECRETARY,
         labelKey: 'role-secretary',
+        actor: 'staff',
+        assignable: true,
+        permissions: [
+            ...perms('patient', ['read', 'create', 'update'], 'structure'),
+            ...crud('note', 'own'),
+            ...crud('reminder', 'structure'),
+            perm('activity', 'manage', 'structure'),
+            ...crud('agenda', 'structure'),
+            perm('product', 'read', 'tenant'),
+            perm('user', 'read', 'structure'),
+            perm('structure', 'read', 'structure'),
+            perm('patient_balance', 'read', 'structure'),
+            ...perms('payment', ['read', 'create'], 'structure')
+        ]
+    },
+
+    [RoleCode.ADMIN_SECRETARY]: {
+        code: RoleCode.ADMIN_SECRETARY,
+        labelKey: 'role-admin-secretary',
         actor: 'staff',
         assignable: true,
         permissions: [
@@ -133,13 +166,18 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             ...perms('tenant', ['read', 'update'], 'tenant'),
             perm('clinical_content', 'manage', 'tenant'),
             perm('dashboard', 'read', 'structure'),
+            ...perms('analytics', ['read', 'export'], 'structure'),
+            perm('patient_balance', 'read', 'structure'),
+            ...perms('payment', ['read', 'create'], 'structure'),
+            perm('appointment_pricing', 'update', 'structure'),
+            perm('payment_reversal', 'create', 'structure'),
             perm('price_list', 'manage', 'tenant'),
             perm('quote', 'manage', 'structure'),
             perm('treasury', 'manage', 'structure'),
             perm('expense', 'manage', 'structure'),
             perm('supplier', 'manage', 'tenant'),
             ...perms('fiscal_submission', ['read', 'create', 'export'], 'tenant'),
-            ...perms('accountant_export', ['read', 'export'], 'tenant')
+            ...perms('accountant_export', ['read', 'export'], 'structure')
         ]
     },
 
@@ -149,6 +187,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
         actor: 'staff',
         assignable: true,
         permissions: [
+            ...ownPaymentPermissions(),
             ...perms('patient', ['read', 'create', 'update'], 'structure'),
             ...clinicalCrud('own'),
             ...crud('reminder', 'own'),
@@ -187,6 +226,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
         actor: 'staff',
         assignable: true,
         permissions: [
+            ...ownPaymentPermissions(),
             ...perms('patient', ['read', 'create', 'update'], 'structure'),
             ...CLINICAL_RESOURCES.flatMap((resource) =>
                 perms(resource, ['read', 'create', 'update'], 'own')
@@ -218,6 +258,9 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             perm('user', 'read', 'tenant'),
             perm('structure', 'read', 'tenant'),
             perm('dashboard', 'read', 'tenant'),
+            ...perms('analytics', ['read', 'export'], 'tenant'),
+            perm('patient_balance', 'read', 'tenant'),
+            perm('payment', 'read', 'tenant'),
             ...ADMINISTRATION_RESOURCES.map((resource) => perm(resource, 'read', 'tenant')),
             perm('accountant_export', 'export', 'tenant')
         ]

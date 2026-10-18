@@ -6,6 +6,7 @@ import { boundedInteger, textSearchWhere } from '../../../utils/search.js';
 import { sequelize } from '../../../config/database.js';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
 import EventType from '../models/eventType.model.js';
+import {canChangeEventTypePricing} from '../services/appointmentFinancialAccess.service.js';
 import EventTypeStructure from '../models/eventTypeStructure.model.js';
 import { Service, ServiceStructure } from '../../products-services/models/index.js';
 import {
@@ -160,6 +161,7 @@ export const createEventType = asyncHandler(async (req: Request, res: Response) 
     if (isReservedTimeOffTitle(source.title)) {
         return sendErrorResponse(res, 409, 'Ferie e Permesso sono tipi di assenza gestiti dalla sezione dedicata');
     }
+    if (!canChangeEventTypePricing(req, source)) return sendErrorResponse(res, 403, 'Non puoi impostare prezzi o servizi collegati al tipo appuntamento');
     const config = await normalizedConfiguration(req, source);
     const eventType = await sequelize.transaction(async transaction => {
         const created = await EventType.schema(schema).create({
@@ -211,6 +213,7 @@ export const updateEventType = asyncHandler(async (req: Request, res: Response) 
     }
     const current = await EventType.schema(schema).findByPk(id);
     if (!current) return sendErrorResponse(res, 404, 'Event Type not found');
+    if (!canChangeEventTypePricing(req, source, current.get({plain: true}))) return sendErrorResponse(res, 403, 'Non puoi modificare prezzi o servizi collegati al tipo appuntamento');
     const mappings = await ownMappings(schema, id);
     const currentSelected = current.availabilityMode === 'SELECTED'
         ? mappings.map(mapping => String(mapping.structureId))

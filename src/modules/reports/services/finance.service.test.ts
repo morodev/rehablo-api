@@ -5,6 +5,7 @@ import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
+import { PatientCredit, TreasuryMovement } from '../../administration/models/index.js';
 import { aggregateFinance, aggregateTherapyPayments, FinanceData, FinanceQuery, invoiceMatchesContext, loadFinanceData, parseFinanceFilters } from './finance.service.js';
 
 const query = (overrides: Partial<FinanceQuery> = {}): FinanceQuery => ({
@@ -163,6 +164,12 @@ describe('shared cash and document reporting', () => {
 });
 
 describe('therapy payment filters and pagination', () => {
+    it('rejects repeated or object financial query parameters', () => {
+        for (const key of ['paymentStatus', 'documentStatus', 'status', 'eventTypeIds', 'agendaEventIds', 'patientId']) {
+            assert.throws(() => parseFinanceFilters({ query: { [key]: ['paid'] } } as any), /non valido/);
+            assert.throws(() => parseFinanceFilters({ query: { [key]: { nested: 'paid' } } } as any), /non valido/);
+        }
+    });
     it('computes totals across more than 200 therapies before returning a page', () => {
         const events = Array.from({ length: 251 }, (_, n) => event({ id: `event-${n}` }));
         const payments = events.map((row) => payment({ id: `cash-${row.id}`, agendaEventId: row.id }));
@@ -239,6 +246,26 @@ describe('therapy payment filters and pagination', () => {
 });
 
 describe('financial report loading and access boundaries', () => {
+    it('does not attribute a document to an operator when a linked therapy belongs to an unselected site', async t => {
+        const selectedSite = '11111111-1111-4111-8111-111111111111';
+        const hiddenSite = '22222222-2222-4222-8222-222222222222';
+        const selectedEvent = event({ id: 'visible', structureId: selectedSite, calendarId: 'operator-a', appointmentExpectedAmount: 100 });
+        const hiddenEvent = event({ id: 'hidden', structureId: hiddenSite, calendarId: 'operator-a' });
+        const bill = invoice({ structureId: selectedSite, agendaEventId: 'visible' });
+        const model = (value: any) => ({ ...value, get: () => value });
+        t.mock.method(AgendaEvent, 'schema', (() => ({ findAll: async (options: any) => options.attributes
+            ? [model(selectedEvent), model(hiddenEvent)] : [model(selectedEvent)] })) as any);
+        t.mock.method(Invoice, 'schema', (() => ({ findAll: async () => [model(bill)] })) as any);
+        t.mock.method(InvoiceAgendaEvent, 'schema', (() => ({ findAll: async (options: any) => options.where.agendaEventId ? []
+            : ['visible', 'hidden'].map(agendaEventId => model({ invoiceId: bill.id, agendaEventId })) })) as any);
+        t.mock.method(InvoicePayment, 'schema', (() => ({ findAll: async () => [] })) as any);
+        const scope = { tenantId: 'tenant', userId: 'user', scope: 'assigned' as const, selectedStructureIds: [selectedSite], allowedStructureIds: [selectedSite], structures: [] };
+        const filtered = await loadFinanceData({ tenantSchema: 'test_tenant', query: {} } as any, query({ operatorId: 'operator-a' }), scope);
+        assert.equal(filtered.scopeCompleteInvoiceIds?.has(bill.id), false);
+        assert.equal(filtered.attributableInvoiceIds.has(bill.id), false);
+        const unfiltered = await loadFinanceData({ tenantSchema: 'test_tenant', query: {} } as any, query(), scope);
+        assert.equal(unfiltered.attributableInvoiceIds.has(bill.id), true, 'Fiscal document remains visible in its authorized issuing site');
+    });
     it('restricts event cash to authorized patients and retains the event owner filter', async () => {
         const ownerId = '11111111-1111-4111-8111-111111111111';
         const request = { tenantSchema: 'test_tenant', access: { scope: 'own', userId: ownerId, structureId: null } } as any;
@@ -261,6 +288,8 @@ describe('financial report loading and access boundaries', () => {
         const model = (value: any) => ({ ...value, get: () => value });
         let eventCalls = 0;
         const stubs = [
+            mock.method(PatientCredit, 'schema', (() => ({ findAll: async () => [] })) as any),
+            mock.method(TreasuryMovement, 'schema', (() => ({ findAll: async () => [] })) as any),
             mock.method(AgendaEvent, 'schema', (() => ({ findAll: async () => ++eventCalls === 1 ? [model(detached)] : [model(detached)] })) as any),
             mock.method(Invoice, 'schema', (() => ({ findAll: async () => [model(voidInvoice)] })) as any),
             mock.method(InvoicePayment, 'schema', (() => ({ findAll: async () => [model(payment())] })) as any),
@@ -281,6 +310,8 @@ describe('financial report loading and access boundaries', () => {
         const voidInvoice = invoice({ agendaEventId: null, status: 'void' });
         const model = (value: any) => ({ ...value, get: () => value });
         const stubs = [
+            mock.method(PatientCredit, 'schema', (() => ({ findAll: async () => [] })) as any),
+            mock.method(TreasuryMovement, 'schema', (() => ({ findAll: async () => [] })) as any),
             mock.method(AgendaEvent, 'schema', (() => ({ findAll: async () => [model(detached)] })) as any),
             mock.method(Invoice, 'schema', (() => ({ findAll: async () => [model(voidInvoice)] })) as any),
             mock.method(InvoicePayment, 'schema', (() => ({ findAll: async () => [model(payment({ agendaEventId: null, invoiceId: 'invoice-1', source: 'USER' }))] })) as any),

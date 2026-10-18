@@ -6,6 +6,7 @@ import AgendaEventException from '../../agenda/models/agendaEventException.model
 import EventType from '../../agenda/models/eventType.model.js';
 import TimeOffRequest from '../../agenda/models/timeOffRequest.model.js';
 import { getInvoiceAgendaLinksByEventIds } from '../../invoice/services/invoiceAgendaEvent.service.js';
+import {subtractIntervals} from './operationalMetrics.js';
 import {
     StructureAvailability,
     User,
@@ -28,6 +29,7 @@ export interface AnalyticsQuery {
     granularity: AnalyticsGranularity;
     compare: AnalyticsCompare;
     structureId: string | null;
+    structureIds?: string[];
     operatorId: string | null;
     eventTypeId: string | null;
 }
@@ -75,7 +77,7 @@ function currentLocalDate(): string {
     return localDateKey(new Date());
 }
 
-function addDays(date: string, days: number): string {
+export function addDays(date: string, days: number): string {
     const value = new Date(`${date}T12:00:00.000Z`);
     value.setUTCDate(value.getUTCDate() + days);
     return value.toISOString().slice(0, 10);
@@ -94,9 +96,12 @@ function defaultRange(): { from: string; to: string } {
 
 export function parseAnalyticsQuery(req: Request): AnalyticsQuery {
     const defaults = defaultRange();
+    for (const key of ['from', 'to', 'granularity', 'compare']) {
+        if (req.query[key] != null && typeof req.query[key] !== 'string') throw new AnalyticsQueryError(`${key} non valido`);
+    }
     const from = String(req.query.from ?? defaults.from);
     const to = String(req.query.to ?? defaults.to);
-    if (!DATE_RE.test(from) || !DATE_RE.test(to) || from > to) {
+    if (!DATE_RE.test(from) || !DATE_RE.test(to) || !Number.isFinite(Date.parse(from)) || !Number.isFinite(Date.parse(to)) || new Date(from).toISOString().slice(0, 10) !== from || new Date(to).toISOString().slice(0, 10) !== to || from > to) {
         throw new AnalyticsQueryError('Intervallo date non valido');
     }
     const dayCount = daysBetween(from, to) + 1;
@@ -127,16 +132,17 @@ export function parseAnalyticsQuery(req: Request): AnalyticsQuery {
     const requestedOperator = optionalUuid('operatorId');
     const eventTypeId = optionalUuid('eventTypeId');
     const access = req.access!;
+    const reportScope = (req as any).reportScope as {selectedStructureIds: string[]; operatorId?: string} | undefined;
 
     let structureId = requestedStructure;
     let operatorId = requestedOperator;
-    if (access.scope === 'structure') {
+    if (!reportScope && access.scope === 'structure') {
         if (requestedStructure && requestedStructure !== access.structureId) {
             throw new AnalyticsQueryError('La sede richiesta non è accessibile');
         }
         structureId = access.structureId;
     }
-    if (access.scope === 'own') {
+    if (!reportScope && access.scope === 'own') {
         if (requestedOperator && requestedOperator !== access.userId) {
             throw new AnalyticsQueryError('L’operatore richiesto non è accessibile');
         }
@@ -144,7 +150,11 @@ export function parseAnalyticsQuery(req: Request): AnalyticsQuery {
         structureId = access.structureId;
     }
 
-    return { from, to, granularity, compare, structureId, operatorId, eventTypeId };
+    if (reportScope) {
+        structureId = reportScope.selectedStructureIds.length === 1 ? reportScope.selectedStructureIds[0] : null;
+        operatorId = reportScope.operatorId ?? operatorId;
+    }
+    return { from, to, granularity, compare, structureId, operatorId, eventTypeId, ...(reportScope ? {structureIds: reportScope.selectedStructureIds} : {}) };
 }
 
 export function comparisonRange(query: AnalyticsQuery): AnalyticsQuery | null {
@@ -236,7 +246,7 @@ export function expandRecurringEvent(
     try {
         const parts = String(event.recurrence)
             .split(';')
-            .filter((part) => !part.startsWith('UNTIL=') && !part.startsWith('COUNT='));
+            .filter((part) => !part.startsWith('UNTIL='));
         const seriesEnd = new Date(event.end);
         if (!Number.isNaN(seriesEnd.getTime())) parts.push(`UNTIL=${utcRuleDate(seriesEnd)}`);
         const rule = rrulestr(`DTSTART:${utcRuleDate(start)}\nRRULE:${parts.join(';')}`, { forceset: true });
@@ -252,7 +262,8 @@ export function expandRecurringEvent(
 
 export async function loadOccurrences(
     schema: string,
-    query: AnalyticsQuery
+    query: AnalyticsQuery,
+    includeTimeOff = false
 ): Promise<ReportOccurrence[]> {
     // The stored timestamps are UTC while report days are Europe/Rome. A small padded SQL range
     // prevents losing appointments close to local midnight; `inDateRange` applies the exact cut.
@@ -266,7 +277,8 @@ export async function loadOccurrences(
             { recurrence: { [Op.ne]: null }, start: { [Op.lte]: paddedEnd.toISOString() }, end: { [Op.gte]: paddedStart.toISOString() } }
         ]
     };
-    if (query.structureId) where.structureId = query.structureId;
+    if (query.structureIds) where.structureId = {[Op.in]: query.structureIds};
+    else if (query.structureId) where.structureId = query.structureId;
     if (query.operatorId) where.calendarId = query.operatorId;
     if (query.eventTypeId) where.eventTypeId = query.eventTypeId;
 
@@ -296,7 +308,7 @@ export async function loadOccurrences(
         byEvent.set(eventId, values);
     });
 
-    return plain.flatMap((event) => expandRecurringEvent(event, byEvent.get(event.id) ?? new Set(), query));
+    return plain.filter(event => includeTimeOff || !['Ferie', 'Permesso'].includes(String(event.title))).flatMap((event) => expandRecurringEvent(event, byEvent.get(event.id) ?? new Set(), query));
 }
 
 function mondayOf(dateKey: string): string {
@@ -360,7 +372,7 @@ function finishActivity(target: ReturnType<typeof blankActivityTotals>) {
     return target;
 }
 
-function rangesOfRow(row: Record<string, any>): Array<[number, number]> {
+export function rangesOfRow(row: Record<string, any>): Array<[number, number]> {
     const values = row.open != null
         ? [[row.open, row.close]]
         : [
@@ -379,7 +391,7 @@ function rangesOfRow(row: Record<string, any>): Array<[number, number]> {
     });
 }
 
-function localMinute(date: Date): number {
+export function localMinute(date: Date): number {
     const parts = localTimeFormatter.formatToParts(date);
     const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
     return Number(value.hour) * 60 + Number(value.minute);
@@ -427,21 +439,25 @@ async function operatorCapacity(
         });
     }
 
+    const blocked = new Map<string, Array<[number, number]>>();
     approvedTimeOff.forEach((row) => {
         const startKey = localDateKey(row.start);
         const endKey = localDateKey(row.end);
         const first = startKey < query.from ? query.from : startKey;
         const last = endKey > query.to ? query.to : endKey;
-        let unavailableMinutes = 0;
         for (let date = first; date <= last; date = addDays(date, 1)) {
             const absenceStart = row.allDay || date > startKey ? 0 : localMinute(row.start);
             const absenceEnd = row.allDay || date < endKey ? 24 * 60 : localMinute(row.end);
-            for (const [workStart, workEnd] of schedule.get(`${row.userId}:${date}`) ?? []) {
-                unavailableMinutes += Math.max(Math.min(workEnd, absenceEnd) - Math.max(workStart, absenceStart), 0);
-            }
+            const key = `${row.userId}:${date}`, intervals = blocked.get(key) ?? [];
+            intervals.push([absenceStart, absenceEnd]); blocked.set(key, intervals);
         }
-        totals.set(row.userId, Math.max((totals.get(row.userId) ?? 0) - unavailableMinutes, 0));
     });
+    operatorIds.forEach(id => totals.set(id, 0));
+    for (let date = query.from; date <= query.to; date = addDays(date, 1)) for (const id of operatorIds) {
+        const key = `${id}:${date}`;
+        const minutes = subtractIntervals(schedule.get(key) ?? [], blocked.get(key) ?? []).reduce((sum, [a, b]) => sum + b - a, 0);
+        totals.set(id, (totals.get(id) ?? 0) + minutes);
+    }
     return totals;
 }
 
@@ -456,6 +472,7 @@ export async function aggregateActivity(
     const byOperator = new Map<string, ReturnType<typeof blankActivityTotals>>();
     const byType = new Map<string, ReturnType<typeof blankActivityTotals>>();
 
+    for (const bucket of enumerateBuckets(query)) series.set(bucket, blankActivityTotals());
     rows.forEach((occurrence) => {
         accumulateActivity(totals, occurrence);
         const bucket = bucketKey(occurrence.start, query.granularity);
@@ -473,10 +490,11 @@ export async function aggregateActivity(
         byType.set(typeKey, typeTotals);
     });
 
-    // A selected professional must still appear with zero values; an empty table would make it
-    // impossible to distinguish "no activity" from a missing/failed filter.
+    // A zero-activity filter must never disclose a public user's name outside the selected sites.
     if (query.operatorId && !byOperator.has(query.operatorId)) {
-        byOperator.set(query.operatorId, blankActivityTotals());
+        const sites = query.structureIds ?? (query.structureId ? [query.structureId] : []);
+        const memberships = sites.length ? await StructureUser.findAll({where: {userId: query.operatorId, structureId: {[Op.in]: sites}}, attributes: ['userId']}) : [];
+        if (memberships.length) byOperator.set(query.operatorId, blankActivityTotals());
     }
 
     const operatorIds = [...byOperator.keys()];
@@ -513,11 +531,12 @@ export async function aggregateActivity(
             eventTypeName: eventTypeId.startsWith('legacy:') ? eventTypeId.slice(7) : typeNames.get(eventTypeId) ?? 'Altro',
             ...finishActivity(values)
         })).sort((a, b) => b.completed - a.completed),
-        details: rows.sort((a, b) => b.start.getTime() - a.start.getTime()).slice(0, 200).map((row) => ({
+        details: rows.sort((a, b) => b.start.getTime() - a.start.getTime()).map((row) => ({
             id: row.id,
             start: row.start,
             end: row.end,
             patientName: row.patientName,
+            patientId: row.patientId,
             title: row.title,
             status: row.status,
             operatorId: row.calendarId,
@@ -538,4 +557,11 @@ export function documentDiscountRatio(discountedSubtotal: unknown, storedLineSub
     if (!Number.isFinite(subtotal) || subtotal <= 0) return 1;
     const discounted = Number(discountedSubtotal);
     return Number.isFinite(discounted) ? Math.min(Math.max(discounted, 0) / subtotal, 1) : 1;
+}
+
+/** Complete time axis, including periods without activity. */
+export function enumerateBuckets(query: AnalyticsQuery): string[] {
+    const buckets = new Set<string>();
+    for (let date = query.from; date <= query.to; date = addDays(date, 1)) buckets.add(bucketKey(new Date(date + 'T12:00:00Z'), query.granularity));
+    return [...buckets];
 }

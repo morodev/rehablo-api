@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { it, TestContext } from 'node:test';
 import { sequelize } from '../../../config/database.js';
+import { Op } from 'sequelize';
 import { Structure, Tenant } from '../../auth/models/index.js';
 import { Invoice } from '../../invoice/models/index.js';
 import { listFinancialAccounts, reports, overview } from '../controllers/administration.view.controller.js';
@@ -68,7 +69,8 @@ function fixture(t: TestContext, movements: any[] = [original()]) {
             observed.push({ kind: 'movementList', ...options });
             return movements.filter(row =>
                 (typeof options.where.accountId !== 'string' || row.accountId === options.where.accountId)
-                && (!options.where.structureId || row.structureId === options.where.structureId)
+                && (!options.where.structureId || row.structureId === options.where.structureId
+                    || options.where.structureId[Op.in]?.includes(row.structureId))
             ).map(model);
         },
         findOne: async (options: any) => {
@@ -264,7 +266,8 @@ function fiscalReadFixture(t: TestContext) {
 }
 function runView(handler: any, query: any = {}): Promise<any> {
     return new Promise(resolve => {
-        const req = { ...request(), query };
+        const req = { ...request(), query, ...([reports, overview].includes(handler) ? { reportScope: { tenantId, userId: otherId, allowedStructureIds: [structureId],
+            selectedStructureIds: [structureId], structures: [{ id: structureId, name: 'Sede' }], scope: 'assigned' } } : {}) };
         const res: any = { status(code: number) { this.code = code; return this; },
             json(body: any) { resolve({ code: this.code, ...body }); } };
         handler(req, res, (error: any) => resolve({ code: error.statusCode ?? 500, error: error.message }));
@@ -351,4 +354,18 @@ it('preview version ignores row order and later-day entries but detects changed 
     assert.equal(closingPreviewVersion(accountId, 20, [...rows].reverse(), '2026-01-11'), before);
     assert.equal(closingPreviewVersion(accountId, 20, [...rows, original({ id: 'future', occurredAt: '2026-01-12T12:00:00Z' })], '2026-01-11'), before);
     assert.notEqual(closingPreviewVersion(accountId, 25, rows, '2026-01-11'), before);
+});
+
+it('overview keeps account balances inside reportScope even when legacy access is tenant wide', async t => {
+    const f = fixture(t, [original(), original({ id: otherId, structureId: otherId, amount: 900 })]);
+    fiscalReadFixture(t);
+    const result = await runView(overview, { from: '2026-01-01', to: '2026-01-31' });
+    assert.equal(result.code, 200, result.error);
+    assert.equal(result.data.accounts[0].balance, 120);
+    const accountRead = f.observed.find(row => row.kind === 'movementList' && row.where.accountId);
+    assert.deepEqual(accountRead.where.structureId[Op.in], [structureId]);
+    f.account.structureId = null;
+    const shared = await runView(overview, { from: '2026-01-01', to: '2026-01-31' });
+    assert.equal(shared.data.accounts[0].balance, null);
+    assert.ok(shared.data.warnings.some((row: any) => row.code === 'shared-account-balances'));
 });

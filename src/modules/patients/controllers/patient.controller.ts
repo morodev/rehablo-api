@@ -249,6 +249,23 @@ function getPagingData(data: { count: number; rows: unknown[] }, page?: string, 
     return { totalItems, contents, totalPages, currentPage };
 }
 
+async function validatePatientDefaultEventType(
+    schema: string, eventTypeId: unknown, structureId: string | null | undefined
+): Promise<{status: number; message: string} | null> {
+    if (eventTypeId !== null && (typeof eventTypeId !== 'string' || !UUID_REGEX.test(eventTypeId))) {
+        return {status: 422, message: 'Tipo appuntamento non valido'};
+    }
+    if (eventTypeId === null) return null;
+    const eventType = await EventType.schema(schema).findByPk(eventTypeId as string, {
+        attributes: ['id', 'availabilityMode']
+    });
+    if (!eventType) return {status: 404, message: 'Tipo appuntamento non trovato'};
+    if (!await itemAvailableInStructure(eventType, EventTypeStructure, schema, 'eventTypeId', structureId)) {
+        return {status: 409, message: 'Il tipo appuntamento non e disponibile nella sede del paziente'};
+    }
+    return null;
+}
+
 export const savePatient = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const structureId = await resolveWritableStructureId(req);
@@ -257,6 +274,11 @@ export const savePatient = asyncHandler(async (req: Request, res: Response) => {
     }
 
     const payload = sanitizePatientPayload(req.body);
+    if (Object.prototype.hasOwnProperty.call(req.body ?? {}, 'defaultEventTypeId')) {
+        const error = await validatePatientDefaultEventType(schema, req.body.defaultEventTypeId, structureId);
+        if (error) return sendErrorResponse(res, error.status, error.message);
+        payload.defaultEventTypeId = req.body.defaultEventTypeId;
+    }
     const colorError = sanitizePatientColor(payload);
     if (colorError) {
         return sendErrorResponse(res, 422, colorError);
@@ -389,6 +411,14 @@ export const update = asyncHandler(async (req: Request, res: Response) => {
     }
 
     const payload = sanitizePatientPayload(req.body.contact ?? req.body);
+    // Explicit sibling field: stale full contact objects still cannot overwrite this preference.
+    if (Object.prototype.hasOwnProperty.call(req.body ?? {}, 'contact')
+        && Object.prototype.hasOwnProperty.call(req.body ?? {}, 'defaultEventTypeId')) {
+        const structureId = currentPatient.get('structureId') as string | null;
+        const error = await validatePatientDefaultEventType(schema, req.body.defaultEventTypeId, structureId);
+        if (error) return sendErrorResponse(res, error.status, error.message);
+        payload.defaultEventTypeId = req.body.defaultEventTypeId;
+    }
     const colorError = sanitizePatientColor(payload);
     if (colorError) {
         return sendErrorResponse(res, 422, colorError);
@@ -438,8 +468,8 @@ export const update = asyncHandler(async (req: Request, res: Response) => {
 /**
  * PATCH /patient/:patientId/default-event-type
  *
- * Il tipo abituale e' un'azione rapida dell'anagrafica e non fa parte della PUT generale:
- * in questo modo un form paziente aperto da tempo non puo' cancellarlo con dati obsoleti.
+ * Azione rapida delle righe anagrafica. La PUT accetta la preferenza solo come campo
+ * esplicito accanto a contact, evitando sovrascritture da vecchi oggetti anagrafica.
  */
 export const setDefaultEventType = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
@@ -455,25 +485,11 @@ export const setDefaultEventType = asyncHandler(async (req: Request, res: Respon
     }
 
     const eventTypeId = req.body.eventTypeId;
-    if (eventTypeId !== null && (typeof eventTypeId !== 'string' || !UUID_REGEX.test(eventTypeId))) {
-        return sendErrorResponse(res, 422, 'Tipo appuntamento non valido');
-    }
-
-    if (eventTypeId) {
-        const eventType = await EventType.schema(schema).findByPk(eventTypeId, { attributes: ['id'] });
-        if (!eventType) {
-            return sendErrorResponse(res, 404, 'Tipo appuntamento non trovato');
-        }
-        const patientStructureId = typeof patient.get === 'function'
-            ? patient.get('structureId') as string | null
-            : (patient as any).structureId as string | null;
-        const structureId = patientStructureId ?? req.access?.structureId;
-        if (!await itemAvailableInStructure(
-            eventType, EventTypeStructure, schema, 'eventTypeId', structureId
-        )) {
-            return sendErrorResponse(res, 409, 'Il tipo appuntamento non e disponibile nella sede del paziente');
-        }
-    }
+    const patientStructureId = typeof patient.get === 'function'
+        ? patient.get('structureId') as string | null
+        : (patient as any).structureId as string | null;
+    const error = await validatePatientDefaultEventType(schema, eventTypeId, patientStructureId ?? req.access?.structureId);
+    if (error) return sendErrorResponse(res, error.status, error.message);
 
     await patient.update({ defaultEventTypeId: eventTypeId });
     const updatedPatient = await Patient.schema(schema).findOne({

@@ -1,3 +1,4 @@
+import {canAccessAppointmentFinance} from '../services/appointmentFinancialAccess.service.js';
 import { Request, Response } from 'express';
 import { Op } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
@@ -153,6 +154,7 @@ async function writePayment(req: Request, res: Response, cumulative: boolean, pr
             }
             const pricing = pricingOnly ? req.body : req.body?.pricing;
             if (pricingOnly || pricing !== undefined) {
+                if (!canAccessAppointmentFinance(req, event.get({plain: true}), 'appointment_pricing', 'update')) fail(403, 'Non puoi modificare il prezzo della seduta');
                 if (!pricing || typeof pricing !== 'object' || Array.isArray(pricing)) fail(400, 'Prezzo non valido');
                 if (pricing.note != null && (typeof pricing.note !== 'string' || pricing.note.length > 2000)) {
                     fail(400, 'La nota può contenere al massimo 2000 caratteri');
@@ -200,6 +202,7 @@ async function writePayment(req: Request, res: Response, cumulative: boolean, pr
                 await assertPatientSettlementAllocations(schema, settlementContext(req, event),
                     [{ kind: 'APPOINTMENT', targetId: event.id, amount }], transaction);
                 if (expected.amount === null) {
+                    if (!canAccessAppointmentFinance(req, event.get({plain: true}), 'appointment_pricing', 'update')) fail(403, 'Il prezzo deve essere definito da un operatore autorizzato');
                     const finalAmount = paymentMoney(previous.paidAmount + amount);
                     await event.update({
                         appointmentExpectedAmount: finalAmount,
@@ -221,6 +224,7 @@ async function writePayment(req: Request, res: Response, cumulative: boolean, pr
                 }, { transaction });
             }
             if (req.body?.markCompleted === true) {
+                if (!canAccessAppointmentFinance(req, event.get({plain: true}), 'agenda', 'update')) fail(403, 'Non puoi modificare la presenza della seduta');
                 await completeAppointmentAfterPayment(event, getUserId(req), transaction);
             }
             const summary = await syncAppointmentPaymentStatus(schema, event, transaction, getUserId(req));
@@ -312,6 +316,7 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
 
             const pricing = req.body?.pricing;
             if (pricing !== undefined) {
+                if (!canAccessAppointmentFinance(req, reference.get({plain: true}), 'appointment_pricing', 'update')) fail(403, 'Non puoi modificare il prezzo della seduta');
                 if (!pricing || typeof pricing !== 'object' || Array.isArray(pricing)) fail(400, 'Prezzo non valido');
                 if (pricing.note != null && (typeof pricing.note !== 'string' || pricing.note.length > 2000)) {
                     fail(400, 'La nota può contenere al massimo 2000 caratteri');
@@ -363,6 +368,7 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
                 const { event, history, previous } = preparedItem;
                 let { price } = preparedItem;
                 if (price.amount === null) {
+                    if (!canAccessAppointmentFinance(req, event.get({plain: true}), 'appointment_pricing', 'update')) fail(403, 'Il prezzo deve essere definito da un operatore autorizzato');
                     const finalAmount = paymentMoney(previous.paidAmount + allocation.amount);
                     await event.update({
                         appointmentExpectedAmount: finalAmount,
@@ -381,6 +387,7 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
                     source: 'APPOINTMENT', status: 'POSTED', createdByUserId: getUserId(req)
                 }, { transaction });
                 if (req.body?.markReferenceCompleted === true && event.id === reference.id) {
+                    if (!canAccessAppointmentFinance(req, event.get({plain: true}), 'agenda', 'update')) fail(403, 'Non puoi modificare la presenza della seduta');
                     await completeAppointmentAfterPayment(event, getUserId(req), transaction);
                 }
                 const summary = await syncAppointmentPaymentStatus(schema, event, transaction, getUserId(req));
@@ -424,7 +431,7 @@ export const listAppointmentPayments = asyncHandler(async (req, res) => {
     if (!event) return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
     const plainEvent = event.get({ plain: true }) as Record<string, any>;
     const canReadFinance = Boolean(req.user?.isSuperAdmin)
-        || hasPermission(getGrantedPermissions(req), 'invoice', 'read');
+        || hasPermission(getGrantedPermissions(req), 'patient_balance', 'read', 'structure');
     const [payments, priceMap, positionMap] = await Promise.all([
         InvoicePayment.schema(schema).findAll({
             where: { agendaEventId: event.id }, order: [['createdAt', 'DESC']]
@@ -442,7 +449,7 @@ export const listAppointmentPayments = asyncHandler(async (req, res) => {
                 ? event.appointmentPriceAdjustment ? null : price.amount : paymentMoney(event.appointmentOriginalAmount),
             adjustment: event.appointmentPriceAdjustment ?? null,
             note: event.appointmentPriceAdjustmentNote ?? null,
-            editable: !await getLinkedInvoiceId(schema, event.id, event.invoiceId)
+            editable: canAccessAppointmentFinance(req, plainEvent, 'appointment_pricing', 'update') && !await getLinkedInvoiceId(schema, event.id, event.invoiceId)
                 && !event.recurrence && !event.recurringEventId
                 && ['CONFIRMED', 'COMPLETED'].includes(String(event.status).toUpperCase())
                 && !!(event.patientId || event.patient?.id)

@@ -36,8 +36,8 @@ const crud = (
     router.delete(`${path}/:id`, requirePermission(resource, 'delete'), controller.remove(name));
 };
 
-router.get('/administration/overview', requireAnyPermission(['treasury', 'read'], ['quote', 'read'], ['invoice', 'read']), views.overview);
-router.get('/administration/reports', requirePermission('accountant_export', 'read'), views.reports);
+router.get('/administration/overview', requirePermission('analytics', 'read'), views.overview);
+router.get('/administration/reports', requirePermission('analytics', 'read'), views.reports);
 router.get('/administration/documents', requirePermission('invoice', 'read'), views.listDocuments);
 router.get('/administration/settings/documents', requirePermission('tenant', 'read'), views.getDocumentSettings);
 router.patch('/administration/settings/documents', requirePermission('tenant', 'update', 'tenant'), views.updateDocumentSettings);

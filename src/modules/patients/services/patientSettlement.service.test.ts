@@ -19,7 +19,8 @@ import {loadPatientSettlementPosition} from './patientSettlementPolicy.service.j
 
 const uid = (index: number) => `aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, '0')}`;
 const patientId = uid(1), structureId = uid(2), userId = uid(3), tenantId = uid(4), currentId = uid(5), creditId = uid(6);
-const perms = ['agenda:read:structure', 'agenda:update:structure', 'invoice:read:structure', 'invoice:update:structure',
+const perms = ['patient_balance:read:structure', 'payment:read:structure', 'payment:create:structure',
+    'appointment_pricing:update:structure', 'payment_reversal:create:structure', 'agenda:read:structure', 'agenda:update:structure', 'invoice:read:structure', 'invoice:update:structure',
     'quote:read:structure', 'quote:update:structure'];
 type Plain = Record<string, any>;
 
@@ -147,7 +148,7 @@ it('rolls back the entire mixed operation if recording a credit application fail
 });
 it('allows pure credit without agenda:update and preserves attendance', async t => {
     const f = fixture(t);
-    f.req.user!.perms = perms.filter(value => value !== 'agenda:update:structure');
+    f.req.user!.perms = perms.filter(value => !['agenda:update:structure', 'payment:create:structure'].includes(value));
     f.tables.credits[0].amount = 60; f.tables.credits[0].remainingAmount = 60; f.tables.treasury[0].amount = 60;
     f.req.body.credits[0].amount = 60; f.req.body.cash.amount = 0;
     const result = await executePatientSettlement(f.req);
@@ -156,14 +157,14 @@ it('allows pure credit without agenda:update and preserves attendance', async t 
 });
 it('refuses new cash without target permission and leaves balances unchanged', async t => {
     const f = fixture(t);
-    f.req.user!.perms = perms.filter(value => value !== 'agenda:update:structure');
+    f.req.user!.perms = perms.filter(value => !['agenda:update:structure', 'payment:create:structure'].includes(value));
     const snapshot = JSON.stringify(f.tables);
     await assert.rejects(() => executePatientSettlement(f.req), /copertura/);
     assert.equal(JSON.stringify(f.tables), snapshot);
 });
 it('hides earlier invoice details but retains its blocking effect', async t => {
     const f = fixture(t);
-    f.req.user!.perms = perms.filter(value => !value.startsWith('invoice:'));
+    f.req.user!.perms = ['patient_balance:read:own', 'payment:create:own', 'agenda:update:own'];
     f.tables.invoices.push({id: uid(8), patientID: patientId, structureId, emissionDate: '2020-01-01',
         documentNumber: 12, documentYear: 2020, documentType: 'fattura', status: 'unpaid', invoiceNet: 1000});
     const context = await resolvePatientSettlementContext(f.req, f.req.body);
@@ -207,7 +208,7 @@ it('reference site is authoritative even if the patient has moved to another pre
 it('derives a legacy invoice site from its original prestation instead of the moved patient default', async t => {
     const f = fixture(t); const invoiceId = uid(8);
     f.tables.patients[0].structureId = uid(9); f.req.user!.sid = uid(9);
-    f.req.user!.perms = ['invoice:read:tenant', 'invoice:update:tenant'];
+    f.req.user!.perms = ['patient_balance:read:tenant', 'payment:create:tenant'];
     f.tables.events[0].invoiceId = invoiceId;
     f.tables.invoices.push({id: invoiceId, patientID: patientId, structureId: null, emissionDate: '2020-01-10',
         documentNumber: 12, documentYear: 2020, documentType: 'fattura', status: 'unpaid', invoiceNet: 60});
@@ -275,7 +276,7 @@ it('keeps nullable and legacy calendar identifiers without guessing a missing op
 });
 it('applies agenda ownership and reference cutoff before looking up verification operators', async t => {
     const f = fixture(t);
-    f.req.user!.perms = ['agenda:read:own'];
+    f.req.user!.perms = ['patient_balance:read:own'];
     f.tables.events.push(unverifiedEvent(uid(10), userId, '2020-01-01T09:00:00.000Z'),
         unverifiedEvent(uid(11), uid(8), '2020-01-02T09:00:00.000Z'),
         unverifiedEvent(uid(12), uid(9), '2020-01-11T09:00:00.000Z'));
@@ -284,7 +285,7 @@ it('applies agenda ownership and reference cutoff before looking up verification
     assert.deepEqual(ownPosition.verification.map(row => row.agendaEventId), [uid(10)]);
     assert.equal(f.operatorQueries.length, 1);
     assert.deepEqual(f.operatorQueries[0].where, {id: {[Op.in]: [userId]}});
-    f.req.user!.perms = ['agenda:read:structure'];
+    f.req.user!.perms = ['patient_balance:read:structure'];
     const structurePosition = await patientSettlementPositionView(f.req, context);
     assert.deepEqual(structurePosition.verification.map(row => row.agendaEventId), [uid(10), uid(11)]);
     assert.equal(f.operatorQueries.length, 2);
@@ -307,4 +308,42 @@ it('skips unused operator lookups and preserves date-only history without invent
     assert.deepEqual(position.verification.map(row => row.start), ['2020-01-01T09:00:00.000Z', null, null]);
     assert.equal(position.verification[1].date, '2020-01-02');
     assert.equal(position.verification[2].date, '2020-01-03');
+});
+
+it('ordinary secretary collects an existing invoice through the patient position without invoice permissions', async t => {
+    const f = fixture(t), invoiceId = uid(8);
+    f.req.user!.perms = ['patient_balance:read:structure', 'payment:read:structure', 'payment:create:structure'];
+    f.tables.invoices.push({id: invoiceId, patientID: patientId, structureId, emissionDate: '2020-01-01',
+        documentNumber: 12, documentYear: 2020, documentType: 'fattura', status: 'unpaid', invoiceNet: 100});
+    f.req.body.allocations = [{kind: 'INVOICE', targetId: invoiceId, amount: 40}];
+    f.req.body.credits = []; f.req.body.cash.amount = 40;
+    const result = await executePatientSettlement(f.req);
+    assert.equal(result.cashAmount, 40);
+    assert.equal(result.position.capabilities.canOpenInvoice, false);
+    assert.equal(result.position.capabilities.canAdjustPrice, false);
+    assert.equal(result.position.capabilities.canReverse, false);
+});
+it('ordinary secretary cannot smuggle a price adjustment inside a permitted settlement', async t => {
+    const f = fixture(t);
+    f.req.user!.perms = ['patient_balance:read:structure', 'payment:create:structure', 'agenda:update:structure'];
+    f.req.body.credits = []; f.req.body.cash.amount = 60;
+    f.req.body.pricing = {adjustment: 'DISCOUNT', discountAmount: 5};
+    const before = JSON.stringify(f.tables);
+    await assert.rejects(() => executePatientSettlement(f.req), /prezzo/);
+    assert.equal(JSON.stringify(f.tables), before);
+});
+it('ordinary secretary cannot define a missing price through a cash allocation', async t => {
+    const f = fixture(t);
+    f.req.user!.perms = ['patient_balance:read:structure', 'payment:create:structure'];
+    f.tables.events[0].appointmentExpectedAmount = null;
+    f.tables.events[0].appointmentOriginalAmount = null;
+    f.req.body.credits = []; f.req.body.cash.amount = 60;
+    await assert.rejects(() => executePatientSettlement(f.req), /permesso|prezzo|copertura/);
+    assert.equal(f.tables.payments.length, 0);
+});
+it('a replay after collection rights were revoked does not return the persisted result', async t => {
+    const f = fixture(t);
+    await executePatientSettlement(f.req);
+    f.req.user!.perms = ['patient_balance:read:structure'];
+    await assert.rejects(() => executePatientSettlement(f.req), /accessibile/);
 });

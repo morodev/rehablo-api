@@ -58,7 +58,7 @@ it('future appointments in another premise do not block current-premise disable'
  assert.equal(result.status,200);assert.equal(f.agendas[0].calendarEnabled,false);assert.equal(f.agendas[1].calendarEnabled,true);
 });
 it('legacy profile updates use the same selected-premise schedule validation',async t=>{
- const f=fixture(t);f.membership.role='SECRETARY';f.req.body={user:{availabilityMode:'CUSTOM',userAvailabilities:f.rows().map(row=>({...row,rangeOneStart:row.enabled?'07:00':null}))}};
+ const f=fixture(t);f.membership.role='ADMIN_SECRETARY';f.req.body={user:{availabilityMode:'CUSTOM',userAvailabilities:f.rows().map(row=>({...row,rangeOneStart:row.enabled?'07:00':null}))}};
  const result=await run(updateUser,f.req);assert.equal(result.status,400);assert.equal(f.rows()[0].rangeOneStart,'09:00:00');
 });
 it('missing current premise allows identity-only changes but refuses calendar writes',async t=>{

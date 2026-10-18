@@ -26,7 +26,7 @@ export function validateUserStructureSelection(
             : 'Un proprietario deve essere abilitato a tutte le sedi';
     }
 
-    if (role === RoleCode.SECRETARY) {
+    if ((role === RoleCode.SECRETARY || role === RoleCode.ADMIN_SECRETARY)) {
         return requested.length > 0
             ? null
             : 'La segreteria deve essere abilitata ad almeno una sede';
@@ -37,3 +37,10 @@ export function validateUserStructureSelection(
         : 'Ogni operatore deve avere una sola sede operativa';
 }
 
+
+/** Team managers may assign other members, but cannot enlarge their own data access. */
+export function canChangeAssignedStructures(
+    actorUserId: string, targetUserId: string, currentStructureIds: readonly string[], nextStructureIds: readonly string[]
+): boolean {
+    return actorUserId !== targetUserId || nextStructureIds.every(id => currentStructureIds.includes(id));
+}
