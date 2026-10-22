@@ -38,6 +38,7 @@ export const RESOURCES = [
     'clinical_content', // cataloghi configurabili: questionari, test e scale
     'price_list',   // listini, versioni e regole tariffarie
     'quote',        // preventivi, pacchetti e crediti
+    'care_package', // acquisti di pacchetti e disponibilità delle sedute
     'treasury',     // prima nota, incassi, chiusure e riconciliazioni
     'expense',      // costi e documenti di acquisto
     'supplier',     // anagrafica fornitori
@@ -79,6 +80,7 @@ export const RESOURCE_LABELS: Record<Resource, string> = {
     clinical_content: 'questionari e test',
     price_list: 'listini',
     quote: 'preventivi e pacchetti',
+    care_package: 'pacchetti del paziente',
     treasury: 'prima nota',
     expense: 'spese',
     supplier: 'fornitori',

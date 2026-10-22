@@ -45,7 +45,7 @@ export async function unassignedFinancialWarnings(req: Request, scope: ReportSco
             Invoice.schema(req.tenantSchema!).findAll({ where: { structureId: null }, attributes: ['id'] }),
             AgendaEvent.schema(req.tenantSchema!).findAll({ where: { structureId: null }, attributes: ['id'] })
         ]);
-        const count = await InvoicePayment.schema(req.tenantSchema!).count({ where: { paidAt: dateRange,
+        const count = await InvoicePayment.schema(req.tenantSchema!).count({ where: { paidAt: dateRange, carePackageId: null,
             source: { [Op.notIn]: ['CREDIT', 'PACKAGE'] }, [Op.and]: [
                 { [Op.or]: [{ invoiceId: null }, { invoiceId: { [Op.in]: invoices.map(row => row.get('id')) } }] },
                 { [Op.or]: [{ agendaEventId: null }, { agendaEventId: { [Op.in]: events.map(row => row.get('id')) } }] }
@@ -150,7 +150,7 @@ export async function financialDataset(req: Request, dataset: string, options: {
     const treasury = treasuryProjection(movements, expenses, query.from, query.to, { accountId, category, paymentMethodIds, direction });
     const finance = data ? aggregateFinance(data, query) : null;
     const selected = data ? financialSelection(data, query) : null;
-    const patients = data ? [...new Set([...data.invoices.map(row => row.patientID), ...data.events.map(row => row.patientId)].filter(Boolean))] : [];
+    const patients = data ? [...new Set([...data.invoices.map(row => row.patientID), ...data.events.map(row => row.patientId), ...(data.packages ?? []).map(row => row.patientId)].filter(Boolean))] : [];
     const patientModels = patients.length ? await Patient.schema(req.tenantSchema!).findAll({ where: { id: { [Op.in]: patients } }, attributes: ['id', 'name', 'surname'] }) : [];
     const names = new Map(patientModels.map(plain).map(row => [row.id, `${row.name ?? ''} ${row.surname ?? ''}`.trim()]));
     const structures = new Map(scope.structures.map(row => [row.id, row.name]));
@@ -178,14 +178,15 @@ export async function financialDataset(req: Request, dataset: string, options: {
     const paymentRows = (selection = selected!) => selection.periodPayments.filter(row => !kind || row.kind === kind).map(row => {
         const invoice = data!.invoices.find(invoice => invoice.id === row.invoiceId);
         const event = data!.events.find(event => event.id === row.agendaEventId);
-        return { id: row.id, sourceId: invoice?.id ?? event?.id ?? row.sourceId, targetType: invoice ? 'invoice' : event ? 'appointment' : 'treasury',
-            structureId: invoice?.structureId ?? event?.structureId ?? null,
-            structure: structures.get(invoice?.structureId ?? event?.structureId) ?? 'Sede non disponibile',
+        const pkg = data!.packages?.find(pkg => pkg.id === row.carePackageId);
+        return { id: row.id, sourceId: invoice?.id ?? pkg?.id ?? event?.id ?? row.sourceId, targetType: invoice ? 'invoice' : pkg ? 'package' : event ? 'appointment' : 'treasury',
+            structureId: invoice?.structureId ?? pkg?.structureId ?? event?.structureId ?? null,
+            structure: structures.get(invoice?.structureId ?? pkg?.structureId ?? event?.structureId) ?? 'Sede non disponibile',
             sourceEventId: event?.id, start: event?.start, occurrenceStart: event?.start,
             number: invoice?.documentNumber == null ? '' : `${invoice.documentNumber}/${invoice.documentYear ?? ''}`,
             date: dateOnly(row.paidAt), kind: ({ receipt: 'Incasso', reversal: 'Rettifica', refund: 'Rimborso' })[row.kind],
-            patient: names.get(invoice?.patientID ?? event?.patientId) ?? 'Paziente non disponibile', method: row.method ?? 'Non specificato',
-            amount: row.amount, origin: row.source === 'APPOINTMENT' ? 'Seduta' : 'Documento' };
+            patient: names.get(invoice?.patientID ?? pkg?.patientId ?? event?.patientId) ?? 'Paziente non disponibile', method: row.method ?? 'Non specificato',
+            amount: row.amount, origin: row.source === 'PACKAGE_PURCHASE' ? 'Acquisto pacchetto' : row.source === 'APPOINTMENT' ? 'Seduta' : 'Documento' };
     }).filter(matchesSearch);
     if (dataset === 'financial-summary') {
         dateBasis = 'Emissione documenti; data incasso/rettifica; data movimento; spese sostenute. Residui attuali.';
@@ -260,6 +261,11 @@ export async function financialDataset(req: Request, dataset: string, options: {
                 amountBasis: financial.priceEstimated ? 'Tariffa stimata' : 'Importo registrato' });
         }
         const dueBucket = String(req.query.dueBucket ?? (req.query.overdue === 'true' ? 'overdue' : 'all'));
+        for (const pkg of selected!.packages.filter(pkg => !pkg.billed && pkg.balance > 0)) {
+            rows.push({sourceId: pkg.id, targetType: 'package', structureId: pkg.structureId,
+                patient: names.get(pkg.patientId) ?? 'Paziente non disponibile', description: pkg.name,
+                dueDate: null, overdue: false, amount: pkg.balance, amountBasis: 'Acquisto pacchetto'});
+        }
         if (!['all', 'overdue', 'today', 'next7', 'future', 'no_due'].includes(dueBucket)) fail('Filtro scadenza non valido');
         const today = dateOnly(new Date());
         const future = new Date(`${today}T12:00:00Z`); future.setUTCDate(future.getUTCDate() + 7);

@@ -6,6 +6,7 @@ import AgendaEvent from '../models/agendaEvent.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
+import {CarePackage} from '../../administration/models/index.js';
 import {createAppointmentPayment, createBulkAppointmentPayments, updateAppointmentPaymentCompatibility, voidAppointmentPayment} from './appointmentPayment.controller.js';
 
 const id = (value: number) => 'bbbbbbbb-bbbb-4bbb-8bbb-' + String(value).padStart(12, '0');
@@ -16,6 +17,7 @@ function row(values: Record<string, any>): any {
         async update(values: any) {Object.assign(this, values); return this;}};
 }
 function fixture(t: TestContext) {
+    t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => []})) as any);
     const current = row({id: currentId, patientId, structureId, start: '2025-02-01T10:00:00Z',
         end: '2025-02-01T11:00:00Z', status: 'COMPLETED', title: 'Seduta corrente',
         appointmentExpectedAmount: 60, appointmentPaymentHistoryKnown: true});

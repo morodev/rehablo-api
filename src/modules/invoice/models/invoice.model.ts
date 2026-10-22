@@ -14,6 +14,7 @@ export interface InvoiceAttributes {
     structureId?: string | null;
     /** Appuntamento da cui nasce il documento. NULL per le fatture create manualmente. */
     agendaEventId?: string | null;
+    carePackageId?: string | null;
     isCashPro: boolean;
     cashPro?: string | null;
     isRivals: boolean;
@@ -161,6 +162,7 @@ export class Invoice extends Model<InvoiceAttributes, InvoiceCreationAttributes>
     declare patientID: string | null;
     declare structureId: string | null;
     declare agendaEventId: string | null;
+    declare carePackageId: string | null;
     declare isCashPro: boolean;
     declare cashPro: string | null;
     declare isRivals: boolean;
@@ -201,6 +203,7 @@ Invoice.init(
         structureId: { type: DataTypes.UUID, allowNull: true },
         // Un appuntamento non puo' generare piu' documenti. PostgreSQL consente invece
         // piu' valori NULL, quindi le fatture create manualmente restano ammesse.
+        carePackageId: { type: DataTypes.UUID, allowNull: true, unique: 'invoices_care_package_unique' },
         agendaEventId: {
             type: DataTypes.UUID,
             allowNull: true,

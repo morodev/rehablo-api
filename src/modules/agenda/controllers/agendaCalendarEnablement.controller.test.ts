@@ -8,7 +8,8 @@ import Patient from '../../patients/models/patient.model.js';
 import TimeOffRequest from '../models/timeOffRequest.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
-import { reportMissedArrival, saveAgendaEvent, updateAgendaEvent, updateRecurringEvent } from './agenda.controller.js';
+import { deleteAgendaEvent, reportMissedArrival, saveAgendaEvent, updateAgendaEvent, updateRecurringEvent } from './agenda.controller.js';
+import {PackageConsumption} from '../../administration/models/administration.model.js';
 
 const id = (value: number) => 'aaaaaaaa-aaaa-4aaa-8aaa-' + String(value).padStart(12, '0');
 const tenantId = id(1), structureId = id(2), otherStructure = id(3), operatorId = id(4), patientId = id(5), eventId = id(6);
@@ -74,6 +75,15 @@ it('create refuses an active account whose calendar is disabled in the current p
     const result = await run(saveAgendaEvent, f.req);
     assert.equal(result.status, 409); assert.match(result.body.message, /agenda.*disabilitata/);
     assert.equal(f.created.length, 0);
+});
+it('a reopened appointment retains its package consumption audit and cannot be deleted', async t => {
+    const f = fixture(t); f.req.query = {id: eventId};
+    f.current.packageReservationStatus = 'RESERVED';
+    t.mock.method(PackageConsumption, 'schema', (() => ({count: async () => 2})) as any);
+    const result = await run(deleteAgendaEvent, f.req);
+    assert.equal(result.status, 409);
+    assert.match(result.body.message, /storico di utilizzo del pacchetto/);
+    assert.equal(f.updated.length, 0);
 });
 it('create uses the current premise calendar enablement independently of another premise', async t => {
     const f = fixture(t); f.req.access.structureId = otherStructure;

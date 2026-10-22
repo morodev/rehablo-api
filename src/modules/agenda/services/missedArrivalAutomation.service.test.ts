@@ -52,6 +52,7 @@ describe('automatic appointment completion eligibility', () => {
         assert.equal(shouldAutoCompleteAppointment(appointment({ status: 'COMPLETED' }), now), false);
         assert.equal(shouldAutoCompleteAppointment(appointment({ status: 'NO_SHOW' }), now), false);
         assert.equal(shouldAutoCompleteAppointment(appointment({ status: 'CANCELLED' }), now), false);
+        assert.equal(shouldAutoCompleteAppointment(appointment({ carePackageId: 'package-1' }), now), false);
         assert.equal(shouldAutoCompleteAppointment(appointment({ recurrence: 'FREQ=WEEKLY' }), now), false);
         assert.equal(shouldAutoCompleteAppointment(appointment({ patientId: null }), now), false);
         assert.equal(

@@ -11,7 +11,7 @@ import {
     APPOINTMENT_LEDGER_VERSION, prepareTenantPaymentHistory, runTenantMigrations,
     PATIENT_DEFAULT_EVENT_TYPE_VERSION, TENANT_MODEL_BASELINE_VERSION, APPOINTMENT_PRICE_ADJUSTMENTS_VERSION,
     CATALOG_STRUCTURE_AVAILABILITY_VERSION, ADMINISTRATION_SEED_VERSION, WORK_ITEM_ASSIGNEES_VERSION,
-    ACTIVITIES_FOUNDATION_VERSION, ACTIVITIES_DELIVERY_VERSION, PATIENT_SETTLEMENTS_VERSION
+    ACTIVITIES_FOUNDATION_VERSION, ACTIVITIES_DELIVERY_VERSION, PATIENT_SETTLEMENTS_VERSION, CARE_PACKAGE_PURCHASES_VERSION
 } from './tenantMigrations.js';
 
 const require = createRequire(import.meta.url);
@@ -35,6 +35,7 @@ let pricingApplied: boolean;
 let catalogAvailabilityApplied: boolean, administrationApplied: boolean, publicationApplied: boolean;
 let workItemAssignmentsApplied: boolean, activitiesApplied: boolean, activitiesDeliveryApplied: boolean;
 let patientSettlementsApplied: boolean;
+let packagePurchasesApplied: boolean;
 let migrationWork: (options: any) => Promise<void>;
 const transaction = {id: 'test-transaction'};
 
@@ -53,13 +54,16 @@ beforeEach(() => {
     catalogAvailabilityApplied = false; administrationApplied = false; publicationApplied = false;
     workItemAssignmentsApplied = false; activitiesApplied = false; activitiesDeliveryApplied = false;
     patientSettlementsApplied = false;
+    packagePurchasesApplied = false;
     migrationWork = async () => {};
     sequelize.createSchema = (async () => {}) as any;
     sequelize.transaction = (async (callback: any) => {
         transactionStarts++;
         const previouslyApplied = applied, previousBaseline = baselineApplied, previousSettlements = patientSettlementsApplied;
+        const previousPackages = packagePurchasesApplied;
         try {return await callback(transaction);} catch (error) {
-            applied = previouslyApplied; baselineApplied = previousBaseline; patientSettlementsApplied = previousSettlements; throw error;
+            applied = previouslyApplied; baselineApplied = previousBaseline; patientSettlementsApplied = previousSettlements;
+            packagePurchasesApplied = previousPackages; throw error;
         }
     }) as any;
     sequelize.query = (async (sql: string, options?: any) => {
@@ -84,6 +88,7 @@ beforeEach(() => {
             ...(activitiesApplied ? [{version: ACTIVITIES_FOUNDATION_VERSION}] : []),
             ...(activitiesDeliveryApplied ? [{version: ACTIVITIES_DELIVERY_VERSION}] : []),
             ...(patientSettlementsApplied ? [{version: PATIENT_SETTLEMENTS_VERSION}] : []),
+            ...(packagePurchasesApplied ? [{version: CARE_PACKAGE_PURCHASES_VERSION}] : []),
             ...(legacyBaselineApplied ? [{version: '20260907-tenant-model-baseline-v1'}] : []),
             ...(baselineApplied ? [{version: TENANT_MODEL_BASELINE_VERSION}] : [])
         ]];
@@ -119,6 +124,9 @@ beforeEach(() => {
         }
         if (sql.startsWith('INSERT INTO') && options?.replacements?.version === PATIENT_SETTLEMENTS_VERSION) {
             patientSettlementsApplied = true;
+        }
+        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === CARE_PACKAGE_PURCHASES_VERSION) {
+            packagePurchasesApplied = true;
         }
         return [[]];
     }) as any;

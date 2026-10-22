@@ -40,6 +40,10 @@ export async function validateQuoteDraft(req: Request, payload: Record<string, u
     const merged = { ...previous, ...payload };
     const dates = quoteDateError(merged.issuedAt, merged.expiresAt);
     if (dates) throw new QuoteFlowError(422, dates);
+    const today = new Intl.DateTimeFormat('sv-SE', {timeZone: 'Europe/Rome'}).format(new Date());
+    if (String(merged.issuedAt) < today && merged.issuedAt !== previous?.issuedAt) {
+        throw new QuoteFlowError(422, 'La data del preventivo non può essere antecedente a oggi');
+    }
     await accessibleQuotePatient(req, merged.patientId, transaction);
     if (!validQuoteUuid(merged.structureId)) throw new QuoteFlowError(422, 'Seleziona una sede valida');
     const structure = await Structure.findOne({ where: { id: merged.structureId, tenantId: getCurrentTenantId(req) }, transaction });

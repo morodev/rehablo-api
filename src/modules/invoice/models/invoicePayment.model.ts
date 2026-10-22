@@ -8,12 +8,13 @@ import {
 export const INVOICE_PAYMENT_STATUSES = ['POSTED', 'VOID', 'CREDIT'] as const;
 export type InvoicePaymentStatus = (typeof INVOICE_PAYMENT_STATUSES)[number];
 
-export const INVOICE_PAYMENT_SOURCES = ['USER', 'LEGACY_IMPORT', 'APPOINTMENT', 'PACKAGE', 'CREDIT'] as const;
+export const INVOICE_PAYMENT_SOURCES = ['USER', 'LEGACY_IMPORT', 'APPOINTMENT', 'PACKAGE', 'PACKAGE_PURCHASE', 'CREDIT'] as const;
 export type InvoicePaymentSource = (typeof INVOICE_PAYMENT_SOURCES)[number];
 
 export interface InvoicePaymentAttributes {
     id: string;
     invoiceId?: string | null;
+    carePackageId?: string | null;
     /** Seduta che ha originato il movimento, valorizzata solo per gli incassi pre-fattura. */
     agendaEventId?: string | null;
     amount: number;
@@ -50,6 +51,7 @@ export class InvoicePayment
     implements InvoicePaymentAttributes {
     declare id: string;
     declare invoiceId: string | null;
+    declare carePackageId: string | null;
     declare agendaEventId: string | null;
     declare amount: number;
     declare paidAt: Date | null;
@@ -67,6 +69,7 @@ InvoicePayment.init(
     {
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
         invoiceId: { type: DataTypes.UUID, allowNull: true },
+        carePackageId: { type: DataTypes.UUID, allowNull: true },
         agendaEventId: { type: DataTypes.UUID, allowNull: true },
         amount: { type: DataTypes.DECIMAL(10, 2), allowNull: false },
         paidAt: { type: DataTypes.DATEONLY, allowNull: true },
@@ -84,6 +87,7 @@ InvoicePayment.init(
         modelName: 'invoicePayment',
         tableName: 'invoice_payments',
         indexes: [
+            { name: 'invoice_payments_package_status_idx', fields: ['carePackageId', 'status'] },
             { name: 'invoice_payments_invoice_status_idx', fields: ['invoiceId', 'status'] },
             { name: 'invoice_payments_paid_at_idx', fields: ['paidAt'] },
             { name: 'invoice_payments_agenda_event_status_idx', fields: ['agendaEventId', 'status'] }

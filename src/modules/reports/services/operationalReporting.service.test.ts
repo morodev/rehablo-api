@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {describe, it} from 'node:test';
+import { beforeEach,describe, it} from 'node:test';
 import type {Request} from 'express';
 import {Op} from 'sequelize';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
@@ -11,12 +11,14 @@ import InvoiceProduct from '../../invoice/models/invoiceProduct.model.js';
 import InvoiceService from '../../invoice/models/invoiceService.model.js';
 import {StructureAvailability, StructureUserAvailability, StructureUser, TenantUser, User} from '../../auth/models/index.js';
 import TimeOffRequest from '../../agenda/models/timeOffRequest.model.js';
-import {PatientCredit, TreasuryMovement} from '../../administration/models/index.js';
+import { CarePackage,PatientCredit, TreasuryMovement} from '../../administration/models/index.js';
 import Patient from '../../patients/models/patient.model.js';
 import {operationalDataset} from './operationalReporting.service.js';
 import {capacityValues, mergeIntervals, followupEligible} from './operationalMetrics.js';
 import {reportCsv} from './reporting.types.js';
 import {addDays, aggregateActivity, expandRecurringEvent, localDateKey, parseAnalyticsQuery, type AnalyticsQuery} from './analytics.service.js';
+
+beforeEach((t: any) => { t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => []})) as any); });
 
 const site = '11111111-1111-4111-8111-111111111111';
 const otherSite = '22222222-2222-4222-8222-222222222222';

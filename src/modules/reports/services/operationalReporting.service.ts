@@ -136,12 +136,12 @@ export async function operationalDataset(req: Request, dataset: string, options:
             const financial = financeById.get(row.id)!;
             const complimentary = financial.appointmentPriceAdjustment === 'COMPLIMENTARY';
             return {...row, ...financial, status: row.status,
-                paymentStatusLabel: complimentary ? 'Omaggio' : paidLabels[financial.paymentStatus],
+                paymentStatusLabel: financial.packageCovered ? 'Inclusa nel pacchetto' : complimentary ? 'Omaggio' : paidLabels[financial.paymentStatus],
                 invoicePaymentStatusLabel: financial.invoicePaymentStatus ? paidLabels[financial.invoicePaymentStatus] ?? financial.invoicePaymentStatus : null,
-                documentStatus: complimentary ? 'Omaggio' : financial.invoiceId ? 'Fatturata' : 'Da fatturare',
-                paymentScopeLabel: financial.paymentScope === 'invoice' ? 'Documento cumulativo' : 'Seduta',
+                documentStatus: financial.packageCovered ? 'Gestita sul pacchetto' : complimentary ? 'Omaggio' : financial.invoiceId ? 'Fatturata' : 'Da fatturare',
+                paymentScopeLabel: financial.packageCovered ? 'Pacchetto' : financial.paymentScope === 'invoice' ? 'Documento cumulativo' : 'Seduta',
                 paymentMethodsLabel: financial.paymentMethods.map(method => method === '__unspecified__' ? 'Non specificato' : method).join(', '),
-                priceBasis: financial.expectedAmount == null ? 'Non disponibile' : complimentary ? 'Omaggio' : financial.priceEstimated ? 'Tariffa stimata' : 'Prezzo confermato'};
+                priceBasis: financial.packageCovered ? 'Inclusa nel pacchetto' : financial.expectedAmount == null ? 'Non disponibile' : complimentary ? 'Omaggio' : financial.priceEstimated ? 'Tariffa stimata' : 'Prezzo confermato'};
         });
         const values = therapy.totals;
         summary.push(item('expectedAmount', 'Valore previsto sedute', values.expectedAmount, 'currency', 'Somma dei prezzi noti, incluse le tariffe stimate; prezzi non disponibili esclusi'),

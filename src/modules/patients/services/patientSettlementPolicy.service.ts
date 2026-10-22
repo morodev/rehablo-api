@@ -6,8 +6,9 @@ import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
 import {appointmentPricesByEvent, paymentMoney, summarizeAppointmentPayments} from '../../invoice/services/appointmentPayment.service.js';
 import {summarizeInvoicePayments} from '../../invoice/services/payment.service.js';
+import {CarePackage} from '../../administration/models/index.js';
 
-export type PatientSettlementKind = 'APPOINTMENT' | 'INVOICE';
+export type PatientSettlementKind = 'APPOINTMENT' | 'INVOICE' | 'PACKAGE';
 export interface PatientSettlementContext {
     patientId: string;
     structureId: string;
@@ -16,7 +17,7 @@ export interface PatientSettlementContext {
     referenceOccurrenceStart?: string;
 }
 export interface PatientSettlementAllocation {
-    kind: PatientSettlementKind;
+    kind: Exclude<PatientSettlementKind, 'PACKAGE'>;
     targetId: string;
     amount: number;
 }
@@ -56,6 +57,7 @@ export interface RawPatientSettlementPosition {
     referenceInvoice: Record<string, any> | null;
 }
 export interface PatientSettlementSources {
+    packages?: Array<Record<string, any>>;
     events: Array<Record<string, any>>;
     invoices: Array<Record<string, any>>;
     links: Array<{invoiceId: string; agendaEventId: string}>;
@@ -134,9 +136,18 @@ export function buildPatientSettlementPosition(
     const referenceInvoice = invoiceById.get(currentInvoiceId ?? '') ?? null;
     const obligations: PatientSettlementObligation[] = [];
     const verification: PatientSettlementVerification[] = [];
+    const packages = (sources.packages ?? []).filter(pack => pack.templateId && pack.patientId === context.patientId && pack.structureId === context.structureId);
 
     events.forEach(event => {
         const isCurrent = event.id === context.referenceAgendaEventId && !currentInvoiceId;
+        if (event.carePackageId && ['RESERVED', 'CONSUMED'].includes(String(event.packageReservationStatus))) {
+            if (isCurrent) obligations.push({key: key('APPOINTMENT', event.id), kind: 'APPOINTMENT', targetId: event.id,
+                title: event.title || 'Seduta', date: localDate(event.start), orderDate: event.start,
+                balance: 0, expectedAmount: 0, paidAmount: 0, isCurrent, invoiceNumber: null, linkedEventIds: [],
+                eligible: false, unavailableReason: 'Seduta inclusa nel pacchetto: il saldo è gestito sull’acquisto.',
+                coverageSources: ['PACKAGE'], methods: [], hasUndatedPayments: false, record: event});
+            return;
+        }
         if (invoiceByEvent.has(event.id)) return;
         // An unresolved fiscal link must never become a second appointment cash target.
         if (event.invoiceId || sources.links.some(link => link.agendaEventId === event.id)) {
@@ -190,7 +201,8 @@ export function buildPatientSettlementPosition(
         const linkedEventIds = [...(eventsByInvoice.get(invoice.id) ?? [])].sort();
         const anchors = linkedEventIds.map(id => time(eventById.get(id)?.start)).filter(value => value !== null) as number[];
         const emission = time(invoice.emissionDate);
-        const anchor = anchors.length ? Math.min(...anchors) : emission;
+        const packagePurchase = packages.find(pack => pack.invoiceId === invoice.id);
+        const anchor = packagePurchase ? time(packagePurchase.purchasedAt) : anchors.length ? Math.min(...anchors) : emission;
         if (anchor === null) return;
         const eligible = activeInvoices.has(invoice.id) && emission !== null && emission <= now;
         if (!isCurrent && (!eligible || summary.balance <= 0.009)) return;
@@ -206,6 +218,17 @@ export function buildPatientSettlementPosition(
             methods: [...new Set(sources.payments.filter(payment => payment.invoiceId === invoice.id && payment.status === 'POSTED')
                 .map(payment => payment.method || null))], hasUndatedPayments: summary.hasUndatedLegacyPayments
                     || sources.payments.some(payment => payment.invoiceId === invoice.id && payment.status === 'POSTED' && !payment.paidAt), record: invoice});
+    });
+    packages.forEach(pack => {
+        if (pack.invoiceId && activeInvoices.has(pack.invoiceId)) return;
+        const history = sources.payments.filter(payment => payment.carePackageId === pack.id);
+        const summary = summarizeInvoicePayments({invoiceTotal: pack.totalPrice}, history);
+        if (summary.balance <= 0.009) return;
+        obligations.push({key: key('PACKAGE', pack.id), kind: 'PACKAGE', targetId: pack.id, title: pack.name,
+            date: pack.purchasedAt, orderDate: new Date(pack.purchasedAt).toISOString(), balance: summary.balance,
+            expectedAmount: paymentMoney(pack.totalPrice), paidAmount: summary.paidAmount, isCurrent: false,
+            invoiceNumber: null, linkedEventIds: [], eligible: false,
+            unavailableReason: 'Registra l’incasso dal dettaglio del pacchetto.', coverageSources: [], methods: [], hasUndatedPayments: false, record: pack});
     });
     obligations.sort((a, b) => a.orderDate.localeCompare(b.orderDate) || a.key.localeCompare(b.key));
     verification.sort((a, b) => String(a.date).localeCompare(String(b.date)) || a.agendaEventId.localeCompare(b.agendaEventId));
@@ -229,6 +252,9 @@ export async function loadPatientSettlementPosition(
     ]}, order: [['id', 'ASC']], transaction});
     const events = eventModels.map(row => row.get({plain: true}) as Record<string, any>);
     const invoices = invoiceModels.map(row => row.get({plain: true}) as Record<string, any>);
+    const packages = (await CarePackage.schema(schema).findAll({where: {patientId: context.patientId,
+        structureId: context.structureId, templateId: {[Op.ne]: null}}, transaction})).map(row => row.get({plain: true}) as Record<string, any>);
+    const packageIds = packages.map(row => row.id);
     const eventIds = events.map(row => row.id);
     const invoiceIds = invoices.map(row => row.id);
     const links = eventIds.length || invoiceIds.length ? (await InvoiceAgendaEvent.schema(schema).findAll({where: {
@@ -238,12 +264,13 @@ export async function loadPatientSettlementPosition(
         ]}, transaction})).map(row => row.get({plain: true}) as {invoiceId: string; agendaEventId: string}) : [];
     const [prices, paymentModels] = await Promise.all([
         appointmentPricesByEvent(schema, events, transaction),
-        eventIds.length || invoiceIds.length ? InvoicePayment.schema(schema).findAll({where: {[Op.or]: [
+        eventIds.length || invoiceIds.length || packageIds.length ? InvoicePayment.schema(schema).findAll({where: {[Op.or]: [
+            ...(packageIds.length ? [{carePackageId: {[Op.in]: packageIds}}] : []),
             ...(eventIds.length ? [{agendaEventId: {[Op.in]: eventIds}}] : []),
             ...(invoiceIds.length ? [{invoiceId: {[Op.in]: invoiceIds}}] : [])
         ]}, transaction}) : Promise.resolve([])
     ]);
-    return buildPatientSettlementPosition(context, {events, invoices, links, prices,
+    return buildPatientSettlementPosition(context, {events, invoices, links, prices, packages,
         payments: paymentModels.map(row => row.get({plain: true})), now: options.now});
 }
 

@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
-import { describe, it, mock } from 'node:test';
+import { beforeEach, describe, it, mock } from 'node:test';
 import { Op } from 'sequelize';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
-import { PatientCredit, TreasuryMovement } from '../../administration/models/index.js';
+import { CarePackage, PatientCredit, TreasuryMovement } from '../../administration/models/index.js';
 import { aggregateFinance, aggregateTherapyPayments, FinanceData, FinanceQuery, invoiceMatchesContext, loadFinanceData, parseFinanceFilters } from './finance.service.js';
+
+beforeEach((t: any) => { t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => []})) as any); });
 
 const query = (overrides: Partial<FinanceQuery> = {}): FinanceQuery => ({
     from: '2026-01-01', to: '2026-01-31', granularity: 'month', compare: 'none',
@@ -34,6 +36,45 @@ const occurrences = (events: Array<Record<string, any>>) => events.map((row) => 
 }));
 
 describe('shared cash and document reporting', () => {
+    it('keeps a package deposit and its debt stable through consumption and subsequent invoicing', () => {
+        const pkg = {id: 'package-1', patientId: 'patient-1', templateId: 'template-1', totalPrice: 400, invoiceId: null};
+        const included = event({carePackageId: pkg.id, packageReservationStatus: 'CONSUMED', expectedAmount: 60});
+        const deposit = payment({id: 'deposit', agendaEventId: null, carePackageId: pkg.id, source: 'PACKAGE_PURCHASE', amount: 100});
+        const input = data({packages: [pkg], events: [included], payments: [deposit]});
+        let totals = aggregateFinance(input, query()).totals;
+        assert.equal(totals.collected, 100);
+        assert.equal(totals.collectedFromPackages, 100);
+        assert.equal(totals.outstanding, 300);
+        assert.equal(totals.appointmentOutstanding, 0);
+        assert.equal(totals.unbilledCompleted, 0);
+        assert.equal(totals.unbilledEstimatedValue, 0);
+        const bill = invoice({invoiceTotal: 400, invoiceNet: 400, status: 'partial', emissionDate: '2026-01-11', carePackageId: pkg.id});
+        input.invoices = [bill]; input.attributableInvoiceIds.add(bill.id);
+        input.packages![0] = {...pkg, invoiceId: bill.id};
+        input.payments = [{...deposit, invoiceId: bill.id}];
+        totals = aggregateFinance(input, query()).totals;
+        assert.equal(totals.collected, 100);
+        assert.equal(totals.outstanding, 300);
+        assert.equal(totals.packageOutstanding, 0);
+        assert.equal(totals.invoiceOutstanding, 300);
+        input.payments.push({...deposit, id: 'balance', invoiceId: bill.id, amount: 300});
+        totals = aggregateFinance(input, query()).totals;
+        assert.equal(totals.collected, 400);
+        assert.equal(totals.outstanding, 0);
+        const therapy = aggregateTherapyPayments(input, query(), occurrences([included]));
+        assert.equal(therapy.details[0].paymentScope, 'package');
+        assert.equal(therapy.totals.collected, 0);
+        assert.equal(therapy.totals.outstanding, 0);
+    });
+
+    it('does not assign package purchase cash to an individual therapist', () => {
+        const pkg = {id: 'package-1', totalPrice: 400};
+        const input = data({events: [], packages: [pkg], payments: [payment({agendaEventId: null, carePackageId: pkg.id, source: 'PACKAGE_PURCHASE'})]});
+        const totals = aggregateFinance(input, query({operatorId: 'operator-1'})).totals;
+        assert.equal(totals.collected, 0);
+        assert.equal(totals.outstanding, 0);
+    });
+
     it('treats package coverage as settled while leaving cash collection at zero', () => {
         const input = data({ payments: [payment({ source: 'PACKAGE', method: 'Pacchetto' })] });
         const summary = aggregateFinance(input, query());
@@ -246,6 +287,25 @@ describe('therapy payment filters and pagination', () => {
 });
 
 describe('financial report loading and access boundaries', () => {
+    it('loads purchase receipts before any invoice within the authorized package site', async t => {
+        const site = '11111111-1111-4111-8111-111111111111';
+        let packageWhere: any, paymentWhere: any;
+        const model = (value: any) => ({get: () => value});
+        for (const entity of [AgendaEvent, Invoice, InvoiceAgendaEvent, PatientCredit, TreasuryMovement]) {
+            t.mock.method(entity, 'schema', (() => ({findAll: async () => []})) as any);
+        }
+        t.mock.method(CarePackage, 'schema', (() => ({findAll: async ({where}: any) => {
+            packageWhere = where; return [model({id: 'package-1', structureId: site, templateId: 'template-1', totalPrice: 400})];
+        }})) as any);
+        t.mock.method(InvoicePayment, 'schema', (() => ({findAll: async ({where}: any) => {
+            paymentWhere = where; return [model(payment({agendaEventId: null, carePackageId: 'package-1', source: 'PACKAGE_PURCHASE'}))];
+        }})) as any);
+        const scope = {tenantId: 'tenant', userId: 'user', scope: 'assigned' as const, selectedStructureIds: [site], allowedStructureIds: [site], structures: []};
+        const loaded = await loadFinanceData({tenantSchema: 'test_tenant', query: {}} as any, query(), scope);
+        assert.deepEqual(packageWhere.structureId[Op.in], [site]);
+        assert.deepEqual(paymentWhere[Op.or].find((where: any) => where.carePackageId).carePackageId[Op.in], ['package-1']);
+        assert.equal(aggregateFinance(loaded, query()).totals.collected, 100);
+    });
     it('does not attribute a document to an operator when a linked therapy belongs to an unselected site', async t => {
         const selectedSite = '11111111-1111-4111-8111-111111111111';
         const hiddenSite = '22222222-2222-4222-8222-222222222222';

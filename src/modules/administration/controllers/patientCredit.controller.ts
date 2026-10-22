@@ -152,8 +152,9 @@ export const applyCredit = asyncHandler(async (req: Request, res: Response) => {
             await assertPatientSettlementAllocations(req.tenantSchema!, {
                 patientId: String(credit.get('patientId')), structureId: String(credit.get('structureId')), referenceInvoiceId: targetId
             }, [{ kind: 'INVOICE', targetId, amount }], transaction);
+            if (invoice.get('carePackageId')) return {error: 409, message: 'Per questo acquisto registra un incasso dal pacchetto; il credito paziente non è ancora previsto'};
             payment = await InvoicePayment.schema(req.tenantSchema!).create({
-                invoiceId: targetId, amount, paidAt: new Date(), method: 'Credito paziente', source: 'CREDIT',
+                invoiceId: targetId, carePackageId: invoice.get('carePackageId') as string | null, amount, paidAt: new Date(), method: 'Credito paziente', source: 'CREDIT',
                 status: 'POSTED', createdByUserId: req.access!.userId
             }, { transaction });
             await syncInvoicePaymentStatus(req.tenantSchema!, targetId, transaction);
@@ -162,6 +163,7 @@ export const applyCredit = asyncHandler(async (req: Request, res: Response) => {
                 id: targetId, patientId: String(credit.get('patientId')), structureId: String(credit.get('structureId'))
             }, transaction, lock: transaction.LOCK.UPDATE });
             if (!event || event.get('invoiceId') || event.get('recurrence') || event.get('recurringEventId')
+                || (event.get('carePackageId') && ['RESERVED', 'CONSUMED'].includes(String(event.get('packageReservationStatus'))))
                 || !['CONFIRMED', 'COMPLETED'].includes(String(event.get('status')).toUpperCase())
                 || !Number.isFinite(Date.parse(String(event.get('start') ?? ''))) || Date.parse(String(event.get('start'))) > Date.now()) {
                 return { error: 404, message: 'Seduta non disponibile' };

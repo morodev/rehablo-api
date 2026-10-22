@@ -38,6 +38,8 @@ import {
     shouldOpenAttendanceCorrection
 } from '../services/missedArrivalAutomation.service.js';
 import { lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
+import {syncPackageAssignment} from '../services/packageAssignment.service.js';
+import {PackageConsumption} from '../../administration/models/administration.model.js';
 
 async function lockAgendaPatients(schema: string, events: Array<Record<string, any>>, transaction: Transaction): Promise<void> {
     const ids = [...new Set(events.map(event => event.patientId ?? event.patient?.id).filter(Boolean))] as string[];
@@ -567,6 +569,7 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
     // Il collegamento fiscale e' server-managed dal controller fatture. In particolare,
     // copia/incolla di un appuntamento gia' fatturato non deve duplicarne invoiceId.
     delete payload.invoiceId;
+    delete payload.packageReservationStatus;
     removeAttendanceManagedFields(payload);
     removeAppointmentPaymentManagedFields(payload);
 
@@ -594,7 +597,14 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
         if (eventTypeError) {sendErrorResponse(res, 400, eventTypeError); return null;}
         if (await rejectApprovedTimeOffConflict(res, schema, payload)) return null;
         Object.assign(payload, await snapshotAppointmentPrice(schema, payload, transaction), {appointmentPaymentHistoryKnown: true});
-        return AgendaEvent.schema(schema).create(payload, {transaction});
+        const packageId = payload.carePackageId ?? null;
+        const created = await AgendaEvent.schema(schema).create({...payload, carePackageId: null, packageReservationStatus: null}, {transaction});
+        if (packageId) {
+            const packagePatch = {carePackageId: packageId};
+            await syncPackageAssignment(req, created, packagePatch, transaction, {newEvent: true});
+            await created.update(packagePatch, {transaction});
+        }
+        return created;
     });
     if (!agendaEvent) return;
 
@@ -625,6 +635,7 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     const event = { ...req.body.event };
     delete event.id;
     delete event.invoiceId;
+    delete event.packageReservationStatus;
     removeAttendanceManagedFields(event);
     removeAppointmentPaymentManagedFields(event);
 
@@ -736,6 +747,7 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
             }, transaction));
             event.appointmentOriginalAmount = null;
         }
+        await syncPackageAssignment(req, locked, event, transaction);
         await locked.update(event, { transaction });
         return 'updated';
     });
@@ -1057,6 +1069,7 @@ export const completeAppointmentIfUntouched = asyncHandler(async (req: Request, 
                         ...scope,
                         status: { [Op.iLike]: 'CONFIRMED' },
                         invoiceId: null,
+                        carePackageId: null,
                         missedArrivalReportedAt: null,
                         [Op.and]: [
                             { [Op.or]: [{ recurrence: null }, { recurrence: '' }] },
@@ -1108,13 +1121,15 @@ export const resolveMissedArrival = asyncHandler(async (req: Request, res: Respo
             }
         }
         const status = resolution === 'ARRIVING' ? 'CONFIRMED' : resolution;
-        await event.update({
+        const attendancePatch = {
             status,
             missedArrivalResolvedAt: new Date(),
             missedArrivalResolvedBy: req.access!.userId,
             missedArrivalResolution: resolution,
             noShowBillingDecision
-        }, { transaction });
+        };
+        await syncPackageAssignment(req, event, attendancePatch, transaction);
+        await event.update(attendancePatch, { transaction });
 
         return event;
     });
@@ -1167,12 +1182,20 @@ export const deleteAgendaEvent = asyncHandler(async (req: Request, res: Response
         if (await getLinkedInvoiceId(schema, current.id, current.invoiceId)) return 'invoiced';
         if (Number(current.appointmentPaidAmount) > 0
             || await InvoicePayment.schema(schema).count({ where: { agendaEventId: id }, transaction }) > 0) return 'history';
+        if (current.packageReservationStatus === 'CONSUMED'
+            || await PackageConsumption.schema(schema).count({where: {agendaEventId: id}, transaction}) > 0) return 'package-history';
+        if (current.carePackageId) {
+            const release = {status: 'CANCELLED'};
+            await syncPackageAssignment(req, current, release, transaction);
+            await current.update(release, {transaction});
+        }
         await current.destroy({ transaction });
         return 'deleted';
     });
     if (result === 'missing') return sendErrorResponse(res, 404, 'Appuntamento non trovato');
     if (result === 'invoiced') return sendErrorResponse(res, 409, 'Appuntamento fatturato: eliminazione non consentita');
     if (result === 'history') return sendErrorResponse(res, 409, 'Una seduta con storico incassi non può essere eliminata');
+    if (result === 'package-history') return sendErrorResponse(res, 409, 'Una seduta con storico di utilizzo del pacchetto non può essere eliminata: puoi correggerne l’esito in agenda.');
     return sendSuccessResponse(res, 200, { removed: 1 }, 'Evento eliminato correttamente');
 });
 
@@ -1201,6 +1224,8 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
     const schema = req.tenantSchema!;
     const { event: requestedEvent, originalEvent: requestedOriginalEvent, mode } = req.body;
     const event = { ...requestedEvent };
+    delete event.packageReservationStatus;
+    if (event.carePackageId && mode !== 'single') return sendErrorResponse(res, 422, 'Il pacchetto può essere assegnato solo a una singola occorrenza separata dalla serie.');
     delete event.invoiceId;
     removeAttendanceManagedFields(event);
     removeAppointmentPaymentManagedFields(event);
@@ -1313,7 +1338,13 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
             if (await rejectApprovedTimeOffConflict(res, schema, newEvent)) return;
 
             Object.assign(newEvent, await snapshotAppointmentPrice(schema, newEvent, transaction), { appointmentPaymentHistoryKnown: true });
-            await AgendaEvent.schema(schema).create(newEvent, {transaction});
+            const requestedPackage = newEvent.carePackageId;
+            const created = await AgendaEvent.schema(schema).create({...newEvent, carePackageId: null, packageReservationStatus: null}, {transaction});
+            if (requestedPackage) {
+                const packagePatch = {carePackageId: requestedPackage};
+                await syncPackageAssignment(req, created, packagePatch, transaction, {newEvent: true});
+                await created.update(packagePatch, {transaction});
+            }
             await AgendaEventException.schema(schema).create({
                 eventId: originalEvent.recurringEventId,
                 exdate: moment(originalEvent.start).toISOString()

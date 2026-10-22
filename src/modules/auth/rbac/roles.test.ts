@@ -6,6 +6,18 @@ import {canAccessAppointmentFinance} from '../../agenda/services/appointmentFina
 import {defaultCalendarEnabled} from '../services/structureCalendar.service.js';
 import {validateUserStructureSelection} from '../services/userStructurePolicy.service.js';
 
+it('package use is independent of quote permissions and does not grant clinical staff sales rights', () => {
+    const therapist = getRolePermissions(RoleCode.THERAPIST);
+    assert.equal(resolveGrantedScope(therapist, 'care_package', 'read'), 'own');
+    assert.equal(hasPermission(therapist, 'care_package', 'create'), false);
+    assert.equal(hasPermission(therapist, 'quote', 'read'), false);
+    for (const role of [RoleCode.OWNER, RoleCode.ADMIN_SECRETARY, RoleCode.SECRETARY]) {
+        assert.ok(hasPermission(getRolePermissions(role), 'care_package', 'create', 'structure'));
+    }
+    assert.equal(hasPermission(getRolePermissions(RoleCode.VIEWER), 'care_package', 'create'), false);
+    assert.equal(hasPermission(getRolePermissions(RoleCode.PATIENT), 'care_package', 'read'), false);
+});
+
 it('separates ordinary reception collection from administration, analytics, prices and reversals', () => {
     const permissions = getRolePermissions(RoleCode.SECRETARY);
     for (const resource of ['patient_balance', 'payment'] as const) assert.ok(hasPermission(permissions, resource, 'read', 'structure'));

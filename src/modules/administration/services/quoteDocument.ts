@@ -52,5 +52,5 @@ export function quoteDateError(issuedAt: unknown, expiresAt: unknown): string | 
         && new Date(value + 'T12:00:00Z').toISOString().slice(0, 10) === value;
     if (!valid(issuedAt)) return 'Inserisci una data del preventivo valida';
     if (!valid(expiresAt)) return 'Inserisci una data di scadenza valida';
-    return expiresAt < issuedAt ? 'La scadenza non può precedere la data del preventivo' : null;
+    return expiresAt <= issuedAt ? 'La scadenza deve essere almeno il giorno successivo alla data del preventivo' : null;
 }

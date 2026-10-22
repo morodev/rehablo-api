@@ -103,12 +103,24 @@ Quote.init({
     { name: 'quotes_patient_idx', fields: ['patientId'] }
 ] });
 
+export class PackageTemplate extends Model {}
+PackageTemplate.init({
+    id, structureId: uuid(false), name: text(false), serviceId: uuid(false), serviceName: text(false),
+    sessionCount: { type: DataTypes.INTEGER, allowNull: false }, totalPrice: money(false),
+    validityDays: { type: DataTypes.INTEGER, allowNull: true },
+    isActive: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true }
+}, { sequelize, modelName: 'packageTemplate', tableName: 'package_templates', indexes: [
+    { name: 'package_templates_structure_active_idx', fields: ['structureId', 'isActive'] }
+] });
+
 export class CarePackage extends Model {}
 CarePackage.init({
     id,
     structureId: uuid(false),
     patientId: uuid(false),
     quoteId: uuid(),
+    templateId: uuid(), serviceId: uuid(), serviceName: text(), purchasedAt: date(), invoiceId: uuid(),
+    idempotencyKey: { ...text(), unique: true }, purchaseSnapshot: json(),
     name: text(false),
     status: { ...text(false), defaultValue: 'ACTIVE' },
     purchasedUnits: money(false, 0),
@@ -125,6 +137,7 @@ export class PackageConsumption extends Model {}
 PackageConsumption.init({
     id,
     packageId: uuid(false),
+    type: { ...text(false), defaultValue: 'CONSUME' }, reversalOfId: { ...uuid(), unique: true },
     agendaEventId: uuid(),
     units: money(false, 1),
     consumedAt: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
@@ -297,7 +310,7 @@ FiscalSubmission.init({
 ] });
 
 export const ADMINISTRATION_MODELS = [
-    BillingParty, PriceList, PriceListVersion, PriceListItem, Quote, CarePackage,
+    BillingParty, PriceList, PriceListVersion, PriceListItem, Quote, PackageTemplate, CarePackage,
     PackageConsumption, PatientCredit, PaymentMethod, FinancialAccount, TreasuryMovement,
     PaymentAllocation, DailyClosing, Reconciliation, Supplier, PurchaseDocument, Expense,
     FiscalSubmission, QuoteDelivery

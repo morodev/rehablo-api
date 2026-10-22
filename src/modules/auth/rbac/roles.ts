@@ -50,7 +50,7 @@ export interface RoleDefinition {
 /** Risorse cliniche: tutto ciò che costituisce cartella clinica del paziente. */
 const CLINICAL_RESOURCES = ['evaluation', 'protocol', 'note', 'bodymap', 'measurement'] as const;
 const ADMINISTRATION_RESOURCES = [
-    'price_list', 'quote', 'treasury', 'expense', 'supplier', 'fiscal_submission', 'accountant_export'
+    'price_list', 'quote', 'care_package', 'treasury', 'expense', 'supplier', 'fiscal_submission', 'accountant_export'
 ] as const;
 
 const clinicalCrud = (scope: 'own' | 'structure' | 'tenant'): Permission[] =>
@@ -61,6 +61,7 @@ const clinicalRead = (scope: 'own' | 'structure' | 'tenant'): Permission[] =>
 
 /** Preset condiviso dai medici specialisti (fisiatra / ortopedico). */
 const ownPaymentPermissions = (): Permission[] => [
+    perm('care_package', 'read', 'own'),
     perm('patient_balance', 'read', 'own'),
     ...perms('payment', ['read', 'create'], 'own'),
     perm('appointment_pricing', 'update', 'own'),
@@ -137,6 +138,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             perm('user', 'read', 'structure'),
             perm('structure', 'read', 'structure'),
             perm('patient_balance', 'read', 'structure'),
+            ...perms('care_package', ['read', 'create'], 'structure'),
             ...perms('payment', ['read', 'create'], 'structure')
         ]
     },
@@ -173,6 +175,7 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             perm('payment_reversal', 'create', 'structure'),
             perm('price_list', 'manage', 'tenant'),
             perm('quote', 'manage', 'structure'),
+            ...perms('care_package', ['read', 'create', 'update'], 'structure'),
             perm('treasury', 'manage', 'structure'),
             perm('expense', 'manage', 'structure'),
             perm('supplier', 'manage', 'tenant'),

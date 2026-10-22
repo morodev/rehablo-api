@@ -143,7 +143,15 @@ export const listQuotes = asyncHandler(async (req, res) => {
 export const getQuote = asyncHandler(async (req, res) => {
     const rows = await enrichedQuotes(req);
     const quote = rows.find(row => String(row.id) === req.params.id);
-    return quote ? sendSuccessResponse(res, 200, quote) : sendErrorResponse(res, 404, 'Preventivo non trovato');
+    if (!quote) return sendErrorResponse(res, 404, 'Preventivo non trovato');
+    const linkedPackage = await CarePackage.schema(req.tenantSchema!).findOne({
+        where: { quoteId: quote.id, structureId: quote.structureId, patientId: quote.patientId, templateId: null },
+        attributes: ['id', 'status']
+    });
+    return sendSuccessResponse(res, 200, {
+        ...quote,
+        linkedPackage: linkedPackage ? { id: linkedPackage.get('id'), status: linkedPackage.get('status') } : null
+    });
 });
 
 async function patientEntityPage(req: Request, model: ModelStatic<Model>): Promise<Plain> {

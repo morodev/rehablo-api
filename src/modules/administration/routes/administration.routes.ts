@@ -12,11 +12,13 @@ import { previewFiscalSubmission, transmitFiscal } from '../controllers/fiscalSi
 
 import { getFiscalSettings, updateFiscalSettings, getStsCredentials, updateStsCredentials } from '../controllers/fiscalSettings.controller.js';
 import { createAdvance, applyCredit, refundCredit, creditMovements, reverseCreditApplication } from '../controllers/patientCredit.controller.js';
+import * as carePackages from '../controllers/carePackage.controller.js';
+import {listEligibleCarePackages} from '../../agenda/controllers/packageAssignment.controller.js';
 
 const router = Router();
 router.use(requireAuth, resolveTenantSchema);
 
-router.get('/administration/capabilities', requireAnyPermission(['tenant', 'read'], ['invoice', 'read'], ['price_list', 'read'], ['quote', 'read'], ['treasury', 'read'], ['expense', 'read'], ['supplier', 'read'], ['fiscal_submission', 'read'], ['accountant_export', 'read']), controller.getCapabilities);
+router.get('/administration/capabilities', requireAnyPermission(['care_package', 'read'], ['tenant', 'read'], ['invoice', 'read'], ['price_list', 'read'], ['quote', 'read'], ['treasury', 'read'], ['expense', 'read'], ['supplier', 'read'], ['fiscal_submission', 'read'], ['accountant_export', 'read']), controller.getCapabilities);
 router.patch('/administration/capabilities', requirePermission('tenant', 'update', 'tenant'), controller.updateCapabilities);
 router.get('/administration/fiscal-settings', requireAnyPermission(['invoice', 'read'], ['invoice', 'create'], ['invoice', 'update'], ['fiscal_submission', 'create'], ['fiscal_submission', 'read'], ['tenant', 'read']), getFiscalSettings);
 router.patch('/administration/fiscal-settings', requirePermission('tenant', 'update', 'tenant'), updateFiscalSettings);
@@ -62,7 +64,18 @@ router.post('/administration/quotes/:id/deliveries/:deliveryId/revoke', requireP
 router.post('/administration/quotes/:id/accept', requirePermission('quote', 'update'), controller.acceptQuote);
 router.post('/administration/quotes/:id/reject', requirePermission('quote', 'update'), controller.rejectQuote);
 router.post('/administration/quotes/:id/create-package', requirePermission('quote', 'update'), controller.createPackageFromQuote);
-router.get('/administration/care-packages', requirePermission('quote', 'read'), views.listCarePackages);
+router.get('/administration/package-templates', requirePermission('care_package', 'read'), carePackages.listPackageTemplates);
+router.get('/administration/package-templates/:id', requirePermission('care_package', 'read'), carePackages.getPackageTemplate);
+router.post('/administration/package-templates', requirePermission('price_list', 'create', 'structure'), carePackages.savePackageTemplate);
+router.patch('/administration/package-templates/:id', requirePermission('price_list', 'update', 'structure'), carePackages.savePackageTemplate);
+router.get('/administration/care-packages/payment-options', requirePermission('payment', 'create'), carePackages.packagePaymentOptions);
+router.get('/administration/care-packages/eligible', requirePermission('care_package', 'read'), listEligibleCarePackages);
+router.get('/administration/care-packages', requireAnyPermission(['care_package', 'read'], ['quote', 'read']), carePackages.listCarePackages);
+router.post('/administration/care-packages', requirePermission('care_package', 'create', 'structure'), carePackages.createCarePackage);
+router.get('/administration/care-packages/:id', requirePermission('care_package', 'read'), carePackages.getCarePackage);
+router.post('/administration/care-packages/:id/payments', requirePermission('payment', 'create'), carePackages.createPackagePayment);
+router.post('/administration/care-packages/:id/payments/:paymentId/void', requirePermission('payment_reversal', 'create'), carePackages.voidPackagePayment);
+router.post('/administration/care-packages/:id/invoice', requirePermission('invoice', 'create'), carePackages.createPackageInvoice);
 router.get('/administration/package-consumptions', requirePermission('quote', 'read'), controller.list('packageConsumptions'));
 router.post('/administration/care-packages/:id/consume', requirePermission('quote', 'update'), controller.consumePackage);
 router.get('/administration/patient-credits', requirePermission('quote', 'read'), views.listPatientCredits);

@@ -16,10 +16,12 @@ export const ADMINISTRATION_SEED_VERSION = '20260922-seed-administration';
 export const WORK_ITEM_ASSIGNEES_VERSION = '20261010-work-item-assignees';
 export const ACTIVITIES_FOUNDATION_VERSION = '20261011-activities-foundation';
 // Increment this whenever the tenant model registry changes, so existing schemas run model sync.
-export const TENANT_MODEL_BASELINE_VERSION = '20261012-tenant-model-baseline-v16';
+export const TENANT_MODEL_BASELINE_VERSION = '20261022-tenant-model-baseline-v17';
+export const CARE_PACKAGE_PURCHASES_VERSION = '20261022-care-package-purchases';
 export const PATIENT_SETTLEMENTS_VERSION = '20261012-patient-settlements';
 export const ACTIVITIES_DELIVERY_VERSION = '20261011-activities-delivery';
 const tenantMigrations: Array<{version: string; module: MigrationModule}> = [
+    {version: CARE_PACKAGE_PURCHASES_VERSION, module: require('../../migrations/20261022-care-package-purchases.js')},
     {version: PATIENT_SETTLEMENTS_VERSION, module: require('../../migrations/20261012-patient-settlements.js')},
     {version: APPOINTMENT_LEDGER_VERSION, module: require('../../migrations/20260907-unify-appointment-payment-ledger.js')},
     {version: PATIENT_DEFAULT_EVENT_TYPE_VERSION, module: require('../../migrations/20260908-add-patient-default-event-type.js')},

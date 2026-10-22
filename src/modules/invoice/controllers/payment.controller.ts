@@ -136,7 +136,7 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
         if (amount > summary.balance + 0.009) {
             return { kind: 'overpayment', balance: summary.balance } as const;
         }
-        if (invoice.patientID) {
+        if (invoice.patientID && !invoice.carePackageId) {
             if (!structureId) treasuryError('Verifica la sede del documento prima di registrare il pagamento', 409);
             await assertPatientSettlementAllocations(schema, {
                 patientId: invoice.patientID, structureId: structureId!, referenceInvoiceId: invoice.id
@@ -146,11 +146,12 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
         const payment = await InvoicePayment.schema(schema).create(
             {
                 invoiceId: invoice.id,
+                carePackageId: invoice.carePackageId ?? null,
                 amount: Math.round(amount * 100) / 100,
                 paidAt: new Date(`${paidAt}T12:00:00.000Z`),
                 method: selectedMethod ? String(selectedMethod.get('label')) : method,
                 note,
-                source: 'USER',
+                source: invoice.carePackageId ? 'PACKAGE_PURCHASE' : 'USER',
                 status: 'POSTED',
                 createdByUserId: getUserId(req)
             },
@@ -179,6 +180,7 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
 
     const invoice = await findScopedInvoice(req);
     if (!invoice) return sendErrorResponse(res, 404, 'Fattura non trovata');
+    if (convertToCredit && invoice.carePackageId) return sendErrorResponse(res, 409, 'Gli incassi del pacchetto possono essere annullati; la conversione a credito non è prevista per questo acquisto');
 
     const result = await sequelize.transaction(async (transaction) => {
         // Serialize the patient's position before document, movement and event locks.

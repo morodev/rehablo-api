@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { it, TestContext } from 'node:test';
 import { Request, Response, NextFunction } from 'express';
 import { sequelize } from '../../../config/database.js';
-import { PatientCredit, TreasuryMovement } from '../models/administration.model.js';
+import { CarePackage, PatientCredit, TreasuryMovement } from '../models/administration.model.js';
 import { PatientCreditMovement } from '../models/patientCreditMovement.model.js';
 import { applyCredit, refundCredit, reverseCreditApplication } from './patientCredit.controller.js';
 import Invoice from '../../invoice/models/invoice.model.js';
@@ -32,6 +32,7 @@ async function run(handler: (req: Request, res: Response, next: NextFunction) =>
 }
 
 function fixture(t: TestContext) {
+    t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => []})) as any);
     t.mock.method(sequelize, 'transaction', (async (callback: any) => callback({ LOCK: { UPDATE: 'UPDATE' } })) as any);
     t.mock.method(PatientCredit, 'schema', (() => ({ findByPk: async () => legacyCredit() })) as any);
     t.mock.method(PatientCreditMovement, 'schema', (() => ({ findOne: async () => null })) as any);
@@ -64,6 +65,7 @@ function row(values: Record<string, any>): any {
     }, async update(values: Record<string, any>) {Object.assign(this, values); return this;}};
 }
 function backedFixture(t: TestContext) {
+    t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => []})) as any);
     const credit = row({id: creditId, patientId, structureId, amount: 100, remainingAmount: 100,
         status: 'ACTIVE', sourceType: 'TREASURY_ADVANCE', sourceId: receiptId});
     const receipt = row({id: receiptId, structureId, amount: 100, direction: 'IN', status: 'POSTED',

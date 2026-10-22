@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { it } from 'node:test';
+import { beforeEach, it } from 'node:test';
 import { Op } from 'sequelize';
-import { Expense, PatientCredit, TreasuryMovement } from '../../administration/models/index.js';
+import { CarePackage, Expense, PatientCredit, TreasuryMovement } from '../../administration/models/index.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
@@ -9,6 +9,8 @@ import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import Patient from '../../patients/models/patient.model.js';
 import { financialDataset, treasuryProjection, unassignedFinancialWarnings } from './financialReporting.service.js';
 import { reportCsv } from './reporting.types.js';
+
+beforeEach((t: any) => { t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => []})) as any); });
 
 const site = '11111111-1111-4111-8111-111111111111';
 const otherSite = '22222222-2222-4222-8222-222222222222';

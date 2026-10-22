@@ -8,6 +8,8 @@ export const AUTOMATIC_APPOINTMENT_COMPLETION_LOOKBACK_MS = 24 * 60 * 60_000;
 const TENANT_SCHEMA_PATTERN = /^rehablo_[a-z0-9]+$/i;
 const preparedSchemas = new Set<string>();
 const MISSED_ARRIVAL_COLUMNS = {
+    carePackageId: 'UUID NULL',
+    packageReservationStatus: 'VARCHAR(16) NULL',
     missedArrivalReportedAt: 'TIMESTAMPTZ NULL',
     missedArrivalReportedBy: 'UUID NULL',
     missedArrivalResolvedAt: 'TIMESTAMPTZ NULL',
@@ -25,6 +27,7 @@ type AppointmentLike = Pick<
     | 'recurrence'
     | 'recurringEventId'
     | 'invoiceId'
+    | 'carePackageId'
     | 'patientId'
     | 'patient'
     | 'missedArrivalReportedAt'
@@ -54,7 +57,7 @@ export function shouldAutoCompleteAppointment(
     now: Date = new Date()
 ): boolean {
     if (String(event.status ?? '').toUpperCase() !== 'CONFIRMED') return false;
-    if (event.invoiceId || event.recurrence || event.recurringEventId || event.missedArrivalReportedAt) return false;
+    if (event.carePackageId || event.invoiceId || event.recurrence || event.recurringEventId || event.missedArrivalReportedAt) return false;
 
     const patient = event.patient as Record<string, unknown> | null | undefined;
     if (!event.patientId && !patient?.id) return false;
@@ -153,12 +156,14 @@ export async function autoCompleteEndedAppointmentsForSchema(
             'recurrence',
             'recurringEventId',
             'invoiceId',
+            'carePackageId',
             'patient',
             'missedArrivalReportedAt'
         ],
         where: {
             status: { [Op.iLike]: 'CONFIRMED' },
             invoiceId: null,
+            carePackageId: null,
             missedArrivalReportedAt: null,
             start: { [Op.gte]: earliestCandidateStart, [Op.lte]: now.toISOString() },
             ...singleAppointmentWhere
@@ -179,6 +184,7 @@ export async function autoCompleteEndedAppointmentsForSchema(
                     id: candidate.id,
                     status: { [Op.iLike]: 'CONFIRMED' },
                     invoiceId: null,
+                    carePackageId: null,
                     missedArrivalReportedAt: null,
                     ...singleAppointmentWhere
                 }

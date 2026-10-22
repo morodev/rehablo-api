@@ -25,6 +25,7 @@ import Patient from '../../patients/models/patient.model.js';
 import Tenant from '../../auth/models/tenant.model.js';
 import EventType from '../../agenda/models/eventType.model.js';
 import { getRolePermissions, RoleCode } from '../../auth/rbac/roles.js';
+import {CarePackage} from '../../administration/models/index.js';
 
 describe('summarizeInvoicePayments', () => {
     it('derives unpaid, partial and paid states only from posted movements', () => {
@@ -190,6 +191,7 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
         assert.equal(resolveAppointmentAdjustment(null, 'COMPLIMENTARY', null, 0, null).amount, 0);
     });
     it('requires the full residual, refuses destructive compatibility edits and voids only the selected movement', async context => {
+        context.mock.method(CarePackage, 'schema', () => ({findAll: async () => []}) as any);
         const eventId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
         const patientId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
         const structureId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
@@ -303,6 +305,7 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
             get() { return Object.fromEntries(Object.entries(this).filter(([, value]) => typeof value !== 'function')); },
             async update(update: any) { Object.assign(this, update); return this; }
         });
+        context.mock.method(CarePackage, 'schema', () => ({findAll: async () => []}) as any);
         const events = [
             record({id: previousId, start: '2026-01-05T10:00:00Z', status: 'COMPLETED', title: 'Seduta precedente',
                 patientId, structureId, calendarId: 'owner', appointmentExpectedAmount: 40,

@@ -38,6 +38,7 @@ function run(handler: (req: Request, res: Response, next: NextFunction) => void,
 }
 
 function fixture(t: TestContext) {
+    t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => []})) as any);
     const invoice = record({ id, structureId, patientID: userId, invoiceTotal: 100, status: 'unpaid', documentType: 'fattura',
         documentNumber: 1, emissionDate: '2025-01-01' });
     const invoices = [invoice];

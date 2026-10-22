@@ -49,6 +49,8 @@ export interface AgendaEventAttributes {
     appointmentPaymentHistoryKnown?: boolean;
     erasable?: boolean | null;
     eventTypeId?: string | null;
+    carePackageId?: string | null;
+    packageReservationStatus?: 'RESERVED' | 'CONSUMED' | 'RELEASED' | null;
     /**
      * Legacy single-appointment document reference. Cumulative documents use InvoiceAgendaEvent.
      * Payment and document state are independent; appointment compatibility columns summarize
@@ -102,6 +104,8 @@ export class AgendaEvent
     declare appointmentPaymentHistoryKnown: boolean;
     declare erasable: boolean | null;
     declare eventTypeId: string | null;
+    declare carePackageId: string | null;
+    declare packageReservationStatus: 'RESERVED' | 'CONSUMED' | 'RELEASED' | null;
     declare invoiceId: string | null;
 }
 
@@ -146,6 +150,8 @@ AgendaEvent.init(
         appointmentPaymentHistoryKnown: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
         erasable: { type: DataTypes.BOOLEAN, defaultValue: true },
         eventTypeId: { type: DataTypes.UUID, allowNull: true },
+        carePackageId: { type: DataTypes.UUID, allowNull: true },
+        packageReservationStatus: { type: DataTypes.STRING(16), allowNull: true },
         invoiceId: {
             type: DataTypes.UUID,
             allowNull: true,

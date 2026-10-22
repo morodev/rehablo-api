@@ -190,6 +190,7 @@ export async function executePatientSettlement(req: Request) {
         const invoices = new Map(invoiceModels.map(invoice => [invoice.id, invoice]));
         for (const event of eventModels) {
             const plain = event.get({plain: true});
+            if (plain.carePackageId && ['RESERVED', 'CONSUMED'].includes(String(plain.packageReservationStatus))) settlementFail(409, 'La seduta è inclusa nel pacchetto: gestisci il saldo dall’acquisto');
             if ((plain.patientId ?? plain.patient?.id) !== context.patientId || (plain.structureId ?? context.structureId) !== context.structureId
                 || !settlementRecordAccess(req, context, 'APPOINTMENT', plain, 'read')) settlementFail(404, 'Uno degli obblighi non è accessibile');
             await ensureAppointmentPaymentHistory(schema, event, transaction);
@@ -247,6 +248,7 @@ export async function executePatientSettlement(req: Request) {
                 if (!use) continue;
                 const payment = await InvoicePayment.schema(schema).create({id: randomUUID(),
                     invoiceId: row.kind === 'INVOICE' ? row.targetId : null, agendaEventId: row.kind === 'APPOINTMENT' ? row.targetId : null,
+                    carePackageId: row.kind === 'INVOICE' ? invoices.get(row.targetId)?.carePackageId ?? null : null,
                     amount: use, paidAt: new Date(), method: 'Credito paziente', note: request.cash.note,
                     source: 'CREDIT', status: 'POSTED', createdByUserId: getUserId(req)}, {transaction});
                 const movementId = randomUUID();
@@ -263,8 +265,9 @@ export async function executePatientSettlement(req: Request) {
                     paymentMethodId: request.cash.paymentMethodId, idempotencyKey: `settlement_${operationId}_${paymentId}`}};
                 const payment = await InvoicePayment.schema(schema).create({id: paymentId,
                     invoiceId: row.kind === 'INVOICE' ? row.targetId : null, agendaEventId: row.kind === 'APPOINTMENT' ? row.targetId : null,
+                    carePackageId: row.kind === 'INVOICE' ? invoices.get(row.targetId)?.carePackageId ?? null : null,
                     amount: split.cash, paidAt: new Date(request.cash.paidAt + 'T12:00:00.000Z'), method, note: request.cash.note,
-                    source: row.kind === 'INVOICE' ? 'USER' : 'APPOINTMENT', status: 'POSTED', createdByUserId: getUserId(req)}, options);
+                    source: row.kind === 'INVOICE' ? invoices.get(row.targetId)?.carePackageId ? 'PACKAGE_PURCHASE' : 'USER' : 'APPOINTMENT', status: 'POSTED', createdByUserId: getUserId(req)}, options);
                 entry.paymentIds.push(payment.id);
             }
             if (row.kind === 'APPOINTMENT') {

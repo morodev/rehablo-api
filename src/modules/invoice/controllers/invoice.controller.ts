@@ -36,6 +36,8 @@ import { invoiceEmissionMonth, invoicePaymentMonth, parseInvoiceMonthFilter } fr
 import { decorateInvoicesWithPayments, syncInvoicePaymentStatus } from '../services/payment.service.js';
 import { appointmentPricesByEvent, ensureAppointmentPaymentHistory, isValidPaymentDate, linkAppointmentPayments } from '../services/appointmentPayment.service.js';
 import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
+import {packageToday, scopedCarePackage} from '../../administration/services/carePackage.service.js';
+import {treasuryError} from '../../administration/services/treasuryValidation.service.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AGENDA_SCOPE_FIELDS = {
@@ -339,6 +341,7 @@ export const findEligibleAppointments = asyncHandler(async (req: Request, res: R
     const existingLinks = await getInvoiceAgendaLinksByEventIds(schema, eventIds);
     const alreadyLinked = new Set(existingLinks.map((link) => link.agendaEventId));
     const eligibleRows = datedRows.filter((event) => !alreadyLinked.has(event.id)
+        && !(event.carePackageId && ['RESERVED', 'CONSUMED'].includes(String(event.packageReservationStatus)))
         && event.appointmentPriceAdjustment !== 'COMPLIMENTARY');
 
     const eventTypeIds = [...new Set(eligibleRows.map((event) => event.eventTypeId).filter(Boolean))] as string[];
@@ -497,6 +500,15 @@ function applyFiscalRules(params: {
 
 export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
+    const packagePurchase = req.body?.carePackageId ? await scopedCarePackage(req, req.body.carePackageId) : null;
+    if (packagePurchase) {
+        if (!packagePurchase.get('templateId')) treasuryError('Il pacchetto storico richiede riconciliazione prima della fatturazione', 409);
+        if (packagePurchase.get('invoiceId')) return sendSuccessResponse(res, 200, {
+            invoiceId: packagePurchase.get('invoiceId'), carePackageId: packagePurchase.get('id')});
+        req.body = {carePackageId: packagePurchase.get('id'), patientID: packagePurchase.get('patientId'),
+            documentType: 'fattura', emissionDate: packageToday(), products: [],
+            services: [{id: packagePurchase.get('serviceId'), quantity: 1}], stampChargedToPatient: false};
+    }
     const {
         InvoiceScoped,
         ProductScoped,
@@ -607,6 +619,16 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     }
     const issuerData = issuerTenant!.get({ plain: true }) as any;
     const issuer = buildIssuerSnapshot(issuerData);
+    const fiscalProfile = resolveFiscalProfile(issuerData);
+    if (packagePurchase) {
+        const snapshot = packagePurchase.get('purchaseSnapshot') as Record<string, any>;
+        const vat = snapshot.serviceVat ?? null;
+        const vatRate = fiscalProfile.appliesVat && Number.isFinite(Number(vat)) ? Number(vat) : 0;
+        serviceLines[0] = {id: String(packagePurchase.get('serviceId')), quantity: 1,
+            unitPrice: money(Number(packagePurchase.get('totalPrice')) / (1 + vatRate / 100)), vat,
+            name: `${String(packagePurchase.get('name'))} - ${Number(packagePurchase.get('purchasedUnits'))} sedute di ${String(packagePurchase.get('serviceName'))}`,
+            percentageDiscount: null, discountAmount: null};
+    }
     invoiceFields.stsExpenseTypeCode = invoiceStsCodeForSave({
         ...invoiceFields, issuer, products: productLines, services: serviceLines
     }, getStsFiscalSettings(issuerData), invoiceFields.stsExpenseTypeCode);
@@ -615,12 +637,14 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
 
     // Il regime fiscale dello studio decide IVA, natura, ritenuta e bollo: va applicato PRIMA di
     // calcolare i totali, non dopo (vedi docs/REGIME_FISCALE_IT.md).
-    const fiscalProfile = resolveFiscalProfile(issuerData);
     let fiscal = applyFiscalRules({
         profile: fiscalProfile,
         invoiceFields,
         evalLines: { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) }
     });
+    if (packagePurchase && Math.abs(Number(fiscal.totals.invoiceNet) - Number(packagePurchase.get('totalPrice'))) > 0.009) {
+        treasuryError('Il prezzo concordato non coincide con il totale fiscale: verifica la configurazione IVA prima di emettere', 409);
+    }
     const initialFinancialError = validateFinancialInput(
         invoiceFields,
         { products: productLines.map(toEvalLine), services: serviceLines.map(toEvalLine) },
@@ -675,7 +699,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     if (unavailableProductId) {
         return sendErrorResponse(res, 409, 'Prodotto non disponibile nella sede selezionata');
     }
-    if (unavailableServiceId) {
+    if (unavailableServiceId && !packagePurchase) {
         return sendErrorResponse(res, 409, 'Servizio non disponibile nella sede selezionata');
     }
 
@@ -684,6 +708,8 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     // una fattura senza le sue righe.
     const transactionResult = await sequelize.transaction(async (t) => {
         if (invoiceFields.patientID) await lockPatientSettlement(schema, invoiceFields.patientID, t);
+        const lockedPackage = packagePurchase ? await scopedCarePackage(req, packagePurchase.get('id'), t, true) : null;
+        if (lockedPackage?.get('invoiceId')) return {kind: 'package-reused', invoiceId: String(lockedPackage.get('invoiceId'))} as const;
         let agendaEvents: AgendaEvent[] = [];
         let appointmentPayments: InvoicePayment[] = [];
 
@@ -699,6 +725,9 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
 
             if (agendaEvents.length !== agendaEventIds.length) {
                 return { kind: 'agenda-not-found' } as const;
+            }
+            if (agendaEvents.some(event => event.get('carePackageId') && ['RESERVED', 'CONSUMED'].includes(String(event.get('packageReservationStatus'))))) {
+                treasuryError('Le sedute incluse nel pacchetto sono fatturate attraverso l’acquisto del pacchetto', 409);
             }
 
             if (agendaEvents.some((event) => event.get('recurrence'))) {
@@ -908,6 +937,11 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
 
         // Reconcile the original movement IDs: invoice emission never creates a second receipt.
         await linkAppointmentPayments(schema, agendaEventIds, invoiceId, t);
+        if (lockedPackage) {
+            await InvoicePaymentScoped.update({invoiceId}, {where: {carePackageId: String(lockedPackage.get('id')), invoiceId: null}, transaction: t});
+            await lockedPackage.update({invoiceId}, {transaction: t});
+            await syncInvoicePaymentStatus(schema, invoiceId, t);
+        }
 
         const appointmentPaidTotal = money(
             appointmentPayments.reduce((sum, payment) => sum + Number(payment.amount), 0)
@@ -965,6 +999,8 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         return { kind: 'created', invoice: createdInvoice } as const;
     });
 
+    if (transactionResult.kind === 'package-reused') return sendSuccessResponse(res, 200, {
+        invoiceId: transactionResult.invoiceId, carePackageId: packagePurchase!.get('id')});
     if (transactionResult.kind === 'agenda-not-found') {
         return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
     }
@@ -1032,7 +1068,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     });
 
     const [decoratedInvoice] = await decorateInvoicesWithPayments(schema, invoiceWithLines ? [invoiceWithLines] : []);
-    return sendSuccessResponse(res, 201, decoratedInvoice, 'Invoice Created');
+    return sendSuccessResponse(res, 201, packagePurchase ? {...decoratedInvoice, invoiceId: invoice.get('id'), carePackageId: packagePurchase.get('id')} : decoratedInvoice, 'Invoice Created');
 });
 
 export const findAllInvoices = asyncHandler(async (req: Request, res: Response) => {
@@ -1211,6 +1247,8 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
     if (!existingInvoice) {
         return sendErrorResponse(res, 404, 'Fattura non trovata');
     }
+    if (existingInvoice.carePackageId) return sendErrorResponse(res, 409,
+        'La fattura del pacchetto mantiene il prezzo concordato e gli incassi collegati. La rettifica di questo acquisto richiede riconciliazione amministrativa.');
     if (String(existingInvoice.get('status') ?? '').toLowerCase() === 'void') {
         return sendErrorResponse(res, 409, 'Una fattura stornata non può più essere modificata');
     }
@@ -1222,6 +1260,7 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
         products: requestedProducts,
         services: requestedServices,
         agendaEventId: _immutableAgendaEventId,
+        carePackageId: _immutableCarePackageId,
         appointments: _immutableAppointments,
         structureId: _immutableStructureId,
         paymentDate: _paymentDate,
@@ -1513,6 +1552,7 @@ export const deleteInvoice = asyncHandler(async (req: Request, res: Response) =>
             where: { id, ...patientScopeWhere(req, schema, 'patientID') }, transaction, lock: transaction.LOCK.UPDATE
         });
         if (!removedInvoice) return { kind: 'missing' } as const;
+        if (removedInvoice.carePackageId) treasuryError('La fattura del pacchetto non può essere eliminata: conserva il collegamento all’acquisto', 409);
         const linkedAgendaEvent = await AgendaEvent.schema(schema).findOne({
             where: { invoiceId: id }, attributes: ['id'], transaction
         });

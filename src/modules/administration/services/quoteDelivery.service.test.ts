@@ -84,9 +84,12 @@ function fixture(t: TestContext) {
 
 describe('quote document and recipients', () => {
     it('rejects invalid/reversed calendar dates without UTC date shifts', () => {
-        assert.equal(quoteDateError('2026-03-29', '2026-03-29'), null);
+        assert.match(quoteDateError('2026-03-29', '2026-03-29')!, /giorno successivo/);
+        assert.equal(quoteDateError('2026-03-29', '2026-03-30'), null);
+        assert.equal(quoteDateError('2026-12-31', '2027-01-01'), null);
+        assert.equal(quoteDateError('2028-02-29', '2028-03-01'), null);
         assert.match(quoteDateError('2026-02-30', '2026-03-01')!, /data/);
-        assert.match(quoteDateError('2026-03-29', '2026-03-28')!, /precedere/);
+        assert.match(quoteDateError('2026-03-29', '2026-03-28')!, /giorno successivo/);
         assert.match(quoteDateError('2026-03-29T00:00:00Z', null)!, /data/);
     });
     it('uses contact arrays and legacy fallback while rejecting an explicitly invalid recipient', () => {
@@ -118,6 +121,19 @@ describe('quote document and recipients', () => {
 });
 
 describe('quote save/access policy', () => {
+    it('enforces Rome today for new dates and allows only the persisted past date', async t => {
+        const f = fixture(t);
+        t.mock.timers.enable({apis: ['Date'], now: new Date('2026-10-21T22:30:00Z')});
+        const base = {patientId, structureId, expiresAt: '2026-11-30'};
+        await assert.rejects(validateQuoteDraft(f.request, {...base, issuedAt: '2026-10-21'}), /antecedente a oggi/);
+        await validateQuoteDraft(f.request, {...base, issuedAt: '2026-10-22'});
+        await validateQuoteDraft(f.request, {...base, issuedAt: '2026-10-23'});
+        await validateQuoteDraft(f.request, {issuedAt: '2026-01-01'}, f.quote);
+        await validateQuoteDraft(f.request, {notes: 'Updated'}, f.quote);
+        await assert.rejects(validateQuoteDraft(f.request, {issuedAt: '2026-01-02'}, f.quote), /antecedente a oggi/);
+        await validateQuoteDraft(f.request, {issuedAt: '2026-10-22'}, f.quote);
+        await assert.rejects(validateQuoteDraft(f.request, {...base, issuedAt: '2026-10-22', expiresAt: '2026-10-22'}), /giorno successivo/);
+    });
     it('preserves SENT when saving and rejects direct status transitions', async t => {
         const f = fixture(t);
         f.quote.data.status = 'SENT';
@@ -129,8 +145,8 @@ describe('quote save/access policy', () => {
     });
     it('requires a selected patient and valid dates for a new saved quote', async t => {
         const f = fixture(t);
-        await assert.rejects(validateQuoteDraft(f.request, { issuedAt: '2026-01-01', expiresAt: '2026-02-01', structureId }), /paziente/);
-        await assert.rejects(validateQuoteDraft(f.request, { issuedAt: '2026-02-01', expiresAt: '2026-01-01', patientId, structureId }), /precedere/);
+        await assert.rejects(validateQuoteDraft(f.request, { issuedAt: '2099-01-01', expiresAt: '2099-02-01', structureId }), /paziente/);
+        await assert.rejects(validateQuoteDraft(f.request, { issuedAt: '2026-02-01', expiresAt: '2026-01-01', patientId, structureId }), /giorno successivo/);
     });
     it('combines quote ownership/structure and patient scope, never a foreign UUID sentinel', () => {
         const req = { tenantSchema: 'rehablo_' + tenantId.replace(/-/g, ''), access: { scope: 'structure', structureId, userId } } as Request;

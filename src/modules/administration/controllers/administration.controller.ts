@@ -405,7 +405,9 @@ const createPackageFromQuote = asyncHandler(async (req, res) => {
         return { carePackage, reused: false };
     });
     if ('error' in result) return sendErrorResponse(res, result.error ?? 409, result.message ?? 'Pacchetto non disponibile');
-    return sendSuccessResponse(res, result.reused ? 200 : 201, result.carePackage, 'Pacchetto attivato');
+    return sendSuccessResponse(res, result.reused ? 200 : 201, {
+        ...result.carePackage.get({ plain: true }), reused: result.reused
+    }, result.reused ? 'Pacchetto già creato per questo preventivo' : 'Pacchetto creato dal preventivo');
 });
 
 const consumePackage = asyncHandler(async (req, res) => {
@@ -425,6 +427,7 @@ const consumePackage = asyncHandler(async (req, res) => {
         await lockPatientSettlement(req.tenantSchema!, String(snapshot.get('patientId')), transaction);
         const pack = await Pack.findOne({ where: { id: req.params.id, ...structureWhere(req, SPECS.carePackages) }, transaction, lock: transaction.LOCK.UPDATE });
         if (!pack || pack.get('status') !== 'ACTIVE') return null;
+        if (pack.get('templateId')) throw Object.assign(new Error('Le sedute dei nuovi pacchetti si utilizzano segnando l’appuntamento come effettuato in agenda.'), {statusCode: 409});
         if (String(pack.get('patientId')) !== String(snapshot.get('patientId'))) throw Object.assign(new Error('Il paziente del pacchetto è cambiato: ricarica'), { statusCode: 409 });
         const remaining = Number(pack.get('remainingUnits'));
         if (units > remaining) throw Object.assign(new Error('Sedute residue insufficienti'), { statusCode: 409 });
@@ -458,6 +461,9 @@ async function settleAppointmentWithPackage(req: Request, agendaEventId: string,
         throw Object.assign(new Error('La seduta non appartiene al paziente o alla sede del pacchetto'), { statusCode: 409 });
     }
     if (event.get('invoiceId')) throw Object.assign(new Error('La seduta è già fatturata'), { statusCode: 409 });
+    if (event.carePackageId && ['RESERVED', 'CONSUMED'].includes(String(event.packageReservationStatus))) {
+        throw Object.assign(new Error('Questa seduta è già assegnata a un pacchetto in agenda.'), {statusCode: 409});
+    }
     if (Number(event.get('appointmentPaidAmount')) > 0.009) throw Object.assign(new Error('Questa seduta ha già una copertura registrata'), {statusCode: 409});
     const alreadyConsumed = await PackageConsumption.schema(schema).count({ where: { agendaEventId, status: 'POSTED' }, transaction });
     if (alreadyConsumed) throw Object.assign(new Error('Questa seduta è già stata usata da un pacchetto'), { statusCode: 409 });
