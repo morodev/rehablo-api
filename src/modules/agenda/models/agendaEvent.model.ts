@@ -51,6 +51,7 @@ export interface AgendaEventAttributes {
     erasable?: boolean | null;
     eventTypeId?: string | null;
     carePackageId?: string | null;
+    carePackageServiceId?: string | null;
     packageReservationStatus?: 'RESERVED' | 'CONSUMED' | 'RELEASED' | null;
     /**
      * Legacy single-appointment document reference. Cumulative documents use InvoiceAgendaEvent.
@@ -107,6 +108,7 @@ export class AgendaEvent
     declare erasable: boolean | null;
     declare eventTypeId: string | null;
     declare carePackageId: string | null;
+    declare carePackageServiceId: string | null;
     declare packageReservationStatus: 'RESERVED' | 'CONSUMED' | 'RELEASED' | null;
     declare invoiceId: string | null;
 }
@@ -154,6 +156,7 @@ AgendaEvent.init(
         erasable: { type: DataTypes.BOOLEAN, defaultValue: true },
         eventTypeId: { type: DataTypes.UUID, allowNull: true },
         carePackageId: { type: DataTypes.UUID, allowNull: true },
+        carePackageServiceId: { type: DataTypes.UUID, allowNull: true },
         packageReservationStatus: { type: DataTypes.STRING(16), allowNull: true },
         invoiceId: {
             type: DataTypes.UUID,

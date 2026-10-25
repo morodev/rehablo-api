@@ -3,7 +3,7 @@ import {randomUUID} from 'node:crypto';
 import {it, TestContext} from 'node:test';
 import {Op} from 'sequelize';
 import {sequelize} from '../../../config/database.js';
-import {CarePackage, PackageTemplate, PackageConsumption, FinancialAccount, PaymentMethod, TreasuryMovement} from '../models/index.js';
+import {CarePackage, PackageTemplate, PackageConsumption, FinancialAccount, PaymentMethod, TreasuryMovement, Quote} from '../models/index.js';
 import Patient from '../../patients/models/patient.model.js';
 import Service from '../../products-services/models/service.model.js';
 import Product from '../../products-services/models/product.model.js';
@@ -16,7 +16,7 @@ import InvoiceProduct from '../../invoice/models/invoiceProduct.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import {Tenant, Structure} from '../../auth/models/index.js';
-import {createCarePackage, createPackagePayment, createPackageInvoice, voidPackagePayment, getCarePackage} from './carePackage.controller.js';
+import {createCarePackage, createPackagePayment, createPackageInvoice, voidPackagePayment, getCarePackage, listCarePackages, setupCarePackageBooking} from './carePackage.controller.js';
 import {packageMoneySummary, packagePatientWhere} from '../services/carePackage.service.js';
 
 const id = (n: number) => `aaaaaaaa-aaaa-4aaa-8aaa-${String(n).padStart(12, '0')}`;
@@ -46,9 +46,13 @@ function matches(row: any, where: any): boolean {
 }
 function fixture(t: TestContext) {
     const collections = new Map<any, any[]>();
+    const packagePages: any[] = [];
     const install = (model: any, rows: any[] = []) => {
         collections.set(model, rows);
         t.mock.method(model, 'schema', (() => ({
+            findAndCountAll: async (options: any) => {packagePages.push(options); const matching = rows.filter(row => matches(row, options.where))
+                .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')) || String(a.id).localeCompare(String(b.id)));
+                return {count: matching.length, rows: matching.slice(options.offset, options.offset + options.limit)};},
             findOne: async ({where}: any) => rows.find(row => matches(row, where)) ?? null,
             findByPk: async (key: string) => rows.find(row => row.get('id') === key) ?? null,
             findAll: async ({where, raw}: any = {}) => rows.filter(row => matches(row, where)).map(row => raw ? values(row) : row),
@@ -61,6 +65,7 @@ function fixture(t: TestContext) {
     const templates = install(PackageTemplate, [record({id: templateId, structureId, name: '10 fisioterapie', serviceId,
         serviceName: 'Fisioterapia', sessionCount: 10, totalPrice: 400, validityDays: null, isActive: true})]);
     const packages = install(CarePackage), events = install(AgendaEvent), invoices = install(Invoice), lines = install(InvoiceService), ledger = install(TreasuryMovement);
+    const quotes = install(Quote);
     install(PackageConsumption); install(InvoiceProduct); install(InvoiceAgendaEvent); install(ServiceStructure); install(ProductStructure); install(Product);
     install(Patient, [record({id: patientId, name: 'Mario', surname: 'Rossi', structureId})]);
     const services = install(Service, [record({id: serviceId, name: 'Fisioterapia', sellingPrice: 70, productVat: 'N4', isActive: true, availabilityMode: 'ALL'})]);
@@ -103,7 +108,7 @@ function fixture(t: TestContext) {
             }
         }); tail = task.then(() => undefined, () => undefined); return task;
     }) as any);
-    return {templates, packages, events, payments, ledger, invoices, lines, services};
+    return {templates, packages, events, payments, ledger, invoices, lines, services, quotes, packagePages};
 }
 function request(body: object, params: object = {}, key = 'purchase-operation-001'): any {
     return {tenantSchema: schema, body, params, query: {}, header: () => key,
@@ -185,4 +190,83 @@ it('projects expired purchases without bookable units while preserving the unpai
 it('excludes voided cash from money balance without treating session usage as payment', () => {
     assert.deepEqual(packageMoneySummary({totalPrice: 400, remainingUnits: 3}, [{amount: 100, status: 'POSTED'}, {amount: 300, status: 'VOID'}]),
         {paidAmount: 100, balance: 300, paymentStatus: 'partial'});
+});
+
+it('pages the permitted origins once with a global count and keeps legacy/default queries compatible', async t => {
+    const f = fixture(t);
+    f.packages.push(record({id: id(20), patientId, structureId, templateId, name: 'Catalogo', purchasedUnits: 10, remainingUnits: 10, totalPrice: 400, serviceId, status: 'ACTIVE', createdAt: '2026-01-01'}),
+        record({id: id(21), patientId, structureId, templateId: null, quoteId: id(50), name: 'Da preventivo', purchasedUnits: 10, remainingUnits: 10, totalPrice: 300, serviceId, status: 'ACTIVE', createdAt: '2026-01-03'}),
+        record({id: id(22), patientId, structureId, templateId: null, name: 'Sorgente non disponibile', purchasedUnits: 10, remainingUnits: 10, totalPrice: 0, serviceId, status: 'ACTIVE', createdAt: '2026-01-02'}));
+    const req = request({}); req.query = {origin: 'all', page: '2', limit: '2'};
+    const page = await run(listCarePackages, req);
+    assert.equal(page.status, 200, page.message); assert.equal(page.data.total, 3); assert.deepEqual(page.data.items.map((row: any) => row.id), [id(20)]);
+    assert.equal(f.packagePages.length, 1); assert.equal(f.packagePages[0].offset, 2); assert.equal(f.packagePages[0].limit, 2);
+    req.query = {}; assert.equal((await run(listCarePackages, req)).data.total, 1);
+    req.query = {legacy: 'true'}; assert.equal((await run(listCarePackages, req)).data.total, 2);
+    for (const [origin, expected] of [['catalog', id(20)], ['quote', id(21)], ['other', id(22)]]) {
+        req.query = {origin}; const response = await run(listCarePackages, req);
+        assert.deepEqual(response.data.items.map((row: any) => row.id), [expected]);
+    }
+    req.query = {origin: 'unknown'}; assert.equal((await run(listCarePackages, req)).status, 422);
+});
+
+it('applies each origin authorization before paging rather than combining separately limited lists', async t => {
+    const f = fixture(t);
+    f.packages.push(...[templateId, null].map((template, index) => record({id: id(20 + index), patientId, structureId, templateId: template,
+        name: 'Pacchetto', purchasedUnits: 10, remainingUnits: 10, totalPrice: 400, serviceId, status: 'ACTIVE'})));
+    const req = request({}); req.user = {...req.user, isSuperAdmin: false, perms: ['care_package:read:own']}; req.query = {origin: 'all'};
+    const catalog = await run(listCarePackages, req);
+    assert.equal(catalog.data.total, 1); assert.equal(catalog.data.items[0].id, id(20));
+    assert.match(f.packagePages[0].where[Op.and][0][Op.or][0][Op.and][0][Op.and][0].patientId[Op.in].val, /agenda_events/);
+    req.user.perms = ['quote:read:structure'];
+    const previous = await run(listCarePackages, req); assert.equal(previous.data.total, 1); assert.equal(previous.data.items[0].id, id(21));
+    assert.equal((await run(getCarePackage, {...req, params: {id: id(20)}})).status, 404);
+    assert.equal((await run(getCarePackage, {...req, params: {id: id(21)}})).status, 200);
+});
+
+it('distinguishes commercial quote origin from template ACL and protects quote links with document scope', async t => {
+    const f = fixture(t);
+    f.packages.push(record({id: id(20), patientId, structureId, templateId: null, quoteId: id(50), name: 'Sedute da preventivo', purchasedUnits: 10,
+        remainingUnits: 10, totalPrice: 300, serviceId, status: 'ACTIVE'}));
+    f.quotes.push(record({id: id(50), patientId, structureId, number: 7, year: 2026, createdByUserId: id(99)}));
+    const req = request({}, {id: id(20)}); req.user = {...req.user, isSuperAdmin: false, perms: ['quote:read:own']};
+    const ownPackage = await run(getCarePackage, req); assert.equal(ownPackage.status, 200, ownPackage.message);
+    assert.equal(ownPackage.data.origin, 'QUOTE'); assert.equal(ownPackage.data.canOpenQuote, false); assert.equal(ownPackage.data.quoteNumber, null);
+    req.user.perms = ['quote:read:structure']; const quote = await run(getCarePackage, req);
+    assert.equal(quote.data.canOpenQuote, true); assert.equal(quote.data.quoteNumber, 'PRV-2026/0007');
+    assert.equal(quote.data.totalPrice, 300); assert.equal(quote.data.paidAmount, null); assert.equal(quote.data.balance, null); assert.equal(quote.data.paymentStatus, null);
+    f.packages[0].quoteId = null; f.packages[0].totalPrice = 0;
+    const unknown = await run(getCarePackage, req); assert.equal(unknown.data.origin, 'OTHER'); assert.equal(unknown.data.totalPrice, null);
+    assert.equal(unknown.data.canOpenQuote, false); assert.equal(unknown.data.quoteId, null);
+    f.packages[0].templateId = templateId; f.packages[0].quoteId = id(50); req.user.perms.push('care_package:read:structure');
+    assert.equal((await run(getCarePackage, req)).data.origin, 'QUOTE');
+});
+
+it('configures the existing historical package with scoped quote rights and preserves all financial facts', async t => {
+    const f = fixture(t), stamp = '2026-10-01T10:00:00.000Z';
+    f.packages.push(record({id: id(20), patientId, structureId, templateId: null, name: 'Trattamenti precedenti', purchasedUnits: 10, remainingUnits: 8,
+        totalPrice: 300, status: 'ACTIVE', updatedAt: stamp, lines: [{id: 'line-1', itemType: 'SERVICE', description: 'Trattamenti', quantity: 10}],
+        purchaseSnapshot: {agreement: 'unchanged'}}));
+    const req = request({expectedRemainingUnits: 8, expectedUpdatedAt: stamp, lines: [{lineId: 'line-1', serviceId}],
+        remainingByService: [{serviceId, remainingUnits: 8}]}, {id: id(20)});
+    req.user = {...req.user, isSuperAdmin: false, perms: ['quote:read:structure', 'quote:update:structure']};
+    const detail = await run(getCarePackage, req); assert.equal(detail.data.canConfigureBooking, true);
+    assert.deepEqual(detail.data.booking.availableServices, [{id: serviceId, name: 'Fisioterapia'}]);
+    const [first, second] = await Promise.all([run(setupCarePackageBooking, req), run(setupCarePackageBooking, req)]);
+    assert.deepEqual([first.status, second.status], [200, 409]); assert.equal(first.data.id, id(20)); assert.equal(first.data.booking.status, 'READY');
+    assert.equal(f.packages.length, 1); assert.equal(f.packages[0].remainingUnits, 8); assert.equal(f.packages[0].totalPrice, 300);
+    assert.equal(f.packages[0].purchaseSnapshot.agreement, 'unchanged'); assert.equal(f.packages[0].purchaseSnapshot.bookingAudit.length, 1);
+    assert.equal(f.payments.length, 0); assert.equal(f.ledger.length, 0); assert.equal(f.invoices.length, 0);
+});
+
+it('rejects stale setup quantities or missing quote update permission before changing the package', async t => {
+    const f = fixture(t), stamp = '2026-10-01T10:00:00.000Z';
+    f.packages.push(record({id: id(20), patientId, structureId, templateId: null, name: 'Trattamenti', purchasedUnits: 10, remainingUnits: 8,
+        totalPrice: 300, status: 'ACTIVE', updatedAt: stamp, lines: [{itemType: 'SERVICE', description: 'Trattamenti', quantity: 10}]}));
+    const req = request({expectedRemainingUnits: 9, expectedUpdatedAt: stamp, lines: [{lineId: 'line-0', serviceId}],
+        remainingByService: [{serviceId, remainingUnits: 8}]}, {id: id(20)});
+    req.user = {...req.user, isSuperAdmin: false, perms: ['quote:read:structure', 'quote:update:structure']};
+    assert.equal((await run(setupCarePackageBooking, req)).status, 409); assert.equal(f.packages[0].purchaseSnapshot, undefined);
+    req.user.perms = ['quote:read:structure']; assert.equal((await run(setupCarePackageBooking, req)).status, 403);
+    assert.equal(f.packages[0].remainingUnits, 8); assert.equal(f.payments.length, 0);
 });

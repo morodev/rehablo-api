@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {describe, it} from 'node:test';
-import {invoiceEmissionMonth, invoicePaymentMonth, parseInvoiceMonthFilter} from './invoiceFilters.js';
+import {invoiceEmissionMonth, invoicePaymentMonth, parseInvoiceMonthFilter, invoiceListOrder} from './invoiceFilters.js';
 
 describe('invoice list month filter', () => {
     it('treats missing and explicit "all" values as no restriction', () => {
@@ -34,5 +34,25 @@ describe('invoice list month filter', () => {
         assert.equal(invoiceEmissionMonth('2026-08-31'), '2026-08');
         assert.equal(invoicePaymentMonth('2026-09-01'), '2026-09');
         assert.equal(invoicePaymentMonth(null), '');
+    });
+});
+
+describe('invoice list ordering', () => {
+    it('defaults to newest dates and descending numeric document ties with a stable ID', () => {
+        assert.deepEqual(invoiceListOrder(), [['emissionDate', 'DESC NULLS LAST'], ['documentYear', 'DESC NULLS LAST'], ['documentNumber', 'DESC NULLS LAST'], ['id', 'ASC']]);
+        assert.deepEqual(invoiceListOrder('date', 'asc'), [['emissionDate', 'ASC NULLS LAST'], ['documentYear', 'DESC NULLS LAST'], ['documentNumber', 'DESC NULLS LAST'], ['id', 'ASC']]);
+    });
+    it('sorts year and number together for documents and retains latest date ties', () => {
+        for (const [direction, sqlDirection] of [['asc', 'ASC NULLS LAST'], ['desc', 'DESC NULLS LAST']]) {
+            assert.deepEqual(invoiceListOrder('document', direction), [['documentYear', sqlDirection], ['documentNumber', sqlDirection], ['emissionDate', 'DESC NULLS LAST'], ['id', 'ASC']]);
+        }
+    });
+    it('rejects unknown, repeated or structured ordering values instead of accepting SQL fragments', () => {
+        for (const invalid of [null, '', 'createdAt', 'DATE', 'date; DROP TABLE invoices', ['date'], {sort: 'date'}, 1]) {
+            assert.equal(invoiceListOrder(invalid, 'desc'), null);
+        }
+        for (const invalid of [null, '', 'descending', 'DESC', ['asc'], {direction: 'asc'}, 1]) {
+            assert.equal(invoiceListOrder('date', invalid), null);
+        }
     });
 });

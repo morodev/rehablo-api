@@ -5,21 +5,16 @@ import {getGrantedPermissions, getSelectedStructureId} from '../../../middleware
 import {Action, Resource, resolveGrantedScope} from '../../auth/rbac/permissions.js';
 import {Structure, Tenant} from '../../auth/models/index.js';
 import Patient from '../models/patient.model.js';
-import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import {CarePackage, PatientCredit} from '../../administration/models/index.js';
-import {packagePatient, packageSelectedStructure, packageToday, packageUuid} from '../../administration/services/carePackage.service.js';
+import {packagePatient, packageSelectedStructure, packageUuid} from '../../administration/services/carePackage.service.js';
 import {treasuryError} from '../../administration/services/treasuryValidation.service.js';
 import {verifiedPatientCredits} from '../../administration/services/patientCreditBacking.service.js';
 import {paymentMoney} from '../../invoice/services/appointmentPayment.service.js';
+import {CarePackageReadView, decorateCarePackages} from '../../administration/services/carePackageProjection.service.js';
 
 type Plain = Record<string, any>;
 type Domain = 'catalog' | 'legacy' | 'credits';
-export interface CoveragePackage {
-    id: string; quoteId: string | null; templateId: string | null; patientId: string; name: string; status: string;
-    purchasedUnits: number; remainingUnits: number; totalPrice: number; expiresAt: string | null;
-    serviceId: string | null; serviceName: string | null; reservedUnits: number; availableUnits: number;
-    includedInSummary: boolean; canOpen: boolean;
-}
+export interface CoveragePackage extends CarePackageReadView {}
 export interface CoverageCredit {
     id: string; patientId: string; amount: number; remainingAmount: number; status: string;
     sourceType: string | null; sourceId: string | null; expiresAt: string | null;
@@ -28,7 +23,7 @@ export interface CoverageCredit {
 export interface CoveragePosition {
     patientId: string; structureId: string;
     catalog: CoveragePackage[] | null; legacy: CoveragePackage[] | null; credits: CoverageCredit[] | null;
-    packagesSummary: {activeCount: number; remainingUnits: number; availableUnits: number; reservedUnits: number; legacyRemainingUnits: number} | null;
+    packagesSummary: {activeCount: number; remainingUnits: number; availableUnits: number; reservedUnits: number; legacyRemainingUnits: number; pendingSetupUnits?: number} | null;
     creditsSummary: {verifiedRemaining: number; unverifiedCount: number} | null;
     errors: Partial<Record<Domain, string>>;
 }
@@ -55,20 +50,6 @@ export async function resolvePatientCoverageContext(req: Request, transaction?: 
     return {patientId, structureId, patient: model!.get({plain: true})};
 }
 
-function projectPackage(row: Plain, legacy: boolean, reservedUnits: number, today: string): CoveragePackage {
-    const remainingUnits = Math.max(0, Number(row.remainingUnits) || 0);
-    const expiresAt = row.expiresAt ? String(row.expiresAt).slice(0, 10) : null;
-    const includedInSummary = row.status === 'ACTIVE' && remainingUnits > 0 && (!expiresAt || expiresAt >= today);
-    const validToday = includedInSummary && (!row.purchasedAt || String(row.purchasedAt).slice(0, 10) <= today);
-    return {id: row.id, quoteId: row.quoteId ?? null, templateId: row.templateId ?? null, patientId: row.patientId,
-        name: row.name, status: row.status === 'ACTIVE' && expiresAt && expiresAt < today ? 'EXPIRED' : row.status,
-        purchasedUnits: Number(row.purchasedUnits) || 0, remainingUnits, totalPrice: Number(row.totalPrice) || 0, expiresAt,
-        serviceId: row.serviceId ?? null, serviceName: row.serviceName ?? null,
-        reservedUnits: legacy ? 0 : reservedUnits,
-        availableUnits: !legacy && validToday ? Math.max(0, remainingUnits - reservedUnits) : 0,
-        includedInSummary, canOpen: !legacy};
-}
-
 /** One canonical, unpaginated snapshot supplies both the coverage list and its totals. */
 export async function patientCoveragePosition(req: Request, context: CoverageContext,
     options: {transaction?: Transaction; administrationEnabled?: boolean; catalogAuthorized?: boolean} = {}): Promise<CoveragePosition> {
@@ -77,9 +58,9 @@ export async function patientCoveragePosition(req: Request, context: CoverageCon
     const enabled = options.administrationEnabled ?? ((await Tenant.findByPk(getCurrentTenantId(req),
         {attributes: ['featureFlags'], transaction: options.transaction}))?.get('featureFlags') as {administration?: boolean} | undefined)?.administration === true;
     if (!enabled || getSelectedStructureId(req) !== context.structureId || context.patient.structureId !== context.structureId) return result;
-    const schema = req.tenantSchema!, transaction = options.transaction, today = packageToday();
+    const schema = req.tenantSchema!, transaction = options.transaction;
     const unavailable = (domain: Domain) => {result.errors[domain] = ({catalog: 'Non è stato possibile caricare i pacchetti.',
-        legacy: 'Non è stato possibile caricare i pacchetti precedenti.', credits: 'Non è stato possibile caricare i crediti.'})[domain];};
+        legacy: 'Non è stato possibile caricare questi pacchetti.', credits: 'Non è stato possibile caricare i crediti.'})[domain];};
     const authorizePackages = async (resource: 'care_package' | 'quote'): Promise<boolean> => {
         if (!grantedScope(req, resource, 'read')) return false;
         try {
@@ -99,13 +80,7 @@ export async function patientCoveragePosition(req: Request, context: CoverageCon
             const packages = (await CarePackage.schema(schema).findAll({where: {patientId: context.patientId,
                 structureId: context.structureId, templateId: legacy ? null : {[Op.ne]: null}},
                 order: [['createdAt', 'DESC'], ['id', 'ASC']], transaction})).map(model => model.get({plain: true}) as Plain);
-            const ids = packages.map(pkg => pkg.id);
-            const reservations = !legacy && ids.length ? await AgendaEvent.schema(schema).findAll({where: {
-                carePackageId: {[Op.in]: ids},
-                packageReservationStatus: 'RESERVED'}, attributes: ['carePackageId'], transaction}) : [];
-            const counts = new Map<string, number>();
-            for (const event of reservations) {const id = String(event.get('carePackageId')); counts.set(id, (counts.get(id) ?? 0) + 1);}
-            result[domain] = packages.map(pkg => projectPackage(pkg, legacy, counts.get(String(pkg.id)) ?? 0, today));
+            result[domain] = await decorateCarePackages(req, packages, {transaction, patientNames: false});
         } catch (error) {
             if (transaction) throw error;
             unavailable(domain);
@@ -143,9 +118,11 @@ export async function patientCoveragePosition(req: Request, context: CoverageCon
         const legacy = (result.legacy ?? []).filter(pkg => pkg.includedInSummary);
         result.packagesSummary = {activeCount: catalog.length + legacy.length,
             remainingUnits: [...catalog, ...legacy].reduce((sum, pkg) => sum + pkg.remainingUnits, 0),
-            availableUnits: catalog.reduce((sum, pkg) => sum + pkg.availableUnits, 0),
-            reservedUnits: catalog.reduce((sum, pkg) => sum + pkg.reservedUnits, 0),
-            legacyRemainingUnits: legacy.reduce((sum, pkg) => sum + pkg.remainingUnits, 0)};
+            availableUnits: [...catalog, ...legacy].reduce((sum, pkg) => sum + pkg.availableUnits, 0),
+            reservedUnits: [...catalog, ...legacy].reduce((sum, pkg) => sum + pkg.reservedUnits, 0),
+            legacyRemainingUnits: legacy.reduce((sum, pkg) => sum + pkg.remainingUnits, 0),
+            ...([...catalog, ...legacy].some(pkg => pkg.booking.status === 'NEEDS_SETUP') ? {pendingSetupUnits: [...catalog, ...legacy]
+                .filter(pkg => pkg.booking.status === 'NEEDS_SETUP').reduce((sum, pkg) => sum + pkg.remainingUnits, 0)} : {})};
     }
     return result;
 }

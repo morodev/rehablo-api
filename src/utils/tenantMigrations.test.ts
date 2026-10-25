@@ -8,7 +8,7 @@ import {
     registerTenantScopedModel, warmTenantSchemas
 } from './tenantSchema.js';
 import {
-    SOCIAL_SECURITY_PRICING_VERSION, ACTIVITIES_REVIEW_VERSION, APPOINTMENT_LEDGER_VERSION, prepareTenantPaymentHistory, runTenantMigrations,
+    PACKAGE_BOOKING_SERVICES_VERSION, SOCIAL_SECURITY_PRICING_VERSION, ACTIVITIES_REVIEW_VERSION, APPOINTMENT_LEDGER_VERSION, prepareTenantPaymentHistory, runTenantMigrations,
     PATIENT_DEFAULT_EVENT_TYPE_VERSION, TENANT_MODEL_BASELINE_VERSION, APPOINTMENT_PRICE_ADJUSTMENTS_VERSION,
     CATALOG_STRUCTURE_AVAILABILITY_VERSION, ADMINISTRATION_SEED_VERSION, WORK_ITEM_ASSIGNEES_VERSION,
     ACTIVITIES_FOUNDATION_VERSION, ACTIVITIES_DELIVERY_VERSION, PATIENT_SETTLEMENTS_VERSION, CARE_PACKAGE_PURCHASES_VERSION
@@ -95,7 +95,7 @@ beforeEach(() => {
             ...(legacyBaselineApplied ? [{version: '20260907-tenant-model-baseline-v1'}] : []),
             ...(baselineApplied ? [{version: TENANT_MODEL_BASELINE_VERSION}] : [])
         ]];
-        if (sql.startsWith('INSERT INTO') && [SOCIAL_SECURITY_PRICING_VERSION, ACTIVITIES_REVIEW_VERSION].includes(options?.replacements?.version)) {
+        if (sql.startsWith('INSERT INTO') && [PACKAGE_BOOKING_SERVICES_VERSION, SOCIAL_SECURITY_PRICING_VERSION, ACTIVITIES_REVIEW_VERSION].includes(options?.replacements?.version)) {
             extraVersions.add(options.replacements.version);
         }
         if (sql.startsWith('INSERT INTO') && options?.replacements?.version === APPOINTMENT_LEDGER_VERSION) {

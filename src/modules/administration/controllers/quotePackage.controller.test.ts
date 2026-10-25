@@ -209,7 +209,8 @@ it('filters the historical list by package ID for a quote-only user', async t =>
     const result = await history(request({legacy: 'true', packageId}));
     assert.equal(result.status, 200, result.message); assert.equal(result.data.total, 1);
     assert.deepEqual(result.data.items.map((row: any) => row.id), [packageId]);
-    assert.equal(Object.hasOwn(result.data.items[0], 'balance'), false);
+    assert.equal(result.data.items[0].balance, null, 'Unknown historical money must remain unknown');
+    assert.equal(result.data.items[0].paidAmount, null); assert.equal(result.data.items[0].paymentStatus, null);
 });
 
 it('keeps package ID filtering additive to structure, patient, status and legacy scopes', async t => {

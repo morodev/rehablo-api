@@ -24,3 +24,12 @@ export function invoiceEmissionMonth(emissionDate: unknown): string {
 export function invoicePaymentMonth(paidAt: unknown): string {
     return String(paidAt ?? '').slice(0, 7);
 }
+
+/** Whitelisted SQL ordering shared by all pages of the invoice list. */
+export function invoiceListOrder(sort: unknown = 'date', direction: unknown = 'desc'): import('sequelize').Order | null {
+    if (sort !== 'date' && sort !== 'document' || direction !== 'asc' && direction !== 'desc') return null;
+    const selectedDirection = direction === 'asc' ? 'ASC NULLS LAST' : 'DESC NULLS LAST';
+    return sort === 'document'
+        ? [['documentYear', selectedDirection], ['documentNumber', selectedDirection], ['emissionDate', 'DESC NULLS LAST'], ['id', 'ASC']]
+        : [['emissionDate', selectedDirection], ['documentYear', 'DESC NULLS LAST'], ['documentNumber', 'DESC NULLS LAST'], ['id', 'ASC']];
+}

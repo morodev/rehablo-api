@@ -27,6 +27,7 @@ import { reportStructureWhere, resolveReportScope } from '../../reports/services
 import { resolveAdministrationDateRange, romeToday } from '../services/administrationQuery.service.js';
 import { ensureNoPendingQuoteDelivery, loadScopedQuote, revokeQuoteLinks } from '../services/quoteDelivery.service.js';
 import { lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
+import {ensurePackageBooking} from '../services/packageBooking.service.js';
 
 type AdminModel = ModelStatic<Model>;
 interface EntitySpec {
@@ -412,6 +413,7 @@ const createPackageFromQuote = asyncHandler(async (req, res) => {
             purchasedUnits: units, remainingUnits: units, totalPrice: quote.get('total'), lines: quote.get('lines'),
             expiresAt: null, notes: source['notes'] ?? null
         }, { transaction });
+        await ensurePackageBooking(carePackage, transaction, req.access?.userId);
         return { carePackage, reused: false };
     });
     if ('error' in result) return sendErrorResponse(res, result.error ?? 409, result.message ?? 'Pacchetto non disponibile');
@@ -437,7 +439,7 @@ const consumePackage = asyncHandler(async (req, res) => {
         await lockPatientSettlement(req.tenantSchema!, String(snapshot.get('patientId')), transaction);
         const pack = await Pack.findOne({ where: { id: req.params.id, ...structureWhere(req, SPECS.carePackages) }, transaction, lock: transaction.LOCK.UPDATE });
         if (!pack || pack.get('status') !== 'ACTIVE') return null;
-        if (pack.get('templateId')) throw Object.assign(new Error('Le sedute dei nuovi pacchetti si utilizzano segnando l’appuntamento come effettuato in agenda.'), {statusCode: 409});
+        if (pack.get('templateId') || (pack.get('purchaseSnapshot') as any)?.booking) throw Object.assign(new Error('Le sedute dei nuovi pacchetti si utilizzano segnando l’appuntamento come effettuato in agenda.'), {statusCode: 409});
         if (String(pack.get('patientId')) !== String(snapshot.get('patientId'))) throw Object.assign(new Error('Il paziente del pacchetto è cambiato: ricarica'), { statusCode: 409 });
         const remaining = Number(pack.get('remainingUnits'));
         if (units > remaining) throw Object.assign(new Error('Sedute residue insufficienti'), { statusCode: 409 });

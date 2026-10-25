@@ -33,7 +33,7 @@ import { buildSistemaTSRecord, generateSistemaTSXml, SistemaTSRecord } from '../
 import { InvoiceLineLike, invoiceRoutingLines } from '../utils/invoiceFatturaPa.js';
 import { buildSdiPayloadFromInvoice } from '../../administration/services/fiscalPayload.js';
 import { resolveFiscalRouting } from '../../administration/services/fiscalRouting.service.js';
-import { invoiceEmissionMonth, invoicePaymentMonth, parseInvoiceMonthFilter } from '../utils/invoiceFilters.js';
+import { invoiceEmissionMonth, invoicePaymentMonth, parseInvoiceMonthFilter, invoiceListOrder } from '../utils/invoiceFilters.js';
 import { decorateInvoicesWithPayments, syncInvoicePaymentStatus } from '../services/payment.service.js';
 import { appointmentPricesByEvent, ensureAppointmentPaymentHistory, isValidPaymentDate, linkAppointmentPayments } from '../services/appointmentPayment.service.js';
 import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
@@ -1111,6 +1111,8 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
     const paymentState = String(req.query.paymentState ?? 'all');
     const dueState = String(req.query.dueState ?? 'all');
     const month = parseInvoiceMonthFilter(req.query.month);
+    const order = invoiceListOrder(req.query.sort, req.query.direction);
+    if (!order) return sendErrorResponse(res, 400, 'Ordinamento fatture non valido');
     if (!['all', 'unpaid', 'partial', 'paid', 'void'].includes(paymentState)) {
         return sendErrorResponse(res, 400, 'Filtro stato pagamento non valido');
     }
@@ -1129,7 +1131,7 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
             { model: InvoiceServiceScoped, as: 'services' },
             { model: InvoiceAgendaEventScoped, as: 'appointmentLinks' }
         ],
-        order: [['emissionDate', 'DESC']]
+        order
     });
 
     const allInvoices = await attachInvoicePatients(schema, await decorateInvoicesWithPayments(schema, rows));

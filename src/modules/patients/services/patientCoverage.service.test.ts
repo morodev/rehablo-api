@@ -5,6 +5,9 @@ import {CarePackage, PatientCredit, TreasuryMovement} from '../../administration
 import {Structure, Tenant} from '../../auth/models/index.js';
 import Patient from '../models/patient.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
+import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
+import {Quote} from '../../administration/models/index.js';
+import {sequelize} from '../../../config/database.js';
 import patientRouter from '../routes/patient.routes.js';
 import {getPatientCoveragePosition} from '../controllers/patientCoverage.controller.js';
 import {patientCoveragePosition, resolvePatientCoverageContext} from './patientCoverage.service.js';
@@ -23,7 +26,9 @@ const pkg = (n: number, extra: Record<string, any> = {}) => ({id: id(n), patient
     totalPrice: 400, purchasedAt: '2020-01-01', expiresAt: null, status: 'ACTIVE', ...extra});
 
 function fixture(t: TestContext) {
-    const packages: any[] = [], credits: any[] = [], ledger: any[] = [], events: any[] = [];
+    const packages: any[] = [], credits: any[] = [], ledger: any[] = [], events: any[] = [], quotes: any[] = [];
+    t.mock.method(sequelize, 'query', (async () => {throw new Error('Unmocked SQL is forbidden in coverage unit tests');}) as any);
+    t.mock.method(InvoicePayment, 'schema', (() => ({findAll: async () => []})) as any);
     const patients = [{...context.patient}];
     const faults: {catalog?: boolean; legacy?: boolean; credits?: boolean; backing?: boolean} = {};
     const packageReads: any[] = [], patientReads: any[] = [], ledgerReads: any[] = [];
@@ -46,7 +51,8 @@ function fixture(t: TestContext) {
             return value == null ? actual == null : actual === value;
         });
     }
-    t.mock.method(Patient, 'schema', (() => ({findOne: async (options: any) => {
+    t.mock.method(Quote, 'schema', (() => ({findAll: async (options: any) => quotes.filter(row => matches(row, options.where)).map(record)})) as any);
+    t.mock.method(Patient, 'schema', (() => ({findAll: async (options: any) => patients.filter(row => matches(row, options.where)).map(record), findOne: async (options: any) => {
         patientReads.push(options);
         const row = patients.find(row => matches(row, options.where)); return row ? record(row) : null;
     }})) as any);
@@ -69,15 +75,15 @@ function fixture(t: TestContext) {
     })) as any);
     t.mock.method(Structure, 'findOne', (async ({where}: any) => where.id === structureId && where.tenantId === tenantId ? record({id: structureId}) : null) as any);
     t.mock.method(Tenant, 'findByPk', (async () => record({featureFlags: {administration: true}})) as any);
-    return {packages, credits, ledger, events, patients, faults, packageReads, patientReads, ledgerReads};
+    return {packages, credits, ledger, events, patients, quotes, faults, packageReads, patientReads, ledgerReads};
 }
 
 it('returns all three counted packages: 30 residual, 20 available and 10 previous sessions', async t => {
-    const f = fixture(t); f.packages.push(pkg(10), pkg(11), pkg(12, {templateId: null, name: 'Preventivo 8'}));
+    const f = fixture(t); f.packages.push(pkg(10), pkg(11), pkg(12, {templateId: null, serviceId: null, name: 'Pacchetto da completare'}));
     const result = await patientCoveragePosition(request(), context);
     assert.equal(result.catalog!.length, 2); assert.equal(result.legacy!.length, 1);
-    assert.deepEqual(result.packagesSummary, {activeCount: 3, remainingUnits: 30, availableUnits: 20, reservedUnits: 0, legacyRemainingUnits: 10});
-    assert.equal(result.legacy![0].availableUnits, 0); assert.equal(result.legacy![0].canOpen, false);
+    assert.deepEqual(result.packagesSummary, {activeCount: 3, remainingUnits: 30, availableUnits: 20, reservedUnits: 0, legacyRemainingUnits: 10, pendingSetupUnits: 10});
+    assert.equal(result.legacy![0].availableUnits, 0); assert.equal(result.legacy![0].canOpen, true);
     assert.equal(result.catalog![0].canOpen, true);
     assert.deepEqual(result.creditsSummary, {verifiedRemaining: 0, unverifiedCount: 0});
 });
@@ -120,7 +126,8 @@ it('separates catalog and quote permissions and never turns an unauthorized doma
     assert.equal(catalogOnly.catalog!.length, 1); assert.equal(catalogOnly.legacy, null); assert.equal(catalogOnly.credits, null);
     assert.equal(catalogOnly.creditsSummary, null); assert.equal(catalogOnly.packagesSummary!.remainingUnits, 10);
     const quoteOnly = await patientCoveragePosition(request(['quote:read:structure']), context);
-    assert.equal(quoteOnly.catalog, null); assert.equal(quoteOnly.legacy!.length, 1); assert.equal(quoteOnly.packagesSummary!.availableUnits, 0);
+    assert.equal(quoteOnly.catalog, null); assert.equal(quoteOnly.legacy!.length, 1); assert.equal(quoteOnly.packagesSummary!.availableUnits, 10);
+    assert.equal(quoteOnly.legacy![0].booking.status, 'READY');
     const noAccess = await patientCoveragePosition(request([]), context);
     assert.equal(noAccess.packagesSummary, null); assert.equal(noAccess.creditsSummary, null);
 });
@@ -221,4 +228,73 @@ it('returns the controller data envelope and keeps the administration feature ga
     t.mock.method(Tenant, 'findByPk', (async () => record({featureFlags: {administration: false}})) as any);
     const route = (patientRouter as any).stack.find((layer: any) => layer.route?.path === '/patient/:patientId/coverage-position').route;
     assert.equal((await invoke(route.stack[1].handle, request())).statusCode, 403);
+});
+
+it('uses the same booking projection for ready quote sessions and pending setup units without duplicating residuals', async t => {
+    const f = fixture(t);
+    f.packages.push(pkg(10), pkg(11, {templateId: null, quoteId: id(80), name: 'Preventivo terapia', totalPrice: 300}),
+        pkg(12, {templateId: null, serviceId: null, name: 'Dati da completare', purchasedUnits: 5, remainingUnits: 5, totalPrice: 0}));
+    f.quotes.push({id: id(80), patientId, structureId, number: 9, year: 2026});
+    f.events.push({id: id(40), carePackageId: id(11), carePackageServiceId: id(7), packageReservationStatus: 'RESERVED'},
+        {id: id(41), carePackageId: id(11), carePackageServiceId: id(7), packageReservationStatus: 'RESERVED'});
+    const result = await patientCoveragePosition(request(['care_package:read:structure', 'quote:read:structure', 'agenda:create:own']), context);
+    assert.deepEqual(result.packagesSummary, {activeCount: 3, remainingUnits: 25, availableUnits: 18, reservedUnits: 2, legacyRemainingUnits: 15, pendingSetupUnits: 5});
+    const quote = result.legacy!.find(row => row.id === id(11))!;
+    assert.equal(quote.origin, 'QUOTE'); assert.equal(quote.canOpen, true); assert.equal(quote.canOpenQuote, true); assert.equal(quote.quoteNumber, 'PRV-2026/0009');
+    assert.equal(quote.booking.status, 'READY'); assert.equal(quote.booking.services[0].reservedUnits, 2); assert.equal(quote.booking.services[0].availableUnits, 8);
+    assert.equal(quote.canBook, true); assert.equal(quote.totalPrice, 300); assert.equal(quote.paidAmount, null); assert.equal(quote.balance, null);
+    const pending = result.legacy!.find(row => row.id === id(12))!;
+    assert.equal(pending.origin, 'OTHER'); assert.equal(pending.totalPrice, null); assert.equal(pending.booking.status, 'NEEDS_SETUP');
+    assert.equal(pending.availableUnits, 0); assert.equal(pending.canBook, false);
+});
+
+it('does not invent per-service balances for a historical multi-service package with unallocated past use', async t => {
+    const f = fixture(t); f.packages.push(pkg(10, {templateId: null, quoteId: id(80), purchasedUnits: 10, remainingUnits: 7,
+        lines: [{itemType: 'SERVICE', itemId: id(7), description: 'Terapia A', quantity: 5},
+            {itemType: 'SERVICE', itemId: id(8), description: 'Terapia B', quantity: 5}]}));
+    const result = await patientCoveragePosition(request(), context), purchase = result.legacy![0];
+    assert.equal(purchase.booking.status, 'NEEDS_SETUP'); assert.deepEqual(purchase.booking.services, []);
+    assert.equal(purchase.booking.unallocatedConsumedUnits, 3); assert.equal(purchase.remainingUnits, 7); assert.equal(purchase.availableUnits, 0);
+    assert.equal(result.packagesSummary!.remainingUnits, 7); assert.equal(result.packagesSummary!.pendingSetupUnits, 7);
+});
+
+it('reserves unclassified sessions conservatively for every service without duplicating the global reservation count', async t => {
+    const f = fixture(t);
+    f.packages.push(pkg(10, {templateId: null, purchasedUnits: 10, remainingUnits: 10,
+        lines: [{itemType: 'SERVICE', itemId: id(7), description: 'Terapia A', quantity: 5},
+            {itemType: 'SERVICE', itemId: id(8), description: 'Terapia B', quantity: 5}]}));
+    f.events.push({id: id(40), carePackageId: id(10), carePackageServiceId: null, packageReservationStatus: 'RESERVED'},
+        {id: id(41), carePackageId: id(10), carePackageServiceId: id(99), packageReservationStatus: 'RESERVED'},
+        {id: id(42), carePackageId: id(10), carePackageServiceId: id(7), packageReservationStatus: 'RESERVED'});
+    const result = await patientCoveragePosition(request(['quote:read:structure', 'agenda:create:own']), context);
+    const purchase = result.legacy![0];
+    assert.equal(purchase.booking.status, 'READY'); assert.equal(purchase.remainingUnits, 10);
+    assert.equal(purchase.reservedUnits, 3); assert.equal(purchase.availableUnits, 5); assert.equal(purchase.canBook, true);
+    assert.deepEqual(purchase.booking.services.map(service => [service.reservedUnits, service.availableUnits]), [[3, 2], [2, 3]]);
+    assert.equal(result.packagesSummary!.reservedUnits, 3); assert.equal(result.packagesSummary!.remainingUnits, 10);
+});
+
+it('recognizes a documented decimal zero price while retaining missing historical amounts as null', async t => {
+    const f = fixture(t);
+    f.packages.push(pkg(10, {templateId: null, quoteId: id(80), totalPrice: '0.00'}),
+        pkg(11, {templateId: null, quoteId: id(81), totalPrice: 0}),
+        pkg(12, {templateId: null, quoteId: null, totalPrice: 0}), pkg(13, {totalPrice: -1}));
+    f.quotes.push({id: id(80), patientId, structureId, total: '0.00'}, {id: id(81), patientId, structureId, total: null});
+    const result = await patientCoveragePosition(request(), context);
+    assert.deepEqual(result.legacy!.map(purchase => purchase.totalPrice), [0, null, null]);
+    assert.equal(result.catalog![0].totalPrice, null);
+    assert.ok(result.legacy!.every(purchase => purchase.paidAmount === null && purchase.balance === null && purchase.paymentStatus === null));
+});
+
+
+it('caps every service by the global residual when previous reservations exceed one service quota', async t => {
+    const f = fixture(t);
+    f.packages.push(pkg(10, {templateId: null, purchasedUnits: 6, remainingUnits: 6,
+        lines: [{itemType: 'SERVICE', itemId: id(7), description: 'Terapia A', quantity: 5},
+            {itemType: 'SERVICE', itemId: id(8), description: 'Terapia B', quantity: 1}]}));
+    f.events.push(...[40, 41, 42].map(n => ({id: id(n), carePackageId: id(10), carePackageServiceId: id(8), packageReservationStatus: 'RESERVED'})));
+    const result = await patientCoveragePosition(request(), context), purchase = result.legacy![0];
+    assert.equal(purchase.remainingUnits, 6); assert.equal(purchase.reservedUnits, 3); assert.equal(purchase.availableUnits, 3);
+    assert.deepEqual(purchase.booking.services.map(service => service.availableUnits), [3, 0]);
+    assert.equal(result.packagesSummary!.availableUnits, 3);
 });

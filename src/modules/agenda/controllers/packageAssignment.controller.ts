@@ -2,13 +2,23 @@ import {Op} from 'sequelize';
 import {packagePatient} from '../../administration/services/carePackage.service.js';
 import {asyncHandler} from '../../../utils/asyncHandler.js';
 import {sendErrorResponse, sendSuccessResponse} from '../../../utils/response.js';
-import {getSelectedStructureId, getUserId} from '../../../middleware/rbac.js';
+import {getGrantedPermissions, getSelectedStructureId, getUserId} from '../../../middleware/rbac.js';
+import {resolveGrantedScope} from '../../auth/rbac/permissions.js';
 import Patient from '../../patients/models/patient.model.js';
 import {canAccessAppointmentFinance} from '../services/appointmentFinancialAccess.service.js';
 import AgendaEvent from '../models/agendaEvent.model.js';
 import {eligibleCarePackages, appointmentCarePackageOptions} from '../services/packageAssignment.service.js';
 
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+async function bookingOrigins(req: any, patientId: string, target: {structureId: string; calendarId: string}) {
+    const includeCatalog = canAccessAppointmentFinance(req, target, 'care_package', 'read');
+    let includeLegacy = false;
+    if (req.user?.isSuperAdmin || resolveGrantedScope(getGrantedPermissions(req), 'quote', 'read')) {
+        try {await packagePatient(req, patientId, 'quote', 'read'); includeLegacy = true;}
+        catch (error) {if (![403, 404].includes((error as {statusCode?: number}).statusCode ?? 0)) throw error;}
+    }
+    return {includeCatalog, includeLegacy};
+}
 export const listEligibleCarePackages = asyncHandler(async (req, res) => {
     const patientId = String(req.query.patientId ?? ''), eventTypeId = String(req.query.eventTypeId ?? ''), start = String(req.query.start ?? '');
     const agendaEventId = req.query.agendaEventId ? String(req.query.agendaEventId) : undefined;
@@ -25,7 +35,10 @@ export const listEligibleCarePackages = asyncHandler(async (req, res) => {
     } else if (!canAccessAppointmentFinance(req, {structureId, calendarId}, 'agenda', 'create')) {
         return sendErrorResponse(res, 403, 'Non puoi prenotare su questa agenda.');
     }
-    const items = await eligibleCarePackages(req.tenantSchema!, {patientId, structureId, eventTypeId, start, agendaEventId});
+    if (!canAccessAppointmentFinance(req, {structureId, calendarId}, 'agenda', agendaEventId ? 'update' : 'create')) return sendErrorResponse(res, 403, 'Non puoi prenotare su questa agenda.');
+    const origins = await bookingOrigins(req, patientId, {structureId, calendarId});
+    if (!origins.includeCatalog && !origins.includeLegacy) return sendErrorResponse(res, 403, 'Non puoi consultare i pacchetti per questa agenda.');
+    const items = await eligibleCarePackages(req.tenantSchema!, {patientId, structureId, eventTypeId, start, agendaEventId, ...origins});
     return sendSuccessResponse(res, 200, {items});
 });
 
@@ -73,20 +86,14 @@ export const listAppointmentCarePackageOptions = asyncHandler(async (req, res) =
         }
     }
     const target = {structureId, calendarId};
-    if (!canAccessAppointmentFinance(req, target, 'agenda', agendaEventId ? 'update' : 'create')
-        || !canAccessAppointmentFinance(req, target, 'care_package', 'read')) {
+    if (!canAccessAppointmentFinance(req, target, 'agenda', agendaEventId ? 'update' : 'create')) {
         return sendErrorResponse(res, 403, 'Non puoi consultare i pacchetti per questa agenda.');
     }
-    let includeLegacy = false;
-    try {
-        await packagePatient(req, patientId, 'quote', 'read');
-        includeLegacy = true;
-    } catch (error) {
-        if (![403, 404].includes((error as {statusCode?: number}).statusCode ?? 0)) throw error;
-    }
+    const origins = await bookingOrigins(req, patientId, target);
+    if (!origins.includeCatalog && !origins.includeLegacy) return sendErrorResponse(res, 403, 'Non puoi consultare i pacchetti per questa agenda.');
     const items = await appointmentCarePackageOptions(req.tenantSchema!, {
         patientId, calendarId, structureId, eventTypeId, start, agendaEventId,
-        recurring: req.query.recurring === 'true', includeLegacy, currentEvent
+        recurring: req.query.recurring === 'true', ...origins, currentEvent
     });
     return sendSuccessResponse(res, 200, {items});
 });

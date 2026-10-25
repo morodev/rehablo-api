@@ -40,7 +40,8 @@ it('requires the patient, site, linked service and appointment date of a current
     for(const patch of [{patientId:id(99)},{structureId:id(99)},{recurrence:'FREQ=WEEKLY'},{start:'2026-01-01T10:00:00Z'},{start:'2024-12-31T10:00:00Z'}])
         assert.ok(packageCompatibilityError(pkg,{...event,...patch},serviceId));
     assert.ok(packageCompatibilityError(pkg,event,id(99)));
-    assert.ok(packageCompatibilityError({...pkg,templateId:null},event,serviceId));
+    assert.equal(packageCompatibilityError({...pkg,templateId:null},event,serviceId),null);
+    assert.ok(packageCompatibilityError({...pkg,templateId:null,serviceId:null},event,serviceId));
 });
 it('reserves on saving, preserves a valid move, consumes once on completion, and audits reopening',async t=>{
     const f=fixture(t), event=f.events[0];
@@ -122,7 +123,7 @@ it('returns compatible appointment package choices first and no financial fields
     assert.match(items[1].reason!, /prestazione/);
     assert.equal(items[0].reservedUnits, 1); assert.equal(items[0].availableUnits, 1);
     assert.deepEqual(Object.keys(items[0]).sort(), ['id','name','serviceId','serviceName','purchasedUnits','remainingUnits',
-        'reservedUnits','availableUnits','expiresAt','selectable','reason'].sort());
+        'reservedUnits','availableUnits','expiresAt','selectable','reason','origin','quoteId','booking'].sort());
     assert.equal(f.queries.filter(query => query.table === 'reservations').length, 1);
     assert.deepEqual(f.queries[0].where.patientId, patientId); assert.deepEqual(f.queries[0].where.structureId, structureId);
 });
@@ -191,5 +192,5 @@ it('filters other patients and sites and reveals legacy packages only with expli
     const items = await f.load({includeLegacy: true});
     assert.deepEqual(items.map(row => row.id), [packageId, id(32)]);
     assert.equal(items[1].serviceId, null); assert.equal(items[1].serviceName, null);
-    assert.equal(items[1].selectable, false); assert.match(items[1].reason!, /precedente non è abilitato/);
+    assert.equal(items[1].selectable, false); assert.match(items[1].reason!, /Collega/);
 });

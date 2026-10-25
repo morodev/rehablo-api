@@ -73,7 +73,8 @@ router.get('/administration/care-packages/appointment-options', requirePermissio
 router.get('/administration/care-packages/eligible', requirePermission('care_package', 'read'), listEligibleCarePackages);
 router.get('/administration/care-packages', requireAnyPermission(['care_package', 'read'], ['quote', 'read']), carePackages.listCarePackages);
 router.post('/administration/care-packages', requirePermission('care_package', 'create', 'structure'), carePackages.createCarePackage);
-router.get('/administration/care-packages/:id', requirePermission('care_package', 'read'), carePackages.getCarePackage);
+router.get('/administration/care-packages/:id', requireAnyPermission(['care_package', 'read'], ['quote', 'read']), carePackages.getCarePackage);
+router.post('/administration/care-packages/:id/booking-setup', requirePermission('quote', 'update'), carePackages.setupCarePackageBooking);
 router.post('/administration/care-packages/:id/payments', requirePermission('payment', 'create'), carePackages.createPackagePayment);
 router.post('/administration/care-packages/:id/payments/:paymentId/void', requirePermission('payment_reversal', 'create'), carePackages.voidPackagePayment);
 router.post('/administration/care-packages/:id/invoice', requirePermission('invoice', 'create'), carePackages.createPackageInvoice);

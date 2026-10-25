@@ -599,7 +599,7 @@ export const saveAgendaEvent = asyncHandler(async (req: Request, res: Response) 
         if (await rejectApprovedTimeOffConflict(res, schema, payload)) return null;
         Object.assign(payload, await snapshotAppointmentPrice(schema, payload, transaction), {appointmentPaymentHistoryKnown: true});
         const packageId = payload.carePackageId ?? null;
-        const created = await AgendaEvent.schema(schema).create({...payload, carePackageId: null, packageReservationStatus: null}, {transaction});
+        const created = await AgendaEvent.schema(schema).create({...payload, carePackageId: null, carePackageServiceId: null, packageReservationStatus: null}, {transaction});
         if (packageId) {
             const packagePatch = {carePackageId: packageId};
             await syncPackageAssignment(req, created, packagePatch, transaction, {newEvent: true});
@@ -1340,7 +1340,7 @@ export const updateRecurringEvent = asyncHandler(async (req: Request, res: Respo
 
             Object.assign(newEvent, await snapshotAppointmentPrice(schema, newEvent, transaction), { appointmentPaymentHistoryKnown: true });
             const requestedPackage = newEvent.carePackageId;
-            const created = await AgendaEvent.schema(schema).create({...newEvent, carePackageId: null, packageReservationStatus: null}, {transaction});
+            const created = await AgendaEvent.schema(schema).create({...newEvent, carePackageId: null, carePackageServiceId: null, packageReservationStatus: null}, {transaction});
             if (requestedPackage) {
                 const packagePatch = {carePackageId: requestedPackage};
                 await syncPackageAssignment(req, created, packagePatch, transaction, {newEvent: true});

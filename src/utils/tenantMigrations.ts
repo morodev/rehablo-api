@@ -16,7 +16,8 @@ export const ADMINISTRATION_SEED_VERSION = '20260922-seed-administration';
 export const WORK_ITEM_ASSIGNEES_VERSION = '20261010-work-item-assignees';
 export const ACTIVITIES_FOUNDATION_VERSION = '20261011-activities-foundation';
 // Increment this whenever the tenant model registry changes, so existing schemas run model sync.
-export const TENANT_MODEL_BASELINE_VERSION = '20261023-tenant-model-baseline-v18';
+export const TENANT_MODEL_BASELINE_VERSION = '20261025-tenant-model-baseline-v19';
+export const PACKAGE_BOOKING_SERVICES_VERSION = '20261025-package-booking-services';
 export const CARE_PACKAGE_PURCHASES_VERSION = '20261022-care-package-purchases';
 export const PATIENT_SETTLEMENTS_VERSION = '20261012-patient-settlements';
 export const ACTIVITIES_REVIEW_VERSION = '20261024-activities-review';
@@ -25,6 +26,7 @@ export const SOCIAL_SECURITY_PRICING_VERSION = '20261023-social-security-pricing
 const tenantMigrations: Array<{version: string; module: MigrationModule}> = [
     {version: SOCIAL_SECURITY_PRICING_VERSION, module: require('../../migrations/20261023-social-security-pricing.js')},
     {version: CARE_PACKAGE_PURCHASES_VERSION, module: require('../../migrations/20261022-care-package-purchases.js')},
+    {version: PACKAGE_BOOKING_SERVICES_VERSION, module: require('../../migrations/20261025-package-booking-services.js')},
     {version: PATIENT_SETTLEMENTS_VERSION, module: require('../../migrations/20261012-patient-settlements.js')},
     {version: APPOINTMENT_LEDGER_VERSION, module: require('../../migrations/20260907-unify-appointment-payment-ledger.js')},
     {version: PATIENT_DEFAULT_EVENT_TYPE_VERSION, module: require('../../migrations/20260908-add-patient-default-event-type.js')},

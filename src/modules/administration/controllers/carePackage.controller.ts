@@ -16,8 +16,12 @@ import {saveInvoice} from '../../invoice/controllers/invoice.controller.js';
 import {lockPatientSettlement} from '../../patients/services/patientSettlementPolicy.service.js';
 import {CarePackage, FinancialAccount, PackageConsumption, PackageTemplate, PaymentMethod} from '../models/index.js';
 import {treasuryError} from '../services/treasuryValidation.service.js';
-import {lockPackageOperation, normalizePackageReceipt, packageAccessRequest, packageIdempotency, packageMoneySummary,
+import {lockPackageOperation, normalizePackageReceipt, packageAccessRequest, packageIdempotency,
     packagePatient, packagePatientWhere, packageSelectedStructure, packageService, packageToday, packageUuid, recordPackageReceipt, scopedCarePackage} from '../services/carePackage.service.js';
+
+import {decorateCarePackages} from '../services/carePackageProjection.service.js';
+import {configurePackageBooking} from '../services/packageBooking.service.js';
+import {packageOriginReadWhere, scopedReadableCarePackage} from '../services/carePackage.service.js';
 
 const plain = (row: {get: (options: any) => any}) => row.get({plain: true}) as Record<string, any>;
 function paging(req: Request) {return {page: Math.max(1, Math.trunc(Number(req.query.page)) || 1),
@@ -66,45 +70,33 @@ export const savePackageTemplate = asyncHandler(async (req, res) => {
     return sendSuccessResponse(res, req.params.id ? 200 : 201, plain(result));
 });
 
-async function decoratePackages(req: Request, rows: Array<Record<string, any>>) {
-    if (!rows.length) return [];
-    const ids = rows.map(row => row.id), patientIds = [...new Set(rows.map(row => row.patientId))];
-    const [payments, reservations, patients] = await Promise.all([
-        InvoicePayment.schema(req.tenantSchema!).findAll({where: {carePackageId: {[Op.in]: ids}}}),
-        AgendaEvent.schema(req.tenantSchema!).findAll({where: {carePackageId: {[Op.in]: ids}, packageReservationStatus: 'RESERVED'}, attributes: ['id', 'carePackageId']}),
-        Patient.schema(req.tenantSchema!).findAll({where: {id: {[Op.in]: patientIds}}, attributes: ['id', 'name', 'surname']})
-    ]);
-    return rows.map(row => {
-        const reservedUnits = reservations.filter(event => event.get('carePackageId') === row.id).length;
-        const patient = patients.find(patient => patient.get('id') === row.patientId);
-        const expired = !!row.templateId && row.status === 'ACTIVE' && row.expiresAt && String(row.expiresAt).slice(0, 10) < packageToday();
-        return {...row, status: expired ? 'EXPIRED' : row.status, legacy: !row.templateId, patientName: patient ? [patient.get('name'), patient.get('surname')].filter(Boolean).join(' ') : null,
-            reservedUnits, availableUnits: expired ? 0 : Math.max(0, Number(row.remainingUnits) - reservedUnits),
-            ...(row.templateId ? packageMoneySummary(row, payments.filter(payment => payment.carePackageId === row.id).map(plain)) : {})};
-    });
-}
 export const listCarePackages = asyncHandler(async (req, res) => {
     const {page, limit} = paging(req), legacy = req.query.legacy === 'true';
-    const packageId = legacy && req.query.packageId !== undefined ? packageUuid(req.query.packageId, 'Pacchetto') : null;
+    const origin = req.query.origin;
+    if (origin !== undefined && (typeof origin !== 'string' || !['all', 'catalog', 'quote', 'other'].includes(origin))) treasuryError('Origine del pacchetto non valida', 422);
+    const unified = origin !== undefined;
+    const packageId = (legacy || unified) && req.query.packageId !== undefined ? packageUuid(req.query.packageId, 'Pacchetto') : null;
     const q = String(req.query.q ?? '').trim().slice(0, 150);
     const matchingPatients = q ? await Patient.schema(req.tenantSchema!).findAll({where: {
         [Op.or]: [{name: {[Op.iLike]: `%${q}%`}}, {surname: {[Op.iLike]: `%${q}%`}}]}, attributes: ['id']}) : [];
-    const statusFilter = !legacy && req.query.status === 'EXPIRED' ? {status: 'ACTIVE', expiresAt: {[Op.lt]: packageToday()}}
-        : !legacy && req.query.status === 'ACTIVE' ? {status: 'ACTIVE', [Op.or]: [{expiresAt: null}, {expiresAt: {[Op.gte]: packageToday()}}]}
+    const statusFilter = (!legacy || unified) && req.query.status === 'EXPIRED' ? {status: 'ACTIVE', expiresAt: {[Op.lt]: packageToday()}}
+        : (!legacy || unified) && req.query.status === 'ACTIVE' ? {status: 'ACTIVE', [Op.or]: [{expiresAt: null}, {expiresAt: {[Op.gte]: packageToday()}}]}
         : req.query.status ? {status: String(req.query.status)} : {};
-    const where = {[Op.and]: [packagePatientWhere(req, legacy ? 'quote' : 'care_package'),
-        {templateId: legacy ? null : {[Op.ne]: null}},
+    const originFilter = origin === 'quote' ? {quoteId: {[Op.ne]: null}} : origin === 'catalog' ? {quoteId: null, templateId: {[Op.ne]: null}}
+        : origin === 'other' ? {quoteId: null, templateId: null} : {};
+    const where = {[Op.and]: [packageOriginReadWhere(req, unified ? 'all' : legacy ? 'legacy' : 'catalog'),
+        originFilter,
         ...(packageId ? [{id: packageId}] : []),
         ...(req.query.patientId ? [{patientId: packageUuid(req.query.patientId, 'Paziente')}] : []),
         statusFilter,
         ...(q ? [{[Op.or]: [{name: {[Op.iLike]: `%${q}%`}}, {patientId: {[Op.in]: matchingPatients.map(row => String(row.get('id')))}}]}] : [])]};
     const result = await CarePackage.schema(req.tenantSchema!).findAndCountAll({where, limit, offset: (page - 1) * limit, order: [['createdAt', 'DESC'], ['id', 'ASC']]});
-    return sendSuccessResponse(res, 200, {items: await decoratePackages(req, result.rows.map(plain)), total: result.count, page, limit});
+    return sendSuccessResponse(res, 200, {items: await decorateCarePackages(req, result.rows.map(plain)), total: result.count, page, limit});
 });
 export async function carePackageDetail(req: Request, id: string) {
-    const pack = await scopedCarePackage(req, id);
+    const pack = await scopedReadableCarePackage(req, id);
     const [[detail], payments, appointments, consumptions] = await Promise.all([
-        decoratePackages(req, [plain(pack)]),
+        decorateCarePackages(req, [plain(pack)], {setupOptions: true}),
         InvoicePayment.schema(req.tenantSchema!).findAll({where: {carePackageId: id}, order: [['createdAt', 'DESC']]}),
         AgendaEvent.schema(req.tenantSchema!).findAll({where: {carePackageId: id}, attributes: ['id', 'start', 'end', 'title', 'status', 'carePackageId', 'packageReservationStatus'], order: [['start', 'ASC']]}),
         PackageConsumption.schema(req.tenantSchema!).findAll({where: {packageId: id}, order: [['consumedAt', 'DESC']]})
@@ -191,3 +183,18 @@ export const createPackageInvoice = (req: Request, res: any, next: any) => {
     try {packageIdempotency(req); req.body = {carePackageId: packageUuid(req.params.id)}; return saveInvoice(req, res, next);}
     catch (error) {return next(error);}
 };
+
+export const setupCarePackageBooking = asyncHandler(async (req, res) => {
+    const id = packageUuid(req.params.id, 'Pacchetto');
+    await scopedReadableCarePackage(req, id);
+    const where = {[Op.and]: [{id, templateId: null}, packagePatientWhere(req, 'quote', 'update')]};
+    const snapshot = await CarePackage.schema(req.tenantSchema!).findOne({where});
+    if (!snapshot) treasuryError('Pacchetto non trovato o non accessibile', 404);
+    await sequelize.transaction(async transaction => {
+        await lockPatientSettlement(req.tenantSchema!, String(snapshot!.get('patientId')), transaction);
+        const pack = await CarePackage.schema(req.tenantSchema!).findOne({where, transaction, lock: transaction.LOCK.UPDATE});
+        if (!pack || pack.get('patientId') !== snapshot!.get('patientId')) treasuryError('Pacchetto cambiato o non accessibile', 409);
+        await configurePackageBooking(req, pack!, req.body, transaction);
+    });
+    return sendSuccessResponse(res, 200, await carePackageDetail(req, id));
+});

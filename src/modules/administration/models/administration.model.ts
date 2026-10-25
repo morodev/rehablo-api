@@ -137,6 +137,7 @@ export class PackageConsumption extends Model {}
 PackageConsumption.init({
     id,
     packageId: uuid(false),
+    serviceId: uuid(),
     type: { ...text(false), defaultValue: 'CONSUME' }, reversalOfId: { ...uuid(), unique: true },
     agendaEventId: uuid(),
     units: money(false, 1),

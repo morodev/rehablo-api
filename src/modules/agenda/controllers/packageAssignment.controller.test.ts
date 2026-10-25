@@ -124,7 +124,7 @@ it('appointment options expose legacy only when existing quote patient scope adm
     response = await f.run();
     assert.equal(response.body.data.items.length, 2);
     assert.equal(response.body.data.items[1].selectable, false);
-    assert.match(response.body.data.items[1].reason, /precedente non è abilitato/);
+    assert.match(response.body.data.items[1].reason, /Collega/);
 });
 
 it('appointment options mark recurring requests unavailable instead of omitting patient packages', async t => {
@@ -145,4 +145,14 @@ it('mounts contextual package options before the ID route and retains the unchan
     options.stack[0].handle({user: {sub: operatorId, sid: structureId, perms: ['agenda:create:own']}},
         {status(code: number) {denied = code; return this;}, json() {}}, () => {next = true;});
     assert.equal(denied, 403); assert.equal(next, false);
+});
+
+it('appointment options allow quote-only patient scope on an agenda authorized for a colleague', async t => {
+    const f = appointmentOptionsFixture(t); f.allowLegacy();
+    f.req.user.perms = ['agenda:create:structure', 'quote:read:own']; f.req.query.calendarId = secretaryId;
+    Object.assign(f.packages[1], {quoteId: id(80), purchasedUnits: 5, remainingUnits: 5,
+        lines: [{itemType: 'SERVICE', itemId: id(7), description: 'Fisio', quantity: 5}]});
+    const response = await f.run(); assert.equal(response.status, 200);
+    assert.equal(response.body.data.items.length, 1); assert.equal(response.body.data.items[0].id, id(12));
+    assert.equal(response.body.data.items[0].selectable, true); assert.equal(response.body.data.items[0].origin, 'QUOTE');
 });

@@ -114,3 +114,27 @@ export async function recordPackageReceipt(req: Request, pack: Model, input: Pac
     if (pack.get('invoiceId')) await syncInvoicePaymentStatus(schema, String(pack.get('invoiceId')), transaction);
     return payment;
 }
+
+
+export type CarePackageOrigin = 'CATALOG' | 'QUOTE' | 'OTHER';
+export function carePackageOrigin(pack: Record<string, any>): CarePackageOrigin {return pack.quoteId ? 'QUOTE' : pack.templateId ? 'CATALOG' : 'OTHER';}
+/** Origin labels do not change the existing template/non-template authorization buckets. */
+export function packageOriginReadWhere(req: Request, mode: 'all' | 'catalog' | 'legacy' = 'all') {
+    const branches: object[] = [];
+    for (const [resource, templateId] of [['care_package', {[Op.ne]: null}], ['quote', null]] as const) {
+        if (mode === 'catalog' && resource !== 'care_package' || mode === 'legacy' && resource !== 'quote') continue;
+        try {branches.push({[Op.and]: [packagePatientWhere(req, resource, 'read'), {templateId}]});}
+        catch (error) {if ((error as {statusCode?: number}).statusCode !== 403) throw error;}
+    }
+    if (!branches.length) treasuryError('Non sei autorizzato a consultare questi pacchetti', 403);
+    return {[Op.or]: branches};
+}
+export function packagePatientIdentityWhere(req: Request, resource: Resource, action: Action) {
+    return {[Op.and]: [packagePatientScope(packageAccessRequest(req, resource, action), 'id'), {structureId: packageSelectedStructure(req)}]};
+}
+export async function scopedReadableCarePackage(req: Request, id: unknown, transaction?: Transaction, lock = false): Promise<Model> {
+    const pack = await CarePackage.schema(req.tenantSchema!).findOne({where: {[Op.and]: [{id: packageUuid(id, 'Pacchetto')}, packageOriginReadWhere(req)]},
+        transaction, ...(lock && transaction ? {lock: transaction.LOCK.UPDATE} : {})});
+    if (!pack) treasuryError('Pacchetto non trovato o non accessibile', 404);
+    return pack;
+}
