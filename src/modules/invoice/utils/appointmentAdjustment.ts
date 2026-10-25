@@ -1,6 +1,16 @@
 export type AppointmentPriceAdjustment = 'DISCOUNT' | 'COMPLIMENTARY' | null;
 
-export class AppointmentAdjustmentError extends Error {}
+export class AppointmentAdjustmentError extends Error {
+    constructor(message: string, public readonly status = 400) {super(message);}
+}
+
+export interface AppointmentPricingInput {
+    adjustment: AppointmentPriceAdjustment;
+    discountAmount?: number | null;
+    note?: string | null;
+    baseAmount?: number;
+    confirmHistory?: boolean;
+}
 
 const money = (value: number) => Math.round((value + Number.EPSILON) * 100) / 100;
 
@@ -33,4 +43,24 @@ export function resolveAppointmentAdjustment(
     }
     return { adjustment: adjustment as AppointmentPriceAdjustment, amount,
         netAmount: vatRate === null || amount === null ? null : money(amount / (1 + vatRate / 100)) };
+}
+
+/** Defining a price and confirming old receipts are independent decisions. */
+export function resolveAppointmentPricing(originalAmount: number | null,
+    input: {adjustment: unknown; discountAmount?: unknown; baseAmount?: unknown; confirmHistory?: unknown},
+    paidAmount: number, vatRate: number | null, historyKnown: boolean) {
+    if (input.confirmHistory !== undefined && typeof input.confirmHistory !== 'boolean') {
+        throw new AppointmentAdjustmentError('La conferma dello storico non è valida');
+    }
+    if (input.baseAmount !== undefined) {
+        if (originalAmount !== null) throw new AppointmentAdjustmentError('Il prezzo è già definito. Ricarica la seduta prima di proseguire.', 409);
+        const amount = input.baseAmount;
+        if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0.01 || amount > 99999999.99
+            || Math.abs(amount * 100 - Math.round(amount * 100)) > 0.000001) {
+            throw new AppointmentAdjustmentError('Inserisci un prezzo maggiore di zero, con al massimo due decimali. Per azzerarlo scegli Omaggio');
+        }
+        originalAmount = money(amount);
+    }
+    return {...resolveAppointmentAdjustment(originalAmount, input.adjustment, input.discountAmount, paidAmount, vatRate),
+        originalAmount, historyKnown: historyKnown || input.confirmHistory === true};
 }

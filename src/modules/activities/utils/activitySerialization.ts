@@ -65,6 +65,12 @@ export function serializeActivity(
         due,
         alert: options.alert?.scheduledAt ? {...serializeAlert(options.alert)!, ...(options.deliveryState ? {deliveryState: options.deliveryState} : {})} : null,
         assigneeIds,
+        reviewerUserId: activity.reviewerUserId ?? null,
+        reviewer: activity.reviewerUserId ? person(options.people?.get(activity.reviewerUserId))
+            ?? {id: activity.reviewerUserId, name: null, surname: null, eligible: false} : null,
+        reviewStatus: activity.reviewStatus ?? 'not_requested',
+        reviewApprovedByUserId: activity.reviewApprovedByUserId ?? null,
+        reviewApprovedAt: iso(activity.reviewApprovedAt),
         assignees: assigneeIds.map(id => person(byUser.get(id) ?? options.people?.get(id))
             ?? {id, name: null, surname: null, eligible: false}),
         createdByUserId: activity.createdByUserId,

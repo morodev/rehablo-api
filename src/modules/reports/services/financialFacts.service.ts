@@ -7,7 +7,7 @@ export interface ClinicalCashFact extends Row {
     paidAt: unknown; kind: 'receipt' | 'reversal' | 'refund';
 }
 const money = (value: unknown) => Math.round((Number(value) || 0) * 100) / 100;
-const cashSource = (row: Row) => !['PACKAGE', 'CREDIT'].includes(row.source);
+const cashSource = (row: Row) => !['PACKAGE', 'CREDIT', 'OPENING_BALANCE'].includes(row.source);
 
 /** A read projection only: never repairs dates, writes a mirror, or guesses a refund. */
 export function clinicalCashFacts(payments: Row[], movements: Row[] = [], credits: Row[] = [], creditMovements: Row[] = []) {

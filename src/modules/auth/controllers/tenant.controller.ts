@@ -12,6 +12,7 @@ import { env } from '../../../config/env.js';
 import { signUpSendMail } from '../../../services/email.service.js';
 import { sequelize } from '../../../config/database.js';
 import { TENANT_OWNER_ROLE } from '../rbac/roles.js';
+import {contributionPolicy} from '../../invoice/utils/socialSecurity.js';
 import { isTaxRegimeCode } from '../../invoice/utils/fiscalRegime.js';
 import { Tenant, TenantUser, User, Structure, StructureAvailability } from '../models/index.js';
 import { issueAccountActionToken } from '../services/accountActionToken.service.js';
@@ -172,6 +173,18 @@ export const updateTenant = asyncHandler(async (req: Request, res: Response) => 
         req.body.taxRegime = normalized;
     }
 
+    if (req.body.socialSecurityPricingMode !== undefined || req.body.socialSecurityFund !== undefined || req.body.socialSecurityRate !== undefined) {
+        const current = await Tenant.findByPk(id);
+        try {
+            const policy = contributionPolicy(req.body.socialSecurityFund ?? current?.socialSecurityFund,
+                req.body.socialSecurityPricingMode ?? current?.socialSecurityPricingMode ?? 'EXCLUDED',
+                req.body.socialSecurityRate ?? current?.socialSecurityRate ?? 4);
+            if (policy.fund === 'INPS_GS' && req.body.socialSecurityRate != null && Number(req.body.socialSecurityRate) !== 4)
+                return sendErrorResponse(res, 422, 'La rivalsa INPS Gestione Separata è del 4%');
+        } catch (error) { return sendErrorResponse(res, 422, (error as Error).message); }
+    }
+    if (req.body.withholdingType != null && !['RT01', 'RT02'].includes(req.body.withholdingType)) return sendErrorResponse(res, 422, 'Tipo ritenuta non valido');
+    if (req.body.withholdingCausale != null && req.body.withholdingCausale !== 'A') return sendErrorResponse(res, 422, 'Per le prestazioni professionali selezionare la causale A');
     const [, updated] = await Tenant.update(req.body, { where: { id }, returning: true });
     return sendSuccessResponse(res, 200, updated, 'Tenant updated');
 });

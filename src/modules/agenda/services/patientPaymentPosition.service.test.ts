@@ -116,3 +116,43 @@ describe('buildPatientPaymentPositions', () => {
         });
     });
 });
+
+
+describe('automatic historical payment evidence', () => {
+    const base = {prices: new Map([['legacy', {amount: 50}]]), invoices: [], invoiceSummaries: new Map(),
+        invoiceIdByEventId: new Map(), now: Date.parse('2026-09-08T12:00:00Z')};
+    const legacy = {id: 'legacy', patientId: 'patient-1', start: '2026-08-01T10:00:00Z', status: 'COMPLETED',
+        appointmentPaymentHistoryKnown: false, appointmentPaidAmount: 20, appointmentPaymentStatus: 'partial'};
+    it('recognizes a snapshot without manual verification and does not resurrect it after a VOID row', () => {
+        const position = buildPatientPaymentPositions([reference], {...base, historicalEvents: [legacy], payments: []}).get('current')!;
+        assert.equal(position.outstandingAmount, 30);
+        assert.equal(position.unknownCount, 0);
+        const reversed = buildPatientPaymentPositions([reference], {...base, historicalEvents: [legacy],
+            payments: [{agendaEventId: 'legacy', amount: 20, status: 'VOID'}]}).get('current')!;
+        assert.equal(reversed.outstandingAmount, 50);
+        assert.equal(reversed.items[0].paidAmount, 0);
+    });
+    it('excludes package-covered visits and identifies a catalogue estimate as missing final price', () => {
+        const covered = {...legacy, id: 'covered', carePackageId: 'package', packageReservationStatus: 'CONSUMED'};
+        const position = buildPatientPaymentPositions([reference], {...base, historicalEvents: [covered,
+            {...legacy, appointmentPaymentHistoryKnown: true}], payments: [],
+            prices: new Map([['legacy', {amount: 75, estimated: true}]])}).get('current')!;
+        assert.equal(position.outstandingAmount, 0);
+        assert.equal(position.items.length, 1);
+        assert.equal(position.items[0].issueKind, 'MISSING_PRICE');
+        assert.equal(position.items[0].expectedAmount, null);
+        assert.equal(position.items[0].suggestedAmount, 75);
+    });
+    it('recognizes reverse-only invoice links and distinguishes missing fiscal documents', () => {
+        const bill = {id: 'invoice', agendaEventId: 'legacy', emissionDate: '2026-08-02', documentNumber: 12};
+        const position = buildPatientPaymentPositions([reference], {...base, historicalEvents: [legacy], payments: [],
+            invoices: [bill], invoiceSummaries: new Map([['invoice', {paidAmount: 20, balance: 30,
+                paymentStatus: 'partial' as const, hasUndatedLegacyPayments: false}]])}).get('current')!;
+        assert.equal(position.invoiceCount, 1);
+        assert.equal(position.appointmentCount, 0);
+        assert.equal(position.outstandingAmount, 30);
+        const missing = buildPatientPaymentPositions([reference], {...base, historicalEvents: [{...legacy, invoiceId: 'missing'}], payments: []}).get('current')!;
+        assert.equal(missing.outstandingAmount, 0);
+        assert.equal(missing.items[0].issueKind, 'UNRESOLVED_INVOICE');
+    });
+});

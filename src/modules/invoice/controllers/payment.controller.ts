@@ -200,6 +200,7 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
         if (payment.status !== 'POSTED') return { kind: 'already-void' } as const;
         if (payment.source === 'PACKAGE') return { kind: 'package-coverage' } as const;
         if (payment.source === 'CREDIT') return { kind: 'credit-application' } as const;
+        if (payment.source === 'OPENING_BALANCE' && convertToCredit) return { kind: 'opening-balance' } as const;
 
         const voidedAmount = Number(payment.get('amount')) || 0;
         const patientId = lockedInvoice.get('patientID') as string | null;
@@ -226,7 +227,7 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
             },
             { transaction }
         );
-        if (payment.source === 'APPOINTMENT' && payment.agendaEventId) {
+        if (['APPOINTMENT', 'OPENING_BALANCE'].includes(payment.source) && payment.agendaEventId) {
             const event = await AgendaEvent.schema(schema).findByPk(payment.agendaEventId, {
                 transaction, lock: transaction.LOCK.UPDATE
             });
@@ -247,6 +248,7 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
     if (result.kind === 'already-void') return sendErrorResponse(res, 409, 'Movimento già annullato o trasferito a credito');
     if (result.kind === 'package-coverage') return sendErrorResponse(res, 409, 'La copertura da pacchetto non è uno storno di incasso');
     if (result.kind === 'credit-application') return sendErrorResponse(res, 409, 'La copertura da credito va gestita dal registro crediti');
+    if (result.kind === 'opening-balance') return sendErrorResponse(res, 409, 'Il pagamento precedente non è un nuovo incasso da trasferire a credito');
     if (result.kind === 'credit-unavailable') return sendErrorResponse(res, 409, 'Credito non disponibile: serve un incasso effettivo non rimborsato e una sede associata');
     return sendSuccessResponse(res, 200, result, result.creditCreated ? 'Incasso trasferito a credito del paziente' : 'Pagamento annullato');
 });

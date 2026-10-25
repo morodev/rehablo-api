@@ -1,6 +1,6 @@
 import {
     ACTIVITY_ALERT_CHANNELS, ACTIVITY_PRIORITIES, ACTIVITY_STATUSES, ACTIVITY_TIMEZONE,
-    ActivityAlertInput, ActivityArchiveInput, ActivityChanges, ActivityCreateInput,
+    ActivityAlertInput, ActivityArchiveInput, ActivityReviewInput, ActivityChanges, ActivityCreateInput,
     ActivityDue, ActivityDueFilter, ActivityMoveInput, ActivityPatchInput, ActivityPlacement,
     ActivityPriority, ActivityQuery, ActivityRecord, ActivityRestoreInput, ActivitySchedule,
     ActivityStatus, ActivityView, ActivityChecklistCreateInput, ActivityChecklistPatchInput,
@@ -64,10 +64,12 @@ export function parseChecklistCreateInput(value: unknown): ActivityChecklistCrea
         text: text(input.text, 'text', 300)!, placement: own(input, 'placement') ? checklistPlacement(input.placement) : {kind: 'end'}};
 }
 export function parseChecklistPatchInput(value: unknown): ActivityChecklistPatchInput {
-    const input = object(value, 'body'); whitelist(input, ['operationId', 'expectedVersion', 'changes']);
+    const input = object(value, 'body'); whitelist(input, ['operationId', 'expectedVersion', 'changes', 'allowReopen', 'expectedActivityVersion']);
     const changes = object(input.changes, 'changes'); whitelist(changes, ['text', 'checked'], 'changes');
     if (!Object.keys(changes).length) activityValidationError('changes', 'Indica il testo oppure lo stato da aggiornare.');
     return {operationId: parseActivityId(input.operationId, 'operationId'), expectedVersion: integer(input.expectedVersion, 'expectedVersion', 1),
+        ...(own(input, 'allowReopen') ? {allowReopen: boolean(input.allowReopen, 'allowReopen')} : {}),
+        ...(own(input, 'expectedActivityVersion') ? {expectedActivityVersion: integer(input.expectedActivityVersion, 'expectedActivityVersion', 1)} : {}),
         changes: {...(own(changes, 'text') ? {text: text(changes.text, 'changes.text', 300)!} : {}),
             ...(own(changes, 'checked') ? {checked: boolean(changes.checked, 'changes.checked')} : {})}};
 }
@@ -188,13 +190,14 @@ export function parseActivityAlert(value: unknown): ActivityAlertInput | null {
     return {scheduledAt: parseActivityUtcInstant(alert.scheduledAt, 'alert.scheduledAt'), channels};
 }
 
-const CORE_FIELDS = ['title', 'description', 'priority', 'assigneeIds', 'due', 'alert', 'patientId', 'agendaEventId'] as const;
+const CORE_FIELDS = ['title', 'description', 'priority', 'assigneeIds', 'due', 'alert', 'patientId', 'agendaEventId', 'reviewerUserId'] as const;
 
 function coreChanges(value: Record<string, unknown>, timezone: string): ActivityChanges {
     const changes: ActivityChanges = {};
     if (own(value, 'title')) changes.title = text(value.title, 'title', 200)!;
     if (own(value, 'description')) changes.description = text(value.description, 'description', 5000, false);
     if (own(value, 'priority')) changes.priority = choice(value.priority, ACTIVITY_PRIORITIES, 'priority');
+    if (own(value, 'reviewerUserId')) changes.reviewerUserId = nullableId(value.reviewerUserId, 'reviewerUserId');
     if (own(value, 'assigneeIds')) changes.assigneeIds = ids(value.assigneeIds, 'assigneeIds');
     if (own(value, 'due')) changes.due = parseActivityDue(value.due, timezone);
     if (own(value, 'alert')) changes.alert = parseActivityAlert(value.alert);
@@ -223,6 +226,7 @@ export function parseCreateActivityInput(value: unknown, options: {timezone?: st
         status: own(input, 'status') ? choice(input.status, ACTIVITY_STATUSES, 'status') : 'TODO',
         priority: changes.priority ?? 'NORMAL',
         assigneeIds: changes.assigneeIds ?? options.defaultAssigneeIds ?? [],
+        reviewerUserId: changes.reviewerUserId ?? null,
         due: changes.due ?? null,
         alert: changes.alert ?? null,
         patientId: changes.patientId ?? null,
@@ -252,6 +256,13 @@ function versionedCommand(value: unknown, extra: readonly string[] = []): {input
         expectedVersion: integer(input.expectedVersion, 'expectedVersion', 1),
         expectedOrderRevision: integer(input.expectedOrderRevision, 'expectedOrderRevision')
     }};
+}
+
+export function parseActivityReviewInput(value: unknown): ActivityReviewInput {
+    const {input, base} = versionedCommand(value, ['action', 'expectedChecklistRevision', 'comment']);
+    const action = choice(input.action, ['request', 'approveAndComplete', 'authorizeCompletion', 'returnToProgress'] as const, 'action');
+    return {...base, action, expectedChecklistRevision: integer(input.expectedChecklistRevision, 'expectedChecklistRevision'),
+        ...(action === 'returnToProgress' ? {comment: text(input.comment, 'comment', 5000)!} : {})};
 }
 
 export function parseMoveActivityInput(value: unknown): ActivityMoveInput {
@@ -435,7 +446,6 @@ export function validateActivitySchedule(
     if (schedule.status === 'COMPLETED' || schedule.archivedAt) {
         activityValidationError('alert', "Riapri o ripristina l'attività prima di attivare un avviso.", 'INVALID_ALERT');
     }
-    if (!deadline) activityValidationError('due', "Aggiungi una scadenza prima di attivare l'avviso.", 'INVALID_ALERT');
     if (!schedule.assigneeIds.length) {
         activityValidationError('assigneeIds', "Assegna l'attività ad almeno un operatore prima di attivare l'avviso.", 'INVALID_ALERT');
     }
@@ -445,7 +455,7 @@ export function validateActivitySchedule(
     if (alertChanged && scheduledAt.getTime() <= now.getTime()) {
         activityValidationError('alert.scheduledAt', "L'avviso deve essere programmato nel futuro.", 'INVALID_ALERT');
     }
-    if (scheduledAt.getTime() > deadline.getTime()) {
+    if (deadline && scheduledAt.getTime() > deadline.getTime()) {
         activityValidationError('alert.scheduledAt', "L'avviso non può essere successivo alla scadenza dell'attività.", 'INVALID_ALERT');
     }
 }

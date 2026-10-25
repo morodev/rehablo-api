@@ -1,4 +1,6 @@
+import {ContributionPolicy, contributionPolicy} from './socialSecurity.js';
 interface PriceSnapshot {
+    socialSecurity?: ContributionPolicy | null;
     source?: unknown;
     amount: number | null;
     netAmount: number | null;
@@ -17,7 +19,7 @@ export function applyAppointmentPriceSnapshot(
     price: PriceSnapshot | undefined,
     line: { unitPrice: number; vat: string | null },
     appliesVat: boolean
-): { unitPrice: number; vat: string | null } {
+): { unitPrice: number; vat: string | null; socialSecurity?: ContributionPolicy } {
     if (price?.source !== 'SNAPSHOT' || price.amount === null) return line;
     const vat = price.vatRate === null ? line.vat
         : price.vatRate > 0 ? String(price.vatRate)
@@ -27,6 +29,7 @@ export function applyAppointmentPriceSnapshot(
     const frozenNetMatches = price.netAmount !== null
         && money(price.netAmount * (1 + rate / 100)) === money(price.amount);
     return {
+        socialSecurity: price.socialSecurity ? {...price.socialSecurity, mode: price.socialSecurity.mode === 'NONE' ? 'NONE' : 'INCLUDED'} : contributionPolicy('NONE'),
         unitPrice: frozenNetMatches ? price.netAmount! : money(price.amount / (1 + rate / 100)),
         vat
     };

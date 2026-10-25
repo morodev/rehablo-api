@@ -7,7 +7,7 @@ import {CarePackage, Quote} from '../models/index.js';
 import Patient from '../../patients/models/patient.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
-import controller from './administration.controller.js';
+import controller, {normalizeQuoteLines} from './administration.controller.js';
 import {getQuote, listQuotes} from './administration.view.controller.js';
 import {listCarePackages} from './carePackage.controller.js';
 import {documentHash, quoteDocument} from '../services/quoteDocument.js';
@@ -254,4 +254,17 @@ it('does not change delivered quote snapshots or hashes when a private package l
     const linked = quoteDocument({...quote, linkedPackage: {id: packageId, status: 'ACTIVE'}}, patient, {});
     assert.deepEqual(linked, original); assert.equal(documentHash(linked), documentHash(original));
     assert.equal(JSON.stringify(linked).includes(packageId), false);
+});
+
+it('normalizes quote customer totals and savings with added INPS without changing the tariff', () => {
+    const payload: any = {lines: [{itemType: 'SERVICE', description: 'Sedute', quantity: 2, unitPrice: 50, baseUnitPrice: 100,
+        vatNature: 'N4', socialSecurity: {fund: 'INPS_GS', mode: 'EXCLUDED', rate: 4}, appliesVat: true}]};
+    assert.equal(normalizeQuoteLines(payload, true), null);
+    assert.equal(payload.total, 104); assert.equal(payload.subtotal, 208);
+    assert.equal(payload.lines[0].unitPrice, 50); assert.equal(payload.lines[0].contributionAmount, 4);
+});
+it('preserves legacy quote calculations without a frozen contribution agreement', () => {
+    const payload: any = {lines: [{itemType: 'SERVICE', description: 'Sedute', quantity: 2, unitPrice: 50, baseUnitPrice: 100}]};
+    assert.equal(normalizeQuoteLines(payload, true), null);
+    assert.equal(payload.total, 100); assert.equal(payload.subtotal, 200);
 });

@@ -23,6 +23,7 @@ export interface PublicInvoiceIssuer {
 }
 
 export interface PublicInvoicePayload {
+    socialSecuritySnapshot?: unknown;
     id: string;
     documentType: string | null;
     documentNumber: number | null;
@@ -80,6 +81,7 @@ export function buildPublicInvoicePayload(
     const breakdown = invoiceBreakdown(invoice);
 
     return {
+        ...(invoice.socialSecuritySnapshot ? {socialSecuritySnapshot: invoice.socialSecuritySnapshot} : {}),
         id: String(invoice.id),
         documentType: asString(invoice.documentType),
         documentNumber: asNumber(invoice.documentNumber),

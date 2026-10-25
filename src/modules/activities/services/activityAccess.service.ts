@@ -109,6 +109,7 @@ export async function validateActivityAssignees(
 export interface ActivityAccessRecord {
     createdByUserId: string;
     status: string;
+    reviewerUserId?: string | null; reviewStatus?: string;
     archivedAt?: Date | string | null;
 }
 
@@ -122,6 +123,10 @@ export function activityCapabilities(
         || (operational && assigneeIds.includes(context.userId));
     const canUpdate = canRead && operational && !!scope && (scope !== 'own' || owned);
     const archived = !!activity.archivedAt;
+    const manager = canRead && operational && (hasPermission(context.permissions, 'activity', 'manage', 'structure')
+        || resolveGrantedScope(context.permissions, 'activity', 'manage') === 'tenant');
+    const reviewer = canRead && operational && !!scope && activity.reviewerUserId === context.userId;
+    const reviewing = !!activity.reviewerUserId;
     return {
         canEdit: canUpdate && !archived,
         canMove: canUpdate && !archived,
@@ -129,7 +134,14 @@ export function activityCapabilities(
         canManageChecklist: canUpdate && !archived && activity.status !== 'COMPLETED',
         canComment: canRead && operational && !archived && hasPermission(context.permissions, 'activity', 'create'),
         canArchive: canUpdate && !archived,
-        canRestore: canUpdate && archived
+        canRestore: canUpdate && archived,
+        canRequestReview: canUpdate && !archived && activity.status !== 'COMPLETED' && reviewing,
+        canReview: !archived && activity.status === 'WAITING' && activity.reviewStatus === 'pending' && (reviewer || manager),
+        canComplete: !archived && activity.status !== 'COMPLETED' && (reviewing
+            ? activity.reviewStatus === 'approved' && (manager || (canUpdate && assigneeIds.includes(context.userId)))
+            : canUpdate),
+        canAssignReviewer: !archived && (reviewing ? reviewer || manager : canUpdate),
+        canReopenChecklist: canUpdate && !archived && activity.status === 'COMPLETED'
     };
 }
 

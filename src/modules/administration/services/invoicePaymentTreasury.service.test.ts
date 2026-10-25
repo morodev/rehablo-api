@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import {it} from 'node:test';
 import {sequelize} from '../../../config/database.js';
-import {mirrorInvoicePaymentToTreasury} from './invoicePaymentTreasury.service.js';
+import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
+import {mirrorInvoicePaymentToTreasury, mirrorVoidedInvoicePaymentToTreasury} from './invoicePaymentTreasury.service.js';
 
 it('mirrors cash using the validated site and its default account when a legacy invoice has no site column', async t => {
     const structureId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -28,4 +29,24 @@ it('mirrors cash using the validated site and its default account when a legacy 
     assert.equal(queries[1].options.replacements.idempotencyKey, 'settlement_receipt');
     assert.equal(queries[1].options.replacements.amount, 40);
     assert.match(queries[1].sql, /ON CONFLICT .* DO NOTHING/);
+});
+
+it('never mirrors an opening balance or its correction into an account', async t => {
+    let queryCount = 0;
+    t.mock.method(sequelize, 'query', (async () => {queryCount++; return [[], {}];}) as any);
+    const payment = {id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', amount: 40, paidAt: null, source: 'OPENING_BALANCE'};
+    await mirrorInvoicePaymentToTreasury('rehablo_0123456789abcdef0123456789abcdef', payment);
+    await mirrorVoidedInvoicePaymentToTreasury('rehablo_0123456789abcdef0123456789abcdef', payment);
+    assert.equal(queryCount, 0);
+});
+
+it('opening balance model hooks preserve coverage without cash creation or reversal', async t => {
+    let queryCount = 0;
+    t.mock.method(sequelize, 'query', (async () => {queryCount++; return [[], {}];}) as any);
+    const opening = InvoicePayment.schema('rehablo_0123456789abcdef0123456789abcdef').build({
+        id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', amount: 40, source: 'OPENING_BALANCE', status: 'POSTED'});
+    await (InvoicePayment as any).runHooks('afterCreate', opening, {});
+    opening.set('status', 'VOID');
+    await (InvoicePayment as any).runHooks('afterUpdate', opening, {});
+    assert.equal(queryCount, 0);
 });

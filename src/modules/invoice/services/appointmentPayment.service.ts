@@ -1,3 +1,4 @@
+import {ContributionPolicy, contributionPolicy, evaluateContributionInvoice} from '../utils/socialSecurity.js';
 import { Op, Transaction } from 'sequelize';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import EventType from '../../agenda/models/eventType.model.js';
@@ -17,6 +18,7 @@ const nullableMoney = (value: unknown): number | null =>
         ? paymentMoney(value) : null;
 
 export interface AppointmentPrice {
+    socialSecurity?: ContributionPolicy | null;
     amount: number | null;
     netAmount: number | null;
     vatRate: number | null;
@@ -29,12 +31,13 @@ export function resolveAppointmentPrice(
     event: Record<string, any>,
     eventType?: Record<string, any> | null,
     service?: Record<string, any> | null,
-    appliesVat = true
+    appliesVat = true,
+    policy?: ContributionPolicy
 ): AppointmentPrice {
     const frozen = nullableMoney(event.appointmentExpectedAmount);
     if (frozen !== null) {
         return { amount: frozen, netAmount: nullableMoney(event.appointmentNetAmount),
-            vatRate: nullableMoney(event.appointmentVatRate), source: 'SNAPSHOT', estimated: false };
+            vatRate: nullableMoney(event.appointmentVatRate), source: 'SNAPSHOT', estimated: false, socialSecurity: event.appointmentSocialSecurity ?? null };
     }
     // A historical full payment is evidence of its agreed customer amount, never of a prior net tariff.
     const knownPaid = nullableMoney(event.appointmentPaidAmount);
@@ -45,12 +48,16 @@ export function resolveAppointmentPrice(
         const netAmount = nullableMoney(service?.sellingPrice);
         const rawVat = String(service?.productVat ?? '').trim();
         const vatRate = appliesVat && ['4', '5', '10', '22'].includes(rawVat) ? Number(rawVat) : 0;
-        return { amount: netAmount === null ? null : paymentMoney(netAmount * (1 + vatRate / 100)),
-            netAmount, vatRate: netAmount === null ? null : vatRate,
+        const calculation = policy && netAmount !== null ? evaluateContributionInvoice({policy, appliesVat,
+            lines: [{sellingPrice: netAmount, productVat: vatRate ? String(vatRate) : 'N4', type: 'SERVICE'}]}) : null;
+        return {socialSecurity: policy, amount: calculation?.invoiceTotal ?? (netAmount === null ? null : paymentMoney(netAmount * (1 + vatRate / 100))),
+            netAmount: calculation ? paymentMoney(calculation.discSellingPrice + calculation.rivalsAmount) : netAmount, vatRate: netAmount === null ? null : vatRate,
             source: netAmount === null ? null : 'SERVICE', estimated: true };
     }
     const amount = nullableMoney(eventType?.price);
-    return { amount, netAmount: null, vatRate: null, source: amount === null ? null : 'EVENT_TYPE', estimated: true };
+    // Event-type prices are already agreed customer totals, including any configured contribution.
+    return { amount, netAmount: null, vatRate: null, socialSecurity: policy ? {...policy, mode: policy.mode === 'NONE' ? 'NONE' : 'INCLUDED'} : undefined,
+        source: amount === null ? null : 'EVENT_TYPE', estimated: true };
 }
 
 export async function appointmentPricesByEvent(
@@ -69,24 +76,25 @@ export async function appointmentPricesByEvent(
     const tenantId = /^[a-f0-9]{32}$/i.test(hex)
         ? [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join('-')
         : null;
-    const tenant = tenantId ? await Tenant.findByPk(tenantId, { attributes: ['taxRegime'], transaction }) : null;
+    const tenant = tenantId ? await Tenant.findByPk(tenantId, { attributes: ['taxRegime', 'socialSecurityFund', 'socialSecurityRate', 'socialSecurityPricingMode'], transaction }) : null;
     const appliesVat = getTaxRegime(tenant?.taxRegime).appliesVat;
+    const policy = contributionPolicy(tenant?.socialSecurityFund, tenant?.socialSecurityPricingMode ?? 'EXCLUDED', tenant?.socialSecurityRate ?? 4);
     const typesById = new Map(types.map(type => [type.id, type.get({ plain: true })]));
     const servicesById = new Map(services.map(service => [service.id, service.get({ plain: true })]));
     return new Map(events.map(event => {
         const type = typesById.get(event.eventTypeId);
         return [event.id, resolveAppointmentPrice(event, type,
-            type?.linkedServiceId ? servicesById.get(type.linkedServiceId) : null, appliesVat)];
+            type?.linkedServiceId ? servicesById.get(type.linkedServiceId) : null, appliesVat, event.__newPriceAgreement ? policy : undefined)];
     }));
 }
 
 export function appointmentPriceFields(price: AppointmentPrice): Record<string, any> {
-    return { appointmentExpectedAmount: price.amount, appointmentNetAmount: price.netAmount,
+    return { appointmentSocialSecurity: price.socialSecurity ?? null, appointmentExpectedAmount: price.amount, appointmentNetAmount: price.netAmount,
         appointmentVatRate: price.vatRate, appointmentPriceRecordedAt: price.amount === null ? null : new Date() };
 }
 
 export async function snapshotAppointmentPrice(schema: string, event: Record<string, any>, transaction?: Transaction) {
-    const price = (await appointmentPricesByEvent(schema, [event], transaction)).get(event.id)!;
+    const price = (await appointmentPricesByEvent(schema, [{...event, __newPriceAgreement: event.__newPriceAgreement ?? event.appointmentPaymentHistoryKnown === undefined}], transaction)).get(event.id)!;
     return appointmentPriceFields(price);
 }
 
@@ -107,6 +115,12 @@ export function summarizeAppointmentPayments(expectedAmount: number | null, paym
         paymentStatus: expectedAmount === 0 ? 'paid' : paidAmount <= 0 ? 'unpaid' : balance !== null && balance <= 0.009 ? 'paid' : 'partial',
         methods: [...new Set(posted.map(payment => payment.method || null))],
         hasUndatedPayments: posted.some(payment => !payment.paidAt) };
+}
+
+/** Any existing ledger row, including a reversal, makes the recorded history authoritative. */
+export function isAppointmentPaymentHistoryKnown(event: Record<string, any>, movements: unknown[] = []): boolean {
+    return event.appointmentPaymentHistoryKnown === true || movements.length > 0
+        || (paymentMoney(event.appointmentPaidAmount) > 0 && ['paid', 'partial'].includes(event.appointmentPaymentStatus));
 }
 
 /** Caller holds the event row lock. Also covers deployments where old snapshots predate migration. */
@@ -151,7 +165,7 @@ export async function syncAppointmentPaymentStatus(
         appointmentPaidAt: dated.at(-1) ?? null,
         appointmentPaymentMethod: summary.methods.length === 1 ? summary.methods[0] : null,
         appointmentPaymentNote: posted.length === 1 ? posted[0].note : null,
-        appointmentPaymentHistoryKnown: true, appointmentPaymentRecordedBy: recordedBy ?? event.appointmentPaymentRecordedBy
+        appointmentPaymentHistoryKnown: isAppointmentPaymentHistoryKnown(event.get({plain: true}), plain), appointmentPaymentRecordedBy: recordedBy ?? event.appointmentPaymentRecordedBy
     }, { transaction });
     return summary;
 }

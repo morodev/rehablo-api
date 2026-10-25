@@ -46,6 +46,7 @@ export interface FatturaPaParty {
 }
 
 export interface FatturaPaLine {
+    withholding?: boolean;
     description: string;
     quantity: number;
     /** Prezzo unitario netto (imponibile). */
@@ -73,6 +74,9 @@ export interface FatturaPaInput {
     cedente: FatturaPaParty & { regimeFiscale: string };
     cessionario: FatturaPaParty;
     document: {
+        contributions?: Array<{tipoCassa: string; aliquota: number; base: number; amount: number; vatRate: number; natura: string | null; withholding: boolean}>;
+        withholding?: {type: string | null; causale: string | null; rate: number; amount: number} | null;
+        rounding?: number;
         tipoDocumento: TipoDocumento;
         /** Data documento in formato YYYY-MM-DD. */
         data: string;
@@ -88,7 +92,10 @@ export interface FatturaPaInput {
 const money = (value: number): string => roundInvoiceAmount(value).toFixed(2);
 const rate = (value: number): string => (Math.round(value * 100) / 100).toFixed(2);
 const qty = (value: number): string => (Math.round(value * 100) / 100).toFixed(2);
-const preciseAmount = (value: number): string => value.toFixed(8).replace(/0+$/, '').replace(/\.$/, '.00');
+const preciseAmount = (value: number): string => {
+    const [integer, decimals] = value.toFixed(8).split('.');
+    return integer + '.' + decimals.replace(/0+$/, '').padEnd(2, '0');
+};
 const lineBase = (line: FatturaPaLine): number => line.netAmount ?? roundInvoiceAmount(line.quantity * line.unitPrice);
 
 function escapeXml(value: string): string {
@@ -200,12 +207,25 @@ export function validateFatturaPaInput(input: FatturaPaInput): string[] {
         errors.push('FISCAL_TOTAL_MISMATCH: totale XML diverso dal documento congelato.');
     }
 
+    for (const contribution of input.document.contributions ?? []) {
+        if (contribution.tipoCassa !== 'TC22' || contribution.aliquota !== 4 || !Number.isFinite(contribution.base)
+            || contribution.base < 0 || !Number.isFinite(contribution.amount) || contribution.amount < 0
+            || Math.abs(roundInvoiceAmount(contribution.base * contribution.aliquota / 100) - contribution.amount) > 0.011)
+            errors.push('Rivalsa INPS non riconciliata.');
+        if (contribution.vatRate === 0 && !filled(contribution.natura)) errors.push('Natura IVA della rivalsa mancante.');
+    }
+    const withholding = input.document.withholding;
+    if (withholding && (!['RT01', 'RT02'].includes(withholding.type ?? '') || withholding.causale !== 'A'
+        || !Number.isFinite(withholding.amount) || withholding.amount < 0 || !Number.isFinite(withholding.rate) || withholding.rate <= 0))
+        errors.push('Dati ritenuta incompleti.');
+    if (!Number.isFinite(input.document.rounding ?? 0) || Math.abs(input.document.rounding ?? 0) > input.lines.length * 0.02)
+        errors.push('Arrotondamento fiscale non valido.');
     return errors;
 }
 
 interface RiepilogoRow { aliquota: number; natura: string | null; imponibile: number; imposta: number; }
 
-function summarize(lines: FatturaPaLine[]): RiepilogoRow[] {
+function summarize(lines: FatturaPaLine[], contributions: NonNullable<FatturaPaInput['document']['contributions']> = []): RiepilogoRow[] {
     const groups = new Map<string, RiepilogoRow>();
     for (const line of lines) {
         const imponibile = lineBase(line);
@@ -215,6 +235,12 @@ function summarize(lines: FatturaPaLine[]): RiepilogoRow[] {
         current.imponibile = roundInvoiceAmount(current.imponibile + imponibile);
         groups.set(key, current);
     }
+    for (const contribution of contributions) {
+        const key = contribution.vatRate + '|' + (contribution.vatRate ? '' : contribution.natura ?? '');
+        const row = groups.get(key) ?? {aliquota: contribution.vatRate, natura: contribution.natura, imponibile: 0, imposta: 0};
+        row.imponibile = roundInvoiceAmount(row.imponibile + contribution.amount);
+        groups.set(key, row);
+    }
     for (const row of groups.values()) {
         row.imposta = roundInvoiceAmount((row.aliquota / 100) * row.imponibile);
     }
@@ -223,11 +249,11 @@ function summarize(lines: FatturaPaLine[]): RiepilogoRow[] {
 
 /** Totale documento: imponibili + imposte + eventuale bollo riaddebitato. */
 export function fatturaPaTotal(input: FatturaPaInput): number {
-    const riepilogo = summarize(input.lines);
+    const riepilogo = summarize(input.lines, input.document.contributions);
     const base = riepilogo.reduce((sum, row) => sum + row.imponibile + row.imposta, 0);
     const bollo = input.document.bollo?.virtuale && input.document.bollo.chargedToCustomer !== false
         ? input.document.bollo.importo : 0;
-    return roundInvoiceAmount(base + bollo);
+    return roundInvoiceAmount(base + bollo + (input.document.rounding ?? 0));
 }
 
 function anagraficaXml(party: FatturaPaParty): string {
@@ -266,7 +292,7 @@ export function buildFatturaPaXml(input: FatturaPaInput): string {
 
     const t = input.transmission;
     const divisa = input.document.divisa ?? 'EUR';
-    const riepilogo = summarize(input.lines);
+    const riepilogo = summarize(input.lines, input.document.contributions);
     const totale = fatturaPaTotal(input);
 
     const cedenteDati = [
@@ -292,6 +318,7 @@ export function buildFatturaPaXml(input: FatturaPaInput): string {
             + (line.discountUnitAmount ? `<ScontoMaggiorazione><Tipo>SC</Tipo><Importo>${preciseAmount(line.discountUnitAmount)}</Importo></ScontoMaggiorazione>` : '')
             + `<PrezzoTotale>${money(prezzoTotale)}</PrezzoTotale>`
             + `<AliquotaIVA>${rate(line.vatRate)}</AliquotaIVA>`
+            + (line.withholding ? '<Ritenuta>SI</Ritenuta>' : '')
             + naturaXml
             + `</DettaglioLinee>`;
     }).join('');
@@ -309,6 +336,14 @@ export function buildFatturaPaXml(input: FatturaPaInput): string {
         ? `<DatiBollo><BolloVirtuale>SI</BolloVirtuale><ImportoBollo>${money(input.document.bollo.importo)}</ImportoBollo></DatiBollo>`
         : '';
 
+    const withholding = input.document.withholding;
+    const withholdingXml = withholding ? '<DatiRitenuta><TipoRitenuta>' + withholding.type + '</TipoRitenuta><ImportoRitenuta>' + money(withholding.amount)
+        + '</ImportoRitenuta><AliquotaRitenuta>' + rate(withholding.rate) + '</AliquotaRitenuta><CausalePagamento>' + withholding.causale + '</CausalePagamento></DatiRitenuta>' : '';
+    const contributionXml = (input.document.contributions ?? []).map(value => '<DatiCassaPrevidenziale><TipoCassa>' + value.tipoCassa
+        + '</TipoCassa><AlCassa>' + rate(value.aliquota) + '</AlCassa><ImportoContributoCassa>' + money(value.amount)
+        + '</ImportoContributoCassa><ImponibileCassa>' + money(value.base) + '</ImponibileCassa><AliquotaIVA>' + rate(value.vatRate)
+        + '</AliquotaIVA>' + (value.withholding ? '<Ritenuta>SI</Ritenuta>' : '')
+        + (value.vatRate === 0 ? '<Natura>' + escapeXml(value.natura!) + '</Natura>' : '') + '</DatiCassaPrevidenziale>').join('');
     const pecXml = filled(t.pecDestinatario) ? `<PECDestinatario>${escapeXml(t.pecDestinatario!.trim())}</PECDestinatario>` : '';
 
     return `<?xml version="1.0" encoding="UTF-8"?>`
@@ -330,8 +365,9 @@ export function buildFatturaPaXml(input: FatturaPaInput): string {
         + `<Divisa>${escapeXml(divisa)}</Divisa>`
         + `<Data>${escapeXml(input.document.data)}</Data>`
         + `<Numero>${escapeXml(input.document.numero.trim())}</Numero>`
-        + bolloXml
+        + withholdingXml + bolloXml + contributionXml
         + `<ImportoTotaleDocumento>${money(totale)}</ImportoTotaleDocumento>`
+        + (input.document.rounding ? `<Arrotondamento>${money(input.document.rounding)}</Arrotondamento>` : '')
         + `</DatiGeneraliDocumento></DatiGenerali>`
         + `<DatiBeniServizi>${dettaglioLinee}${datiRiepilogo}</DatiBeniServizi>`
         + `</FatturaElettronicaBody>`

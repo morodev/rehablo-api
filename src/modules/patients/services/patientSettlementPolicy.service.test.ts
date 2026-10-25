@@ -112,3 +112,51 @@ it('an invoice plus one appointment does not unlock a partial appointment', () =
     assert.throws(() => validatePatientSettlementAllocations(position.queue, [{kind: 'INVOICE', targetId: 'invoice', amount: 20},
         {kind: 'APPOINTMENT', targetId: 'current', amount: 60}]), /residuo precedente/);
 });
+
+
+it('classifies incomplete current and historical data without turning catalogue estimates into debts', () => {
+    const position = buildPatientSettlementPosition(context, sources({events: [
+        event('current', '2026-10-12T09:00:00Z', {appointmentPaymentHistoryKnown: false}),
+        event('old', '2026-09-05T09:00:00Z'),
+        event('uncertain', '2026-09-04T09:00:00Z', {appointmentPaymentHistoryKnown: false})],
+        prices: new Map([['current', {amount: 60, estimated: true}], ['old', {amount: 55, estimated: true}],
+            ['uncertain', {amount: 70, estimated: false}]])}));
+    assert.deepEqual(position.issues!.map(row => [row.agendaEventId, row.kind, row.expectedAmount, row.suggestedAmount]), [
+        ['uncertain', 'UNKNOWN_PREVIOUS_PAYMENT', 70, undefined], ['old', 'MISSING_PRICE', null, 55],
+        ['current', 'UNKNOWN_PREVIOUS_PAYMENT', null, 60]]);
+    assert.equal(position.current!.eligible, false);
+    assert.equal(position.current!.balance, null);
+    assert.deepEqual(position.queue.map(row => [row.targetId, row.balance]), [['old', null]]);
+    assert.equal(position.issues!.find(row => row.isCurrent)!.agendaEventId, 'current');
+});
+
+it('automatically recognizes positive historical snapshots and keeps VOID rows authoritative', () => {
+    const old = event('old', '2026-09-05T09:00:00Z', {appointmentPaymentHistoryKnown: false,
+        appointmentPaidAmount: 20, appointmentPaymentStatus: 'partial'});
+    const position = buildPatientSettlementPosition(context, sources({events: [old, event('current', '2026-10-12T09:00:00Z')]}));
+    assert.equal(position.queue[0].balance, 40);
+    assert.equal(position.issues!.length, 0);
+    const reversed = buildPatientSettlementPosition(context, sources({events: [old],
+        payments: [{agendaEventId: 'old', amount: 20, status: 'VOID'}]}));
+    assert.equal(reversed.queue[0].paidAmount, 0);
+    assert.equal(reversed.queue[0].balance, 60);
+    assert.equal(reversed.issues!.length, 0);
+});
+
+it('classifies an unresolved current fiscal link without permitting a duplicate appointment receipt', () => {
+    const position = buildPatientSettlementPosition(context, sources({events: [
+        event('current', '2026-10-12T09:00:00Z', {invoiceId: 'missing'})]}));
+    assert.deepEqual(position.queue, []);
+    assert.equal(position.current, null);
+    assert.equal(position.issues![0].kind, 'UNRESOLVED_INVOICE');
+    assert.equal(position.issues![0].isCurrent, true);
+});
+
+it('recognizes reverse invoice ownership and counts it once even with repeated join links', () => {
+    const position = buildPatientSettlementPosition(context, sources({invoices: [
+        invoice('reverse', '2026-10-10', {agendaEventId: 'current'})], links: [
+            {invoiceId: 'reverse', agendaEventId: 'current'}, {invoiceId: 'reverse', agendaEventId: 'current'}]}));
+    assert.deepEqual(position.queue.map(row => row.key), ['INVOICE:reverse']);
+    assert.deepEqual(position.current!.linkedEventIds, ['current']);
+    assert.equal(position.issues!.length, 0);
+});

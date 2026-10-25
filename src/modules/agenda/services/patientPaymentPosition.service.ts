@@ -2,7 +2,7 @@ import { Op, Transaction } from 'sequelize';
 import AgendaEvent from '../models/agendaEvent.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
-import { appointmentPricesByEvent, paymentMoney } from '../../invoice/services/appointmentPayment.service.js';
+import { appointmentPricesByEvent, isAppointmentPaymentHistoryKnown, paymentMoney } from '../../invoice/services/appointmentPayment.service.js';
 import { getInvoiceAgendaLinksByEventIds } from '../../invoice/services/invoiceAgendaEvent.service.js';
 import { getPaymentSummaries, InvoicePaymentSummary } from '../../invoice/services/payment.service.js';
 
@@ -21,6 +21,8 @@ export interface PatientPaymentPositionItem {
     paidAmount: number;
     selectable: boolean;
     blockedReason: 'UNVERIFIED_HISTORY' | 'NO_SHOW' | 'INVOICE' | null;
+    issueKind?: 'MISSING_PRICE' | 'UNKNOWN_PREVIOUS_PAYMENT' | 'UNRESOLVED_INVOICE' | 'NO_SHOW';
+    suggestedAmount?: number | null;
 }
 
 export interface PatientPaymentPosition {
@@ -47,7 +49,7 @@ export interface PatientPaymentPositionOptions {
 
 interface PatientPaymentPositionSources {
     historicalEvents: Array<Record<string, any>>;
-    prices: Map<string, { amount: number | null }>;
+    prices: Map<string, { amount: number | null; estimated?: boolean }>;
     payments: Array<Record<string, any>>;
     invoices: Array<Record<string, any>>;
     invoiceSummaries: Map<string, InvoicePaymentSummary>;
@@ -104,6 +106,8 @@ export function buildPatientPaymentPositions(
         paymentsByEvent.set(payment.agendaEventId, rows);
     });
     const invoiceById = new Map(sources.invoices.map(invoice => [invoice.id, invoice]));
+    const invoiceIdByEventId = new Map(sources.invoiceIdByEventId);
+    sources.invoices.forEach(invoice => { if (invoice.agendaEventId && String(invoice.status).toLowerCase() !== 'void') invoiceIdByEventId.set(invoice.agendaEventId, invoice.id); });
 
     return new Map(referenceEvents.map(reference => {
         const patientId = patientIdOf(reference);
@@ -113,31 +117,40 @@ export function buildPatientPaymentPositions(
         const dueItems: PatientPaymentPositionItem[] = [];
         const unknownItems: PatientPaymentPositionItem[] = [];
         const invoiceIds = new Set<string>();
-        const referenceInvoiceId = reference.invoiceId ?? sources.invoiceIdByEventId.get(reference.id) ?? null;
+        const referenceInvoiceId = reference.invoiceId ?? invoiceIdByEventId.get(reference.id) ?? null;
 
         sources.historicalEvents.forEach(event => {
             const eventTime = timestamp(event.start);
             if (!event.id || patientIdOf(event) !== patientId || event.id === reference.id || eventTime === null
-                || eventTime >= referenceTime || eventTime > now || event.recurrence) return;
+                || eventTime >= referenceTime || eventTime > now || event.recurrence || event.recurringEventId) return;
             const status = String(event.status ?? '').toUpperCase();
             if (!['CONFIRMED', 'COMPLETED', 'NO_SHOW'].includes(status)) return;
             if (status === 'CONFIRMED' && appointmentEndTime(event, eventTime) > now) return;
-            if (event.appointmentPriceAdjustment === 'COMPLIMENTARY'
+            if ((event.carePackageId && ['RESERVED', 'CONSUMED'].includes(String(event.packageReservationStatus)))
+                || event.appointmentPriceAdjustment === 'COMPLIMENTARY'
                 || (status === 'NO_SHOW' && String(event.noShowBillingDecision ?? '').toUpperCase() === 'WAIVED')) return;
 
-            const invoiceId = event.invoiceId ?? sources.invoiceIdByEventId.get(event.id) ?? null;
+            const invoiceId = event.invoiceId ?? invoiceIdByEventId.get(event.id) ?? null;
             if (invoiceId) {
-                if (invoiceId !== referenceInvoiceId) invoiceIds.add(invoiceId);
+                if (invoiceId !== referenceInvoiceId) {
+                    if (options.includeInvoices !== false && !invoiceById.has(invoiceId)) unknownItems.push({
+                        kind: 'APPOINTMENT', id: event.id, agendaEventId: event.id, invoiceId,
+                        date: dateKey(event.start), title: event.title || 'Seduta', balance: null,
+                        expectedAmount: null, paidAmount: 0, paymentStatus: 'unknown', selectable: false,
+                        blockedReason: 'UNVERIFIED_HISTORY', issueKind: 'UNRESOLVED_INVOICE'});
+                    else invoiceIds.add(invoiceId);
+                }
                 return;
             }
 
             const eventPayments = paymentsByEvent.get(event.id) ?? [];
-            const known = Boolean(event.appointmentPaymentHistoryKnown) || eventPayments.length > 0;
-            const expected = sources.prices.get(event.id)?.amount ?? null;
+            const known = isAppointmentPaymentHistoryKnown(event, eventPayments);
+            const price = sources.prices.get(event.id);
+            const expected = price?.estimated ? null : price?.amount ?? null;
             const posted = eventPayments.filter(payment => payment.status === 'POSTED');
-            const paid = posted.length > 0
+            const paid = eventPayments.length > 0
                 ? paymentMoney(posted.reduce((sum, payment) => sum + Number(payment.amount), 0))
-                : paymentMoney(event.appointmentPaidAmount);
+                : ['paid', 'partial'].includes(event.appointmentPaymentStatus) ? paymentMoney(event.appointmentPaidAmount) : 0;
             const item = {
                 kind: 'APPOINTMENT' as const, id: event.id, agendaEventId: event.id, invoiceId: null,
                 date: dateKey(event.start), title: event.title || 'Seduta', balance: null,
@@ -147,7 +160,8 @@ export function buildPatientPaymentPositions(
                     : !known ? 'UNVERIFIED_HISTORY' as const : null
             };
             if (status === 'NO_SHOW' || !known || expected === null) {
-                unknownItems.push(item);
+                unknownItems.push({...item, issueKind: status === 'NO_SHOW' ? 'NO_SHOW'
+                    : !known ? 'UNKNOWN_PREVIOUS_PAYMENT' : 'MISSING_PRICE', suggestedAmount: price?.estimated ? price.amount : undefined});
                 return;
             }
             const balance = paymentMoney(Math.max(expected - paid, 0));
@@ -238,9 +252,9 @@ export async function patientPaymentPositionsByReferenceEvents(
         if (event.invoiceId) invoiceIdByEventId.set(event.id, event.invoiceId);
     });
     const invoiceIds = options.includeInvoices === false ? [] : [...new Set(invoiceIdByEventId.values())];
-    const invoiceModels = invoiceIds.length ? await Invoice.schema(schema).findAll({
-        where: { id: { [Op.in]: invoiceIds } },
-        attributes: ['id', 'emissionDate', 'invoiceTotal', 'invoiceNet', 'status', 'documentType', 'documentNumber', 'documentYear'],
+    const invoiceModels = options.includeInvoices !== false && (invoiceIds.length || allEventIds.length) ? await Invoice.schema(schema).findAll({
+        where: { patientID: {[Op.in]: patientIds}, [Op.or]: [{id: {[Op.in]: invoiceIds}}, {agendaEventId: {[Op.in]: allEventIds}}] },
+        attributes: ['id', 'agendaEventId', 'emissionDate', 'invoiceTotal', 'invoiceNet', 'status', 'documentType', 'documentNumber', 'documentYear'],
         transaction
     }) : [];
     const invoices = invoiceModels.map(invoice => invoice.get({ plain: true }) as Record<string, any>);

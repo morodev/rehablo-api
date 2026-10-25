@@ -4,7 +4,7 @@ import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
-import {appointmentPricesByEvent, paymentMoney, summarizeAppointmentPayments} from '../../invoice/services/appointmentPayment.service.js';
+import {appointmentPricesByEvent, isAppointmentPaymentHistoryKnown, paymentMoney, summarizeAppointmentPayments} from '../../invoice/services/appointmentPayment.service.js';
 import {summarizeInvoicePayments} from '../../invoice/services/payment.service.js';
 import {CarePackage} from '../../administration/models/index.js';
 
@@ -39,6 +39,7 @@ export interface PatientSettlementObligation {
     coverageSources: string[];
     methods: Array<string | null>;
     hasUndatedPayments: boolean;
+    historyKnown?: boolean;
     record: Record<string, any>;
 }
 export interface PatientSettlementVerification {
@@ -48,10 +49,23 @@ export interface PatientSettlementVerification {
     reason: 'UNVERIFIED_HISTORY' | 'NO_SHOW';
     record: Record<string, any>;
 }
+export type PatientSettlementIssueKind = 'MISSING_PRICE' | 'UNKNOWN_PREVIOUS_PAYMENT' | 'UNRESOLVED_INVOICE' | 'NO_SHOW';
+export interface PatientSettlementIssue {
+    agendaEventId: string;
+    date: string | null;
+    title: string;
+    kind: PatientSettlementIssueKind;
+    expectedAmount: number | null;
+    suggestedAmount?: number | null;
+    paidAmount: number;
+    isCurrent: boolean;
+    record: Record<string, any>;
+}
 export interface RawPatientSettlementPosition {
     obligations: PatientSettlementObligation[];
     queue: PatientSettlementObligation[];
     verification: PatientSettlementVerification[];
+    issues?: PatientSettlementIssue[];
     current: PatientSettlementObligation | null;
     referenceEvent: Record<string, any> | null;
     referenceInvoice: Record<string, any> | null;
@@ -62,7 +76,7 @@ export interface PatientSettlementSources {
     invoices: Array<Record<string, any>>;
     links: Array<{invoiceId: string; agendaEventId: string}>;
     payments: Array<Record<string, any>>;
-    prices: Map<string, {amount: number | null}>;
+    prices: Map<string, {amount: number | null; estimated?: boolean}>;
     now?: number;
 }
 
@@ -136,6 +150,7 @@ export function buildPatientSettlementPosition(
     const referenceInvoice = invoiceById.get(currentInvoiceId ?? '') ?? null;
     const obligations: PatientSettlementObligation[] = [];
     const verification: PatientSettlementVerification[] = [];
+    const issues: PatientSettlementIssue[] = [];
     const packages = (sources.packages ?? []).filter(pack => pack.templateId && pack.patientId === context.patientId && pack.structureId === context.structureId);
 
     events.forEach(event => {
@@ -153,6 +168,8 @@ export function buildPatientSettlementPosition(
         if (event.invoiceId || sources.links.some(link => link.agendaEventId === event.id)) {
             verification.push({agendaEventId: event.id, date: localDate(event.start), title: event.title || 'Seduta',
                 reason: 'UNVERIFIED_HISTORY', record: event});
+            issues.push({agendaEventId: event.id, date: localDate(event.start), title: event.title || 'Seduta',
+                kind: 'UNRESOLVED_INVOICE', expectedAmount: null, paidAmount: 0, isCurrent: event.id === context.referenceAgendaEventId, record: event});
             return;
         }
         const start = time(event.start);
@@ -160,8 +177,9 @@ export function buildPatientSettlementPosition(
         const history = sources.payments.filter(payment => payment.agendaEventId === event.id);
         const legacyPaid = history.length === 0 && ['paid', 'partial'].includes(event.appointmentPaymentStatus)
             ? paymentMoney(event.appointmentPaidAmount) : 0;
-        const known = !!event.appointmentPaymentHistoryKnown || history.length > 0 || legacyPaid > 0;
-        const expected = sources.prices.get(event.id)?.amount ?? null;
+        const known = isAppointmentPaymentHistoryKnown(event, history);
+        const price = sources.prices.get(event.id);
+        const expected = price?.estimated ? null : price?.amount ?? null;
         const summary = summarizeAppointmentPayments(expected, history.length ? history
             : legacyPaid > 0 ? [{status: 'POSTED', amount: legacyPaid, paidAt: event.appointmentPaidAt}] : []);
         const status = String(event.status ?? '').toUpperCase();
@@ -173,7 +191,7 @@ export function buildPatientSettlementPosition(
         else if (status === 'NO_SHOW') reason = 'Per il no-show utilizza la decisione economica e l’eventuale fatturazione.';
         else if (!['CONFIRMED', 'COMPLETED'].includes(status)) reason = 'Gli incassi non sono disponibili per questo appuntamento.';
         else if (event.appointmentPriceAdjustment === 'COMPLIMENTARY') reason = 'La seduta è omaggio: nessun incasso dovuto.';
-        else if (!known) reason = 'Lo storico della seduta deve essere verificato prima di registrare un incasso.';
+        else if (!known) reason = 'Non è disponibile il pagamento precedente: completa la situazione nella registrazione dell’incasso.';
         else if (!isCurrent && status === 'CONFIRMED' && end > now) reason = 'La seduta precedente è ancora in corso.';
         const eligible = reason === null;
         const priorRelevant = start <= now && !event.recurrence && !event.recurringEventId
@@ -185,11 +203,19 @@ export function buildPatientSettlementPosition(
             agendaEventId: event.id, date: localDate(event.start), title: event.title || 'Seduta',
             reason: status === 'NO_SHOW' ? 'NO_SHOW' : 'UNVERIFIED_HISTORY', record: event
         });
+        if (priorRelevant || (isCurrent && start <= now && ['CONFIRMED', 'COMPLETED'].includes(status)
+            && event.appointmentPriceAdjustment !== 'COMPLIMENTARY')) {
+            const kind: PatientSettlementIssueKind | null = status === 'NO_SHOW' ? 'NO_SHOW'
+                : !known ? 'UNKNOWN_PREVIOUS_PAYMENT' : expected === null ? 'MISSING_PRICE' : null;
+            if (kind) issues.push({agendaEventId: event.id, date: localDate(event.start), title: event.title || 'Seduta',
+                kind, expectedAmount: expected, suggestedAmount: price?.estimated ? price.amount : undefined,
+                paidAmount: summary.paidAmount, isCurrent: event.id === context.referenceAgendaEventId, record: event});
+        }
         if (!isCurrent && (!eligible || (summary.balance !== null && summary.balance <= 0.009))) return;
         obligations.push({key: key('APPOINTMENT', event.id), kind: 'APPOINTMENT', targetId: event.id,
             title: event.title || 'Seduta', date: localDate(event.start), orderDate: new Date(start).toISOString(),
             balance: known ? summary.balance : null, expectedAmount: expected, paidAmount: summary.paidAmount,
-            isCurrent, invoiceNumber: null, linkedEventIds: [], eligible, unavailableReason: reason,
+            isCurrent, invoiceNumber: null, linkedEventIds: [], eligible, unavailableReason: reason, historyKnown: known,
             coverageSources: [...new Set(history.filter(payment => payment.status === 'POSTED').map(payment => String(payment.source ?? 'APPOINTMENT')))],
             methods: history.length ? summary.methods : legacyPaid > 0 ? [event.appointmentPaymentMethod ?? null] : [],
             hasUndatedPayments: summary.hasUndatedPayments, record: event});
@@ -233,6 +259,7 @@ export function buildPatientSettlementPosition(
     obligations.sort((a, b) => a.orderDate.localeCompare(b.orderDate) || a.key.localeCompare(b.key));
     verification.sort((a, b) => String(a.date).localeCompare(String(b.date)) || a.agendaEventId.localeCompare(b.agendaEventId));
     return {obligations, queue: obligations.filter(row => row.eligible && (row.balance === null || row.balance > 0.009)),
+        issues: issues.sort((a, b) => String(a.record.start).localeCompare(String(b.record.start)) || a.agendaEventId.localeCompare(b.agendaEventId)),
         verification, current: obligations.find(row => row.isCurrent) ?? null, referenceEvent, referenceInvoice};
 }
 

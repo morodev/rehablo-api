@@ -1,8 +1,11 @@
+import {ContributionPolicy, ContributionSnapshot, contributionPolicy, evaluateContributionInvoice} from './socialSecurity.js';
 import { evalTotalsDetailed, invoiceAmountInCents as cents, roundInvoiceAmount as money } from './evalTotals.js';
 import { getTaxRegime, isTaxRegimeCode } from './fiscalRegime.js';
 
 type Decimal = number | string | null;
 export interface FrozenEconomicLine {
+    socialSecurity?: ContributionPolicy | null;
+    kind?: string;
     unitPrice: Decimal;
     quantity: Decimal;
     vat: string | null;
@@ -12,6 +15,7 @@ export interface FrozenEconomicLine {
     discountAmount?: Decimal;
 }
 export interface FrozenEconomicDocument {
+    socialSecuritySnapshot?: ContributionSnapshot | null;
     discountType?: string | null;
     discountAmount?: Decimal;
     discSellingPrice?: Decimal;
@@ -85,6 +89,63 @@ export function reconcileInvoiceEconomics(document: FrozenEconomicDocument, line
     for (const flag of ['isRivals', 'isCashPro', 'isTaxWithholding', 'isStamp', 'stampChargedToPatient'] as const) {
         if (document[flag] != null && typeof document[flag] !== 'boolean') fail('INVALID_FISCAL_SNAPSHOT', `${flag} non valido.`);
     }
+    if (document.socialSecuritySnapshot) {
+        const snapshot = document.socialSecuritySnapshot;
+        if (snapshot.version !== 1 || !Array.isArray(snapshot.lines) || snapshot.lines.length !== lines.length)
+            fail('INCOMPLETE_FISCAL_SNAPSHOT', 'Snapshot previdenziale incompleto.');
+        const unassigned = [...snapshot.lines];
+        const ordered = lines.map(line => {
+            const vat = effectiveVat(line.vat, String(taxRegime), document.vatNature);
+            const policy = line.socialSecurity ?? (line.kind === 'PRODUCT' ? contributionPolicy('NONE') : snapshot.policy);
+            const index = unassigned.findIndex(saved => saved.policy.mode === policy.mode && saved.policy.fund === policy.fund
+                && Number(saved.policy.rate) === Number(policy.rate) && saved.kind === line.kind && Number(saved.unitPrice) === Number(line.unitPrice)
+                && Number(saved.quantity) === Number(line.quantity) && saved.vatRate === vat.vatRate
+                && (vat.vatRate > 0 || saved.vatKey === vat.natura));
+            if (index < 0) fail('INVALID_FISCAL_SNAPSHOT', 'Righe diverse dallo snapshot economico.');
+            const [saved] = unassigned.splice(index, 1);
+            if (line.totalPrice != null) compare(money(Number(line.unitPrice) * Number(line.quantity)), line.totalPrice, 'totalPrice');
+            return saved;
+        });
+        const calculated = evaluateContributionInvoice({policy: snapshot.policy,
+            lines: snapshot.lines.map(line => ({type: line.kind, sellingPrice: line.unitPrice, quantity: line.quantity,
+                productVat: line.vatKey, socialSecurity: line.policy})),
+            discountType: document.discountType, discountAmount: Number(document.discountAmount ?? 0),
+            appliesVat: getTaxRegime(String(taxRegime)).appliesVat,
+            isTaxWithholding: !!snapshot.withholding, taxWithholding: snapshot.withholding?.rate,
+            withholdingType: snapshot.withholding?.type, withholdingCausale: snapshot.withholding?.causale,
+            isStamp: document.isStamp, stampAmount: Number(document.stampAmount ?? 0), stampChargedToPatient: document.stampChargedToPatient});
+        for (const field of ['discSellingPrice', 'invoiceVAT', 'invoiceTotal', 'invoiceNet'] as const) compare(calculated[field], document[field], field);
+        snapshot.lines.forEach((line, index) => {
+            for (const field of ['base', 'contribution', 'vat', 'customerAmount'] as const)
+                compare(calculated.socialSecuritySnapshot.lines[index][field], line[field], field);
+        });
+        if (!Number.isFinite(snapshot.rounding) || cents(calculated.socialSecuritySnapshot.rounding) !== cents(snapshot.rounding))
+            fail('FISCAL_TOTAL_MISMATCH', 'Arrotondamento congelato non riconciliato.');
+        if (snapshot.withholding && (!['RT01', 'RT02'].includes(snapshot.withholding.type ?? '') || snapshot.withholding.causale !== 'A'))
+            fail('INCOMPLETE_FISCAL_SNAPSHOT', 'Tipo e causale della ritenuta mancanti.');
+        const contributions = new Map<string, {tipoCassa: string; aliquota: number; base: number; amount: number; vatRate: number; natura: string | null; withholding: boolean}>();
+        for (const line of snapshot.lines) {
+            if (!line.contribution) continue;
+            if (line.policy.fund !== 'INPS_GS') fail('UNSUPPORTED_FISCAL_METADATA', 'Codice cassa professionale non congelato sul documento.');
+            const key = line.vatRate + ':' + line.vatKey;
+            const group = contributions.get(key) ?? {tipoCassa: 'TC22', aliquota: 4, base: 0, amount: 0,
+                vatRate: line.vatRate, natura: line.vatRate ? null : line.vatKey, withholding: !!snapshot.withholding};
+            group.base = money(group.base + line.base); group.amount = money(group.amount + line.contribution);
+            contributions.set(key, group);
+        }
+        return {totals: calculated, contributions: [...contributions.values()], withholding: snapshot.withholding, rounding: snapshot.rounding,
+            lines: ordered.map((line, index) => {
+                const reference = snapshot.lines.reduce((sum, value) => sum + value.referenceAmount, 0);
+                const reduction = document.discountType === 'percentage' ? Number(document.discountAmount ?? 0) / 100
+                    : document.discountType === 'value' && reference ? Number(document.discountAmount ?? 0) / reference : 0;
+                // Included contribution is a separate charge, never a fictitious line discount.
+                const unitPrice = line.policy.mode === 'INCLUDED' ? line.base / Number(lines[index].quantity) / (1 - reduction) : Number(lines[index].unitPrice);
+                return {unitPrice, quantity: Number(lines[index].quantity), vatRate: line.vatRate,
+                    withholding: !!snapshot.withholding && line.kind === 'SERVICE',
+                    natura: line.vatRate ? null : line.vatKey, netAmount: line.base,
+                    discountUnitAmount: reduction ? unitPrice - line.base / Number(lines[index].quantity) : 0};
+            })};
+    }
     if (document.isRivals || document.isTaxWithholding) {
         fail('UNSUPPORTED_FISCAL_METADATA', 'Contributo o ritenuta attivi: i codici fiscali necessari non sono congelati sul documento.');
     }
@@ -136,7 +197,7 @@ export function reconcileInvoiceEconomics(document: FrozenEconomicDocument, line
             fail('UNREPRESENTABLE_FISCAL_ROUNDING', 'IVA arrotondata per riga diversa dal riepilogo per aliquota: nessun importo del documento è stato modificato.');
         }
     }
-    return { totals: calculation.totals, lines: normalized.map((line, index) => ({
+    return { contributions: [], withholding: null, rounding: 0, totals: calculation.totals, lines: normalized.map((line, index) => ({
         ...line, netAmount: bases[index],
         discountUnitAmount: (money(line.unitPrice * line.quantity) - bases[index]) / line.quantity
     })) };

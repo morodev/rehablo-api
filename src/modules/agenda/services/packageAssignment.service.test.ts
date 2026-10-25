@@ -4,7 +4,7 @@ import {Op} from 'sequelize';
 import AgendaEvent from '../models/agendaEvent.model.js';
 import EventType from '../models/eventType.model.js';
 import {CarePackage, PackageConsumption} from '../../administration/models/administration.model.js';
-import {packageCompatibilityError, syncPackageAssignment, eligibleCarePackages} from './packageAssignment.service.js';
+import {packageCompatibilityError, syncPackageAssignment, eligibleCarePackages, appointmentCarePackageOptions} from './packageAssignment.service.js';
 
 const id = (n: number) => 'aaaaaaaa-aaaa-4aaa-8aaa-' + String(n).padStart(12, '0');
 const packageId=id(1), patientId=id(2), structureId=id(3), serviceId=id(4), eventTypeId=id(5);
@@ -73,7 +73,7 @@ it('serializes two reservations for the last available session',async t=>{
 });
 it('rejects an incompatible move and cannot consume a future appointment',async t=>{
     const f=fixture(t),event=f.events[0];await f.apply(event,{carePackageId:packageId});
-    await assert.rejects(()=>f.apply(event,{start:'2026-01-01T10:00:00Z'}),/validità/);
+    await assert.rejects(()=>f.apply(event,{start:'2026-01-01T10:00:00Z'}),/scaduto/);
     f.pkg.expiresAt=null;await assert.rejects(()=>f.apply(event,{start:'2099-01-01T10:00:00Z',status:'COMPLETED'}),/futura/);
     assert.equal(f.pkg.remainingUnits,2);assert.equal(event.packageReservationStatus,'RESERVED');
 });
@@ -92,4 +92,104 @@ it('keeps the assigned exhausted package selectable when correcting its complete
     Object.assign(f.events[0],{carePackageId:packageId,packageReservationStatus:'CONSUMED'});
     const items=await eligibleCarePackages('rehablo_test',{patientId,structureId,eventTypeId,start:f.events[0].start,agendaEventId:f.events[0].id});
     assert.equal(items.length,1);assert.equal(items[0].availableUnits,1);
+});
+
+function optionsFixture(t: TestContext) {
+    const packages = [record({...packageData(), name: 'Pacchetto', serviceName: 'Fisioterapia', totalPrice: 999})];
+    const reservations: any[] = [];
+    const queries: any[] = [];
+    const type: any = {linkedServiceId: serviceId};
+    t.mock.method(CarePackage, 'schema', (() => ({findAll: async (options: any) => {
+        queries.push({table: 'packages', ...options}); return packages;
+    }})) as any);
+    t.mock.method(EventType, 'schema', (() => ({findByPk: async () => type})) as any);
+    t.mock.method(AgendaEvent, 'schema', (() => ({findAll: async (options: any) => {
+        queries.push({table: 'reservations', ...options});
+        return reservations.filter(row => options.where.carePackageId[Op.in].includes(row.carePackageId)
+            && row.packageReservationStatus === 'RESERVED' && row.id !== options.where.id?.[Op.ne]);
+    }})) as any);
+    const context = {patientId, structureId, calendarId: id(9), eventTypeId, start: '2025-02-01T10:00:00Z'};
+    return {packages, reservations, queries, type, context, load: (extra: Record<string, any> = {}) =>
+        appointmentCarePackageOptions('rehablo_test', {...context, ...extra})};
+}
+
+it('returns compatible appointment package choices first and no financial fields while batching reservations', async t => {
+    const f = optionsFixture(t);
+    f.packages.unshift(record({...packageData(), id: id(30), name: 'Altra prestazione', serviceId: id(31)}));
+    f.reservations.push(record({id: id(40), carePackageId: packageId, packageReservationStatus: 'RESERVED'}));
+    const items = await f.load();
+    assert.deepEqual(items.map(row => [row.id, row.selectable]), [[packageId, true], [id(30), false]]);
+    assert.match(items[1].reason!, /prestazione/);
+    assert.equal(items[0].reservedUnits, 1); assert.equal(items[0].availableUnits, 1);
+    assert.deepEqual(Object.keys(items[0]).sort(), ['id','name','serviceId','serviceName','purchasedUnits','remainingUnits',
+        'reservedUnits','availableUnits','expiresAt','selectable','reason'].sort());
+    assert.equal(f.queries.filter(query => query.table === 'reservations').length, 1);
+    assert.deepEqual(f.queries[0].where.patientId, patientId); assert.deepEqual(f.queries[0].where.structureId, structureId);
+});
+
+it('keeps context-incomplete packages visible with concrete missing type, linked-service or date reasons', async t => {
+    const f = optionsFixture(t);
+    let items = await f.load({eventTypeId: undefined, start: undefined});
+    assert.equal(items[0].selectable, false); assert.match(items[0].reason!, /tipo di appuntamento/);
+    f.type.linkedServiceId = null;
+    items = await f.load(); assert.match(items[0].reason!, /collegato a una prestazione/);
+    f.type.linkedServiceId = serviceId;
+    items = await f.load({start: undefined}); assert.match(items[0].reason!, /data della seduta/);
+});
+
+it('shows unavailable dates, inactive purchases and recurrence without offering them for selection', async t => {
+    const f = optionsFixture(t);
+    for (const [start, reason] of [['2024-12-31T10:00:00Z', /non era ancora stato acquistato/], ['2026-01-01T10:00:00Z', /scaduto/]] as const) {
+        const [row] = await f.load({start}); assert.equal(row.selectable, false); assert.match(row.reason!, reason);
+    }
+    const [recurring] = await f.load({recurring: true});
+    assert.equal(recurring.selectable, false); assert.match(recurring.reason!, /serie/);
+    f.packages[0].status = 'CANCELLED';
+    const [inactive] = await f.load(); assert.equal(inactive.selectable, false); assert.match(inactive.reason!, /non è attivo/);
+});
+
+it('explains full reservation and exhaustion and excludes the current reservation from capacity', async t => {
+    const f = optionsFixture(t);
+    f.packages[0].remainingUnits = 1;
+    f.reservations.push(record({id: id(7), carePackageId: packageId, packageReservationStatus: 'RESERVED'}));
+    const [full] = await f.load(); assert.equal(full.availableUnits, 0); assert.match(full.reason!, /residue sono già tutte prenotate/);
+    const [ownReservation] = await f.load({agendaEventId: id(7)});
+    assert.equal(ownReservation.availableUnits, 1); assert.equal(ownReservation.selectable, true);
+    f.packages[0].remainingUnits = 0; f.packages[0].status = 'EXHAUSTED';
+    const [used] = await f.load({agendaEventId: id(7)});
+    assert.equal(used.selectable, false); assert.equal(used.availableUnits, 0);
+});
+
+it('preserves current consumed capacity without inventing availability when another reservation exhausts it', async t => {
+    const f = optionsFixture(t);
+    Object.assign(f.packages[0], {remainingUnits: 0, status: 'EXHAUSTED'});
+    const currentEvent = {...eventData(), status: 'COMPLETED', carePackageId: packageId, packageReservationStatus: 'CONSUMED'};
+    const [row] = await f.load({agendaEventId: id(7), currentEvent});
+    assert.equal(row.availableUnits, 1); assert.equal(row.selectable, true);
+    f.reservations.push(record({id: id(8), carePackageId: packageId, packageReservationStatus: 'RESERVED'}));
+    const [overreserved] = await f.load({agendaEventId: id(7), currentEvent});
+    assert.equal(overreserved.availableUnits, 0); assert.equal(overreserved.selectable, false);
+    assert.match(overreserved.reason!, /Non restano sedute/);
+    const [foreign] = await f.load({agendaEventId: id(7), currentEvent: {...currentEvent, patientId: id(90)}});
+    assert.equal(foreign.availableUnits, 0); assert.equal(foreign.selectable, false);
+});
+
+it('does not attach a different purchase to an already completed or invoiced appointment', async t => {
+    const f = optionsFixture(t);
+    const [completed] = await f.load({currentEvent: {...eventData(), status: 'COMPLETED'}});
+    assert.equal(completed.selectable, false); assert.match(completed.reason!, /Riapri/);
+    const [invoiced] = await f.load({currentEvent: {...eventData(), invoiceId: id(90)}});
+    assert.equal(invoiced.selectable, false); assert.match(invoiced.reason!, /fatturata/);
+});
+
+it('filters other patients and sites and reveals legacy packages only with explicit scoped authorization', async t => {
+    const f = optionsFixture(t);
+    f.packages.push(record({...packageData(), id: id(30), patientId: id(99)}),
+        record({...packageData(), id: id(31), structureId: id(99)}),
+        record({...packageData(), id: id(32), templateId: null, serviceId: null, serviceName: null}));
+    assert.deepEqual((await f.load()).map(row => row.id), [packageId]);
+    const items = await f.load({includeLegacy: true});
+    assert.deepEqual(items.map(row => row.id), [packageId, id(32)]);
+    assert.equal(items[1].serviceId, null); assert.equal(items[1].serviceName, null);
+    assert.equal(items[1].selectable, false); assert.match(items[1].reason!, /precedente non è abilitato/);
 });

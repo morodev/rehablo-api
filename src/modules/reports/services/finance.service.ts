@@ -8,7 +8,7 @@ import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
 import { getInvoiceAgendaLinksByEventIds } from '../../invoice/services/invoiceAgendaEvent.service.js';
 import { summarizeInvoicePayments } from '../../invoice/services/payment.service.js';
-import { appointmentPricesByEvent } from '../../invoice/services/appointmentPayment.service.js';
+import { appointmentPricesByEvent, isAppointmentPaymentHistoryKnown, summarizeAppointmentPayments } from '../../invoice/services/appointmentPayment.service.js';
 import { AnalyticsQuery, AnalyticsQueryError, bucketKey, localDateKey, loadOccurrences } from './analytics.service.js';
 import { CarePackage, PatientCredit, TreasuryMovement } from '../../administration/models/index.js';
 import { PatientCreditMovement } from '../../administration/models/patientCreditMovement.model.js';
@@ -158,7 +158,7 @@ export async function loadFinanceData(req: Request, query: FinanceQuery, scope: 
 }
 
 async function loadClinicalCash(schema: string, payments: Array<Record<string, any>>) {
-    const ids = payments.filter(row => !['PACKAGE', 'CREDIT'].includes(row.source)).map(row => row.id);
+    const ids = payments.filter(row => !['PACKAGE', 'CREDIT', 'OPENING_BALANCE'].includes(row.source)).map(row => row.id);
     if (!ids.length) return clinicalCashFacts(payments);
     const credits = (await PatientCredit.schema(schema).findAll({ where: { sourceType: 'VOID_CREDIT', sourceId: { [Op.in]: ids } } })).map(plain);
     const refunds = credits.length ? (await PatientCreditMovement.schema(schema).findAll({
@@ -184,32 +184,42 @@ function financialIndex(data: FinanceData) {
     });
     const invoiceById = new Map(data.invoices.map((invoice) => [invoice.id, invoice]));
     const summaries = new Map(data.invoices.map((invoice) => [invoice.id, summarizeInvoicePayments(invoice, byInvoice.get(invoice.id) ?? [])]));
-    return { payments, byEvent, byInvoice, invoiceById, summaries };
+    const invoiceIdByEvent = new Map<string, string>();
+    data.invoices.forEach(invoice => { if (invoice.agendaEventId && String(invoice.status).toLowerCase() !== 'void') invoiceIdByEvent.set(invoice.agendaEventId, invoice.id); });
+    data.events.forEach(event => { if (event.invoiceId) invoiceIdByEvent.set(event.id, event.invoiceId); });
+    return { payments, byEvent, byInvoice, invoiceById, summaries, invoiceIdByEvent };
 }
 
 function eventFinance(event: Record<string, any>, index: ReturnType<typeof financialIndex>) {
     if (packageCoversAppointment(event)) return {
         expectedAmount: 0, priceEstimated: false, paidAmount: 0, balance: 0,
         paymentStatus: 'paid', invoicePaymentStatus: null, paymentScope: 'package',
-        packageCovered: true, carePackageId: event.carePackageId,
+        packageCovered: true, carePackageId: event.carePackageId, invoiceId: null as string | null,
         paymentMethods: [] as string[], eligible: false, payments: [] as Array<Record<string, any>>
     };
-    const payments = (index.byEvent.get(event.id) ?? []).filter((payment) => payment.status === 'POSTED');
-    const paid = money(payments.reduce((sum, payment) => sum + Number(payment.amount), 0));
+    const history = index.byEvent.get(event.id) ?? [];
+    const payments = history.filter((payment) => payment.status === 'POSTED');
+    const legacy = history.length === 0 && ['paid', 'partial'].includes(event.appointmentPaymentStatus)
+        && money(event.appointmentPaidAmount) > 0 ? [{status: 'POSTED', amount: event.appointmentPaidAmount,
+            method: event.appointmentPaymentMethod, paidAt: event.appointmentPaidAt}] : [];
+    const paid = summarizeAppointmentPayments(null, history.length ? history : legacy).paidAmount;
     const expected = event.expectedAmount == null ? null : money(event.expectedAmount);
-    const invoice = event.invoiceId ? index.invoiceById.get(event.invoiceId) : undefined;
+    const invoiceId = event.invoiceId ?? index.invoiceIdByEvent.get(event.id);
+    const invoice = invoiceId ? index.invoiceById.get(invoiceId) : undefined;
     const summary = invoice ? index.summaries.get(invoice.id) : undefined;
-    const eligible = !event.recurrence && !!event.patientId && !['CANCELLED', 'NO_SHOW'].includes(String(event.status).toUpperCase()) && !!event.start && new Date(event.start).getTime() <= Date.now();
-    const known = !!event.appointmentPaymentHistoryKnown || (index.byEvent.get(event.id)?.length ?? 0) > 0;
-    const directlyPaid = expected != null && paid >= expected && known;
-    const paymentScope = event.invoiceId && !directlyPaid ? 'invoice' : 'appointment';
-    const paymentStatus = paymentScope === 'invoice' || !eligible || !known || expected == null
+    const eligible = !event.recurrence && !event.recurringEventId && !!event.patientId && ['CONFIRMED', 'COMPLETED'].includes(String(event.status).toUpperCase()) && !!event.start && new Date(event.start).getTime() <= Date.now();
+    const known = isAppointmentPaymentHistoryKnown(event, history);
+    const directlyPaid = expected != null && !event.priceEstimated && paid >= expected && known;
+    const paymentScope = invoiceId && !directlyPaid ? 'invoice' : 'appointment';
+    const paymentStatus = paymentScope === 'invoice' || !eligible || !known || expected == null || event.priceEstimated
         ? 'unknown' : paid <= 0 && expected > 0 ? 'unpaid' : paid < expected ? 'partial' : 'paid';
     return { expectedAmount: expected, priceEstimated: !!event.priceEstimated, paidAmount: paymentScope === 'invoice' ? null : paid,
-        packageCovered: false, carePackageId: null,
+        packageCovered: false, carePackageId: null, invoiceId: invoiceId ?? null,
+        issueKind: invoiceId && !invoice ? 'UNRESOLVED_INVOICE' : String(event.status).toUpperCase() === 'NO_SHOW' ? 'NO_SHOW'
+            : !known ? 'UNKNOWN_PREVIOUS_PAYMENT' : expected === null || event.priceEstimated ? 'MISSING_PRICE' : null,
         balance: paymentStatus === 'unknown' ? null : money(Math.max((expected ?? 0) - paid, 0)),
         paymentStatus, invoicePaymentStatus: summary?.paymentStatus ?? null, paymentScope,
-        paymentMethods: [...new Set((paymentScope === 'invoice' ? (index.byInvoice.get(event.invoiceId) ?? []).filter((p) => p.status === 'POSTED') : payments).map((p) => methodKey(p.method)))],
+        paymentMethods: [...new Set((paymentScope === 'invoice' ? (index.byInvoice.get(invoiceId) ?? []).filter((p) => p.status === 'POSTED') : history.length ? payments : legacy).map((p) => methodKey(p.method)))],
         eligible, payments };
 }
 
@@ -218,7 +228,7 @@ function matchesEvent(event: Record<string, any>, financial: ReturnType<typeof e
         ? financial.invoicePaymentStatus : financial.paymentStatus;
     return (query.paymentStatus === 'all' || (query.paymentStatus === 'unknown' ? financial.paymentStatus === 'unknown' : status === query.paymentStatus)) &&
         (query.documentStatus === 'all' || (!financial.packageCovered && event.appointmentPriceAdjustment !== 'COMPLIMENTARY'
-            && (query.documentStatus === 'invoiced') === !!event.invoiceId)) &&
+            && (query.documentStatus === 'invoiced') === !!financial.invoiceId)) &&
         (!query.paymentMethod || financial.paymentMethods.includes(query.paymentMethod)) &&
         (!query.statuses?.length || query.statuses.includes(String(event.status).toUpperCase()));
 }
@@ -300,7 +310,7 @@ export function aggregateFinance(data: FinanceData, query: FinanceQuery) {
         }
     });
     events.forEach((event) => {
-        if (event.invoiceId || packageCoversAppointment(event) || event.appointmentPriceAdjustment === 'COMPLIMENTARY') return;
+        if (index.invoiceIdByEvent.has(event.id) || packageCoversAppointment(event) || event.appointmentPriceAdjustment === 'COMPLIMENTARY') return;
         const financial = financialByEvent.get(event.id)!;
         if (financial.eligible) {
             totals.appointmentOutstanding += financial.balance ?? 0;
@@ -341,7 +351,7 @@ export function aggregateTherapyPayments(data: FinanceData, query: FinanceQuery,
         const { payments, eligible, ...fields } = financial;
         return [{ id: occurrence.id, start: occurrence.start, patientName: occurrence.patientName,
             title: occurrence.title, status: occurrence.status, operatorId: occurrence.calendarId,
-            eventTypeId: occurrence.eventTypeId, invoiceId: event.invoiceId ?? null,
+            eventTypeId: occurrence.eventTypeId,
             appointmentPriceAdjustment: event.appointmentPriceAdjustment ?? null, ...fields }];
     }).sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime() || a.id.localeCompare(b.id));
     const selectedEventIds = new Set(rows.map((row) => row.id));

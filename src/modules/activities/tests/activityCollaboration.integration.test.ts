@@ -24,7 +24,7 @@ async function comment(id: string, text = 'Commento', actor = h.actors.ownerA) {
     return ok(await h.api(actor, 'POST', `/activities/${id}/comments`, {...command(), text}), 201);
 }
 
-test('checklist CRUD increments aggregate/snapshot and preserves core/order versions and actor summaries', async () => {
+test('checklist CRUD increments aggregate/snapshot, tracks automatic transitions and preserves actor summaries', async () => {
     const initial = await create(), id = initial.activity.id;
     const first = await add(id, 0, 'Controllo');
     assert.equal(first.checklistRevision, 1); assert.equal(first.snapshotRevision, initial.snapshotRevision + 1);
@@ -33,26 +33,28 @@ test('checklist CRUD increments aggregate/snapshot and preserves core/order vers
         {...command(), expectedVersion: 1, changes: {checked: true, text: 'Verificato'}}));
     assert.equal(checked.item.version, 2); assert.equal(checked.item.checkedBy.id, h.ids.ownerA); assert.ok(checked.item.checkedAt);
     const current = await detail(id);
-    assert.equal(current.activity.version, 1); assert.equal(current.orderRevision, initial.orderRevision);
+    assert.equal(current.activity.version, 2); assert.equal(current.orderRevision, initial.orderRevision + 1);
     assert.equal(current.activity.checklistProgress.checked, 1); assert.equal(current.activity.checklistRevision, 2);
     assert.equal(current.historyPage.items[0].actor.id, h.ids.ownerA);
     assert.deepEqual(current.history, current.historyPage.items);
+    ok(await h.api(h.actors.ownerA, 'PATCH', `/activities/${id}/checklist/${first.item.id}`,
+        {...command(), expectedVersion: 2, changes: {checked: false}, allowReopen: true, expectedActivityVersion: current.activity.version}));
     const removed = ok(await h.api(h.actors.ownerA, 'DELETE', `/activities/${id}/checklist/${first.item.id}`,
-        {...command(), expectedVersion: 2, expectedChecklistRevision: 2}));
-    assert.equal(removed.item, null); assert.equal(removed.checklist.length, 0); assert.equal(removed.checklistRevision, 3);
+        {...command(), expectedVersion: 3, expectedChecklistRevision: 3}));
+    assert.equal(removed.item, null); assert.equal(removed.checklist.length, 0); assert.equal(removed.checklistRevision, 4);
     const get = ok(await h.api(h.actors.ownerA, 'GET', `/activities/${id}/checklist`));
-    assert.equal(get.items.length, 0); assert.equal(get.checklistRevision, 3);
+    assert.equal(get.items.length, 0); assert.equal(get.checklistRevision, 4);
 });
 
 test('independent checklist item patches succeed concurrently while same-item version conflict is explicit', async () => {
-    const {activity} = await create({checklist: [{text: 'A'}, {text: 'B'}]});
+    const {activity} = await create({checklist: [{text: 'A'}, {text: 'B'}, {text: 'C'}]});
     const original = await detail(activity.id);
     const [a, b] = original.checklist;
     const results = await Promise.all([a, b].map(item => h.api(h.actors.ownerA, 'PATCH', `/activities/${activity.id}/checklist/${item.id}`,
         {...command(), expectedVersion: 1, changes: {checked: true}})));
     results.forEach(result => ok(result));
     const current = await detail(activity.id);
-    assert.equal(current.activity.checklistRevision, 3); assert.equal(current.activity.version, 1);
+    assert.equal(current.activity.checklistRevision, 3); assert.equal(current.activity.version, 2);
     assert.equal(current.activity.checklistProgress.checked, 2);
     fail(await h.api(h.actors.ownerA, 'PATCH', `/activities/${activity.id}/checklist/${a.id}`,
         {...command(), expectedVersion: 1, changes: {text: 'Stale'}}), 409, 'CHECKLIST_ITEM_VERSION_CONFLICT');

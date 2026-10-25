@@ -1,3 +1,6 @@
+import {randomUUID} from 'node:crypto';
+import Tenant from '../../auth/models/tenant.model.js';
+import {contributionPolicy} from '../../invoice/utils/socialSecurity.js';
 import { Request } from 'express';
 import { Model, Op, Transaction } from 'sequelize';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
@@ -53,6 +56,20 @@ export async function validateQuoteDraft(req: Request, payload: Record<string, u
     }
     if (payload.acceptedAt !== undefined || payload.rejectedAt !== undefined) {
         throw new QuoteFlowError(409, 'Usa le azioni di accettazione o rifiuto del preventivo');
+    }
+    if (Array.isArray(payload.lines)) {
+        const tenant = await Tenant.findByPk(getCurrentTenantId(req), {transaction});
+        const policy = contributionPolicy(tenant?.socialSecurityFund, tenant?.socialSecurityPricingMode ?? 'EXCLUDED', tenant?.socialSecurityRate ?? 4);
+        const oldLines = Array.isArray(previous?.lines) ? [...previous!.lines as any[]] : [];
+        payload.lines = (payload.lines as any[]).map(line => {
+            const oldIndex = oldLines.findIndex(saved => line.id ? saved.id === line.id
+                : saved.itemType === line.itemType && saved.itemId === line.itemId);
+            const old = oldIndex < 0 ? null : oldLines.splice(oldIndex, 1)[0];
+            // Existing quotes keep the recorded agreement; legacy rows are never reinterpreted.
+            const socialSecurity = old ? old.socialSecurity : line.itemType === 'SERVICE' ? policy : contributionPolicy('NONE');
+            const {socialSecurity: _ignored, ...fields} = line;
+            return {...fields, id: old?.id ?? randomUUID(), ...(socialSecurity ? {socialSecurity, appliesVat: old?.appliesVat ?? !['RF02', 'RF19'].includes(tenant?.taxRegime ?? '')} : {})};
+        });
     }
     payload.status = previous?.status ?? 'DRAFT';
     if (previous) {

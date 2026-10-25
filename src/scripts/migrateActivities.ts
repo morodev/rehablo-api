@@ -20,6 +20,7 @@ const migration = require('../../migrations/20261011-activities-foundation.js') 
     }): Promise<void>;
 };
 const deliveryMigration = require('../../migrations/20261011-activities-delivery.js') as typeof migration;
+const reviewMigration = require('../../migrations/20261024-activities-review.js') as typeof migration;
 const publicMigration = require('../../migrations/20261011-activities-notifications-public.js') as {
     VERSION: string; contract: {columns: Record<string, string[]>};
     up(queryInterface: ReturnType<typeof sequelize.getQueryInterface>, options?: {transaction?: Transaction}): Promise<void>;
@@ -27,8 +28,9 @@ const publicMigration = require('../../migrations/20261011-activities-notificati
 const contract: FoundationContract = {
     tables: [...migration.contract.tables, ...deliveryMigration.contract.tables],
     columns: {...migration.contract.columns, ...Object.fromEntries(Object.entries(deliveryMigration.contract.columns)
-        .map(([table, columns]) => [table, [...(migration.contract.columns[table] ?? []), ...columns]]))},
-    constraints: [...migration.contract.constraints, ...deliveryMigration.contract.constraints],
+        .map(([table, columns]) => [table, [...(migration.contract.columns[table] ?? []), ...columns]])),
+        ...Object.fromEntries(Object.entries(reviewMigration.contract.columns).map(([table, columns]) => [table, [...(migration.contract.columns[table] ?? []), ...columns]]))},
+    constraints: [...migration.contract.constraints, ...deliveryMigration.contract.constraints, ...reviewMigration.contract.constraints],
     indexes: [...migration.contract.indexes, ...deliveryMigration.contract.indexes]
 };
 const SCHEMA_PATTERN = /^rehablo_[a-f0-9]{32}$/i;
@@ -57,6 +59,7 @@ export interface ActivitiesReadiness {
     schema: string;
     versionApplied: boolean;
     deliveryVersionApplied: boolean;
+    reviewVersionApplied: boolean;
     publicReady: boolean;
     missingPublicColumns: string[];
     missingTables: string[];
@@ -108,7 +111,7 @@ export async function inspectActivities(connection: QueryConnection, schema: str
         actual.table === expected.table && actual.name === expected.name && actual.valid
         && actual.unique === expected.unique && actual.columns.join(',') === expected.columns.join(',')
         && normalizePredicate(actual.predicate) === normalizePredicate(expected.predicate))).map(index => index.name);
-    let versionApplied = false, deliveryVersionApplied = false;
+    let versionApplied = false, deliveryVersionApplied = false, reviewVersionApplied = false;
     if (availableColumns.has('schema_migrations.version')) {
         const [rows] = await connection.query(`SELECT 1 FROM ${quote(schema)}."schema_migrations" WHERE "version" = :version`, {
             replacements: {version: migration.VERSION}
@@ -117,6 +120,8 @@ export async function inspectActivities(connection: QueryConnection, schema: str
         const [deliveryRows] = await connection.query(`SELECT 1 FROM ${quote(schema)}."schema_migrations" WHERE "version" = :version`, {
             replacements: {version: deliveryMigration.VERSION}});
         deliveryVersionApplied = deliveryRows.length > 0;
+        const [reviewRows] = await connection.query(`SELECT 1 FROM ${quote(schema)}."schema_migrations" WHERE "version" = :version`, {replacements: {version: reviewMigration.VERSION}});
+        reviewVersionApplied = reviewRows.length > 0;
     }
     let missingBoards: number | null = null;
     if (availableColumns.has('activity_boards.structureId')) {
@@ -134,9 +139,9 @@ export async function inspectActivities(connection: QueryConnection, schema: str
     const missingPublicColumns = Object.entries(publicMigration.contract.columns).flatMap(([table, names]) =>
         names.filter(name => !availablePublic.has(table + '.' + name)).map(name => table + '.' + name));
     const publicReady = !missingPublicColumns.length;
-    return {schema, versionApplied, deliveryVersionApplied, publicReady, missingPublicColumns,
+    return {schema, versionApplied, deliveryVersionApplied, reviewVersionApplied, publicReady, missingPublicColumns,
         missingTables, missingColumns, missingConstraints, missingIndexes, missingBoards,
-        ready: versionApplied && deliveryVersionApplied && publicReady && !missingTables.length && !missingColumns.length
+        ready: versionApplied && deliveryVersionApplied && reviewVersionApplied && publicReady && !missingTables.length && !missingColumns.length
             && !missingConstraints.length && !missingIndexes.length && missingBoards === 0};
 }
 
@@ -145,6 +150,7 @@ async function applyForTenant(schema: string): Promise<ActivitiesReadiness> {
         await lockTenantSchema(sequelize, schema, transaction);
         await migration.up(sequelize.getQueryInterface(), {schema, transaction});
         await deliveryMigration.up(sequelize.getQueryInterface(), {schema, transaction});
+        await reviewMigration.up(sequelize.getQueryInterface(), {schema, transaction});
         await sequelize.query(`CREATE TABLE IF NOT EXISTS ${quote(schema)}."schema_migrations" (
             "version" VARCHAR(160) PRIMARY KEY, "appliedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )`, {transaction});
@@ -153,6 +159,8 @@ async function applyForTenant(schema: string): Promise<ActivitiesReadiness> {
             ON CONFLICT ("version") DO NOTHING`, {transaction, replacements: {version: migration.VERSION}});
         await sequelize.query(`INSERT INTO ${quote(schema)}."schema_migrations" ("version") VALUES (:version)
             ON CONFLICT ("version") DO NOTHING`, {transaction, replacements: {version: deliveryMigration.VERSION}});
+        await sequelize.query(`INSERT INTO ${quote(schema)}."schema_migrations" ("version") VALUES (:version) ON CONFLICT ("version") DO NOTHING`,
+            {transaction, replacements: {version: reviewMigration.VERSION}});
         const connection: QueryConnection = {
             query: (sql, options = {}) => sequelize.query(sql, {...options, transaction})
         };

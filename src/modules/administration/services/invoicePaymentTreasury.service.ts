@@ -14,6 +14,7 @@ export interface InvoicePaymentCreateOptions {
 }
 
 interface PaymentSnapshot {
+    source?: string;
     id: string;
     invoiceId?: string | null;
     agendaEventId?: string | null;
@@ -35,6 +36,7 @@ export async function mirrorInvoicePaymentToTreasury(
     transaction?: Transaction,
     context?: InvoicePaymentTreasuryContext
 ): Promise<void> {
+    if (payment.source === 'OPENING_BALANCE') return;
     const prefix = schemaPrefix(schema);
     if (!prefix) return;
     let structureId = context?.structureId;
@@ -82,6 +84,7 @@ export async function mirrorVoidedInvoicePaymentToTreasury(
     payment: PaymentSnapshot,
     transaction?: Transaction
 ): Promise<void> {
+    if (payment.source === 'OPENING_BALANCE') return;
     const prefix = schemaPrefix(schema);
     if (!prefix) return;
     await sequelize.query(`INSERT INTO ${prefix}."treasury_movements"

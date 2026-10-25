@@ -40,6 +40,19 @@ describe('financial facts preserve monetary history without writes', () => {
         assert.deepEqual(result.facts.map(row => row.amount), [100, -30]);
         assert.equal(result.facts[1].kind, 'refund');
     });
+
+    it('excludes preceding opening coverage from cash facts, daily totals and reconciliation warnings', () => {
+        for (const paidAt of [null, '2026-09-10']) {
+            const opening = {...payment, id: 'opening', source: 'OPENING_BALANCE', status: 'POSTED', paidAt};
+            const result = clinicalCashFacts([opening]);
+            assert.deepEqual(result.facts, []);
+            assert.deepEqual(result.warnings, []);
+            const data: FinanceData = {events: [], payments: [opening], invoices: [],
+                attributableInvoiceIds: new Set(), excludedMixedInvoiceCount: 0};
+            assert.equal(aggregateFinance(data, query('2026-09-01', '2026-09-30')).totals.collected, 0);
+        }
+    });
+
     it('separates treasury cashflow from unpaid expenses and excludes invalid documents', () => {
         const docs = [ { id: 'a', status: 'paid', structureId: 'site', emissionDate: '2026-09-01', invoiceTotal: 100, documentType: 'fattura' },
             { id: 'b', status: 'void', structureId: 'site', emissionDate: '2026-09-01', invoiceTotal: 200, documentType: 'fattura' },

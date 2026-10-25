@@ -12,6 +12,10 @@ export class Activity extends Model {
     declare position: string;
     declare version: number;
     declare checklistRevision: number;
+    declare reviewerUserId: string | null;
+    declare reviewStatus: 'not_requested' | 'pending' | 'approved';
+    declare reviewApprovedByUserId: string | null;
+    declare reviewApprovedAt: Date | null;
     declare dueKind: 'timed' | 'allDay' | null;
     declare dueAt: Date | null;
     declare dueDate: string | null;
@@ -39,6 +43,10 @@ Activity.init({
     position: {type: DataTypes.BIGINT, allowNull: false, defaultValue: '0'},
     version: {type: DataTypes.INTEGER, allowNull: false, defaultValue: 1, validate: {min: 1}},
     checklistRevision: {type: DataTypes.INTEGER, allowNull: false, defaultValue: 0, validate: {min: 0}},
+    reviewerUserId: {type: DataTypes.UUID, allowNull: true},
+    reviewStatus: {type: DataTypes.STRING(16), allowNull: false, defaultValue: 'not_requested', validate: {isIn: [['not_requested', 'pending', 'approved']]}},
+    reviewApprovedByUserId: {type: DataTypes.UUID, allowNull: true},
+    reviewApprovedAt: {type: DataTypes.DATE, allowNull: true},
     dueKind: {type: DataTypes.STRING(8), allowNull: true, validate: {isIn: [['timed', 'allDay']]}},
     dueAt: {type: DataTypes.DATE, allowNull: true},
     dueDate: {type: DataTypes.DATEONLY, allowNull: true},

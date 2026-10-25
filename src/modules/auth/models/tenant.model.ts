@@ -35,6 +35,9 @@ export interface TenantAttributes {
     /** Codice tabella `RegimeFiscale` FatturaPA (RF01-RF19). Default: RF01 ordinario. */
     taxRegime?: string | null;
     /** Cassa previdenziale: 'NONE' | 'INPS_GS' (rivalsa 4%) | 'CASSA' (contributo integrativo). */
+    socialSecurityPricingMode?: string | null;
+    withholdingType?: string | null;
+    withholdingCausale?: string | null;
     socialSecurityFund?: string | null;
     /** Aliquota del contributo previdenziale proposta in fattura (es. 4 per la Gestione Separata). */
     socialSecurityRate?: number | null;
@@ -69,6 +72,9 @@ export type TenantCreationAttributes = Optional<
     | 'MBQuantity'
     | 'lastDocumentNumberByYear'
     | 'taxRegime'
+    | 'socialSecurityPricingMode'
+    | 'withholdingType'
+    | 'withholdingCausale'
     | 'socialSecurityFund'
     | 'socialSecurityRate'
     | 'withholdingRate'
@@ -106,6 +112,9 @@ export class Tenant extends Model<TenantAttributes, TenantCreationAttributes> im
     declare email: string | null;
     declare phone: string | null;
     declare taxRegime: string | null;
+    declare socialSecurityPricingMode: string | null;
+    declare withholdingType: string | null;
+    declare withholdingCausale: string | null;
     declare socialSecurityFund: string | null;
     declare socialSecurityRate: number | null;
     declare withholdingRate: number | null;
@@ -147,6 +156,9 @@ Tenant.init(
         // Il default RF01 (ordinario) è la scelta prudente: applica l'IVA di riga e ammette la
         // ritenuta, quindi non "nasconde" imposte a chi non ha ancora configurato il regime.
         taxRegime: { type: DataTypes.STRING(4), allowNull: true, defaultValue: 'RF01' },
+        socialSecurityPricingMode: {type: DataTypes.STRING(16), allowNull: true, defaultValue: 'EXCLUDED'},
+        withholdingType: {type: DataTypes.STRING(4), allowNull: true},
+        withholdingCausale: {type: DataTypes.STRING(2), allowNull: true},
         socialSecurityFund: { type: DataTypes.STRING(16), allowNull: true, defaultValue: 'NONE' },
         socialSecurityRate: { type: DataTypes.DECIMAL(5, 2), allowNull: true, defaultValue: 4 },
         withholdingRate: { type: DataTypes.DECIMAL(5, 2), allowNull: true, defaultValue: 20 },

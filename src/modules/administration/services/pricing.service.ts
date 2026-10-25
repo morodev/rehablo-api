@@ -1,3 +1,4 @@
+import {contributionPolicy, evaluateContributionInvoice} from '../../invoice/utils/socialSecurity.js';
 import { Op } from 'sequelize';
 import { Tenant, Structure } from '../../auth/models/index.js';
 import Patient from '../../patients/models/patient.model.js';
@@ -35,7 +36,7 @@ export function choosePriceList(
 export async function resolvePrice(schema: string, tenantId: string, input: PriceResolutionInput) {
     const onDate = input.onDate || new Date().toISOString().slice(0, 10);
     const [tenant, structure, patient, lists] = await Promise.all([
-        Tenant.findByPk(tenantId, { attributes: ['defaultPriceListId'] }),
+        Tenant.findByPk(tenantId, { attributes: ['defaultPriceListId', 'socialSecurityFund', 'socialSecurityRate', 'socialSecurityPricingMode', 'taxRegime'] }),
         input.structureId ? Structure.findByPk(input.structureId, { attributes: ['defaultPriceListId'] }) : null,
         input.patientId ? Patient.schema(schema).findByPk(input.patientId, { attributes: ['defaultPriceListId'] }) : null,
         PriceList.schema(schema).findAll({ where: { isActive: true }, order: [['priority', 'DESC']] })
@@ -77,7 +78,11 @@ export async function resolvePrice(schema: string, tenantId: string, input: Pric
         order: [['structureId', 'DESC'], ['minQuantity', 'DESC']]
     });
     if (!item) return null;
+    const socialSecurity = contributionPolicy(input.itemType === 'SERVICE' ? tenant?.socialSecurityFund : 'NONE', tenant?.socialSecurityPricingMode ?? 'EXCLUDED', tenant?.socialSecurityRate ?? 4);
+    const calculated = evaluateContributionInvoice({policy: socialSecurity, appliesVat: !['RF02', 'RF19'].includes(tenant?.taxRegime ?? ''),
+        lines: [{sellingPrice: Number(item.get('unitPrice')), productVat: Number(item.get('vatRate')) || String(item.get('vatNature') ?? 'N4'), type: input.itemType}]});
     return {
+        socialSecurity, customerAmount: calculated.invoiceTotal,
         ...selected,
         versionId: version.get('id'),
         version: version.get('version'),

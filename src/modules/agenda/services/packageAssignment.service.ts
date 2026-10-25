@@ -16,14 +16,18 @@ export function appointmentPackageDate(start: unknown): string | null {
 }
 
 export function packageCompatibilityError(pkg: Record<string, any>, event: Record<string, any>, serviceId: string | null): string | null {
-    if (!pkg.templateId) return 'Il pacchetto storico richiede una verifica amministrativa prima di poter essere prenotato.';
+    if (!pkg.templateId) return 'Questo pacchetto precedente non è abilitato alla prenotazione in agenda.';
     if (!['ACTIVE', 'EXHAUSTED'].includes(pkg.status)) return 'Il pacchetto non è attivo.';
     if (pkg.patientId !== (event.patientId ?? event.patient?.id) || pkg.structureId !== event.structureId) return 'Il pacchetto appartiene a un altro paziente o a un’altra sede.';
-    if (!serviceId || serviceId !== pkg.serviceId) return 'La prestazione dell’appuntamento non è compresa nel pacchetto.';
+    if (!event.eventTypeId) return 'Seleziona il tipo di appuntamento per verificare la compatibilità del pacchetto.';
+    if (!serviceId) return 'Seleziona un tipo di appuntamento collegato a una prestazione.';
+    if (serviceId !== pkg.serviceId) return 'La prestazione dell’appuntamento non è compresa nel pacchetto.';
     if (event.recurrence || event.recurringEventId) return 'Separa questa occorrenza dalla serie prima di assegnare il pacchetto.';
+    if (!event.start) return 'Imposta la data della seduta per verificare la validità del pacchetto.';
     const day = appointmentPackageDate(event.start);
-    if (!day || (pkg.purchasedAt && day < String(pkg.purchasedAt).slice(0, 10))
-        || (pkg.expiresAt && day > String(pkg.expiresAt).slice(0, 10))) return 'La data della seduta è fuori dalla validità del pacchetto.';
+    if (!day) return 'La data della seduta non è valida per questo pacchetto.';
+    if (pkg.purchasedAt && day < String(pkg.purchasedAt).slice(0, 10)) return 'Il pacchetto non era ancora stato acquistato alla data della seduta.';
+    if (pkg.expiresAt && day > String(pkg.expiresAt).slice(0, 10)) return 'Il pacchetto è scaduto alla data della seduta.';
     return null;
 }
 
@@ -106,4 +110,65 @@ export async function eligibleCarePackages(schema: string, context: {patientId: 
             purchasedUnits: Number(pkg.purchasedUnits), remainingUnits: Number(pkg.remainingUnits), reservedUnits, availableUnits, expiresAt: pkg.expiresAt});
     }
     return result;
+}
+
+export interface AppointmentPackageOptionsContext {
+    patientId: string;
+    structureId: string;
+    calendarId: string;
+    eventTypeId?: string;
+    start?: string;
+    agendaEventId?: string;
+    recurring?: boolean;
+    includeLegacy?: boolean;
+    currentEvent?: Record<string, any>;
+}
+export interface AppointmentPackageOption {
+    id: string; name: string; serviceId: string | null; serviceName: string | null;
+    purchasedUnits: number; remainingUnits: number; reservedUnits: number; availableUnits: number;
+    expiresAt: string | null; selectable: boolean; reason: string | null;
+}
+
+/** A contextual preview only. Saving still owns the locks and revalidates compatibility and capacity. */
+export async function appointmentCarePackageOptions(schema: string, context: AppointmentPackageOptionsContext,
+    transaction?: Transaction): Promise<AppointmentPackageOption[]> {
+    const type = context.eventTypeId ? await EventType.schema(schema).findByPk(context.eventTypeId, {transaction}) : null;
+    const models = await CarePackage.schema(schema).findAll({where: {patientId: context.patientId, structureId: context.structureId,
+        ...(!context.includeLegacy ? {templateId: {[Op.ne]: null}} : {})},
+        order: [['expiresAt', 'ASC'], ['createdAt', 'ASC'], ['id', 'ASC']], transaction});
+    const packages = models.map(model => model.get({plain: true})).filter(pkg => pkg.patientId === context.patientId
+        && pkg.structureId === context.structureId && (context.includeLegacy || !!pkg.templateId));
+    const ids = packages.map(pkg => pkg.id);
+    const reservations = ids.length ? await AgendaEvent.schema(schema).findAll({where: {
+        carePackageId: {[Op.in]: ids}, packageReservationStatus: 'RESERVED',
+        ...(context.agendaEventId ? {id: {[Op.ne]: context.agendaEventId}} : {})
+    }, attributes: ['carePackageId'], transaction}) : [];
+    const reservedByPackage = new Map<string, number>();
+    reservations.forEach(model => {
+        const id = String(model.get('carePackageId'));
+        reservedByPackage.set(id, (reservedByPackage.get(id) ?? 0) + 1);
+    });
+    const current = context.currentEvent;
+    const event = {...current, patientId: context.patientId, structureId: context.structureId, calendarId: context.calendarId,
+        eventTypeId: context.eventTypeId, start: context.start,
+        ...(context.recurring ? {recurrence: 'REQUESTED'} : {})};
+    return packages.map(pkg => {
+        const reservedUnits = reservedByPackage.get(pkg.id) ?? 0;
+        const remainingUnits = Number(pkg.remainingUnits) || 0;
+        const retainedConsumption = current?.id === context.agendaEventId && (current?.patientId ?? current?.patient?.id) === context.patientId
+            && current?.structureId === context.structureId && current?.carePackageId === pkg.id
+            && current?.packageReservationStatus === 'CONSUMED';
+        const availableUnits = Math.max(0, remainingUnits - reservedUnits + (retainedConsumption ? 1 : 0));
+        let reason = packageCompatibilityError(pkg, event, type?.linkedServiceId ?? null);
+        if (!reason && current?.invoiceId) reason = 'La seduta è già fatturata.';
+        if (!reason && current && String(current.status).toUpperCase() === 'COMPLETED' && current.carePackageId !== pkg.id) {
+            reason = 'Riapri la seduta prima di assegnare o cambiare il pacchetto, poi segnala esplicitamente che è stata effettuata.';
+        }
+        if (!reason && availableUnits < 1) reason = remainingUnits <= 0
+            ? 'Non restano sedute da utilizzare in questo pacchetto.' : 'Le sedute residue sono già tutte prenotate.';
+        return {id: String(pkg.id), name: String(pkg.name ?? 'Pacchetto'), serviceId: pkg.serviceId ?? null,
+            serviceName: pkg.serviceName ?? null, purchasedUnits: Number(pkg.purchasedUnits) || 0,
+            remainingUnits, reservedUnits, availableUnits, expiresAt: pkg.expiresAt ? String(pkg.expiresAt).slice(0, 10) : null,
+            selectable: !reason, reason};
+    }).sort((left, right) => Number(right.selectable) - Number(left.selectable));
 }

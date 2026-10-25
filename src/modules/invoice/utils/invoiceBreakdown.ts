@@ -1,3 +1,4 @@
+import {undiscountedCompensation} from './socialSecurity.js';
 const money = (value: unknown): number => Math.round((Number(value) || 0) * 100) / 100;
 
 function lineTotal(line: Record<string, any>, priceField: string): number {
@@ -11,6 +12,17 @@ function lineTotal(line: Record<string, any>, priceField: string): number {
  * Non ricalcola né modifica i valori fiscali persistiti dei documenti già emessi.
  */
 export function invoiceBreakdown(invoice: Record<string, any>) {
+    const snapshot = invoice.socialSecuritySnapshot;
+    if (snapshot?.version === 1 && Array.isArray(snapshot.lines)) {
+        const reference = money(undiscountedCompensation(snapshot.lines).reduce((sum, amount) => sum + amount, 0));
+        const discounted = money(snapshot.lines.reduce((sum: number, line: any) => sum + Number(line.base), 0));
+        const original = money(invoice.sellingPrice ?? reference);
+        return {adjustedSubtotal: reference, appointmentDiscountTotal: money(Math.max(original - reference, 0)),
+            documentDiscountTotal: money(Math.max(reference - discounted, 0)), discountTotal: money(Math.max(original - discounted, 0)),
+            rivalsAmount: money(snapshot.lines.reduce((sum: number, line: any) => sum + Number(line.contribution), 0)),
+            taxWithholdingAmount: money(snapshot.withholding?.amount ?? 0),
+            stampChargedAmount: invoice.isStamp && invoice.stampChargedToPatient ? money(invoice.stampAmount) : 0};
+    }
     const lines = [
         ...(invoice.products ?? []).map((line: Record<string, any>) => lineTotal(line, 'productPrice')),
         ...(invoice.services ?? []).map((line: Record<string, any>) => lineTotal(line, 'servicePrice'))

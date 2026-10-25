@@ -454,3 +454,17 @@ describe('manual treasury controller validation', () => {
         assert.equal(f.movements.length, 0);
     });
 });
+
+it('does not create retained cash credit from a previous opening balance', async t => {
+    const f = fixture(t);
+    const previous = record({id: accountId, invoiceId: id, agendaEventId: methodId,
+        amount: 60, paidAt: null, source: 'OPENING_BALANCE', status: 'POSTED'});
+    f.payments.push(previous);
+    f.req.params.paymentId = previous.id;
+    f.req.body = {reason: 'Correzione del pagamento precedente', convertToCredit: true};
+    const result = await run(voidPayment, f.req);
+    assert.equal(result.status, 409);
+    assert.equal(f.credits.length, 0);
+    assert.equal(f.movements.length, 0);
+    assert.equal(previous.status, 'POSTED');
+});

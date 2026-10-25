@@ -8,7 +8,7 @@ import {
     registerTenantScopedModel, warmTenantSchemas
 } from './tenantSchema.js';
 import {
-    APPOINTMENT_LEDGER_VERSION, prepareTenantPaymentHistory, runTenantMigrations,
+    SOCIAL_SECURITY_PRICING_VERSION, ACTIVITIES_REVIEW_VERSION, APPOINTMENT_LEDGER_VERSION, prepareTenantPaymentHistory, runTenantMigrations,
     PATIENT_DEFAULT_EVENT_TYPE_VERSION, TENANT_MODEL_BASELINE_VERSION, APPOINTMENT_PRICE_ADJUSTMENTS_VERSION,
     CATALOG_STRUCTURE_AVAILABILITY_VERSION, ADMINISTRATION_SEED_VERSION, WORK_ITEM_ASSIGNEES_VERSION,
     ACTIVITIES_FOUNDATION_VERSION, ACTIVITIES_DELIVERY_VERSION, PATIENT_SETTLEMENTS_VERSION, CARE_PACKAGE_PURCHASES_VERSION
@@ -22,6 +22,7 @@ const catalogAvailabilityMigration = require('../../migrations/20260919-add-cata
 const publicationMigration = require('../../migrations/20260924-backfill-patient-publication.js');
 const tenant = '00000000-0000-4000-8000-000000000001';
 const schema = 'rehablo_' + tenant.replaceAll('-', '');
+const extraVersions = new Set<string>();
 const original = {
     query: sequelize.query, transaction: sequelize.transaction, createSchema: sequelize.createSchema,
     migrate: migration.up, patientDefaultMigrate: patientDefaultMigration.up, pricingMigrate: pricingMigration.up,
@@ -44,6 +45,7 @@ registerTenantScopedModel({schema: () => ({sync: async (options: any) => {
 }})} as any);
 
 beforeEach(() => {
+    extraVersions.clear();
     invalidateTenantSchemaCache();
     env.tenantSchemaSync = 'additive';
     queries = []; order = []; applied = false; patientDefaultApplied = false; syncs = 0; migrations = 0;
@@ -78,6 +80,7 @@ beforeEach(() => {
         ]];
         if (sql.includes('ADD COLUMN IF NOT EXISTS "appointmentPaymentHistoryKnown"')) {order.push('preserve-history'); historyExists = true;}
         if (sql.startsWith('SELECT "version"')) return [[
+            ...[...extraVersions].map(version => ({version})),
             ...(applied ? [{version: APPOINTMENT_LEDGER_VERSION}] : []),
             ...(patientDefaultApplied ? [{version: PATIENT_DEFAULT_EVENT_TYPE_VERSION}] : []),
             ...(pricingApplied ? [{version: APPOINTMENT_PRICE_ADJUSTMENTS_VERSION}] : []),
@@ -92,6 +95,9 @@ beforeEach(() => {
             ...(legacyBaselineApplied ? [{version: '20260907-tenant-model-baseline-v1'}] : []),
             ...(baselineApplied ? [{version: TENANT_MODEL_BASELINE_VERSION}] : [])
         ]];
+        if (sql.startsWith('INSERT INTO') && [SOCIAL_SECURITY_PRICING_VERSION, ACTIVITIES_REVIEW_VERSION].includes(options?.replacements?.version)) {
+            extraVersions.add(options.replacements.version);
+        }
         if (sql.startsWith('INSERT INTO') && options?.replacements?.version === APPOINTMENT_LEDGER_VERSION) {
             applied = true; order.push('record-version');
         }

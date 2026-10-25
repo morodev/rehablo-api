@@ -8,11 +8,13 @@ import Patient from '../models/patient.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
-import {CarePackage, PatientCredit, TreasuryMovement} from '../../administration/models/index.js';
-import {PatientSettlementContext, PatientSettlementObligation, RawPatientSettlementPosition,
+import {PatientSettlementContext, PatientSettlementObligation, PatientSettlementIssueKind, RawPatientSettlementPosition,
     loadPatientSettlementPosition, settlementFail, settlementPatientId} from './patientSettlementPolicy.service.js';
 import {canAccessAppointmentFinance} from '../../agenda/services/appointmentFinancialAccess.service.js';
-import {paymentMoney} from '../../invoice/services/appointmentPayment.service.js';
+import {isAppointmentPaymentHistoryKnown, paymentMoney} from '../../invoice/services/appointmentPayment.service.js';
+import {packagePatient, packageSelectedStructure} from '../../administration/services/carePackage.service.js';
+import {patientCoveragePosition} from './patientCoverage.service.js';
+export {verifiedSettlementCredit} from '../../administration/services/patientCreditBacking.service.js';
 
 export const SETTLEMENT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export interface AuthorizedSettlementContext extends PatientSettlementContext {
@@ -23,6 +25,13 @@ export interface SettlementObligationView {
     key: string; kind: 'APPOINTMENT' | 'INVOICE' | 'PACKAGE'; targetId: string; title: string;
     date: string | null; orderDate: string; balance: number | null; expectedAmount: number | null; paidAmount: number;
     isCurrent: boolean; invoiceNumber: string | null; linkedEventIds: string[]; canCash: boolean; canUseCredit: boolean;
+    canPayPackage?: boolean;
+}
+export interface SettlementIssueView {
+    agendaEventId: string; title: string; date: string | null; start: string | null; calendarId: string | null;
+    operatorName: string | null; kind: PatientSettlementIssueKind; expectedAmount: number | null;
+    suggestedAmount?: number | null; paidAmount: number; canResolve: boolean; canSetPrice: boolean;
+    canCash: boolean; canUseCredit: boolean; isCurrent: boolean;
 }
 export interface SettlementPositionView {
     patientId: string; structureId: string;
@@ -31,16 +40,17 @@ export interface SettlementPositionView {
         currentEligible: boolean; unavailableReason: string | null;
         summary: {expectedAmount: number | null; paidAmount: number; balance: number | null; paymentStatus: string;
             coverageSources: string[]; methods: Array<string | null>; hasUndatedPayments: boolean};
-        pricing: {originalAmount: number | null; adjustment: 'DISCOUNT' | 'COMPLIMENTARY' | null; note: string | null; editable: boolean} | null;
+        pricing: {originalAmount: number | null; adjustment: 'DISCOUNT' | 'COMPLIMENTARY' | null; note: string | null; editable: boolean; historyKnown: boolean} | null;
     };
     obligations: SettlementObligationView[];
+    issues?: SettlementIssueView[];
     verification: Array<{agendaEventId: string; date: string | null; start: string | null; calendarId: string | null;
         operatorName: string | null; title: string; reason: 'UNVERIFIED_HISTORY' | 'NO_SHOW'}>;
     totals: {knownOutstandingAmount: number; priorKnownOutstandingAmount: number; unknownPriceCount: number; priorUnknownPriceCount: number; priorCount: number};
     blocker: {kind: 'INACCESSIBLE_PRIOR' | 'READ_ONLY'; message: string} | null;
     capabilities: {cash: boolean; credit: boolean; packages: boolean; canOpenInvoice: boolean; canAdjustPrice: boolean; canReverse: boolean};
     creditsSummary: {verifiedRemaining: number; unverifiedCount: number} | null;
-    packagesSummary: {activeCount: number; remainingUnits: number} | null;
+    packagesSummary: {activeCount: number; remainingUnits: number; availableUnits?: number; reservedUnits?: number; legacyRemainingUnits?: number} | null;
 }
 
 export function settlementScope(req: Request, resource: Resource, action: Action) {
@@ -92,17 +102,25 @@ export async function resolvePatientSettlementContext(req: Request, source: Reco
         if (!referenceInvoiceId) {
             const link = await InvoiceAgendaEvent.schema(req.tenantSchema!).findOne({where: {agendaEventId: event.id, releasedAt: null}, transaction});
             referenceInvoiceId = link?.get('invoiceId') as string | undefined;
+            if (!referenceInvoiceId) {
+                const reverse = await Invoice.schema(req.tenantSchema!).findOne({where: {agendaEventId: event.id, status: {[Op.ne]: 'void'}}, transaction});
+                referenceInvoiceId = reverse?.get('id') as string | undefined;
+            }
         }
     }
     const invoiceModel = referenceInvoiceId ? await Invoice.schema(req.tenantSchema!).findByPk(referenceInvoiceId, {transaction}) : null;
-    const invoice = invoiceModel?.get({plain: true}) as Record<string, any> | undefined;
+    let invoice = invoiceModel?.get({plain: true}) as Record<string, any> | undefined;
     if (event && explicitInvoiceReference) {
         const activeLink = event.invoiceId ? null : await InvoiceAgendaEvent.schema(req.tenantSchema!).findOne({
             where: {agendaEventId: event.id, releasedAt: null}, transaction});
-        if ((event.invoiceId ?? activeLink?.get('invoiceId')) !== referenceInvoiceId) settlementFail(409, 'I riferimenti non descrivono lo stesso appuntamento');
+        if ((event.invoiceId ?? activeLink?.get('invoiceId')) !== referenceInvoiceId && invoice?.agendaEventId !== event.id) settlementFail(409, 'I riferimenti non descrivono lo stesso appuntamento');
     }
     if (referenceAgendaEventId && (!event || settlementPatientId(event) !== patientId)) settlementFail(404, 'Appuntamento non trovato o non accessibile');
-    if (referenceInvoiceId && (!invoice || invoice.patientID !== patientId)) settlementFail(404, 'Fattura non trovata o non accessibile');
+    if (referenceInvoiceId && (!invoice || invoice.patientID !== patientId)) {
+        if (explicitInvoiceReference) settlementFail(404, 'Fattura non trovata o non accessibile');
+        referenceInvoiceId = undefined;
+        invoice = undefined;
+    }
     let legacyInvoiceSite: string | undefined;
     if (invoice && invoice.structureId == null) {
         const links = await InvoiceAgendaEvent.schema(req.tenantSchema!).findAll({where: {invoiceId: invoice.id, releasedAt: null}, transaction});
@@ -147,19 +165,6 @@ export async function settlementAdministrationEnabled(req: Request, transaction?
     return (tenant?.get('featureFlags') as {administration?: boolean} | undefined)?.administration === true;
 }
 
-export async function verifiedSettlementCredit(schema: string, credit: Record<string, any>, transaction?: Transaction): Promise<boolean> {
-    if (!credit.sourceId || !['TREASURY_ADVANCE', 'VOID_CREDIT'].includes(credit.sourceType)) return false;
-    const receiptModel = credit.sourceType === 'TREASURY_ADVANCE'
-        ? await TreasuryMovement.schema(schema).findByPk(credit.sourceId, {transaction})
-        : await TreasuryMovement.schema(schema).findOne({where: {sourceType: 'INVOICE_PAYMENT', sourceId: credit.sourceId}, transaction});
-    if (!receiptModel) return false;
-    const receipt = receiptModel.get({plain: true});
-    if (receipt.status !== 'POSTED' || receipt.direction !== 'IN' || receipt.structureId !== credit.structureId
-        || Number(receipt.amount) < Number(credit.amount)
-        || (credit.sourceType === 'TREASURY_ADVANCE' && (receipt.sourceType !== 'PATIENT_ADVANCE' || receipt.sourceId !== credit.id))) return false;
-    return await TreasuryMovement.schema(schema).count({where: {reversalOfId: receipt.id, status: 'POSTED'}, transaction}) === 0;
-}
-
 export function settlementCanRead(req: Request, context: AuthorizedSettlementContext, row: PatientSettlementObligation): boolean {
     return settlementRecordAccess(req, context, row.kind, row.record, 'read');
 }
@@ -174,6 +179,26 @@ export function settlementCanUseCredit(req: Request, context: AuthorizedSettleme
         && settlementRecordAccess(req, context, 'CREDIT', {structureId: context.structureId}, 'update');
 }
 
+/** Package payments use the same patient authorization as the package receipt endpoint. */
+async function packagePositionAccess(req: Request, context: AuthorizedSettlementContext, administrationEnabled: boolean,
+    transaction?: Transaction): Promise<{read: boolean; pay: boolean}> {
+    const denied = (error: unknown): boolean => {
+        const status = (error as {statusCode?: number})?.statusCode;
+        return status === 403 || status === 404;
+    };
+    let patient;
+    try {patient = await packagePatient(req, context.patientId, 'care_package', 'read', transaction);}
+    catch (error) {if (denied(error)) return {read: false, pay: false}; throw error;}
+    const selected = packageSelectedStructure(req);
+    const read = selected === context.structureId && context.patient.structureId === selected
+        && patient.get('id') === context.patientId && patient.get('structureId') === selected;
+    if (!read || !administrationEnabled) return {read, pay: false};
+    try {
+        const payable = await packagePatient(req, context.patientId, 'payment', 'create', transaction);
+        return {read, pay: payable.get('id') === context.patientId && payable.get('structureId') === selected};
+    } catch (error) {if (denied(error)) return {read, pay: false}; throw error;}
+}
+
 export async function patientSettlementPositionView(req: Request, context: AuthorizedSettlementContext,
     options: {transaction?: Transaction; raw?: RawPatientSettlementPosition; administrationEnabled?: boolean} = {}): Promise<SettlementPositionView> {
     const raw = options.raw ?? await loadPatientSettlementPosition(req.tenantSchema!, context, {transaction: options.transaction});
@@ -182,11 +207,17 @@ export async function patientSettlementPositionView(req: Request, context: Autho
     const cutoff = raw.referenceEvent ? Date.parse(raw.referenceEvent.start) : raw.referenceInvoice
         ? Date.parse(current?.orderDate ?? raw.referenceInvoice.emissionDate) : Infinity;
     const visibleRaw = raw.obligations.filter(row => row.isCurrent || Date.parse(row.orderDate) <= cutoff);
-    const obligations = visibleRaw.filter(row => settlementCanRead(req, context, row)).map(row => ({
+    const packageAccess = visibleRaw.some(row => row.kind === 'PACKAGE')
+        ? await packagePositionAccess(req, context, administrationEnabled, options.transaction) : {read: false, pay: false};
+    const obligations = visibleRaw.filter(row => row.kind === 'PACKAGE'
+        ? packageAccess.read && row.record.structureId === context.structureId
+        : settlementCanRead(req, context, row)).map(row => ({
         key: row.key, kind: row.kind, targetId: row.targetId, title: row.title, date: row.date, orderDate: row.orderDate,
         balance: row.balance, expectedAmount: row.expectedAmount, paidAmount: row.paidAmount, isCurrent: row.isCurrent,
         invoiceNumber: row.invoiceNumber, linkedEventIds: row.linkedEventIds,
-        canCash: settlementCanCash(req, context, row), canUseCredit: settlementCanUseCredit(req, context, row, administrationEnabled)
+        canCash: settlementCanCash(req, context, row), canUseCredit: settlementCanUseCredit(req, context, row, administrationEnabled),
+        ...(row.kind === 'PACKAGE' ? {canPayPackage: packageAccess.pay && !!row.record.templateId && (row.balance ?? 0) > 0.009
+            && row.record.structureId === context.structureId && row.record.patientId === context.patientId} : {})
     }));
     const first = raw.queue[0];
     const firstReadable = !first || settlementCanRead(req, context, first);
@@ -197,36 +228,22 @@ export async function patientSettlementPositionView(req: Request, context: Autho
         && (row.kind === 'PACKAGE' || visibleRaw.find(item => item.key === row.key)?.eligible));
     const prior = open.filter(row => !row.isCurrent);
     const creditVisible = administrationEnabled && settlementRecordAccess(req, context, 'CREDIT', {structureId: context.structureId}, 'read');
-    let creditsSummary: SettlementPositionView['creditsSummary'] = null;
-    let packagesSummary: SettlementPositionView['packagesSummary'] = null;
-    if (creditVisible) {
-        const [credits, packages] = await Promise.all([
-            PatientCredit.schema(req.tenantSchema!).findAll({where: {patientId: context.patientId, structureId: context.structureId, status: 'ACTIVE'}, transaction: options.transaction}),
-            CarePackage.schema(req.tenantSchema!).findAll({where: {patientId: context.patientId, structureId: context.structureId, status: 'ACTIVE'}, transaction: options.transaction})
-        ]);
-        let verifiedRemaining = 0, unverifiedCount = 0;
-        for (const model of credits) {
-            const credit = model.get({plain: true});
-            if (!(Number(credit.remainingAmount) > 0)) continue;
-            if (await verifiedSettlementCredit(req.tenantSchema!, credit, options.transaction)) verifiedRemaining += Number(credit.remainingAmount);
-            else unverifiedCount += 1;
-        }
-        const today = new Date().toLocaleDateString('en-CA', {timeZone: 'Europe/Rome'});
-        const active = packages.map(model => model.get({plain: true})).filter(pkg => Number(pkg.remainingUnits) > 0
-            && (!pkg.expiresAt || String(pkg.expiresAt).slice(0, 10) >= today));
-        creditsSummary = {verifiedRemaining: paymentMoney(verifiedRemaining), unverifiedCount};
-        packagesSummary = {activeCount: active.length, remainingUnits: active.reduce((sum, pkg) => sum + Number(pkg.remainingUnits), 0)};
-    }
+    const coverage = await patientCoveragePosition(req, context, {transaction: options.transaction, administrationEnabled,
+        ...(visibleRaw.some(row => row.kind === 'PACKAGE') ? {catalogAuthorized: packageAccess.read} : {})});
+    const {creditsSummary, packagesSummary} = coverage;
     const event = raw.referenceEvent;
     const currentReadable = !!current && settlementCanRead(req, context, current);
     const pricingEditable = !!event && !event.invoiceId && current?.kind !== 'INVOICE'
+        && !(raw.issues ?? []).some(issue => issue.agendaEventId === event.id && issue.kind === 'UNRESOLVED_INVOICE')
         && !(event.carePackageId && ['RESERVED', 'CONSUMED'].includes(String(event.packageReservationStatus)))
         && !event.recurrence && !event.recurringEventId && ['CONFIRMED', 'COMPLETED'].includes(String(event.status).toUpperCase())
         && Number.isFinite(Date.parse(event.start)) && Date.parse(event.start) <= Date.now()
         && canAccessAppointmentFinance(req, event, 'appointment_pricing', 'update');
     const visibleVerification = raw.verification.filter(row => Date.parse(row.record.start) <= cutoff
         && settlementRecordAccess(req, context, 'APPOINTMENT', row.record, 'read'));
-    const calendarIds = [...new Set(visibleVerification.map(row => row.record.calendarId)
+    const visibleIssues = (raw.issues ?? []).filter(row => (row.isCurrent || Date.parse(row.record.start) <= cutoff)
+        && settlementRecordAccess(req, context, 'APPOINTMENT', row.record, 'read'));
+    const calendarIds = [...new Set([...visibleVerification, ...visibleIssues].map(row => row.record.calendarId)
         .filter((id): id is string => typeof id === 'string' && SETTLEMENT_UUID.test(id)))];
     const operators = calendarIds.length ? await User.findAll({
         where: {id: {[Op.in]: calendarIds}}, attributes: ['id', 'name', 'surname'], transaction: options.transaction
@@ -239,6 +256,26 @@ export async function patientSettlementPositionView(req: Request, context: Autho
         calendarId: record.calendarId ?? null,
         operatorName: operatorNames.get(record.calendarId) ?? null
     }));
+    const issues: SettlementIssueView[] = visibleIssues.map(({record, ...view}) => {
+        const mutable = ['MISSING_PRICE', 'UNKNOWN_PREVIOUS_PAYMENT'].includes(view.kind) && !record.recurrence && !record.recurringEventId && !record.invoiceId
+            && !(record.carePackageId && ['RESERVED', 'CONSUMED'].includes(String(record.packageReservationStatus)))
+            && ['CONFIRMED', 'COMPLETED'].includes(String(record.status).toUpperCase())
+            && Number.isFinite(Date.parse(record.start)) && Date.parse(record.start) <= Date.now()
+            && (view.isCurrent || String(record.status).toUpperCase() !== 'CONFIRMED'
+                || (Date.parse(record.end) || Date.parse(record.start) + (Number(record.duration) || 0) * 60_000) <= Date.now());
+        const canSetPrice = mutable && canAccessAppointmentFinance(req, record, 'appointment_pricing', 'update');
+        const canCash = mutable && settlementRecordAccess(req, context, 'APPOINTMENT', record, 'update')
+            && (view.expectedAmount !== null || canSetPrice);
+        const canResolve = view.kind === 'UNKNOWN_PREVIOUS_PAYMENT' && canCash;
+        return {...view, start: typeof record.start === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(record.start)
+                && Number.isFinite(Date.parse(record.start)) ? record.start : null,
+            calendarId: record.calendarId ?? null, operatorName: operatorNames.get(record.calendarId) ?? null,
+            canResolve, canSetPrice, canCash: (view.kind === 'MISSING_PRICE' || canResolve) && canCash,
+            canUseCredit: administrationEnabled && mutable && (view.kind === 'MISSING_PRICE' || canResolve)
+                && (view.expectedAmount !== null || canSetPrice)
+                && settlementRecordAccess(req, context, 'CREDIT', {structureId: context.structureId}, 'read')
+                && settlementRecordAccess(req, context, 'CREDIT', {structureId: context.structureId}, 'update')};
+    });
     return {patientId: context.patientId, structureId: context.structureId,
         reference: {agendaEventId: context.referenceAgendaEventId ?? null, invoiceId: raw.referenceInvoice?.id ?? null,
             currentObligationKey: currentReadable ? current!.key : null, currentEligible: currentReadable && !!current?.eligible,
@@ -247,18 +284,19 @@ export async function patientSettlementPositionView(req: Request, context: Autho
                 paymentStatus: current!.balance === 0 ? 'paid' : current!.paidAmount > 0 ? 'partial' : current!.balance === null ? 'unknown' : 'unpaid',
                 coverageSources: current!.coverageSources, methods: current!.methods, hasUndatedPayments: current!.hasUndatedPayments}
                 : {expectedAmount: null, paidAmount: 0, balance: null, paymentStatus: 'unknown', coverageSources: [], methods: [], hasUndatedPayments: false},
-            pricing: event ? {originalAmount: event.appointmentOriginalAmount == null ? event.appointmentPriceAdjustment
+            pricing: event ? {historyKnown: current?.historyKnown ?? isAppointmentPaymentHistoryKnown(event), originalAmount: event.appointmentOriginalAmount == null ? event.appointmentPriceAdjustment
                 ? null : current?.kind === 'APPOINTMENT' ? current.expectedAmount
                     : event.appointmentExpectedAmount == null ? null : paymentMoney(event.appointmentExpectedAmount)
                 : paymentMoney(event.appointmentOriginalAmount),
                 adjustment: event.appointmentPriceAdjustment ?? null, note: event.appointmentPriceAdjustmentNote ?? null, editable: pricingEditable} : null},
         obligations,
+        issues,
         verification,
         totals: {knownOutstandingAmount: paymentMoney(open.reduce((sum, row) => sum + (row.balance ?? 0), 0)),
             priorKnownOutstandingAmount: paymentMoney(prior.reduce((sum, row) => sum + (row.balance ?? 0), 0)),
             unknownPriceCount: open.filter(row => row.balance === null).length,
             priorUnknownPriceCount: prior.filter(row => row.balance === null).length, priorCount: prior.length},
-        blocker, capabilities: {cash: obligations.some(row => row.canCash), credit: obligations.some(row => row.canUseCredit),
+        blocker, capabilities: {cash: obligations.some(row => row.canCash) || issues.some(row => row.canCash), credit: obligations.some(row => row.canUseCredit) || issues.some(row => row.canUseCredit),
             packages: creditVisible && settlementRecordAccess(req, context, 'CREDIT', {structureId: context.structureId}, 'update'),
             canOpenInvoice: !!settlementScope(req, 'invoice', 'read'), canAdjustPrice: pricingEditable,
             canReverse: !!event && canAccessAppointmentFinance(req, event, 'payment_reversal', 'create')},

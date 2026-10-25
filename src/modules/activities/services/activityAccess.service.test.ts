@@ -17,6 +17,38 @@ const context = (role: RoleCode): ActivityContext => ({
 });
 const open = {createdByUserId: other, status: 'TODO', archivedAt: null};
 
+test('a designated reviewer can approve without receiving general edit or assignment rights', () => {
+    const reviewing = {...open, status: 'WAITING', reviewerUserId: actor, reviewStatus: 'pending'};
+    const permissions = activityCapabilities(context(RoleCode.THERAPIST), reviewing, [other]);
+    assert.equal(permissions.canReview, true);
+    assert.equal(permissions.canAssignReviewer, true);
+    assert.equal(permissions.canEdit, false);
+    assert.equal(permissions.canManageChecklist, false);
+    assert.equal(permissions.canComplete, false);
+    const readonly = {...context(RoleCode.THERAPIST), permissions: ['activity:read:structure'] as ActivityContext['permissions']};
+    assert.equal(activityCapabilities(readonly, reviewing, [other]).canReview, false);
+});
+
+test('an assignee needs approval and cannot remove an existing reviewer', () => {
+    const activity = {...open, status: 'WAITING', reviewerUserId: other, reviewStatus: 'pending'};
+    const pending = activityCapabilities(context(RoleCode.THERAPIST), activity, [actor]);
+    assert.equal(pending.canRequestReview, true);
+    assert.equal(pending.canComplete, false);
+    assert.equal(pending.canReview, false);
+    assert.equal(pending.canAssignReviewer, false);
+    assert.equal(activityCapabilities(context(RoleCode.THERAPIST), {...activity, reviewStatus: 'approved'}, [actor]).canComplete, true);
+    assert.equal(activityCapabilities(context(RoleCode.THERAPIST), {...activity, createdByUserId: actor, reviewStatus: 'approved'}, []).canComplete, false);
+    assert.equal(activityCapabilities(context(RoleCode.THERAPIST), {...open, reviewerUserId: null}, [actor]).canComplete, true);
+});
+
+test('managers can review and archived work cannot be approved or reopened through a checkbox', () => {
+    const activity = {...open, status: 'WAITING', reviewerUserId: other, reviewStatus: 'pending'};
+    assert.equal(activityCapabilities(context(RoleCode.OWNER), activity, []).canReview, true);
+    const archived = activityCapabilities(context(RoleCode.OWNER), {...activity, archivedAt: new Date()}, []);
+    for (const key of ['canReview', 'canRequestReview', 'canComplete', 'canAssignReviewer', 'canReopenChecklist'] as const) assert.equal(archived[key], false);
+    assert.equal(activityCapabilities(context(RoleCode.THERAPIST), {...open, status: 'COMPLETED'}, [actor]).canReopenChecklist, true);
+});
+
 test('an operational own scope allows creator OR assignee without granting every readable activity update', () => {
     for (const role of [RoleCode.THERAPIST, RoleCode.PHYSIATRIST, RoleCode.ORTHOPEDIST, RoleCode.EXTERNAL_COLLABORATOR]) {
         assert.equal(activityCapabilities(context(role), open, []).canEdit, false, role);

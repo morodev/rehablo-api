@@ -2,6 +2,7 @@ import { DataTypes, Model, Optional } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 
 export interface InvoiceAttributes {
+    socialSecuritySnapshot?: any;
     id: string;
     emissionDate?: Date | null;
     invoiceNet?: number | null;
@@ -163,6 +164,7 @@ export class Invoice extends Model<InvoiceAttributes, InvoiceCreationAttributes>
     declare structureId: string | null;
     declare agendaEventId: string | null;
     declare carePackageId: string | null;
+    declare socialSecuritySnapshot: any;
     declare isCashPro: boolean;
     declare cashPro: string | null;
     declare isRivals: boolean;
@@ -209,6 +211,7 @@ Invoice.init(
             allowNull: true,
             unique: 'invoices_agenda_event_id_unique'
         },
+        socialSecuritySnapshot: {type: DataTypes.JSONB, allowNull: true},
         isCashPro: { type: DataTypes.BOOLEAN, defaultValue: false },
         cashPro: DataTypes.STRING,
         isRivals: { type: DataTypes.BOOLEAN, defaultValue: false },

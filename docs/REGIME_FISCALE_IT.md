@@ -231,3 +231,50 @@ continuare a mostrare le diciture del forfettario anche dopo il passaggio a regi
 - D.Lgs. 175/2014 e D.M. 31/07/2015 — Sistema Tessera Sanitaria
 - Specifiche tecniche FatturaPA — tabelle `RegimeFiscale` (RF01-RF19) e `Natura` (N1-N7)
 
+
+
+## 8. Prezzi e rivalsa INPS (ottobre 2026)
+
+Per le nuove emissioni il profilo studio propone una delle modalità
+
+- EXCLUDED: il prezzo è il compenso, al quale si aggiunge il 4% INPS (50 → 52 euro prima IVA/bollo).
+- INCLUDED: il prezzo contiene il 4%; il compenso è prezzo / 1,04 (50 → 48,08 + 1,92 euro).
+- NONE: nessuna rivalsa.
+
+La scelta si modifica in fattura, senza introdurre una configurazione per ogni servizio.
+Prodotti ed elementi fuori catalogo non ricevono automaticamente una rivalsa professionale.
+L'IVA si applica a compenso e rivalsa; per RF02/RF19 resta disattivata.
+La soglia del bollo comprende la rivalsa delle prestazioni esenti.
+La ritenuta si calcola sui servizi professionali e sulla relativa rivalsa INPS,
+escludendo i prodotti. Richiede RT01/RT02 e causale A congelati sul documento,
+ed è bloccata per il paziente privato e i regimi che non la prevedono.
+
+Sedute, preventivi e acquisti di pacchetti congelano la modalità concordata.
+Un importo già concordato o incassato viene scorporato, senza una seconda aggiunta.
+I dati storici senza questa informazione mantengono il calcolo precedente.
+La modifica di una fattura conserva prezzi e IVA delle sue righe anche se cambia il catalogo.
+
+L'XML delle nuove fatture INPS usa TC22 per ciascun trattamento IVA, DatiRitenuta
+e Ritenuta sulle sole righe professionali. Gli eventuali centesimi di differenza tra
+totali concordati e IVA riepilogata sono espliciti in Arrotondamento, anche negativo.
+Per le casse diverse da INPS non viene inventato un TipoCassa: l'esportazione rimane bloccata.
+Le fatture storiche con metadati previdenziali incompleti rimangono bloccate all'esportazione.
+
+### Distribuzione e verifica
+
+Prima di avviare la nuova versione, con le stesse variabili d'ambiente del backend:
+
+1. Eseguire npm run migrate:social-security -- --check (sola lettura; segnala le colonne mancanti).
+2. Eseguire npm run migrate:social-security -- --apply.
+3. Ripetere --check, poi avviare backend e frontend aggiornati.
+
+La migrazione migrations/20261023-social-security-pricing.js è additiva e rieseguibile;
+aggiunge impostazioni pubbliche e snapshot agli schemi tenant. Non riscrive importi,
+incassi o documenti; il rollback applicativo conserva le colonne fiscali.
+Non è stata eseguita durante lo sviluppo. Non sono stati effettuati invii fiscali reali.
+
+Verifiche ripetibili: npm test, npm run lint, npm run build. Per generare XML sintetici,
+impostare SOCIAL_SECURITY_XML_FIXTURES a una directory e lanciare npm run test:social-security.
+Validarli offline con scripts/validate-invoice-xsd.ps1 -XmlDirectory <directory>:
+gli XSD ufficiali e la loro provenienza sono in src/modules/invoice/utils/fixtures/SOURCES.md.
+La validazione XSD verifica struttura e tipi, senza sostituire i controlli fiscali SdI.

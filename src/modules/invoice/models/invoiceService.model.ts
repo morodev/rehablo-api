@@ -2,6 +2,7 @@ import { DataTypes, Model, Optional } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 
 export interface InvoiceServiceAttributes {
+    socialSecurity?: any;
     id: string;
     InvoiceId: string;
     ServiceId: string;
@@ -27,6 +28,7 @@ export class InvoiceService
     declare InvoiceId: string;
     declare ServiceId: string;
     declare quantity: number | null;
+    declare socialSecurity: any;
     declare servicePrice: number | null;
     declare originalServicePrice: number | null;
     declare totalPrice: number | null;
@@ -42,6 +44,7 @@ InvoiceService.init(
         InvoiceId: { type: DataTypes.UUID, allowNull: false },
         ServiceId: { type: DataTypes.UUID, allowNull: false },
         quantity: DataTypes.INTEGER,
+        socialSecurity: {type: DataTypes.JSONB, allowNull: true},
         servicePrice: DataTypes.DECIMAL(10, 2),
         originalServicePrice: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
         totalPrice: DataTypes.DECIMAL(10, 2),

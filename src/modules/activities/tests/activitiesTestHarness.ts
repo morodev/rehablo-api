@@ -91,6 +91,8 @@ export async function createActivitiesHarness() {
         verifiedDatabase = true;
         auth.registerAuthAssociations();
         await auth.syncAuthModels();
+        const {syncBillingModels} = await import('../../billing/models/billing.model.js');
+        await syncBillingModels();
         // Public calendar tables are normally provisioned by startup migration; this harness owns an isolated test DB.
         await auth.StructureUserAvailability.sync();
         await auth.CalendarPreference.sync();

@@ -1,5 +1,6 @@
 import {Request} from 'express';
 import {Op, Transaction} from 'sequelize';
+import {validateActivityReviewer, setActivityWorkflow, invalidateActivityReview, requireCompletionPermission} from './activityWorkflow.service.js';
 import {sequelize} from '../../../config/database.js';
 import {
     ACTIVITY_STATUSES, ActivityAgendaLookupQuery, ActivityAlertInput, ActivityAlertChannel, ActivityArchiveInput,
@@ -47,7 +48,7 @@ export async function getActivityAssignees(req: Request) {
             throw new ActivityError('ACTIVITY_VALIDATION_FAILED', 422, 'Controlla i parametri di ricerca degli operatori.');
         }
         const available = (await assignableActivityUsers(context, transaction)).filter(user =>
-            !query || `${user.name ?? ''} ${user.surname ?? ''}`.toLocaleLowerCase('it').includes(query));
+            !query || query.split(/\s+/).every(part => `${user.name ?? ''} ${user.surname ?? ''}`.toLocaleLowerCase('it').includes(part)));
         return {items: available.slice(rawOffset, rawOffset + rawLimit), total: available.length,
             nextOffset: rawOffset + rawLimit < available.length ? rawOffset + rawLimit : null};
     });
@@ -111,6 +112,8 @@ export async function createActivity(req: Request, input: ActivityCreateInput) {
     return writeOperation(req, input, 'create', async (context, board, transaction) => {
         requireAccess(context, 'create');
         await validateActivityAssignees(context, input.assigneeIds, transaction);
+        await validateActivityReviewer(context, input.reviewerUserId ?? null, input.assigneeIds, transaction);
+        if (input.reviewerUserId && input.status === 'COMPLETED') throw new ActivityError('REVIEW_REQUIRED', 422, 'Crea l’attività aperta per inviarla al revisore.', {status: 'È necessaria la revisione.'});
         await requireActivityLinks(context, input, transaction);
         const now = new Date();
         validateActivitySchedule({...input, archivedAt: null}, null, now, context.timezone);
@@ -120,6 +123,7 @@ export async function createActivity(req: Request, input: ActivityCreateInput) {
         const scoped = models(context);
         const activity = await scoped.activity.create({
             boardId: board.id, title: input.title, description: input.description,
+            reviewerUserId: input.reviewerUserId ?? null, reviewStatus: 'not_requested',
             status: input.status, priority: input.priority, position, version: 1,
             checklistRevision: input.checklist.length ? 1 : 0, ...dueFields(input.due),
             createdByUserId: context.userId, updatedByUserId: context.userId,
@@ -148,11 +152,25 @@ export async function patchActivity(req: Request, activityId: string, input: Act
     return writeOperation(req, {...input, activityId}, command, async (context, board, transaction) => {
         requireAccess(context, 'update');
         const activity = await activityInBoard(context, board.id, activityId, transaction);
-        await assertCapability(context, activity, activity.archivedAt ? 'canRestore' : 'canEdit', transaction);
+        const reviewerOnly = Object.keys(input.changes).every(key => key === 'reviewerUserId');
+        await assertCapability(context, activity, activity.archivedAt ? 'canRestore' : reviewerOnly ? 'canAssignReviewer' : 'canEdit', transaction);
         if (activity.archivedAt) throw new ActivityError('INVALID_TRANSITION', 409, 'Ripristina l’attività prima di modificarla.');
         assertVersion(activity, input.expectedVersion);
         const original = await currentSchedule(context, activity, transaction);
         const changes = input.changes;
+        if (changes.reviewerUserId !== undefined && changes.reviewerUserId !== activity.reviewerUserId) {
+            await assertCapability(context, activity, 'canAssignReviewer', transaction);
+        }
+        const nextAssignees = changes.assigneeIds ?? original.assigneeIds;
+        const nextReviewer = changes.reviewerUserId === undefined ? activity.reviewerUserId : changes.reviewerUserId;
+        if (changes.reviewerUserId !== undefined || changes.assigneeIds !== undefined) {
+            await validateActivityReviewer(context, nextReviewer, nextAssignees, transaction, nextReviewer === activity.reviewerUserId);
+        }
+        const reviewInvalidated = (changes.title !== undefined && changes.title !== activity.title)
+            || (changes.description !== undefined && changes.description !== activity.description)
+            || (changes.reviewerUserId !== undefined && changes.reviewerUserId !== activity.reviewerUserId)
+            || (changes.assigneeIds !== undefined && JSON.stringify([...changes.assigneeIds].sort()) !== JSON.stringify([...original.assigneeIds].sort()));
+        const workflowChanged = reviewInvalidated ? await invalidateActivityReview(context, board, activity, transaction) : false;
         if (changes.assigneeIds !== undefined) await validateActivityAssignees(context, changes.assigneeIds, transaction);
         if (changes.patientId !== undefined || changes.agendaEventId !== undefined) {
             await requireActivityLinks(context, {
@@ -174,7 +192,7 @@ export async function patchActivity(req: Request, activityId: string, input: Act
         }
         validateActivitySchedule(proposed, original, new Date(), context.timezone);
         const fields: Record<string, unknown> = {version: activity.version + 1, updatedByUserId: context.userId};
-        for (const key of ['title', 'description', 'priority', 'patientId', 'agendaEventId'] as const) {
+        for (const key of ['title', 'description', 'priority', 'patientId', 'agendaEventId', 'reviewerUserId'] as const) {
             if (changes[key] !== undefined) fields[key] = changes[key];
         }
         if (changes.due !== undefined) Object.assign(fields, dueFields(changes.due));
@@ -188,7 +206,7 @@ export async function patchActivity(req: Request, activityId: string, input: Act
             fields: Object.keys(changes),
             ...(changes.assigneeIds !== undefined ? {previousAssigneeIds: original.assigneeIds, assigneeIds: changes.assigneeIds} : {})
         }, transaction);
-        await reviseBoard(board, transaction, false);
+        await reviseBoard(board, transaction, workflowChanged);
         return mutationResponse(context, board, activity, transaction);
     });
 }
@@ -205,11 +223,16 @@ export async function moveActivity(req: Request, activityId: string, input: Acti
         const previousStatus = activity.status;
         const completing = input.targetStatus === 'COMPLETED' && previousStatus !== 'COMPLETED';
         if (completing) {
+            await requireCompletionPermission(context, activity, transaction);
             if (input.expectedChecklistRevision !== activity.checklistRevision) throw new ActivityError('CHECKLIST_VERSION_CONFLICT', 409,
                 'La checklist è stata aggiornata. Controllala prima di completare l’attività.');
             const incomplete = await models(context).checklist.count({where: {activityId, checked: false}, transaction});
             if (incomplete && !input.allowIncompleteChecklist) throw new ActivityError('CHECKLIST_INCOMPLETE', 409,
                 `Ci sono ancora ${incomplete} elementi da completare. Vuoi completare comunque l’attività?`);
+        }
+        if (activity.reviewStatus === 'pending' && previousStatus === 'WAITING' && input.targetStatus !== 'WAITING') {
+            await assertCapability(context, activity, 'canReview', transaction);
+            throw new ActivityError('REVIEW_ACTION_REQUIRED', 409, 'Usa Approva e completa oppure Rimanda in corso per concludere la revisione.');
         }
         const position = await placementPosition(context, board.id, input.targetStatus, input.placement, activityId, transaction);
         const reopened = previousStatus === 'COMPLETED' && input.targetStatus !== 'COMPLETED';
@@ -219,7 +242,8 @@ export async function moveActivity(req: Request, activityId: string, input: Acti
         await activity.update({
             status: input.targetStatus, position, version: activity.version + (previousStatus === input.targetStatus ? 0 : 1), updatedByUserId: context.userId,
             ...(completing ? {completedAt: new Date(), completedByUserId: context.userId} : {}),
-            ...(reopened ? {completedAt: null, completedByUserId: null} : {})
+            ...(reopened ? {completedAt: null, completedByUserId: null} : {}),
+            ...(input.targetStatus !== previousStatus && input.targetStatus !== 'COMPLETED' ? {reviewStatus: 'not_requested', reviewApprovedAt: null, reviewApprovedByUserId: null} : {})
         }, {transaction});
         if (completing) await persistAlert(context, activity.id, null, transaction);
         await recordHistory(context, activity.id, completing ? 'COMPLETED' : reopened ? 'REOPENED' : previousStatus === input.targetStatus ? 'REORDERED' : 'STATUS_CHANGED',

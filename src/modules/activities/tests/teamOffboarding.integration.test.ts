@@ -73,6 +73,45 @@ test('unknown and inherited change discriminators are validation failures', asyn
     }
 });
 
+test('review-only offboarding is visible in preflight and revokes approval without removing the reviewer', async () => {
+    const activity = await create({assigneeIds: [harness.ids.ownerA], reviewerUserId: harness.ids.therapistA});
+    let current = success(await harness.api(harness.actors.ownerA, 'GET', `/activities/${activity.id}`));
+    const review = async (action: string, actor: typeof harness.actors.ownerA) => success(await harness.api(actor, 'POST', `/activities/${activity.id}/review`, {
+        operationId: randomUUID(), expectedVersion: current.activity.version, expectedOrderRevision: current.orderRevision,
+        expectedChecklistRevision: current.activity.checklistRevision, action}));
+    current = await review('request', harness.actors.ownerA);
+    current = await review('authorizeCompletion', harness.actors.therapistA);
+    assert.equal(current.activity.reviewStatus, 'approved');
+    const impact = await preflight({kind: 'status', active: false});
+    const site = impact.structures.find((row: any) => row.structureId === harness.ids.structureA);
+    assert.equal(site.activities.openAssignedCount, 0); assert.equal(site.activities.reviewCount, 1);
+    failure(await harness.api(harness.actors.ownerA, 'PATCH', `/user/${harness.ids.therapistA}/status`, {active: false}), 409, 'OFFBOARDING_IMPACT_CHANGED');
+    success(await deactivate(impact));
+    const blocked = await detail(activity.id);
+    assert.equal(blocked.reviewerUserId, harness.ids.therapistA); assert.equal(blocked.reviewer.eligible, false);
+    assert.equal(blocked.reviewStatus, 'pending'); assert.equal(blocked.reviewApprovedAt, null);
+    assert.equal(blocked.status, 'WAITING'); assert.deepEqual(blocked.assigneeIds, [harness.ids.ownerA]);
+    failure(await harness.api(harness.actors.ownerA, 'POST', `/activities/${activity.id}/review`, {
+        operationId: randomUUID(), expectedVersion: blocked.version, expectedOrderRevision: current.orderRevision,
+        expectedChecklistRevision: blocked.checklistRevision, action: 'authorizeCompletion'}), 422, 'INVALID_REVIEWER');
+});
+
+test('offboarding an assignee returns authorized work to progress and cannot replace them with the reviewer', async () => {
+    const activity = await create({reviewerUserId: harness.ids.ownerA});
+    let current = success(await harness.api(harness.actors.ownerA, 'GET', `/activities/${activity.id}`));
+    for (const action of ['request', 'authorizeCompletion']) {
+        current = success(await harness.api(harness.actors.ownerA, 'POST', `/activities/${activity.id}/review`, {
+            operationId: randomUUID(), expectedVersion: current.activity.version, expectedOrderRevision: current.orderRevision,
+            expectedChecklistRevision: current.activity.checklistRevision, action}));
+    }
+    const impact = await preflight({kind: 'status', active: false});
+    failure(await deactivate(impact, 'replace'), 409, 'INVALID_ASSIGNEE');
+    success(await deactivate(impact, 'defer'));
+    const updated = await detail(activity.id);
+    assert.equal(updated.status, 'IN_PROGRESS'); assert.equal(updated.reviewStatus, 'not_requested');
+    assert.equal(updated.reviewApprovedAt, null); assert.equal(updated.reassignmentRequired, true);
+});
+
 test('preflight separates orphan/shared activity counts and excludes completed/archived assignments', async () => {
     const orphan = await create();
     await create({assigneeIds: [harness.ids.therapistA, harness.ids.ownerA]});
@@ -300,7 +339,7 @@ for (const appointmentChoice of ['defer', 'replace'] as const) test(`combined pr
 test('globally deactivated owners cannot satisfy the last operational owner safeguard', async () => {
     await harness.auth.TenantUser.update({role: 'OWNER'}, {where: {tenantId: harness.ids.tenantA, userId: harness.ids.outsiderA}});
     await harness.auth.User.update({deactivatedAt: new Date()}, {where: {id: harness.ids.outsiderA}});
-    await harness.auth.TenantUser.update({role: 'SECRETARY'}, {where: {tenantId: harness.ids.tenantA, userId: harness.ids.viewerA}});
+    await harness.auth.TenantUser.update({role: 'ADMIN_SECRETARY'}, {where: {tenantId: harness.ids.tenantA, userId: harness.ids.viewerA}});
     failure(await harness.api(harness.actors.viewerA, 'POST', `/user/${harness.ids.ownerA}/offboarding-impact`,
         {change: {kind: 'status', active: false}}), 409, 'TEAM_OWNER_REQUIRED');
     failure(await harness.api(harness.actors.viewerA, 'PATCH', `/user/${harness.ids.ownerA}/status`,

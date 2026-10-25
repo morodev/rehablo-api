@@ -8,11 +8,11 @@ import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import AgendaEvent from '../models/agendaEvent.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
-import { AppointmentAdjustmentError, resolveAppointmentAdjustment } from '../../invoice/utils/appointmentAdjustment.js';
+import { AppointmentAdjustmentError, resolveAppointmentPricing } from '../../invoice/utils/appointmentAdjustment.js';
 import { getLinkedInvoiceId } from '../../invoice/services/invoiceAgendaEvent.service.js';
 import {
     AppointmentPrice, appointmentPricesByEvent, ensureAppointmentPaymentHistory, paymentMoney,
-    snapshotAppointmentPrice, summarizeAppointmentPayments, syncAppointmentPaymentStatus
+    snapshotAppointmentPrice, summarizeAppointmentPayments, syncAppointmentPaymentStatus, isAppointmentPaymentHistoryKnown
 } from '../../invoice/services/appointmentPayment.service.js';
 import { patientPaymentPositionsByReferenceEvents } from '../services/patientPaymentPosition.service.js';
 import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
@@ -155,24 +155,26 @@ async function writePayment(req: Request, res: Response, cumulative: boolean, pr
             const pricing = pricingOnly ? req.body : req.body?.pricing;
             if (pricingOnly || pricing !== undefined) {
                 if (!canAccessAppointmentFinance(req, event.get({plain: true}), 'appointment_pricing', 'update')) fail(403, 'Non puoi modificare il prezzo della seduta');
+                if (event.carePackageId && ['RESERVED', 'CONSUMED'].includes(String(event.packageReservationStatus))) fail(409, 'Il prezzo si gestisce sul pacchetto della seduta');
                 if (!pricing || typeof pricing !== 'object' || Array.isArray(pricing)) fail(400, 'Prezzo non valido');
                 if (pricing.note != null && (typeof pricing.note !== 'string' || pricing.note.length > 2000)) {
                     fail(400, 'La nota può contenere al massimo 2000 caratteri');
                 }
                 const price = (await appointmentPricesByEvent(schema, [event.get({ plain: true })], transaction)).get(event.id)!;
+                const historyKnown = isAppointmentPaymentHistoryKnown(event.get({plain: true}), history);
                 const original = event.appointmentOriginalAmount == null
                     ? event.appointmentPriceAdjustment ? null : price.amount
                     : paymentMoney(event.appointmentOriginalAmount);
                 const paid = summarizeAppointmentPayments(price.amount, history.map(payment => payment.get({ plain: true }))).paidAmount;
-                const adjusted = resolveAppointmentAdjustment(original, pricing.adjustment, pricing.discountAmount, paid, price.vatRate);
+                const adjusted = resolveAppointmentPricing(original, pricing, paid, price.vatRate, historyKnown);
                 await event.update({
-                    appointmentOriginalAmount: original,
+                    appointmentOriginalAmount: adjusted.originalAmount,
                     appointmentPriceAdjustment: adjusted.adjustment,
                     appointmentExpectedAmount: adjusted.amount,
                     appointmentNetAmount: adjusted.netAmount,
                     appointmentPriceAdjustmentNote: pricing.note?.trim() || null,
                     appointmentPriceAdjustedBy: getUserId(req), appointmentPriceAdjustedAt: new Date(),
-                    appointmentPriceRecordedAt: new Date(), appointmentPaymentHistoryKnown: true
+                    appointmentPriceRecordedAt: new Date(), appointmentPaymentHistoryKnown: adjusted.historyKnown
                 }, { transaction });
             }
             let expected = (await appointmentPricesByEvent(schema, [event.get({ plain: true })], transaction)).get(event.id)!;
@@ -223,7 +225,7 @@ async function writePayment(req: Request, res: Response, cumulative: boolean, pr
                     source: 'APPOINTMENT', status: 'POSTED', createdByUserId: getUserId(req)
                 }, { transaction });
             }
-            if (req.body?.markCompleted === true) {
+            if (!pricingOnly && req.body?.markCompleted === true) {
                 if (!canAccessAppointmentFinance(req, event.get({plain: true}), 'agenda', 'update')) fail(403, 'Non puoi modificare la presenza della seduta');
                 await completeAppointmentAfterPayment(event, getUserId(req), transaction);
             }
@@ -234,7 +236,7 @@ async function writePayment(req: Request, res: Response, cumulative: boolean, pr
         return sendSuccessResponse(res, cumulative || pricingOnly ? 200 : 201, cumulative ? result.agendaEvent : result,
             pricingOnly ? 'Prezzo della seduta aggiornato' : 'Incasso registrato');
     } catch (error) {
-        if (error instanceof AppointmentAdjustmentError) return sendErrorResponse(res, 400, error.message);
+        if (error instanceof AppointmentAdjustmentError) return sendErrorResponse(res, error.status, error.message);
         if (error instanceof PaymentError) return sendErrorResponse(res, error.status, error.message);
         throw error;
     }
@@ -317,6 +319,7 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
             const pricing = req.body?.pricing;
             if (pricing !== undefined) {
                 if (!canAccessAppointmentFinance(req, reference.get({plain: true}), 'appointment_pricing', 'update')) fail(403, 'Non puoi modificare il prezzo della seduta');
+                if (reference.carePackageId && ['RESERVED', 'CONSUMED'].includes(String(reference.packageReservationStatus))) fail(409, 'Il prezzo si gestisce sul pacchetto della seduta');
                 if (!pricing || typeof pricing !== 'object' || Array.isArray(pricing)) fail(400, 'Prezzo non valido');
                 if (pricing.note != null && (typeof pricing.note !== 'string' || pricing.note.length > 2000)) {
                     fail(400, 'La nota può contenere al massimo 2000 caratteri');
@@ -324,19 +327,20 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
                 const history = histories.get(reference.id)
                     ?? await ensureAppointmentPaymentHistory(schema, reference, transaction);
                 const price = (await appointmentPricesByEvent(schema, [reference.get({ plain: true })], transaction)).get(reference.id)!;
+                const historyKnown = isAppointmentPaymentHistoryKnown(reference.get({plain: true}), history);
                 const original = reference.appointmentOriginalAmount == null
                     ? reference.appointmentPriceAdjustment ? null : price.amount
                     : paymentMoney(reference.appointmentOriginalAmount);
                 const paid = summarizeAppointmentPayments(price.amount, history.map(payment => payment.get({ plain: true }))).paidAmount;
-                const adjusted = resolveAppointmentAdjustment(original, pricing.adjustment, pricing.discountAmount, paid, price.vatRate);
+                const adjusted = resolveAppointmentPricing(original, pricing, paid, price.vatRate, historyKnown);
                 await reference.update({
-                    appointmentOriginalAmount: original,
+                    appointmentOriginalAmount: adjusted.originalAmount,
                     appointmentPriceAdjustment: adjusted.adjustment,
                     appointmentExpectedAmount: adjusted.amount,
                     appointmentNetAmount: adjusted.netAmount,
                     appointmentPriceAdjustmentNote: pricing.note?.trim() || null,
                     appointmentPriceAdjustedBy: getUserId(req), appointmentPriceAdjustedAt: new Date(),
-                    appointmentPriceRecordedAt: new Date(), appointmentPaymentHistoryKnown: true
+                    appointmentPriceRecordedAt: new Date(), appointmentPaymentHistoryKnown: adjusted.historyKnown
                 }, { transaction });
             }
 
@@ -416,7 +420,7 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
         return sendSuccessResponse(res, 201, result, allocations.length === 1
             ? 'Incasso registrato' : `${allocations.length} incassi registrati`);
     } catch (error) {
-        if (error instanceof AppointmentAdjustmentError) return sendErrorResponse(res, 400, error.message);
+        if (error instanceof AppointmentAdjustmentError) return sendErrorResponse(res, error.status, error.message);
         if (error instanceof PaymentError) return sendErrorResponse(res, error.status, error.message);
         throw error;
     }
@@ -445,11 +449,13 @@ export const listAppointmentPayments = asyncHandler(async (req, res) => {
     const price = priceMap.get(event.id)!;
     return sendSuccessResponse(res, 200, { payments, patientId: patientIdOf(plainEvent), structureId: event.structureId ?? req.access?.structureId ?? null,
         pricing: {
+            historyKnown: isAppointmentPaymentHistoryKnown(plainEvent, payments),
             originalAmount: event.appointmentOriginalAmount == null
                 ? event.appointmentPriceAdjustment ? null : price.amount : paymentMoney(event.appointmentOriginalAmount),
             adjustment: event.appointmentPriceAdjustment ?? null,
             note: event.appointmentPriceAdjustmentNote ?? null,
             editable: canAccessAppointmentFinance(req, plainEvent, 'appointment_pricing', 'update') && !await getLinkedInvoiceId(schema, event.id, event.invoiceId)
+                && !(event.carePackageId && ['RESERVED', 'CONSUMED'].includes(String(event.packageReservationStatus)))
                 && !event.recurrence && !event.recurringEventId
                 && ['CONFIRMED', 'COMPLETED'].includes(String(event.status).toUpperCase())
                 && !!(event.patientId || event.patient?.id)

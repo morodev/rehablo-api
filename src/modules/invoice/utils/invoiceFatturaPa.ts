@@ -117,6 +117,7 @@ export function mapInvoiceToFatturaPa({ issuer, recipient, lines, document, prog
             country: recipient.country ?? 'IT',
         },
         document: {
+            contributions: economics.contributions, withholding: economics.withholding, rounding: economics.rounding,
             tipoDocumento: mapTipoDocumento(document.documentType),
             data: (document.emissionDate ?? '').slice(0, 10),
             numero: `${document.documentNumber ?? ''}`.trim() || '0',
@@ -134,7 +135,7 @@ export function mapInvoiceToFatturaPa({ issuer, recipient, lines, document, prog
 /** Complete adapter shared by download and transmission. No current tenant/patient fallbacks. */
 export function frozenInvoiceToFatturaPaParams(invoice: Record<string, any>): MapInvoiceParams {
     const toLine = (line: Record<string, any>, kind: 'PRODUCT' | 'SERVICE'): InvoiceLineLike => ({
-        kind, name: kind === 'PRODUCT' ? line.productName : line.serviceName,
+        kind, socialSecurity: line.socialSecurity, name: kind === 'PRODUCT' ? line.productName : line.serviceName,
         vat: kind === 'PRODUCT' ? line.productVat : line.serviceVat,
         unitPrice: kind === 'PRODUCT' ? line.productPrice : line.servicePrice,
         quantity: line.quantity, totalPrice: line.totalPrice,

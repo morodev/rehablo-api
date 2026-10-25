@@ -1,3 +1,5 @@
+import {contributionPolicy} from '../../invoice/utils/socialSecurity.js';
+import Tenant from '../../auth/models/tenant.model.js';
 import {Request} from 'express';
 import {Op} from 'sequelize';
 import {sequelize} from '../../../config/database.js';
@@ -130,6 +132,8 @@ export const createCarePackage = asyncHandler(async (req, res) => {
             treasuryError('Il pacchetto è stato modificato: ricarica le condizioni prima di confermare', 409);
         }
         const service = await packageService(req, template.get('serviceId'), String(patient.get('structureId')), transaction);
+        const contributionTenant = await Tenant.findByPk(req.user!.tenants[0].id, {transaction});
+        const contribution = contributionPolicy(contributionTenant?.socialSecurityFund, contributionTenant?.socialSecurityPricingMode ?? 'EXCLUDED', contributionTenant?.socialSecurityRate ?? 4);
         const purchasedAt = packageToday(), validityDays = template.get('validityDays');
         const expiry = new Date(purchasedAt + 'T12:00:00Z');
         if (validityDays) expiry.setUTCDate(expiry.getUTCDate() + Number(validityDays));
@@ -137,7 +141,7 @@ export const createCarePackage = asyncHandler(async (req, res) => {
             templateId, serviceId: service.id, serviceName: service.name, purchasedAt, name: template.get('name'),
             purchasedUnits: template.get('sessionCount'), remainingUnits: template.get('sessionCount'), totalPrice: template.get('totalPrice'),
             status: 'ACTIVE', expiresAt: validityDays ? expiry.toISOString().slice(0, 10) : null, idempotencyKey: key,
-            purchaseSnapshot: {...plain(template), serviceName: service.name, serviceVat: service.productVat, requestFingerprint: fingerprint},
+            purchaseSnapshot: {socialSecurity: {...contribution, mode: contribution.mode === 'NONE' ? 'NONE' : 'INCLUDED'}, ...plain(template), serviceName: service.name, serviceVat: service.productVat, requestFingerprint: fingerprint},
             lines: [{itemType: 'SERVICE', itemId: service.id, description: service.name, quantity: template.get('sessionCount')}]}, {transaction});
         if (payment) await recordPackageReceipt(req, pack, payment, `package-purchase-${key}`, transaction);
         return {id: String(pack.get('id')), reused: false};

@@ -1,3 +1,4 @@
+import {evaluateContributionInvoice} from '../../invoice/utils/socialSecurity.js';
 import { Request, Response } from 'express';
 import { Model, ModelStatic, Op, Transaction } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
@@ -114,16 +115,25 @@ export function normalizeQuoteLines(payload: Record<string, unknown>, required: 
             || !Number.isFinite(unitPrice) || unitPrice < 0 || !Number.isFinite(baseUnitPrice) || baseUnitPrice < 0) {
             return 'Una o piu righe del preventivo non sono valide';
         }
+        const calculation = raw['socialSecurity'] ? evaluateContributionInvoice({
+            policy: raw['socialSecurity'] as any, appliesVat: raw['appliesVat'] !== false, lines: [{sellingPrice: unitPrice, quantity, type: itemType,
+                productVat: Number(raw['vatRate']) > 0 ? Number(raw['vatRate']) : String(raw['vatNature'] ?? 'N4')}]
+        }) : null;
         normalized.push({
-            ...raw, itemType, description, quantity, unitPrice, baseUnitPrice: itemType === 'CUSTOM' ? unitPrice : baseUnitPrice,
-            total: Math.round(quantity * unitPrice * 100) / 100
+            ...raw, ...(calculation ? {contributionAmount: calculation.rivalsAmount, compensationAmount: calculation.discSellingPrice, taxAmount: calculation.invoiceVAT} : {}), itemType, description, quantity, unitPrice, baseUnitPrice: itemType === 'CUSTOM' ? unitPrice : baseUnitPrice,
+            total: calculation?.invoiceTotal ?? Math.round(quantity * unitPrice * 100) / 100
         });
     }
     payload['lines'] = normalized;
     payload['subtotal'] = Math.round(normalized.reduce((sum, line) =>
-        sum + Math.round(Number(line['baseUnitPrice']) * Number(line['quantity']) * 100) / 100, 0) * 100) / 100;
+        sum + (line['socialSecurity'] ? evaluateContributionInvoice({policy: line['socialSecurity'] as any,
+            appliesVat: line['appliesVat'] !== false, lines: [{type: String(line['itemType']), sellingPrice: Number(line['baseUnitPrice']),
+                quantity: Number(line['quantity']), productVat: Number(line['vatRate']) || String(line['vatNature'] ?? 'N4')}]}).invoiceTotal
+            : Math.round(Number(line['baseUnitPrice']) * Number(line['quantity']) * 100) / 100), 0) * 100) / 100;
     payload['total'] = Math.round(normalized.reduce((sum, line) => sum + Number(line['total']), 0) * 100) / 100;
-    payload['taxTotal'] = Number(payload['taxTotal'] ?? 0);
+    if (normalized.some(line => line['socialSecurity'])) {
+        payload['taxTotal'] = Math.round(normalized.reduce((sum, line) => sum + Number(line['taxAmount'] ?? 0), 0) * 100) / 100;
+    } else payload['taxTotal'] = Number(payload['taxTotal'] ?? 0);
     return null;
 }
 

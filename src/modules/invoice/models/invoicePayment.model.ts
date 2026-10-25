@@ -8,7 +8,7 @@ import {
 export const INVOICE_PAYMENT_STATUSES = ['POSTED', 'VOID', 'CREDIT'] as const;
 export type InvoicePaymentStatus = (typeof INVOICE_PAYMENT_STATUSES)[number];
 
-export const INVOICE_PAYMENT_SOURCES = ['USER', 'LEGACY_IMPORT', 'APPOINTMENT', 'PACKAGE', 'PACKAGE_PURCHASE', 'CREDIT'] as const;
+export const INVOICE_PAYMENT_SOURCES = ['USER', 'LEGACY_IMPORT', 'APPOINTMENT', 'PACKAGE', 'PACKAGE_PURCHASE', 'CREDIT', 'OPENING_BALANCE'] as const;
 export type InvoicePaymentSource = (typeof INVOICE_PAYMENT_SOURCES)[number];
 
 export interface InvoicePaymentAttributes {
@@ -18,7 +18,7 @@ export interface InvoicePaymentAttributes {
     /** Seduta che ha originato il movimento, valorizzata solo per gli incassi pre-fattura. */
     agendaEventId?: string | null;
     amount: number;
-    /** Nullable only for payments imported from the old paid/unpaid flag. */
+    /** Unknown dates remain null for imported receipts and preceding opening coverage. */
     paidAt?: Date | null;
     method?: string | null;
     note?: string | null;
@@ -104,8 +104,8 @@ function modelSchema(payment: InvoicePayment): unknown {
 // (fattura, agenda e migrazione appuntamenti) senza duplicare logica nei controller.
 InvoicePayment.addHook('afterCreate', 'mirrorTreasuryMovement', async (payment, options) => {
     const typed = payment as InvoicePayment;
-    // Package coverage settles a visit but is not a new cash receipt.
-    if (typed.status !== 'POSTED' || typed.source === 'PACKAGE' || typed.source === 'CREDIT') return;
+    // Package, credit and opening coverage settle a visit without a new cash receipt.
+    if (typed.status !== 'POSTED' || typed.source === 'PACKAGE' || typed.source === 'CREDIT' || typed.source === 'OPENING_BALANCE') return;
     await mirrorInvoicePaymentToTreasury(modelSchema(typed), typed.get({ plain: true }) as any, options.transaction ?? undefined,
         (options as InvoicePaymentCreateOptions).treasuryContext);
 });
@@ -113,7 +113,7 @@ InvoicePayment.addHook('afterCreate', 'mirrorTreasuryMovement', async (payment, 
 InvoicePayment.addHook('afterUpdate', 'mirrorTreasuryVoid', async (payment, options) => {
     const typed = payment as InvoicePayment;
     if (!typed.changed('status') || typed.status !== 'VOID' || typed.previous('status') !== 'POSTED') return;
-    if (typed.source === 'PACKAGE' || typed.source === 'CREDIT') return;
+    if (typed.source === 'PACKAGE' || typed.source === 'CREDIT' || typed.source === 'OPENING_BALANCE') return;
     await mirrorVoidedInvoicePaymentToTreasury(
         modelSchema(typed), typed.get({ plain: true }) as any, options.transaction ?? undefined
     );

@@ -46,7 +46,7 @@ export async function unassignedFinancialWarnings(req: Request, scope: ReportSco
             AgendaEvent.schema(req.tenantSchema!).findAll({ where: { structureId: null }, attributes: ['id'] })
         ]);
         const count = await InvoicePayment.schema(req.tenantSchema!).count({ where: { paidAt: dateRange, carePackageId: null,
-            source: { [Op.notIn]: ['CREDIT', 'PACKAGE'] }, [Op.and]: [
+            source: { [Op.notIn]: ['CREDIT', 'PACKAGE', 'OPENING_BALANCE'] }, [Op.and]: [
                 { [Op.or]: [{ invoiceId: null }, { invoiceId: { [Op.in]: invoices.map(row => row.get('id')) } }] },
                 { [Op.or]: [{ agendaEventId: null }, { agendaEventId: { [Op.in]: events.map(row => row.get('id')) } }] }
             ] } });

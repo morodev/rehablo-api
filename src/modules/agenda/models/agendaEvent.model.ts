@@ -43,6 +43,7 @@ export interface AgendaEventAttributes {
     appointmentPriceAdjustmentNote?: string | null;
     appointmentPriceAdjustedBy?: string | null;
     appointmentPriceAdjustedAt?: Date | null;
+    appointmentSocialSecurity?: any;
     appointmentNetAmount?: number | null;
     appointmentVatRate?: number | null;
     appointmentPriceRecordedAt?: Date | null;
@@ -98,6 +99,7 @@ export class AgendaEvent
     declare appointmentPriceAdjustmentNote: string | null;
     declare appointmentPriceAdjustedBy: string | null;
     declare appointmentPriceAdjustedAt: Date | null;
+    declare appointmentSocialSecurity: any;
     declare appointmentNetAmount: number | null;
     declare appointmentVatRate: number | null;
     declare appointmentPriceRecordedAt: Date | null;
@@ -144,6 +146,7 @@ AgendaEvent.init(
         appointmentPriceAdjustmentNote: { type: DataTypes.TEXT, allowNull: true },
         appointmentPriceAdjustedBy: { type: DataTypes.UUID, allowNull: true },
         appointmentPriceAdjustedAt: { type: DataTypes.DATE, allowNull: true },
+        appointmentSocialSecurity: {type: DataTypes.JSONB, allowNull: true},
         appointmentNetAmount: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
         appointmentVatRate: { type: DataTypes.DECIMAL(5, 2), allowNull: true },
         appointmentPriceRecordedAt: { type: DataTypes.DATE, allowNull: true },

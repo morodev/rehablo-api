@@ -1,3 +1,4 @@
+import {ContributionPolicy, ContributionSnapshot, contributionPolicy, evaluateContributionInvoice, SocialSecurityPricingMode} from './socialSecurity.js';
 /**
  * Computes invoice totals (selling price, discounted price, VAT, INPS "rivalsa", net amount due).
  * Ported from the former rehablo-invoice (v2) service, which had the most complete fiscal logic
@@ -27,6 +28,8 @@ export const roundInvoiceAmount = (value: number): number => invoiceAmountInCent
 export interface InvoiceLineInput {
     /** Prezzo UNITARIO di riga (dal catalogo Product/Service, non dal client: vedi invoice.controller.ts). */
     sellingPrice: number;
+    type?: string;
+    socialSecurity?: ContributionPolicy | null;
     /** Original net tariff, when a concession was already applied to this appointment. */
     originalSellingPrice?: number | null;
     /** Quantità della riga (default 1 se assente). */
@@ -36,6 +39,10 @@ export interface InvoiceLineInput {
 }
 
 export interface EvalTotalsInput {
+    socialSecurityPricingMode?: SocialSecurityPricingMode;
+    socialSecurityFund?: 'NONE' | 'INPS_GS' | 'CASSA';
+    withholdingType?: string | null;
+    withholdingCausale?: string | null;
     products?: InvoiceLineInput[];
     services?: InvoiceLineInput[];
     discountType?: 'percentage' | 'value';
@@ -58,6 +65,7 @@ export interface EvalTotalsInput {
 }
 
 export interface EvalTotalsResult {
+    socialSecuritySnapshot?: ContributionSnapshot;
     invoiceTotal: number;
     sellingPrice: number;
     discSellingPrice: number;
@@ -125,6 +133,17 @@ export function evalTotalsDetailed(invoiceFields: EvalTotalsInput): {
 } {
     // Invoice lines are currency amounts. Round each line's VAT before aggregation so
     // ten individually agreed/paid appointments retain the sum of their customer amounts.
+    if (invoiceFields.socialSecurityPricingMode !== undefined) {
+        const policy = contributionPolicy(invoiceFields.socialSecurityFund, invoiceFields.socialSecurityPricingMode, invoiceFields.rivals ?? 4);
+        const result = evaluateContributionInvoice({...invoiceFields, policy, lines: [
+            ...(invoiceFields.products ?? []).map(line => ({...line, type: 'PRODUCT'})),
+            ...(invoiceFields.services ?? []).map(line => ({...line, type: 'SERVICE'}))
+        ]});
+        return {totals: result, lines: result.socialSecuritySnapshot.lines.map(line => ({
+            totalLinePrice: line.referenceAmount, discountedPrice: line.base, vatRate: line.vatRate,
+            vatAmount: line.vat, rivalsAmount: line.contribution
+        }))};
+    }
     const money = roundInvoiceAmount;
     const rivals = invoiceFields.rivals || 0;
     const isRivals = !!invoiceFields.isRivals;
@@ -226,6 +245,7 @@ export function evalTotals(invoiceFields: EvalTotalsInput): EvalTotalsResult {
  */
 export function toPersistedTotals(totals: EvalTotalsResult) {
     return {
+        ...(totals.socialSecuritySnapshot ? {socialSecuritySnapshot: totals.socialSecuritySnapshot} : {}),
         invoiceTotal: totals.invoiceTotal,
         sellingPrice: totals.sellingPrice,
         discSellingPrice: totals.discSellingPrice,

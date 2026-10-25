@@ -199,7 +199,7 @@ export async function serializeActivities(context: ActivityContext, activities: 
     ]) : [[], null];
     const peopleIds = [...new Set([
         ...assignments.map(row => row.userId),
-        ...activities.flatMap(row => [row.createdByUserId, row.updatedByUserId].filter(Boolean) as string[])
+        ...activities.flatMap(row => [row.createdByUserId, row.updatedByUserId, row.reviewerUserId].filter(Boolean) as string[])
     ])];
     const people = peopleIds.length ? await User.findAll({
         where: {id: {[Op.in]: peopleIds}}, attributes: ['id', 'name', 'surname'], transaction, raw: true
@@ -214,6 +214,7 @@ export async function serializeActivities(context: ActivityContext, activities: 
         const items = checklist.filter(row => row.activityId === activity.id);
         const alert = alerts.find(row => row.activityId === activity.id) ?? null;
         return serializeActivity(activity.get({plain: true}) as ActivityRecord, context, {
+            people: summaries,
             assignees: assigned.map(row => summaries.get(row.userId) ?? {id: row.userId, name: null, surname: null, eligible: false}),
             alert, deliveryState: alert ? activityAlertDeliveryState(alert, deliveries.filter(row => row.alertId === alert.id),
                 activation?.activatedAt ?? null, evaluationAt) : undefined,

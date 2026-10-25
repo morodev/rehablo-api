@@ -12,9 +12,10 @@ import {PatientCreditMovement} from '../../administration/models/patientCreditMo
 import {validateTreasuryAccount, validateTreasuryMethod} from '../../administration/services/treasuryValidation.service.js';
 import {InvoicePaymentCreateOptions} from '../../administration/services/invoicePaymentTreasury.service.js';
 import {appointmentPricesByEvent, ensureAppointmentPaymentHistory, isValidPaymentDate, paymentMoney,
-    snapshotAppointmentPrice, syncAppointmentPaymentStatus} from '../../invoice/services/appointmentPayment.service.js';
+    appointmentPriceFields, syncAppointmentPaymentStatus, isAppointmentPaymentHistoryKnown} from '../../invoice/services/appointmentPayment.service.js';
 import {syncInvoicePaymentStatus} from '../../invoice/services/payment.service.js';
-import {AppointmentAdjustmentError, resolveAppointmentAdjustment} from '../../invoice/utils/appointmentAdjustment.js';
+import {AppointmentAdjustmentError, AppointmentPricingInput, resolveAppointmentPricing} from '../../invoice/utils/appointmentAdjustment.js';
+import {getLinkedInvoiceId} from '../../invoice/services/invoiceAgendaEvent.service.js';
 import {PatientSettlementOperation} from '../models/patientSettlementOperation.model.js';
 import {PatientSettlementAllocation, PatientSettlementObligation, loadPatientSettlementPosition,
     lockPatientSettlement, settlementFail, validatePatientSettlementAllocations} from './patientSettlementPolicy.service.js';
@@ -22,6 +23,13 @@ import {AuthorizedSettlementContext, SETTLEMENT_UUID, patientSettlementPositionV
     settlementAdministrationEnabled, settlementCanCash, settlementCanRead, settlementCanUseCredit,
     settlementRecordAccess, verifiedSettlementCredit} from './patientSettlementAccess.service.js';
 
+export interface PatientSettlementOpeningBalance {
+    agendaEventId: string;
+    expectedAmount?: number;
+    previouslyPaidAmount: number;
+    paidAt: string | null;
+    method: string | null;
+}
 export interface PatientSettlementRequest {
     referenceAgendaEventId?: string;
     referenceInvoiceId?: string;
@@ -31,16 +39,25 @@ export interface PatientSettlementRequest {
     cash: {amount: number; paidAt: string | null; method: string | null; note: string | null;
         accountId: string | null; paymentMethodId: string | null};
     completeReference: boolean;
-    pricing?: {adjustment: 'DISCOUNT' | 'COMPLIMENTARY' | null; discountAmount: number | null; note: string | null};
+    pricing?: AppointmentPricingInput;
+    openingBalances: PatientSettlementOpeningBalance[];
+}
+interface SettlementOpeningBalanceResult {
+    agendaEventId: string;
+    paymentId: string | null;
+    before: {expectedAmount: number | null; paidAmount: number; historyKnown: boolean};
+    after: {expectedAmount: number; paidAmount: number; historyKnown: true};
+    priceDefined: boolean;
 }
 interface SettlementOperationResult {
     cashAmount: number; creditAmount: number;
     allocations: Array<{kind: 'APPOINTMENT' | 'INVOICE'; targetId: string; paymentIds: string[]; creditMovementIds: string[]}>;
     agendaEventIds: string[]; invoiceIds: string[];
+    openingBalances?: SettlementOpeningBalanceResult[];
 }
 
 const amount = (value: unknown, allowZero = false): number => {
-    if (typeof value !== 'number' || !Number.isFinite(value) || value < (allowZero ? 0 : 0.01)
+    if (typeof value !== 'number' || !Number.isFinite(value) || value > 99999999.99 || value < (allowZero ? 0 : 0.01)
         || Math.abs(value * 100 - Math.round(value * 100)) > 0.000001) settlementFail(400, 'Inserisci importi validi con al massimo due decimali');
     return paymentMoney(value);
 };
@@ -57,7 +74,22 @@ const optionalUuid = (value: unknown): string | undefined => {
 
 export function normalizePatientSettlementRequest(body: Record<string, any>): PatientSettlementRequest {
     if (body.referenceOccurrenceStart != null) settlementFail(400, 'La data dell’occorrenza è ammessa soltanto nella consultazione');
-    if (!Array.isArray(body.allocations) || !body.allocations.length || body.allocations.length > 100) settlementFail(400, 'Seleziona da una a cento righe da saldare');
+    if (body.openingBalances != null && !Array.isArray(body.openingBalances)) settlementFail(400, 'Dati precedenti della seduta non validi');
+    const openingBalances: PatientSettlementOpeningBalance[] = (body.openingBalances ?? []).map((row: any) => {
+        if (!row || !optionalUuid(row.agendaEventId)) settlementFail(400, 'Seduta precedente non valida');
+        const previouslyPaidAmount = amount(row.previouslyPaidAmount, true);
+        const paidAt = row.paidAt ?? null;
+        if (paidAt !== null && (!previouslyPaidAmount || !isValidPaymentDate(paidAt))) settlementFail(400, 'Inserisci una data precedente valida e non futura');
+        return {agendaEventId: row.agendaEventId,
+            ...(row.expectedAmount !== undefined ? {expectedAmount: amount(row.expectedAmount)} : {}),
+            previouslyPaidAmount, paidAt, method: previouslyPaidAmount ? note(row.method, 255) : null};
+    }).sort((a: PatientSettlementOpeningBalance, b: PatientSettlementOpeningBalance) => a.agendaEventId.localeCompare(b.agendaEventId));
+    if (openingBalances.length > 100 || new Set(openingBalances.map(row => row.agendaEventId)).size !== openingBalances.length) {
+        settlementFail(400, 'Ogni seduta precedente può comparire una sola volta, fino a cento sedute');
+    }
+    if (!Array.isArray(body.allocations) || body.allocations.length > 100 || (!body.allocations.length && !openingBalances.length)) {
+        settlementFail(400, 'Seleziona da una a cento righe da saldare o completa i dati precedenti');
+    }
     const allocations = body.allocations.map((row: any) => {
         if (!row || !['APPOINTMENT', 'INVOICE'].includes(row.kind) || !optionalUuid(row.targetId)) settlementFail(400, 'Attribuzione del saldo non valida');
         return {kind: row.kind as 'APPOINTMENT' | 'INVOICE', targetId: row.targetId, amount: amount(row.amount)};
@@ -84,12 +116,17 @@ export function normalizePatientSettlementRequest(body: Record<string, any>): Pa
     const result: PatientSettlementRequest = {referenceAgendaEventId: optionalUuid(body.referenceAgendaEventId),
         referenceInvoiceId: optionalUuid(body.referenceInvoiceId), structureId: optionalUuid(body.structureId), allocations, credits,
         cash: {amount: cashAmount, paidAt, method: note(cash.method, 255), note: note(cash.note), accountId, paymentMethodId},
-        completeReference: body.completeReference === true};
+        completeReference: body.completeReference === true, openingBalances};
     if (body.pricing != null) {
         const pricing = body.pricing;
         if (typeof pricing !== 'object' || Array.isArray(pricing) || ![null, 'DISCOUNT', 'COMPLIMENTARY'].includes(pricing.adjustment)) settlementFail(400, 'Prezzo non valido');
-        result.pricing = {adjustment: pricing.adjustment,
+        if (pricing.confirmHistory !== undefined && typeof pricing.confirmHistory !== 'boolean') settlementFail(400, 'La conferma dello storico non è valida');
+        result.pricing = {...(pricing.baseAmount !== undefined ? {baseAmount: amount(pricing.baseAmount)} : {}),
+            ...(pricing.confirmHistory !== undefined ? {confirmHistory: pricing.confirmHistory} : {}), adjustment: pricing.adjustment,
             discountAmount: pricing.adjustment === 'DISCOUNT' ? amount(pricing.discountAmount) : null, note: note(pricing.note)};
+    }
+    if (result.pricing && openingBalances.some(row => row.agendaEventId === result.referenceAgendaEventId)) {
+        settlementFail(400, 'Completa il prezzo nei dati precedenti della seduta');
     }
     return result;
 }
@@ -101,12 +138,12 @@ export function settlementFundingPlan(rows: Array<{key: string; amount: number; 
     if (requiredCredit > creditAmount + 0.009 || rows.some(row => !row.canCash && !row.canUseCredit)) {
         settlementFail(403, 'Non hai il permesso di registrare denaro su uno degli obblighi: serve una copertura autorizzata sufficiente');
     }
+    const creditCapacity = paymentMoney(rows.filter(row => row.canUseCredit).reduce((sum, row) => sum + row.amount, 0));
+    if (creditAmount > creditCapacity + 0.009) settlementFail(403, 'Il credito selezionato supera gli obblighi su cui puoi applicarlo');
     let remainder = paymentMoney(creditAmount - requiredCredit);
     return new Map(rows.map(row => {
-        let credit = row.canCash ? Math.min(row.amount, remainder) : row.amount;
-        credit = paymentMoney(credit);
-        if (credit > 0 && !row.canUseCredit) settlementFail(403, 'Non hai il permesso di applicare credito su uno degli obblighi');
-        if (row.canCash) remainder = paymentMoney(remainder - credit);
+        const credit = paymentMoney(!row.canCash ? row.amount : row.canUseCredit ? Math.min(row.amount, remainder) : 0);
+        if (row.canCash && row.canUseCredit) remainder = paymentMoney(remainder - credit);
         return [row.key, {credit, cash: paymentMoney(row.amount - credit)}];
     }));
 }
@@ -116,19 +153,73 @@ async function applyPricing(req: Request, context: AuthorizedSettlementContext, 
     if (!request.pricing) return;
     const event = events.get(context.referenceAgendaEventId ?? '');
     if (!event || !canAccessAppointmentFinance(req, event.get({plain: true}), 'appointment_pricing', 'update')) settlementFail(403, 'Non puoi modificare il prezzo della seduta');
-    if (event.invoiceId || event.recurrence || event.recurringEventId || !['CONFIRMED', 'COMPLETED'].includes(String(event.status).toUpperCase())
+    if (await getLinkedInvoiceId(req.tenantSchema!, event.id, event.invoiceId)
+        || (event.carePackageId && ['RESERVED', 'CONSUMED'].includes(String(event.packageReservationStatus)))
+        || event.recurrence || event.recurringEventId || !['CONFIRMED', 'COMPLETED'].includes(String(event.status).toUpperCase())
         || !Number.isFinite(Date.parse(event.start ?? '')) || Date.parse(event.start!) > Date.now()) settlementFail(409, 'Il prezzo della seduta non è modificabile');
     const price = (await appointmentPricesByEvent(req.tenantSchema!, [event.get({plain: true})], transaction)).get(event.id)!;
     const history = await ensureAppointmentPaymentHistory(req.tenantSchema!, event, transaction);
-    const original = event.appointmentOriginalAmount == null ? event.appointmentPriceAdjustment ? null : price.amount : paymentMoney(event.appointmentOriginalAmount);
+    const original = event.appointmentOriginalAmount == null ? event.appointmentPriceAdjustment || price.estimated ? null : price.amount : paymentMoney(event.appointmentOriginalAmount);
     const paid = paymentMoney(history.filter(row => row.status === 'POSTED').reduce((sum, row) => sum + Number(row.amount), 0));
-    let adjusted: ReturnType<typeof resolveAppointmentAdjustment>;
-    try {adjusted = resolveAppointmentAdjustment(original, request.pricing.adjustment, request.pricing.discountAmount, paid, price.vatRate);}
-    catch (error) {if (error instanceof AppointmentAdjustmentError) settlementFail(400, error.message); throw error;}
-    await event.update({appointmentOriginalAmount: original, appointmentPriceAdjustment: adjusted.adjustment,
+    let adjusted: ReturnType<typeof resolveAppointmentPricing>;
+    try {adjusted = resolveAppointmentPricing(original, request.pricing, paid, price.estimated ? null : price.vatRate, isAppointmentPaymentHistoryKnown(event.get({plain: true}), history));}
+    catch (error) {if (error instanceof AppointmentAdjustmentError) settlementFail(error.status, error.message); throw error;}
+    await event.update({appointmentOriginalAmount: adjusted.originalAmount, appointmentPriceAdjustment: adjusted.adjustment,
         appointmentExpectedAmount: adjusted.amount, appointmentNetAmount: adjusted.netAmount,
         appointmentPriceAdjustmentNote: request.pricing.note, appointmentPriceAdjustedBy: getUserId(req),
-        appointmentPriceAdjustedAt: new Date(), appointmentPriceRecordedAt: new Date(), appointmentPaymentHistoryKnown: true}, {transaction});
+        appointmentPriceAdjustedAt: new Date(), appointmentPriceRecordedAt: new Date(), appointmentPaymentHistoryKnown: adjusted.historyKnown}, {transaction});
+}
+
+async function applyOpeningBalances(req: Request, context: AuthorizedSettlementContext, request: PatientSettlementRequest,
+    events: Map<string, AgendaEvent>, transaction: Transaction): Promise<SettlementOpeningBalanceResult[]> {
+    const completed: SettlementOpeningBalanceResult[] = [];
+    for (const opening of request.openingBalances) {
+        const event = events.get(opening.agendaEventId)!;
+        const plain = event.get({plain: true});
+        if (!settlementRecordAccess(req, context, 'APPOINTMENT', plain, 'update')) {
+            settlementFail(403, 'Non puoi completare gli incassi precedenti della seduta');
+        }
+        const history = await InvoicePayment.schema(req.tenantSchema!).findAll({where: {agendaEventId: event.id}, transaction});
+        if (isAppointmentPaymentHistoryKnown(plain, history)) settlementFail(409, 'I dati della seduta sono cambiati: aggiorna la posizione');
+        if (!['CONFIRMED', 'COMPLETED'].includes(String(event.status).toUpperCase())
+            || event.recurrence || event.recurringEventId
+            || !Number.isFinite(Date.parse(event.start ?? '')) || Date.parse(event.start!) > Date.now()
+            || event.appointmentPriceAdjustment === 'COMPLIMENTARY') {
+            settlementFail(409, 'I dati precedenti non sono disponibili per questa seduta');
+        }
+        const reverseInvoices = await Invoice.schema(req.tenantSchema!).findAll({where: {agendaEventId: event.id}, transaction});
+        if (await getLinkedInvoiceId(req.tenantSchema!, event.id, event.invoiceId)
+            || reverseInvoices.some(invoice => String(invoice.status).toLowerCase() !== 'void')) {
+            settlementFail(409, 'La seduta è collegata a una fattura: aggiorna la posizione');
+        }
+        const finalSnapshot = event.appointmentExpectedAmount == null ? null : paymentMoney(event.appointmentExpectedAmount);
+        if (finalSnapshot !== null && opening.expectedAmount !== undefined && Math.abs(finalSnapshot - opening.expectedAmount) > 0.009) {
+            settlementFail(409, 'Il prezzo della seduta è cambiato: aggiorna la posizione');
+        }
+        const expectedAmount = finalSnapshot ?? opening.expectedAmount;
+        if (expectedAmount === undefined || expectedAmount === null || expectedAmount <= 0) settlementFail(400, 'Definisci il prezzo definitivo della seduta');
+        const priceDefined = finalSnapshot === null;
+        if (priceDefined && !canAccessAppointmentFinance(req, plain, 'appointment_pricing', 'update')) {
+            settlementFail(403, 'Non puoi definire il prezzo della seduta');
+        }
+        if (opening.previouslyPaidAmount > expectedAmount + 0.009) settlementFail(400, 'Gli incassi precedenti superano il prezzo della seduta');
+        const before = {expectedAmount: finalSnapshot, paidAmount: paymentMoney(event.appointmentPaidAmount), historyKnown: false};
+        await event.update({...(priceDefined ? {
+            ...appointmentPriceFields({amount: expectedAmount, netAmount: null, vatRate: null, source: 'SNAPSHOT', estimated: false}),
+            appointmentOriginalAmount: expectedAmount, appointmentPriceAdjustedBy: getUserId(req), appointmentPriceAdjustedAt: new Date()} : {}),
+            appointmentPaymentHistoryKnown: true}, {transaction});
+        let paymentId: string | null = null;
+        if (opening.previouslyPaidAmount > 0) {
+            const payment = await InvoicePayment.schema(req.tenantSchema!).create({id: randomUUID(), invoiceId: null,
+                agendaEventId: event.id, amount: opening.previouslyPaidAmount, paidAt: opening.paidAt ? new Date(opening.paidAt + 'T12:00:00.000Z') : null,
+                method: opening.method, source: 'OPENING_BALANCE', status: 'POSTED', createdByUserId: getUserId(req)}, {transaction});
+            paymentId = payment.id;
+        }
+        await syncAppointmentPaymentStatus(req.tenantSchema!, event, transaction, getUserId(req));
+        completed.push({agendaEventId: event.id, paymentId, before,
+            after: {expectedAmount, paidAmount: opening.previouslyPaidAmount, historyKnown: true}, priceDefined});
+    }
+    return completed;
 }
 
 async function responseForOperation(req: Request, context: AuthorizedSettlementContext, operationId: string,
@@ -143,7 +234,7 @@ async function responseForOperation(req: Request, context: AuthorizedSettlementC
         invoiceViews.push({id: invoice.id, ...summary, documentNumber: invoice.documentNumber, documentYear: invoice.documentYear});
     }
     return {operationId, replayed, cashAmount: result.cashAmount, creditAmount: result.creditAmount, allocations: result.allocations,
-        agendaEvents: events.map(event => event.get({plain: true})), invoices: invoiceViews,
+        openingBalances: result.openingBalances ?? [], agendaEvents: events.map(event => event.get({plain: true})), invoices: invoiceViews,
         position: await patientSettlementPositionView(req, context, {transaction})};
 }
 
@@ -153,7 +244,11 @@ export async function executePatientSettlement(req: Request) {
     if (!/^[a-zA-Z0-9_-]{8,128}$/.test(idempotencyKey)) settlementFail(400, 'Identificativo della registrazione obbligatorio e non valido');
     const schema = req.tenantSchema!;
     const initialContext = await resolvePatientSettlementContext(req, request);
-    const requestHash = createHash('sha256').update(JSON.stringify({patientId: initialContext.patientId, structureId: initialContext.structureId, ...request})).digest('hex');
+    // Keep the retry identity of requests recorded before opening balances were supported.
+    const {openingBalances: openingFingerprint, ...existingFingerprint} = request;
+    const requestHash = createHash('sha256').update(JSON.stringify({patientId: initialContext.patientId,
+        structureId: initialContext.structureId, ...existingFingerprint,
+        ...(openingFingerprint.length ? {openingBalances: openingFingerprint} : {})})).digest('hex');
     return sequelize.transaction(async transaction => {
         await sequelize.query('SELECT pg_advisory_xact_lock(hashtextextended(:lockKey, 0))', {
             transaction, replacements: {lockKey: `${schema}:settlement-operation:${idempotencyKey}`}
@@ -176,12 +271,24 @@ export async function executePatientSettlement(req: Request) {
                     || (request.cash.amount > 0 && !settlementRecordAccess(req, context, allocation.kind, model.get({plain: true}), 'update'))
                     || (request.pricing && allocation.kind === 'APPOINTMENT' && !canAccessAppointmentFinance(req, model.get({plain: true}), 'appointment_pricing', 'update'))) settlementFail(403, 'La registrazione non è più accessibile');
             }
+            for (const opening of request.openingBalances) {
+                const model = await AgendaEvent.schema(schema).findByPk(opening.agendaEventId, {transaction});
+                const priceDefined = (existing.get('result') as SettlementOperationResult).openingBalances?.find(row => row.agendaEventId === opening.agendaEventId)?.priceDefined;
+                if (!model || (model.patientId ?? model.patient?.id) !== context.patientId
+                    || (model.structureId ?? context.structureId) !== context.structureId
+                    || !settlementRecordAccess(req, context, 'APPOINTMENT', model.get({plain: true}), 'read')
+                    || !settlementRecordAccess(req, context, 'APPOINTMENT', model.get({plain: true}), 'update')
+                    || (priceDefined && !canAccessAppointmentFinance(req, model.get({plain: true}), 'appointment_pricing', 'update'))) {
+                    settlementFail(403, 'La registrazione non è più accessibile');
+                }
+            }
             if (request.credits.length && (!administrationEnabled || !settlementRecordAccess(req, context, 'CREDIT', {structureId: context.structureId}, 'update'))) settlementFail(403, 'La registrazione non è più accessibile');
             void raw;
             return responseForOperation(req, context, String(existing.get('id')), existing.get('result') as SettlementOperationResult, true, transaction);
         }
         const invoiceIds = request.allocations.filter(row => row.kind === 'INVOICE').map(row => row.targetId).sort();
         const eventIds = [...new Set([...request.allocations.filter(row => row.kind === 'APPOINTMENT').map(row => row.targetId),
+            ...request.openingBalances.map(row => row.agendaEventId),
             ...(request.pricing && context.referenceAgendaEventId ? [context.referenceAgendaEventId] : [])])].sort();
         const invoiceModels = invoiceIds.length ? await Invoice.schema(schema).findAll({where: {id: {[Op.in]: invoiceIds}}, order: [['id', 'ASC']], transaction, lock: transaction.LOCK.UPDATE}) : [];
         const eventModels = eventIds.length ? await AgendaEvent.schema(schema).findAll({where: {id: {[Op.in]: eventIds}}, order: [['id', 'ASC']], transaction, lock: transaction.LOCK.UPDATE}) : [];
@@ -193,17 +300,19 @@ export async function executePatientSettlement(req: Request) {
             if (plain.carePackageId && ['RESERVED', 'CONSUMED'].includes(String(plain.packageReservationStatus))) settlementFail(409, 'La seduta è inclusa nel pacchetto: gestisci il saldo dall’acquisto');
             if ((plain.patientId ?? plain.patient?.id) !== context.patientId || (plain.structureId ?? context.structureId) !== context.structureId
                 || !settlementRecordAccess(req, context, 'APPOINTMENT', plain, 'read')) settlementFail(404, 'Uno degli obblighi non è accessibile');
-            await ensureAppointmentPaymentHistory(schema, event, transaction);
-            if (event.appointmentExpectedAmount == null) await event.update(await snapshotAppointmentPrice(schema, plain, transaction), {transaction});
         }
         for (const invoice of invoiceModels) {
             if (invoice.patientID !== context.patientId || (invoice.structureId ?? context.structureId) !== context.structureId
                 || !settlementRecordAccess(req, context, 'INVOICE', invoice.get({plain: true}), 'read')) settlementFail(404, 'Uno degli obblighi non è accessibile');
         }
+        const openingBalances = await applyOpeningBalances(req, context, request, events, transaction);
+        for (const event of eventModels) {
+            await ensureAppointmentPaymentHistory(schema, event, transaction);
+        }
         await applyPricing(req, context, request, events, transaction);
         const position = await loadPatientSettlementPosition(schema, context, {transaction});
         if (request.pricing && position.current?.kind === 'INVOICE') settlementFail(409, 'La seduta è già fatturata: il prezzo non è modificabile');
-        const ordered = validatePatientSettlementAllocations(position.queue, request.allocations);
+        const ordered = request.allocations.length ? validatePatientSettlementAllocations(position.queue, request.allocations) : [];
         const selected = ordered.map(allocation => position.queue.find(row => row.key === `${allocation.kind}:${allocation.targetId}`)!);
         if (selected.some(row => !settlementCanRead(req, context, row))) settlementFail(403, 'Un obbligo precedente richiede un operatore autorizzato');
         const creditAmount = paymentMoney(request.credits.reduce((sum, credit) => sum + credit.amount, 0));
@@ -230,7 +339,8 @@ export async function executePatientSettlement(req: Request) {
         }
         if (request.cash.accountId) await validateTreasuryAccount(schema, request.cash.accountId, context.structureId, transaction);
         const operationId = randomUUID();
-        const result: SettlementOperationResult = {cashAmount: request.cash.amount, creditAmount, allocations: [], agendaEventIds: [], invoiceIds: []};
+        const result: SettlementOperationResult = {cashAmount: request.cash.amount, creditAmount, allocations: [],
+            agendaEventIds: openingBalances.map(row => row.agendaEventId), invoiceIds: [], openingBalances};
         for (let index = 0; index < ordered.length; index++) {
             const allocation = ordered[index];
             const row = selected[index];
@@ -239,8 +349,9 @@ export async function executePatientSettlement(req: Request) {
             if (row.kind === 'APPOINTMENT' && row.expectedAmount === null) {
                 if (!canAccessAppointmentFinance(req, row.record, 'appointment_pricing', 'update')) settlementFail(403, 'Il prezzo deve essere definito da un operatore autorizzato');
                 const finalAmount = paymentMoney(row.paidAmount + allocation.amount);
-                await events.get(row.targetId)!.update({appointmentExpectedAmount: finalAmount, appointmentOriginalAmount: finalAmount,
-                    appointmentNetAmount: null, appointmentVatRate: null, appointmentPriceRecordedAt: new Date(), appointmentPaymentHistoryKnown: true}, {transaction});
+                await events.get(row.targetId)!.update({
+                    ...appointmentPriceFields({amount: finalAmount, netAmount: null, vatRate: null, source: 'SNAPSHOT', estimated: false}),
+                    appointmentOriginalAmount: finalAmount, appointmentPaymentHistoryKnown: true}, {transaction});
             }
             let creditLeft = split.credit;
             for (const credit of preparedCredits) {
@@ -281,7 +392,7 @@ export async function executePatientSettlement(req: Request) {
                     if (Object.keys(patch).length) await event.update(patch, {transaction});
                 }
                 await syncAppointmentPaymentStatus(schema, event, transaction, getUserId(req));
-                result.agendaEventIds.push(event.id);
+                if (!result.agendaEventIds.includes(event.id)) result.agendaEventIds.push(event.id);
             } else {
                 await syncInvoicePaymentStatus(schema, row.targetId, transaction); result.invoiceIds.push(row.targetId);
             }

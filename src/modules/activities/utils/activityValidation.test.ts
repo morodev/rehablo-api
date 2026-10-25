@@ -74,12 +74,11 @@ test('unchanged historical due and alert permit unrelated edits, while reschedul
     validateActivitySchedule({...original, alert: null, assigneeIds: []}, original, now);
 });
 
-test('alerts need a future instant, a due date, recipients and an open lifecycle; equality with due is valid', () => {
+test('alerts need a future instant, recipients and an open lifecycle; a deadline is optional and bounds alerts when present', () => {
     validateActivitySchedule(schedule({alert: {scheduledAt: '2026-03-28T12:02:00.000Z', channels: ['inApp']}}), null, now);
     for (const candidate of [
         schedule({alert: {scheduledAt: now.toISOString(), channels: ['inApp']}}),
         schedule({alert: {scheduledAt: '2026-03-28T12:03:00.000Z', channels: ['inApp']}}),
-        schedule({due: null, alert: {scheduledAt: '2026-03-28T12:01:00.000Z', channels: ['inApp']}}),
         schedule({assigneeIds: [], alert: {scheduledAt: '2026-03-28T12:01:00.000Z', channels: ['inApp']}}),
         schedule({status: 'COMPLETED', alert: {scheduledAt: '2026-03-28T12:01:00.000Z', channels: ['inApp']}}),
         schedule({archivedAt: now, alert: {scheduledAt: '2026-03-28T12:01:00.000Z', channels: ['inApp']}})
@@ -186,10 +185,10 @@ test('equivalent UTC representations preserve historical milliseconds instead of
     }}, original, now), 'due.at');
 });
 
-test('removing the last recipient or due requires cancelling the active alert in the same command', () => {
+test('removing the last recipient requires cancelling the active alert while a deadline can be removed independently', () => {
     const original = schedule({alert: {scheduledAt: '2026-03-28T12:01:00.000Z', channels: ['inApp']}});
     invalid(() => validateActivitySchedule({...original, assigneeIds: []}, original, now), 'assigneeIds', 'INVALID_ALERT');
-    invalid(() => validateActivitySchedule({...original, due: null}, original, now), 'due', 'INVALID_ALERT');
+    validateActivitySchedule({...original, due: null}, original, now);
     validateActivitySchedule({...original, assigneeIds: [], due: null, alert: null}, original, now);
 });
 

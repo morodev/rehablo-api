@@ -1,10 +1,11 @@
+import {reviewActivity} from '../services/activityWorkflow.service.js';
 import {randomUUID} from 'node:crypto';
 import {Request, Response, Router} from 'express';
 import {requireAuth} from '../../../middleware/auth.js';
 import {sendErrorResponse, sendSuccessResponse} from '../../../utils/response.js';
 import {ActivityError, sendActivityError} from '../utils/activityErrors.js';
 import {
-    parseActivityQuery, parseArchiveActivityInput, parseCreateActivityInput,
+    parseActivityReviewInput, parseActivityQuery, parseArchiveActivityInput, parseCreateActivityInput,
     parseMoveActivityInput, parsePatchActivityInput, parseRestoreActivityInput,
     parseChecklistCreateInput, parseChecklistPatchInput, parseChecklistDeleteInput, parseChecklistMoveInput,
     parseCommentCreateInput, parseCommentPatchInput, parseCommentDeleteInput, parseActivitySummaryQuery, parseActivityLinksQuery
@@ -80,6 +81,8 @@ router.patch('/activities/:activityId/comments/:commentId', handle(async (req, r
     sendChildMutation(res, await updateActivityComment(req, req.params.activityId, req.params.commentId, parseCommentPatchInput(req.body)))));
 router.delete('/activities/:activityId/comments/:commentId', handle(async (req, res) =>
     sendChildMutation(res, await updateActivityComment(req, req.params.activityId, req.params.commentId, parseCommentDeleteInput(req.body), true))));
+router.post('/activities/:activityId/review', handle(async (req, res) =>
+    sendChildMutation(res, await reviewActivity(req, req.params.activityId, parseActivityReviewInput(req.body)))));
 router.post('/activities/:activityId/move', handle(async (req, res) => {
     const result = await moveActivity(req, req.params.activityId, parseMoveActivityInput(req.body));
     if (result.replayed) res.setHeader('Idempotent-Replayed', 'true');

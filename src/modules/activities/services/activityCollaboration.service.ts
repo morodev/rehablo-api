@@ -7,6 +7,8 @@ import type {
     ActivityCommentDeleteInput, ActivityCommentPatchInput, ActivityContext
 } from '../activities.types.js';
 import type {Activity, ActivityBoard, ActivityChecklistItem, ActivityComment} from '../models/index.js';
+import {syncChecklistWorkflow, setActivityWorkflow, invalidateActivityReview} from './activityWorkflow.service.js';
+import {assertVersion, mutationResponse} from './activityPersistence.service.js';
 import {ActivityError} from '../utils/activityErrors.js';
 import {parseActivityId, parseActivityChildPageQuery} from '../utils/activityValidation.js';
 import {childQueryKey, decodeChildCursor, encodeChildCursor, type ActivityChildKind} from '../utils/activityChildCursor.js';
@@ -71,14 +73,14 @@ async function itemInActivity(context: ActivityContext, activityId: string, item
     if (!item) throw new ActivityError('ACTIVITY_NOT_FOUND', 404, 'Questo elemento non è più disponibile nella checklist.');
     return item;
 }
-async function reviseChecklist(activity: Activity, board: ActivityBoard, transaction: Transaction) {
+async function reviseChecklist(activity: Activity, board: ActivityBoard, transaction: Transaction, orderChanged = false) {
     await activity.update({checklistRevision: activity.checklistRevision + 1}, {transaction, silent: true});
-    await reviseBoard(board, transaction, false);
+    await reviseBoard(board, transaction, orderChanged);
 }
 async function checklistResponse(context: ActivityContext, board: ActivityBoard, activity: Activity, itemId: string | null, transaction: Transaction) {
     const rows = await models(context).checklist.findAll({where: {activityId: activity.id}, order: [['position', 'ASC'], ['id', 'ASC']], transaction});
     const checklist = await serializeChecklist(context, rows, transaction);
-    return {activityId: activity.id, item: checklist.find(item => item.id === itemId) ?? null, checklist,
+    return {...await mutationResponse(context, board, activity, transaction), activityId: activity.id, item: checklist.find(item => item.id === itemId) ?? null, checklist,
         checklistRevision: activity.checklistRevision, snapshotRevision: board.snapshotRevision};
 }
 const checklistReceipt = {receipt: (data: Record<string, any>) => ({activityId: data.activityId, itemId: data.item?.id ?? null}),
@@ -95,7 +97,8 @@ export async function addChecklistItem(req: Request, activityId: string, input: 
         const position = await checklistPosition(context, activityId, input.placement, null, transaction);
         const item = await models(context).checklist.create({activityId, text: input.text, position,
             checked: false, version: 1, createdByUserId: context.userId}, {transaction});
-        await reviseChecklist(activity, board, transaction);
+        const orderChanged = await syncChecklistWorkflow(context, board, activity, transaction);
+        await reviseChecklist(activity, board, transaction, orderChanged);
         await recordHistory(context, activityId, 'CHECKLIST_ITEM_ADDED', {itemId: item.id}, transaction);
         return checklistResponse(context, board, activity, item.id, transaction);
     }, {...checklistReceipt, status: 201});
@@ -104,14 +107,23 @@ export async function patchChecklistItem(req: Request, activityId: string, itemI
     parseActivityId(activityId, 'activityId'); parseActivityId(itemId, 'itemId');
     return writeOperation(req, {...input, activityId, itemId}, 'checklist.patch', async (context, board, transaction) => {
         const activity = await activityInBoard(context, board.id, activityId, transaction);
-        await assertCapability(context, activity, 'canManageChecklist', transaction);
+        const reopening = activity.status === 'COMPLETED' && input.changes.checked === false && input.allowReopen === true
+            && input.changes.text === undefined;
+        await assertCapability(context, activity, reopening ? 'canReopenChecklist' : 'canManageChecklist', transaction);
+        if (reopening) assertVersion(activity, input.expectedActivityVersion ?? -1);
         const item = await itemInActivity(context, activityId, itemId, transaction); assertItemVersion(item, input.expectedVersion);
+        if (reopening && !item.checked) throw new ActivityError('INVALID_TRANSITION', 409, 'Questo passaggio è già aperto. Aggiorna la checklist.');
+        const progressChanged = input.changes.checked !== undefined && input.changes.checked !== item.checked;
+        let orderChanged = reopening ? await setActivityWorkflow(context, board, activity, 'IN_PROGRESS', 'not_requested', transaction, 'REOPENED') : false;
+        if (input.changes.text !== undefined && input.changes.text !== item.text) orderChanged = await invalidateActivityReview(context, board, activity, transaction) || orderChanged;
         const values: Record<string, unknown> = {...input.changes, version: item.version + 1};
         if (input.changes.checked !== undefined && input.changes.checked !== item.checked) {
             values.checkedByUserId = input.changes.checked ? context.userId : null;
             values.checkedAt = input.changes.checked ? new Date() : null;
         }
-        await item.update(values, {transaction}); await reviseChecklist(activity, board, transaction);
+        await item.update(values, {transaction});
+        if (progressChanged) orderChanged = await syncChecklistWorkflow(context, board, activity, transaction, input.changes.checked === false) || orderChanged;
+        await reviseChecklist(activity, board, transaction, orderChanged);
         await recordHistory(context, activityId, 'CHECKLIST_ITEM_UPDATED', {itemId, fields: Object.keys(input.changes)}, transaction);
         return checklistResponse(context, board, activity, itemId, transaction);
     }, checklistReceipt);
@@ -122,7 +134,9 @@ export async function deleteChecklistItem(req: Request, activityId: string, item
         const activity = await activityInBoard(context, board.id, activityId, transaction);
         await assertCapability(context, activity, 'canManageChecklist', transaction); assertChecklistRevision(activity, input.expectedChecklistRevision);
         const item = await itemInActivity(context, activityId, itemId, transaction); assertItemVersion(item, input.expectedVersion);
-        await item.destroy({transaction}); await reviseChecklist(activity, board, transaction);
+        await item.destroy({transaction});
+        const orderChanged = await syncChecklistWorkflow(context, board, activity, transaction);
+        await reviseChecklist(activity, board, transaction, orderChanged);
         await recordHistory(context, activityId, 'CHECKLIST_ITEM_DELETED', {itemId}, transaction);
         return checklistResponse(context, board, activity, null, transaction);
     }, checklistReceipt);
@@ -137,7 +151,8 @@ export async function moveChecklistItem(req: Request, activityId: string, itemId
         // Compaction may have moved this row to a temporary rank while this instance still
         // holds the original value. Force the final UPDATE even when those values coincide.
         await models(context).checklist.update({position}, {where: {id: item.id, activityId}, transaction, silent: true});
-        await reviseChecklist(activity, board, transaction);
+        const orderChanged = await invalidateActivityReview(context, board, activity, transaction);
+        await reviseChecklist(activity, board, transaction, orderChanged);
         await recordHistory(context, activityId, 'CHECKLIST_ITEM_MOVED', {itemId, placement: input.placement}, transaction);
         return checklistResponse(context, board, activity, itemId, transaction);
     }, checklistReceipt);

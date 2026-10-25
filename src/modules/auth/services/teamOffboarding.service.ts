@@ -15,6 +15,7 @@ import {canChangeAssignedStructures, validateUserStructureSelection} from './use
 import {defaultCalendarEnabled} from './structureCalendar.service.js';
 import {Activity, ActivityAlert, ActivityAssignment, ActivityBoard, ActivityDelivery, ActivityHistory, ActivityOperation} from '../../activities/models/index.js';
 import {assignableActivityUsers, isEligibleActivityRole} from '../../activities/services/activityAccess.service.js';
+import {invalidateActivityReview} from '../../activities/services/activityWorkflow.service.js';
 import {cancelActivityDeliveries, materializeActivityDeliveries} from '../../activities/services/activityDeliveryPersistence.service.js';
 import type {ActivityContext} from '../../activities/activities.types.js';
 import {getOperatorDeactivationImpact, reassignFutureAppointments} from '../../agenda/services/operatorReassignment.service.js';
@@ -41,7 +42,7 @@ export interface TeamOffboardingImpact {
         structureName: string;
         appointments: Awaited<ReturnType<typeof getOperatorDeactivationImpact>>;
         activities: {
-            openAssignedCount: number;
+            openAssignedCount: number; reviewCount?: number;
             orphanCount: number;
             alertsDisabledCount: number;
             replacementOperators: Array<{id: string; fullName: string}>;
@@ -214,15 +215,16 @@ async function prepare(
                 attributes: ['id', 'start', 'end', 'recurrence', 'status', 'updatedAt'], order: [['id', 'ASC']], transaction,
                 ...(lock ? {lock: transaction.LOCK.UPDATE} : {})})
         ]);
-        const rows = assignments.length ? await Activity.schema(actor.schema).findAll({where: {boardId: board.id,
-            id: {[Op.in]: assignments.map(row => row.activityId)}, archivedAt: null, status: {[Op.ne]: 'COMPLETED'}},
-            order: [['id', 'ASC']], transaction}) : [];
+        const rows = await Activity.schema(actor.schema).findAll({where: {boardId: board.id,
+            [Op.or]: [{id: {[Op.in]: assignments.map(row => row.activityId)}}, {reviewerUserId: targetUserId}],
+            archivedAt: null, status: {[Op.ne]: 'COMPLETED'}}, order: [['id', 'ASC']], transaction});
         const allAssignments = rows.length ? await ActivityAssignment.schema(actor.schema).findAll({where: {
             activityId: {[Op.in]: rows.map(row => row.id)}}, order: [['activityId', 'ASC'], ['userId', 'ASC']], transaction}) : [];
         const enabledAlerts = rows.length ? await ActivityAlert.schema(actor.schema).findAll({where: {
             activityId: {[Op.in]: rows.map(row => row.id)}, enabled: true}, transaction}) : [];
         const eligibleSet = new Set(eligible.filter(row => row.id !== targetUserId).map(row => row.id));
-        const orphaned = rows.filter(row => !allAssignments.some(item => item.activityId === row.id && eligibleSet.has(item.userId)));
+        const assignedRows = rows.filter(row => assignments.some(assignment => assignment.activityId === row.id));
+        const orphaned = assignedRows.filter(row => !allAssignments.some(item => item.activityId === row.id && eligibleSet.has(item.userId)));
         const visibleRole = resolveEffectiveRole(actor.role, actorStructures.find(row => row.structureId === structureId)?.role);
         const canReadDetails = actorStructures.some(row => row.structureId === structureId)
             && hasPermission(getRolePermissions(visibleRole), 'activity', 'read', 'structure');
@@ -231,7 +233,7 @@ async function prepare(
             order: [['id', 'ASC']], transaction, ...(lock ? {lock: transaction.LOCK.UPDATE} : {})}) : [];
         impact.structures.push({structureId, structureName: structures.find(row => row.id === structureId)?.get('name') as string ?? 'Sede',
             appointments: appointmentImpact,
-            activities: {openAssignedCount: rows.length, orphanCount: orphaned.length,
+            activities: {openAssignedCount: assignedRows.length, reviewCount: rows.filter(row => row.reviewerUserId === targetUserId).length, orphanCount: orphaned.length,
                 alertsDisabledCount: enabledAlerts.filter(alert => orphaned.some(row => row.id === alert.activityId)).length,
                 replacementOperators: eligible.filter(row => row.id !== targetUserId).map(row => ({id: row.id,
                     fullName: [row.name, row.surname].filter(Boolean).join(' ') || 'Operatore'})),
@@ -305,10 +307,26 @@ async function applyOffboarding(prepared: PreparedTeamChange, resolutions: TeamS
         }
         const activities = prepared.activityRows.get(impact.structureId)!;
         const assignments = prepared.assignmentRows.get(impact.structureId)!;
+        const board = prepared.boards.find(row => row.structureId === impact.structureId)!;
+        const workflowContext: ActivityContext = {tenantId: actor.tenantId, structureId: impact.structureId, userId: actor.userId,
+            schema: actor.schema, role: actor.role, permissions: getRolePermissions(actor.role), timezone: board.timezone};
+        let orderChanged = false;
         for (const activity of activities) {
+            if (activity.reviewerUserId === targetUserId) {
+                await activity.update({version: activity.version + 1, updatedByUserId: actor.userId,
+                    reviewStatus: activity.reviewStatus === 'approved' ? 'pending' : activity.reviewStatus,
+                    reviewApprovedAt: null, reviewApprovedByUserId: null}, {transaction});
+                await ActivityHistory.schema(actor.schema).create({activityId: activity.id, actorUserId: actor.userId,
+                    eventType: 'REVIEWER_OFFBOARDED', data: {userId: targetUserId, reason: prepared.change.kind}}, {transaction});
+            }
+            if (!assignments.some(row => row.activityId === activity.id && row.userId === targetUserId)) continue;
             const previous = assignments.filter(row => row.activityId === activity.id).map(row => row.userId);
             const next = previous.filter(id => id !== targetUserId);
             const orphan = !next.some(id => eligible.has(id));
+            if (orphan && activityDecision?.kind === 'replace' && activityDecision.userId === activity.reviewerUserId) {
+                throw new TeamOffboardingError(409, 'INVALID_ASSIGNEE', 'Il nuovo assegnatario è il revisore di un’attività: scegli un altro operatore.', prepared.impact);
+            }
+            orderChanged = await invalidateActivityReview(workflowContext, board, activity, transaction) || orderChanged;
             if (orphan && activityDecision?.kind === 'replace') next.push(activityDecision.userId);
             await ActivityAssignment.schema(actor.schema).destroy({where: {activityId: activity.id, userId: targetUserId}, transaction});
             if (orphan && activityDecision?.kind === 'replace') await ActivityAssignment.schema(actor.schema).bulkCreate([
@@ -331,8 +349,8 @@ async function applyOffboarding(prepared: PreparedTeamChange, resolutions: TeamS
                     previousAssigneeIds: previous, assigneeIds: next, reassignmentRequired: activity.reassignmentRequired}}, {transaction});
         }
         if (activities.length) {
-            const board = prepared.boards.find(row => row.structureId === impact.structureId)!;
-            await board.update({snapshotRevision: board.snapshotRevision + 1}, {transaction});
+            await board.update({snapshotRevision: board.snapshotRevision + 1,
+                orderRevision: board.orderRevision + (orderChanged ? 1 : 0)}, {transaction});
         }
     }
 }
@@ -390,7 +408,7 @@ export async function runTeamMutation<T extends Record<string, any>>(
             || body.impactFingerprint !== prepared.impact.fingerprint)) {
             throw new TeamOffboardingError(409, 'OFFBOARDING_IMPACT_CHANGED', 'L’impatto sul team è cambiato. Controlla nuovamente appuntamenti e attività prima di confermare.', prepared.impact);
         }
-        const hasAffectedWork = prepared.impact.structures.some(row => row.activities.openAssignedCount || row.appointments.hasFutureAppointments);
+        const hasAffectedWork = prepared.impact.structures.some(row => row.activities.openAssignedCount || row.activities.reviewCount || row.appointments.hasFutureAppointments);
         if (hasAffectedWork && !body.impactFingerprint) {
             const orphan = prepared.impact.structures.some(row => row.activities.orphanCount);
             throw new TeamOffboardingError(409, orphan ? 'OPEN_ACTIVITIES_REQUIRE_REASSIGNMENT' : 'OFFBOARDING_IMPACT_CHANGED',

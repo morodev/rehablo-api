@@ -11,7 +11,7 @@ export interface QuoteDocumentSnapshot {
     currency: string;
     issuer: { businessName: string | null; vatNumber: string | null; taxCode: string | null; address: string | null; city: string | null; province: string | null; zipCode: string | null; email: string | null; phone: string | null };
     patient: { name: string | null; surname: string | null; fiscalCode: string | null };
-    lines: Array<{ itemType: string; description: string; quantity: number; unitPrice: number; total: number; vatRate: number | null; vatNature: string | null }>;
+    lines: Array<{ socialSecurity?: any; appliesVat?: boolean; contributionAmount?: number; compensationAmount?: number; taxAmount?: number; itemType: string; description: string; quantity: number; unitPrice: number; total: number; vatRate: number | null; vatNature: string | null }>;
     subtotal: number;
     taxTotal: number;
     total: number;
@@ -34,6 +34,8 @@ export function quoteDocument(quote: Record<string, any>, patient: Record<string
         patient: { name: text(patient.name), surname: text(patient.surname), fiscalCode: text(patient.fiscalCode) },
         lines: (Array.isArray(quote.lines) ? quote.lines : []).map((line: Record<string, any>) => ({
             itemType: String(line.itemType), description: String(line.description), quantity: Number(line.quantity),
+            ...(line.socialSecurity ? {socialSecurity: line.socialSecurity, appliesVat: line.appliesVat, contributionAmount: Number(line.contributionAmount ?? 0),
+                compensationAmount: Number(line.compensationAmount ?? 0), taxAmount: Number(line.taxAmount ?? 0)} : {}),
             unitPrice: Number(line.unitPrice), total: Number(line.total),
             vatRate: line.vatRate == null ? null : Number(line.vatRate), vatNature: text(line.vatNature)
         })),

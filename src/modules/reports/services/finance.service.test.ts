@@ -386,3 +386,41 @@ describe('financial report loading and access boundaries', () => {
         } finally { stubs.forEach((stub) => stub.mock.restore()); }
     });
 });
+
+
+describe('automatic reconciliation classifications', () => {
+    it('recognizes positive historical snapshots without inventing a cash receipt and respects later VOID entries', () => {
+        const historical = event({appointmentPaymentHistoryKnown: false, appointmentPaymentStatus: 'partial', appointmentPaidAmount: 40});
+        const input = data({events: [historical], payments: []});
+        const totals = aggregateFinance(input, query()).totals;
+        assert.equal(totals.appointmentOutstanding, 60);
+        assert.equal(totals.collected, 0);
+        assert.equal(totals.unknownAppointmentCount, 0);
+        const therapy = aggregateTherapyPayments(input, query(), occurrences(input.events));
+        assert.equal(therapy.details[0].paidAmount, 40);
+        assert.equal(therapy.details[0].paymentStatus, 'partial');
+        input.payments = [payment({status: 'VOID', amount: 40})];
+        assert.equal(aggregateFinance(input, query()).totals.appointmentOutstanding, 100);
+        assert.equal(aggregateTherapyPayments(input, query(), occurrences(input.events)).details[0].paidAmount, 0);
+    });
+    it('keeps estimated catalogue amounts outside definite outstanding debt', () => {
+        const input = data({events: [event({priceEstimated: true})], payments: []});
+        assert.equal(aggregateFinance(input, query()).totals.appointmentOutstanding, 0);
+        const therapy = aggregateTherapyPayments(input, query(), occurrences(input.events));
+        assert.equal(therapy.details[0].balance, null);
+        assert.equal(therapy.details[0].issueKind, 'MISSING_PRICE');
+    });
+    it('uses reverse invoice ownership once and labels missing fiscal links explicitly', () => {
+        const input = data({events: [event()], payments: [], invoices: [invoice({agendaEventId: 'event-1', status: 'unpaid'})],
+            attributableInvoiceIds: new Set(['invoice-1'])});
+        const totals = aggregateFinance(input, query()).totals;
+        assert.equal(totals.outstanding, 100);
+        assert.equal(totals.appointmentOutstanding, 0);
+        assert.equal(aggregateTherapyPayments(input, query({documentStatus: 'invoiced'}), occurrences(input.events)).details.length, 1);
+        input.events = [event({invoiceId: 'missing'})];
+        input.invoices = [];
+        const missing = aggregateTherapyPayments(input, query(), occurrences(input.events));
+        assert.equal(missing.details[0].issueKind, 'UNRESOLVED_INVOICE');
+        assert.equal(missing.details[0].balance, null);
+    });
+});

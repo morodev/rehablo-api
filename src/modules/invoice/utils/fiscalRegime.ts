@@ -1,3 +1,4 @@
+import {SocialSecurityPricingMode, contributionPolicy} from './socialSecurity.js';
 /**
  * Regime fiscale del soggetto emittente e regole che ne derivano in fatturazione.
  *
@@ -158,6 +159,9 @@ export type SocialSecurityFund = 'NONE' | 'INPS_GS' | 'CASSA';
 export interface TenantFiscalSettings {
     taxRegime?: string | null;
     socialSecurityFund?: string | null;
+    socialSecurityPricingMode?: string | null;
+    withholdingType?: string | null;
+    withholdingCausale?: string | null;
     socialSecurityRate?: number | string | null;
     withholdingRate?: number | string | null;
     stampDutyAmount?: number | string | null;
@@ -177,6 +181,9 @@ export interface FiscalProfile {
     allowsWithholding: boolean;
     withholdingRate: number;
     socialSecurityFund: SocialSecurityFund;
+    socialSecurityPricingMode: SocialSecurityPricingMode;
+    withholdingType: string | null;
+    withholdingCausale: string | null;
     socialSecurityRate: number;
     /**
      * true quando il contributo previdenziale addebitato è ESCLUSO dalla base della ritenuta
@@ -215,6 +222,9 @@ export function resolveFiscalProfile(tenant: TenantFiscalSettings | null | undef
         allowsWithholding: regime.allowsWithholding,
         withholdingRate: toNumber(tenant?.withholdingRate, 20),
         socialSecurityFund: fund,
+        socialSecurityPricingMode: contributionPolicy(fund, tenant?.socialSecurityPricingMode ?? 'EXCLUDED', tenant?.socialSecurityRate ?? 4).mode,
+        withholdingType: tenant?.withholdingType ?? null,
+        withholdingCausale: tenant?.withholdingCausale ?? null,
         socialSecurityRate: toNumber(tenant?.socialSecurityRate, 4),
         socialSecurityExcludedFromWithholding: fund === 'CASSA',
         stampDutyAmount: toNumber(tenant?.stampDutyAmount, DEFAULT_STAMP_DUTY_AMOUNT),

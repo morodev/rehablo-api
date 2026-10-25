@@ -13,7 +13,7 @@ import { previewFiscalSubmission, transmitFiscal } from '../controllers/fiscalSi
 import { getFiscalSettings, updateFiscalSettings, getStsCredentials, updateStsCredentials } from '../controllers/fiscalSettings.controller.js';
 import { createAdvance, applyCredit, refundCredit, creditMovements, reverseCreditApplication } from '../controllers/patientCredit.controller.js';
 import * as carePackages from '../controllers/carePackage.controller.js';
-import {listEligibleCarePackages} from '../../agenda/controllers/packageAssignment.controller.js';
+import {listEligibleCarePackages, listAppointmentCarePackageOptions} from '../../agenda/controllers/packageAssignment.controller.js';
 
 const router = Router();
 router.use(requireAuth, resolveTenantSchema);
@@ -69,6 +69,7 @@ router.get('/administration/package-templates/:id', requirePermission('care_pack
 router.post('/administration/package-templates', requirePermission('price_list', 'create', 'structure'), carePackages.savePackageTemplate);
 router.patch('/administration/package-templates/:id', requirePermission('price_list', 'update', 'structure'), carePackages.savePackageTemplate);
 router.get('/administration/care-packages/payment-options', requirePermission('payment', 'create'), carePackages.packagePaymentOptions);
+router.get('/administration/care-packages/appointment-options', requirePermission('care_package', 'read'), listAppointmentCarePackageOptions);
 router.get('/administration/care-packages/eligible', requirePermission('care_package', 'read'), listEligibleCarePackages);
 router.get('/administration/care-packages', requireAnyPermission(['care_package', 'read'], ['quote', 'read']), carePackages.listCarePackages);
 router.post('/administration/care-packages', requirePermission('care_package', 'create', 'structure'), carePackages.createCarePackage);

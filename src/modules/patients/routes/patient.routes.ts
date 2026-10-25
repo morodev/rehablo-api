@@ -4,6 +4,8 @@ import { requireAnyPermission, requirePermission } from '../../../middleware/rba
 import { resolveTenantSchema } from '../../../middleware/tenantSchema.js';
 import patientController from '../controllers/patient.controller.js';
 import {createPatientSettlement, getPatientSettlementPosition} from '../controllers/patientSettlement.controller.js';
+import {getPatientCoveragePosition} from '../controllers/patientCoverage.controller.js';
+import {requireAdministrationFeature} from '../../administration/middleware/administrationFeature.js';
 
 const router = Router();
 
@@ -14,6 +16,7 @@ router.use(requireAuth, resolveTenantSchema);
 router.post('/patient', requirePermission('patient', 'create'), patientController.savePatient);
 router.get('/patient/search', requirePermission('patient', 'read'), patientController.searchPatients);
 router.get('/patient', requirePermission('patient', 'read'), patientController.findAndCountAll);
+router.get('/patient/:patientId/coverage-position', requireAnyPermission(['care_package', 'read'], ['quote', 'read']), requireAdministrationFeature, getPatientCoveragePosition);
 // Core cash collection remains available without enabling the Administration module.
 router.get('/patient/:patientId/settlement-position', requirePermission('patient_balance', 'read'), getPatientSettlementPosition);
 router.post('/patient/:patientId/settlements', requireAnyPermission(['payment', 'create'], ['quote', 'update']), createPatientSettlement);

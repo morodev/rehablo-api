@@ -105,6 +105,7 @@ const APPOINTMENT_PAYMENT_MANAGED_FIELDS = [
     'appointmentPaymentMethod',
     'appointmentPaymentNote',
     'appointmentPaymentRecordedBy',
+    'appointmentSocialSecurity',
     'appointmentExpectedAmount',
     'appointmentOriginalAmount',
     'appointmentPriceAdjustment',
@@ -742,7 +743,7 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
         if (event.eventTypeId !== undefined && event.eventTypeId !== locked.eventTypeId) {
             Object.assign(event, await snapshotAppointmentPrice(schema, {
                 ...locked.get({ plain: true }), ...event,
-                appointmentExpectedAmount: null, appointmentNetAmount: null, appointmentVatRate: null,
+                __newPriceAgreement: true, appointmentSocialSecurity: null, appointmentExpectedAmount: null, appointmentNetAmount: null, appointmentVatRate: null,
                 appointmentOriginalAmount: null
             }, transaction));
             event.appointmentOriginalAmount = null;

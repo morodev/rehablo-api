@@ -15,13 +15,14 @@ function record(values: Record<string, any>): any {
         async update(values: any) {Object.assign(this, values); return this;}};
 }
 
-it('fiscal cancellation releases event-owned credit together with cash/package without creating or voiding a receipt', async t => {
+for (const paymentSource of ['CREDIT', 'OPENING_BALANCE']) {
+it(`fiscal cancellation releases event-owned ${paymentSource} without creating or voiding a receipt`, async t => {
     const invoiceId = id(1), patientId = id(2), structureId = id(3), eventId = id(4);
     const invoice = record({id: invoiceId, patientID: patientId, structureId, documentType: 'fattura',
         documentNumber: 10, documentYear: 2025, emissionDate: '2025-01-01', invoiceTotal: 60,
         invoiceNet: 60, status: 'paid', agendaEventId: eventId});
     const event = record({id: eventId, patientId, structureId, invoiceId, appointmentPaidAmount: 60});
-    const payment = record({id: id(5), invoiceId, agendaEventId: eventId, source: 'CREDIT', status: 'POSTED', amount: 60});
+    const payment = record({id: id(5), invoiceId, agendaEventId: eventId, source: paymentSource, status: 'POSTED', amount: 60});
     const links = [record({id: id(6), invoiceId, agendaEventId: eventId, releasedAt: null})];
     const trace: string[] = [];
     t.mock.method(sequelize, 'query', (async (sql: string) => {assert.match(sql, /pg_advisory_xact_lock/); trace.push('patient-lock'); return [[], {}];}) as any);
@@ -65,3 +66,5 @@ it('fiscal cancellation releases event-owned credit together with cash/package w
     assert.ok(trace.indexOf('patient-lock') < trace.indexOf('invoice-lock'));
     assert.ok(trace.indexOf('invoice-lock') < trace.indexOf('event-lock'));
 });
+
+}

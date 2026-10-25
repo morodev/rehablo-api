@@ -1,3 +1,4 @@
+import {ContributionPolicy, contributionPolicy, SocialSecurityPricingMode} from '../utils/socialSecurity.js';
 import { Request, Response } from 'express';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -114,6 +115,7 @@ async function unavailableCatalogId(
 }
 
 interface ResolvedInvoiceLine {
+    socialSecurity?: ContributionPolicy;
     id: string;
     quantity: number;
     unitPrice: number;
@@ -189,7 +191,8 @@ const toEvalLine = (line: ResolvedInvoiceLine) => ({
     sellingPrice: line.unitPrice,
     originalSellingPrice: line.originalUnitPrice,
     quantity: line.quantity,
-    productVat: line.vat
+    productVat: line.vat,
+    socialSecurity: line.socialSecurity
 });
 
 const invoiceDateFormatter = new Intl.DateTimeFormat('en-CA', {
@@ -229,6 +232,9 @@ function validateFinancialInput(
     if (discountType === 'value' && discountAmount >= adjustedSubtotal) {
         return 'Lo sconto deve essere inferiore all’imponibile della fattura';
     }
+    if (invoiceFields.socialSecurityPricingMode !== undefined && invoiceFields.isTaxWithholding
+        && (!['RT01', 'RT02'].includes(invoiceFields.withholdingType) || invoiceFields.withholdingCausale !== 'A'))
+        return 'Completa tipo e causale della ritenuta';
     const validRate = (enabled: unknown, value: unknown) => !enabled
         || (Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 100);
     if (!validRate(invoiceFields.isRivals, invoiceFields.rivals)) return 'Aliquota rivalsa non valida';
@@ -395,6 +401,7 @@ export const findEligibleAppointments = asyncHandler(async (req: Request, res: R
                 productVat: invoicePrice!.vat,
                 sellingPrice: invoicePrice!.unitPrice,
                 originalSellingPrice: originalPrice,
+                socialSecurity: invoicePrice!.socialSecurity,
                 categoryId: service.categoryId,
                 isActive: service.isActive
             } : null,
@@ -417,6 +424,9 @@ export const findEligibleAppointments = asyncHandler(async (req: Request, res: R
 interface FiscalOutcome {
     /** Campi fiscali normalizzati da persistere (sovrascrivono quanto arrivato dal client). */
     fields: {
+        isRivals?: boolean;
+        rivals?: number | null;
+        isCashPro?: boolean;
         vatNature: string;
         isTaxWithholding: boolean;
         taxWithholding: number | null;
@@ -456,13 +466,18 @@ function applyFiscalRules(params: {
         ? Number(invoiceFields.taxWithholding ?? profile.withholdingRate)
         : null;
 
+    const modern = invoiceFields.socialSecurityPricingMode !== undefined;
+    const policy = modern ? contributionPolicy(profile.socialSecurityFund, invoiceFields.socialSecurityPricingMode, profile.socialSecurityRate) : null;
     const baseInput = {
+        ...(policy ? {socialSecurityPricingMode: policy.mode, socialSecurityFund: policy.fund,
+            withholdingType: invoiceFields.withholdingType ?? profile.withholdingType,
+            withholdingCausale: invoiceFields.withholdingCausale ?? profile.withholdingCausale} : {}),
         products: evalLines.products,
         services: evalLines.services,
         discountType: invoiceFields.discountType,
         discountAmount: invoiceFields.discountAmount,
         isRivals: invoiceFields.isRivals,
-        rivals: invoiceFields.rivals,
+        rivals: policy?.rate ?? invoiceFields.rivals,
         isCashPro: invoiceFields.isCashPro,
         isTaxWithholding,
         taxWithholding: taxWithholding ?? 0,
@@ -488,7 +503,8 @@ function applyFiscalRules(params: {
     });
 
     return {
-        fields: { vatNature, isTaxWithholding, taxWithholding, isStamp, stampAmount, stampChargedToPatient },
+        fields: { ...(policy ? {isRivals: totals.rivalsAmount > 0,
+            rivals: totals.rivalsAmount > 0 ? policy.rate : null, isCashPro: policy.fund === 'CASSA'} : {}), vatNature, isTaxWithholding, taxWithholding, isStamp, stampAmount, stampChargedToPatient },
         totals,
         fiscalNotes: buildFiscalNotes({
             profile,
@@ -500,6 +516,7 @@ function applyFiscalRules(params: {
 
 export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
+    delete req.body.socialSecuritySnapshot;
     const packagePurchase = req.body?.carePackageId ? await scopedCarePackage(req, req.body.carePackageId) : null;
     if (packagePurchase) {
         if (!packagePurchase.get('templateId')) treasuryError('Il pacchetto storico richiede riconciliazione prima della fatturazione', 409);
@@ -620,6 +637,15 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const issuerData = issuerTenant!.get({ plain: true }) as any;
     const issuer = buildIssuerSnapshot(issuerData);
     const fiscalProfile = resolveFiscalProfile(issuerData);
+    // Explicit legacy flags retain their old contract. New clients and agenda use the versioned policy.
+    if (invoiceFields.socialSecurityPricingMode === undefined && invoiceFields.isRivals === undefined)
+        invoiceFields.socialSecurityPricingMode = fiscalProfile.socialSecurityPricingMode;
+    if (invoiceFields.socialSecurityPricingMode !== undefined) {
+        invoiceFields.withholdingType ??= fiscalProfile.withholdingType;
+        invoiceFields.withholdingCausale ??= fiscalProfile.withholdingCausale;
+        try { contributionPolicy(fiscalProfile.socialSecurityFund, invoiceFields.socialSecurityPricingMode, fiscalProfile.socialSecurityRate); }
+        catch (error) { return sendErrorResponse(res, 422, (error as Error).message); }
+    }
     if (packagePurchase) {
         const snapshot = packagePurchase.get('purchaseSnapshot') as Record<string, any>;
         const vat = snapshot.serviceVat ?? null;
@@ -627,7 +653,8 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         serviceLines[0] = {id: String(packagePurchase.get('serviceId')), quantity: 1,
             unitPrice: money(Number(packagePurchase.get('totalPrice')) / (1 + vatRate / 100)), vat,
             name: `${String(packagePurchase.get('name'))} - ${Number(packagePurchase.get('purchasedUnits'))} sedute di ${String(packagePurchase.get('serviceName'))}`,
-            percentageDiscount: null, discountAmount: null};
+            percentageDiscount: null, discountAmount: null,
+            socialSecurity: snapshot.socialSecurity ? {...snapshot.socialSecurity, mode: snapshot.socialSecurity.mode === 'NONE' ? 'NONE' : 'INCLUDED'} : contributionPolicy('NONE')};
     }
     invoiceFields.stsExpenseTypeCode = invoiceStsCodeForSave({
         ...invoiceFields, issuer, products: productLines, services: serviceLines
@@ -685,6 +712,9 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         // dal documento immutabile, non da un'anagrafica che può cambiare dopo l'emissione.
         recipient = buildRecipientSnapshot(patient.get({ plain: true }) as any);
     }
+
+    if (invoiceFields.socialSecurityPricingMode !== undefined && fiscal.fields.isTaxWithholding && recipient?.kind !== 'BUSINESS')
+        return sendErrorResponse(res, 422, 'La ritenuta richiede un destinatario sostituto d’imposta');
 
     const [unavailableProductId, unavailableServiceId] = await Promise.all([
         unavailableCatalogId(
@@ -913,6 +943,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                         ServiceId: line.id,
                         quantity: line.quantity,
                         servicePrice: line.unitPrice,
+                        socialSecurity: line.socialSecurity ?? null,
                         originalServicePrice: line.originalUnitPrice ?? null,
                         totalPrice: line.unitPrice * line.quantity,
                         percentageDiscount: line.percentageDiscount,
@@ -1142,7 +1173,7 @@ export const findAllInvoices = asyncHandler(async (req: Request, res: Response) 
     const invoicesWithMovements = new Set(paymentRows.map(row => row.get('invoiceId') as string));
     paymentRows.forEach(row => {
         const payment = row.get({ plain: true }) as Record<string, any>;
-        if (['PACKAGE', 'CREDIT'].includes(payment.source)) return;
+        if (['PACKAGE', 'CREDIT', 'OPENING_BALANCE'].includes(payment.source)) return;
         const paidAt = payment.paidAt ? String(payment.paidAt).slice(0, 10) : null;
         if (!paidAt) {
             aggregates.undatedPaidAmount += Number(payment.amount) || 0;
@@ -1308,7 +1339,7 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
                     transaction, lock: transaction.LOCK.UPDATE
                 });
                 await InvoicePaymentScoped.update({ invoiceId: null }, {
-                    where: { invoiceId: id, agendaEventId: { [Op.in]: eventIds }, source: { [Op.in]: ['APPOINTMENT', 'PACKAGE', 'CREDIT'] } }, transaction
+                    where: { invoiceId: id, agendaEventId: { [Op.in]: eventIds }, source: { [Op.in]: ['APPOINTMENT', 'PACKAGE', 'CREDIT', 'OPENING_BALANCE'] } }, transaction
                 });
                 await AgendaEvent.schema(schema).update({ invoiceId: null }, {
                     where: { id: { [Op.in]: eventIds }, invoiceId: id }, transaction
@@ -1328,6 +1359,10 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
     }) > 0)) {
         return sendErrorResponse(res, 409, 'Per correggere le prestazioni di una fattura collegata a sedute, annulla il documento e riemettilo');
     }
+    delete invoiceFields.socialSecuritySnapshot;
+    if (invoiceFields.socialSecurityPricingMode !== undefined && !existingInvoice.get('socialSecuritySnapshot'))
+        return sendErrorResponse(res, 409, 'Il documento storico mantiene la propria modalità previdenziale');
+    if (!shouldReplaceLines && invoiceFields.socialSecurityPricingMode !== undefined) return sendErrorResponse(res, 409, 'La modalità previdenziale richiede il ricalcolo delle righe');
     if (!shouldReplaceLines && ['discountType', 'discountAmount', 'isRivals', 'rivals', 'isCashPro',
         'isTaxWithholding', 'taxWithholding', 'vatNature', 'isStamp', 'stampAmount', 'stampChargedToPatient'].some(field =>
         invoiceFields[field] !== undefined && String(invoiceFields[field] ?? '') !== String(existingInvoice.get(field as any) ?? '')
@@ -1365,8 +1400,8 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
 
     if (shouldReplaceLines) {
         const [currentProductRows, currentServiceRows] = await Promise.all([
-            InvoiceProductScoped.findAll({where: {InvoiceId: id}, attributes: ['ProductId'], raw: true}),
-            InvoiceServiceScoped.findAll({where: {InvoiceId: id}, attributes: ['ServiceId'], raw: true})
+            InvoiceProductScoped.findAll({where: {InvoiceId: id}, raw: true}),
+            InvoiceServiceScoped.findAll({where: {InvoiceId: id}, raw: true})
         ]);
         const existingProductIds = new Set(currentProductRows.map((row: any) => String(row.ProductId)));
         const existingServiceIds = new Set(currentServiceRows.map((row: any) => String(row.ServiceId)));
@@ -1407,6 +1442,17 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
             return sendErrorResponse(res, 400, `Servizio non trovato nel catalogo: ${missingServiceId}`);
         }
 
+        // Existing document prices and VAT remain authoritative even if the catalogue changes.
+        for (const line of productLines) {
+            const saved = currentProductRows.find((row: any) => row.ProductId === line.id) as any;
+            if (saved) Object.assign(line, {unitPrice: Number(saved.productPrice), vat: saved.productVat, name: saved.productName});
+        }
+        for (const line of serviceLines) {
+            const saved = currentServiceRows.find((row: any) => row.ServiceId === line.id) as any;
+            if (saved) Object.assign(line, {unitPrice: Number(saved.servicePrice), originalUnitPrice: saved.originalServicePrice,
+                vat: saved.serviceVat, name: saved.serviceName, socialSecurity: saved.socialSecurity ?? undefined});
+        }
+
         // Il regime da applicare è quello congelato sul documento (`issuer.taxRegime`), non quello
         // corrente dello studio: correggere una fattura del 2025 emessa in forfettario non deve
         // trasformarla in una fattura con IVA solo perché nel frattempo si è passati all'ordinario.
@@ -1415,10 +1461,18 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
         const issuerTenant = await Tenant.findByPk(req.user!.tenants[0].id);
         const profile = resolveFiscalProfile({
             ...((issuerTenant?.get({ plain: true }) as any) ?? {}),
-            taxRegime: issuerSnapshot?.taxRegime ?? (issuerTenant?.get('taxRegime') as string | null)
+            taxRegime: issuerSnapshot?.taxRegime ?? (issuerTenant?.get('taxRegime') as string | null),
+            socialSecurityFund: (existingInvoice.get('socialSecuritySnapshot') as any)?.policy?.fund ?? issuerTenant?.get('socialSecurityFund'),
+            socialSecurityRate: (existingInvoice.get('socialSecuritySnapshot') as any)?.policy?.rate ?? issuerTenant?.get('socialSecurityRate')
         });
 
+        const frozenContribution = existingInvoice.get('socialSecuritySnapshot') as any;
         const mergedFinancialFields = {
+            ...(invoiceFields.socialSecurityPricingMode !== undefined || frozenContribution ? {
+                socialSecurityPricingMode: invoiceFields.socialSecurityPricingMode ?? frozenContribution.policy.mode,
+                withholdingType: invoiceFields.withholdingType ?? frozenContribution?.withholding?.type,
+                withholdingCausale: invoiceFields.withholdingCausale ?? frozenContribution?.withholding?.causale
+            } : {}),
             discountType: invoiceFields.discountType ?? existingInvoice.get('discountType'),
             discountAmount: invoiceFields.discountAmount ?? existingInvoice.get('discountAmount'),
             isRivals: invoiceFields.isRivals ?? existingInvoice.get('isRivals'),
@@ -1432,6 +1486,12 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
             stampChargedToPatient:
                 invoiceFields.stampChargedToPatient ?? existingInvoice.get('stampChargedToPatient')
         };
+        try { if (mergedFinancialFields.socialSecurityPricingMode !== undefined)
+            contributionPolicy(profile.socialSecurityFund, mergedFinancialFields.socialSecurityPricingMode, profile.socialSecurityRate); }
+        catch (error) { return sendErrorResponse(res, 422, (error as Error).message); }
+        if (mergedFinancialFields.socialSecurityPricingMode !== undefined && mergedFinancialFields.isTaxWithholding
+            && profile.allowsWithholding && (existingInvoice.get('recipient') as any)?.kind !== 'BUSINESS')
+            return sendErrorResponse(res, 422, 'La ritenuta richiede un destinatario sostituto d’imposta');
         const fiscal = applyFiscalRules({
             profile,
             invoiceFields: mergedFinancialFields,
@@ -1496,6 +1556,8 @@ export const updateInvoice = asyncHandler(async (req: Request, res: Response) =>
                             ServiceId: line.id,
                             quantity: line.quantity,
                             servicePrice: line.unitPrice,
+                            originalServicePrice: line.originalUnitPrice ?? null,
+                            socialSecurity: line.socialSecurity ?? null,
                             totalPrice: line.unitPrice * line.quantity,
                             percentageDiscount: line.percentageDiscount,
                             discountAmount: line.discountAmount,

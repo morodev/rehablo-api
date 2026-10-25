@@ -5,6 +5,11 @@ export const ACTIVITY_STATUSES = ['TODO', 'IN_PROGRESS', 'WAITING', 'COMPLETED']
 export type ActivityStatus = typeof ACTIVITY_STATUSES[number];
 export const ACTIVITY_PRIORITIES = ['LOW', 'NORMAL', 'HIGH', 'URGENT'] as const;
 export type ActivityPriority = typeof ACTIVITY_PRIORITIES[number];
+export type ActivityReviewStatus = 'not_requested' | 'pending' | 'approved';
+export interface ActivityReviewInput extends ActivityArchiveInput {
+    action: 'request' | 'approveAndComplete' | 'authorizeCompletion' | 'returnToProgress';
+    expectedChecklistRevision: number; comment?: string;
+}
 export const ACTIVITY_ALERT_CHANNELS = ['inApp', 'push', 'email'] as const;
 export type ActivityAlertChannel = typeof ACTIVITY_ALERT_CHANNELS[number];
 export const ACTIVITY_TIMEZONE = 'Europe/Rome';
@@ -24,6 +29,7 @@ export interface ActivityCoreFields {
     description: string | null;
     priority: ActivityPriority;
     assigneeIds: string[];
+    reviewerUserId?: string | null;
     due: ActivityDue;
     alert: ActivityAlertInput | null;
     patientId: string | null;
@@ -103,6 +109,8 @@ export interface ActivityCapabilities {
     canComment: boolean;
     canArchive: boolean;
     canRestore: boolean;
+    canRequestReview: boolean; canReview: boolean; canComplete: boolean;
+    canAssignReviewer: boolean; canReopenChecklist: boolean;
 }
 
 export interface ActivityUserSummary {
@@ -147,6 +155,8 @@ export interface ActivityCardDto {
     alert: ActivityAlertDto | null;
     assigneeIds: string[];
     assignees: ActivityUserSummary[];
+    reviewerUserId: string | null; reviewer: ActivityUserSummary | null;
+    reviewStatus: ActivityReviewStatus; reviewApprovedByUserId: string | null; reviewApprovedAt: string | null;
     createdByUserId: string;
     updatedByUserId: string | null;
     createdBy: ActivityUserSummary | null;
@@ -183,7 +193,7 @@ export interface ActivityChecklistItemDto {
 
 export type ActivityChecklistPlacement = {kind: 'start' | 'end'} | {kind: 'before'; itemId: string};
 export interface ActivityChecklistCreateInput {operationId: string; expectedChecklistRevision: number; text: string; placement: ActivityChecklistPlacement;}
-export interface ActivityChecklistPatchInput {operationId: string; expectedVersion: number; changes: {text?: string; checked?: boolean};}
+export interface ActivityChecklistPatchInput {operationId: string; expectedVersion: number; allowReopen?: boolean; expectedActivityVersion?: number; changes: {text?: string; checked?: boolean};}
 export interface ActivityChecklistDeleteInput {operationId: string; expectedVersion: number; expectedChecklistRevision: number;}
 export interface ActivityChecklistMoveInput {operationId: string; expectedChecklistRevision: number; placement: ActivityChecklistPlacement;}
 export interface ActivityCommentCreateInput {operationId: string; text: string;}
@@ -200,7 +210,7 @@ export interface ActivityCommentDto {
 }
 export interface ActivityChecklistMutationResponse {
     activityId: string; item: ActivityChecklistItemDto | null; checklist: ActivityChecklistItemDto[];
-    checklistRevision: number; snapshotRevision: number;
+    checklistRevision: number; snapshotRevision: number; activity: ActivityCardDto; orderRevision: number;
 }
 export interface ActivityCommentMutationResponse {activityId: string; comment: ActivityCommentDto; snapshotRevision: number;}
 
@@ -317,6 +327,8 @@ export interface ActivityRecord {
     createdAt: Date | string;
     updatedAt: Date | string;
     reassignmentRequired?: boolean;
+    reviewerUserId?: string | null; reviewStatus?: ActivityReviewStatus;
+    reviewApprovedByUserId?: string | null; reviewApprovedAt?: Date | string | null;
 }
 export interface ActivityBoardRecord {
     id: string;
