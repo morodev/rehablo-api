@@ -16,6 +16,7 @@ import {saveInvoice} from '../../invoice/controllers/invoice.controller.js';
 import {lockPatientSettlement} from '../../patients/services/patientSettlementPolicy.service.js';
 import {CarePackage, FinancialAccount, PackageConsumption, PackageTemplate, PaymentMethod} from '../models/index.js';
 import {treasuryError} from '../services/treasuryValidation.service.js';
+import {readFinancialOptions} from '../services/financialAccountResolver.service.js';
 import {lockPackageOperation, normalizePackageReceipt, packageAccessRequest, packageIdempotency,
     packagePatient, packagePatientWhere, packageSelectedStructure, packageService, packageToday, packageUuid, recordPackageReceipt, scopedCarePackage} from '../services/carePackage.service.js';
 
@@ -154,11 +155,8 @@ export const createPackagePayment = asyncHandler(async (req, res) => {
 export const packagePaymentOptions = asyncHandler(async (req, res) => {
     const patient = await packagePatient(req, req.query.patientId, 'payment', 'create');
     await packagePatient(req, req.query.patientId);
-    const [accounts, methods] = await Promise.all([
-        FinancialAccount.schema(req.tenantSchema!).findAll({where: {isActive: true, [Op.or]: [{structureId: patient.get('structureId')}, {structureId: null}]}, attributes: ['id', 'name'], order: [['name', 'ASC']]}),
-        PaymentMethod.schema(req.tenantSchema!).findAll({where: {isActive: true}, attributes: ['id', 'label'], order: [['label', 'ASC']]})
-    ]);
-    return sendSuccessResponse(res, 200, {accounts: accounts.map(plain), methods: methods.map(plain)});
+    const options = await readFinancialOptions(req.tenantSchema!, String(patient.get('structureId')));
+    return sendSuccessResponse(res, 200, {...options, methods: options.paymentMethods});
 });
 export const voidPackagePayment = asyncHandler(async (req, res) => {
     const id = packageUuid(req.params.id), paymentId = packageUuid(req.params.paymentId, 'Incasso');

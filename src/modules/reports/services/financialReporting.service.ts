@@ -7,6 +7,7 @@ import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import Patient from '../../patients/models/patient.model.js';
 import { balanceEffectiveMovements } from '../../administration/services/treasuryLedger.service.js';
+import {economicMovements} from '../../administration/services/financialMovementPolicy.service.js';
 import { summarizeInvoicePayments } from '../../invoice/services/payment.service.js';
 import { aggregateFinance, FinanceQuery, financialSelection, loadFinanceData, money, parseFinanceFilters } from './finance.service.js';
 import { comparisonRange, parseAnalyticsQuery, percentageChange } from './analytics.service.js';
@@ -63,11 +64,14 @@ export function treasuryProjection(movements: Row[], expenses: Row[], from: stri
         && (!filters.direction || row.direction === filters.direction));
     const costs = expenses.filter(row => inFinancialPeriod(row.incurredAt, from, to)
         && !['VOID', 'CANCELLED'].includes(String(row.status).toUpperCase()) && (!filters.category || row.category === filters.category));
-    const income = sum(rows.filter(row => row.direction === 'IN'), 'amount');
-    const outcome = sum(rows.filter(row => row.direction === 'OUT'), 'amount');
+    const economic = economicMovements(rows);
+    const income = sum(economic.filter(row => row.direction === 'IN'), 'amount');
+    const outcome = sum(economic.filter(row => row.direction === 'OUT'), 'amount');
     return { rows, costs, income, outcome, cashFlow: money(income - outcome), expenses: sum(costs, 'amount'),
-        advances: sum(rows.filter(row => row.direction === 'IN' && row.sourceType === 'PATIENT_ADVANCE'), 'amount'),
-        creditRefunds: sum(rows.filter(row => row.direction === 'OUT' && row.sourceType === 'PATIENT_CREDIT_REFUND'), 'amount') };
+        advances: money(sum(rows.filter(row => row.direction === 'IN' && row.sourceType === 'PATIENT_ADVANCE'), 'amount')
+            - sum(rows.filter(row => row.direction === 'OUT' && row.sourceType === 'PATIENT_ADVANCE_VOID'), 'amount')),
+        creditRefunds: money(sum(rows.filter(row => row.direction === 'OUT' && row.sourceType === 'PATIENT_CREDIT_REFUND'), 'amount')
+            - sum(rows.filter(row => row.direction === 'IN' && row.sourceType === 'PATIENT_REFUND_VOID'), 'amount')) };
 }
 
 /** Shared projection for the existing administrative report and overview. */
@@ -83,7 +87,7 @@ export function administrationFinancialProjection(documents: Row[], movements: R
     const series: Row[] = [];
     for (let day = new Date(`${from.slice(0, 7)}-01T12:00:00Z`); day <= new Date(`${to}T12:00:00Z`); day.setUTCMonth(day.getUTCMonth() + 1)) {
         const key = day.toISOString().slice(0, 7);
-        const cash = treasury.rows.filter(row => dateOnly(row.occurredAt).startsWith(key));
+        const cash = economicMovements(treasury.rows).filter(row => dateOnly(row.occurredAt).startsWith(key));
         const income = sum(cash.filter(row => row.direction === 'IN'), 'amount');
         const outcome = sum(cash.filter(row => row.direction === 'OUT'), 'amount');
         series.push({ label: new Intl.DateTimeFormat('it-IT', { month: 'short', year: 'numeric', timeZone: 'UTC' }).format(day),

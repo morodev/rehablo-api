@@ -1,4 +1,7 @@
 import { Request, Response } from 'express';
+import {recordPatientAdvance, recordPatientRefund} from '../services/patientCashOperations.service.js';
+import {verifiedSettlementCredit} from '../services/patientCreditBacking.service.js';
+import {refundCorrectionCapabilities} from '../services/financialCreditReversal.service.js';
 import { sequelize } from '../../../config/database.js';
 import { Transaction } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -14,58 +17,8 @@ import { appointmentPricesByEvent, ensureAppointmentPaymentHistory, syncAppointm
 import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
 
 /** Advance is cash received and a liability to the patient, not invoice revenue. */
-export const createAdvance = asyncHandler(async (req: Request, res: Response) => {
-    const amount = Number(req.body?.amount);
-    const patientId = String(req.body?.patientId ?? '');
-    const accountId = String(req.body?.accountId ?? '');
-    const paymentMethodId = String(req.body?.paymentMethodId ?? '');
-    const key = String(req.header('Idempotency-Key') ?? '');
-    if (!Number.isFinite(amount) || amount <= 0 || Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-6
-        || !/^[a-f0-9-]{36}$/i.test(patientId) || !/^[a-f0-9-]{36}$/i.test(accountId)
-        || !/^[a-f0-9-]{36}$/i.test(paymentMethodId) || !/^[a-zA-Z0-9_-]{8,128}$/.test(key)) {
-        return sendErrorResponse(res, 422, 'Paziente, importo, conto, metodo e identificativo operazione obbligatori');
-    }
-    const result = await sequelize.transaction(async transaction => {
-        await lockPatientSettlement(req.tenantSchema!, patientId, transaction);
-        const existing = await TreasuryMovement.schema(req.tenantSchema!).findOne({ where: { idempotencyKey: key }, transaction });
-        if (existing) {
-            if (existing.get('category') !== 'PATIENT_ADVANCE' || Number(existing.get('amount')) !== amount) {
-                return { error: 409, message: 'Identificativo già usato per un’altra operazione' };
-            }
-            const credit = await PatientCredit.schema(req.tenantSchema!).findOne({ where: { sourceId: existing.get('id') }, transaction });
-            return credit && credit.get('patientId') === patientId && existing.get('accountId') === accountId
-                && existing.get('paymentMethodId') === paymentMethodId
-                ? { credit, reused: true } : { error: 409, message: 'Identificativo già usato per un altro anticipo' };
-        }
-        const patient = await Patient.schema(req.tenantSchema!).findByPk(patientId, { transaction });
-        if (!patient || !patient.get('structureId') || (req.access?.scope !== 'tenant' && patient.get('structureId') !== req.access?.structureId)) {
-            return { error: 404, message: 'Paziente non disponibile nella sede' };
-        }
-        const structureId = String(patient.get('structureId'));
-        const [account, method] = await Promise.all([
-            FinancialAccount.schema(req.tenantSchema!).findOne({ where: { id: accountId, isActive: true }, transaction }),
-            PaymentMethod.schema(req.tenantSchema!).findOne({ where: { id: paymentMethodId, isActive: true }, transaction })
-        ]);
-        if (!account || !method || (account.get('structureId') && account.get('structureId') !== structureId)) {
-            return { error: 422, message: 'Conto o metodo non disponibile per la sede' };
-        }
-        const credit = await PatientCredit.schema(req.tenantSchema!).create({
-            structureId, patientId, amount, remainingAmount: amount, status: 'ACTIVE', sourceType: 'TREASURY_ADVANCE',
-            note: typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 1000) : null
-        }, { transaction });
-        const movement = await TreasuryMovement.schema(req.tenantSchema!).create({
-            accountId, structureId, direction: 'IN', category: 'PATIENT_ADVANCE', amount, occurredAt: new Date(),
-            status: 'POSTED', paymentMethodId, counterparty: `${patient.get('name')} ${patient.get('surname') ?? ''}`.trim(),
-            description: 'Anticipo paziente', sourceType: 'PATIENT_ADVANCE', sourceId: credit.get('id'),
-            idempotencyKey: key, createdByUserId: req.access!.userId
-        }, { transaction });
-        await credit.update({ sourceId: movement.get('id') }, { transaction });
-        return { credit, reused: false };
-    });
-    if ('error' in result) return sendErrorResponse(res, result.error ?? 409, result.message ?? 'Anticipo non registrato');
-    return sendSuccessResponse(res, result.reused ? 200 : 201, result.credit, 'Anticipo e credito registrati');
-});
-
+export const createAdvance = asyncHandler(async (req: Request, res: Response) =>
+    sendSuccessResponse(res, 201, await recordPatientAdvance(req), 'Anticipo e credito registrati'));
 const validAmount = (value: unknown) => {
     const amount = Number(value);
     return Number.isFinite(amount) && amount > 0 && Math.abs(amount * 100 - Math.round(amount * 100)) < 1e-6 ? amount : null;
@@ -86,25 +39,8 @@ async function lockCreditPatient(req: Request, transaction: Transaction): Promis
 }
 
 async function backingReceipt(schema: string, credit: PatientCredit, transaction: Transaction) {
-    const sourceType = String(credit.get('sourceType') ?? '');
-    const sourceId = String(credit.get('sourceId') ?? '');
-    if (!sourceId) return null;
-    const receipt = sourceType === 'TREASURY_ADVANCE'
-        ? await TreasuryMovement.schema(schema).findByPk(sourceId, { transaction })
-        : sourceType === 'VOID_CREDIT'
-            ? await TreasuryMovement.schema(schema).findOne({ where: { sourceType: 'INVOICE_PAYMENT', sourceId }, transaction })
-            : null;
-    if (!receipt || receipt.get('status') !== 'POSTED' || receipt.get('direction') !== 'IN'
-        || String(receipt.get('structureId')) !== String(credit.get('structureId'))
-        || (sourceType === 'TREASURY_ADVANCE' && (receipt.get('sourceType') !== 'PATIENT_ADVANCE'
-            || String(receipt.get('sourceId')) !== String(credit.get('id'))))
-        || Number(receipt.get('amount')) < Number(credit.get('amount'))
-        || await TreasuryMovement.schema(schema).count({
-            where: { reversalOfId: receipt.get('id'), status: 'POSTED' }, transaction
-        })) return null;
-    return receipt;
+    return verifiedSettlementCredit(schema, credit.get({plain: true}), transaction);
 }
-
 export const creditMovements = asyncHandler(async (req: Request, res: Response) => {
     const credit = await PatientCredit.schema(req.tenantSchema!).findByPk(req.params.id);
     if (!credit || (req.access?.scope !== 'tenant' && credit.get('structureId') !== req.access?.structureId)) {
@@ -113,7 +49,9 @@ export const creditMovements = asyncHandler(async (req: Request, res: Response) 
     const rows = await PatientCreditMovement.schema(req.tenantSchema!).findAll({
         where: { creditId: credit.get('id') }, order: [['createdAt', 'DESC']]
     });
-    return sendSuccessResponse(res, 200, rows);
+    const values = rows.map(row => row.get({plain: true}));
+    const capabilities = await refundCorrectionCapabilities(req, credit.get({plain: true}), values);
+    return sendSuccessResponse(res, 200, values.map(row => ({...row, canVoid: capabilities.get(String(row.id)) === true})));
 });
 
 export const applyCredit = asyncHandler(async (req: Request, res: Response) => {
@@ -201,58 +139,8 @@ export const applyCredit = asyncHandler(async (req: Request, res: Response) => {
     return sendSuccessResponse(res, result.reused ? 200 : 201, result.movement, 'Credito applicato senza nuovo incasso');
 });
 
-export const refundCredit = asyncHandler(async (req: Request, res: Response) => {
-    const amount = validAmount(req.body?.amount);
-    const accountId = String(req.body?.accountId ?? '');
-    const paymentMethodId = String(req.body?.paymentMethodId ?? '');
-    const key = String(req.header('Idempotency-Key') ?? '');
-    if (!amount || !/^[a-f0-9-]{36}$/i.test(accountId) || !/^[a-f0-9-]{36}$/i.test(paymentMethodId) || !validKey(req)) {
-        return sendErrorResponse(res, 422, 'Importo, conto, metodo e identificativo operazione non validi');
-    }
-    const result = await sequelize.transaction(async transaction => {
-        const credit = await lockCreditPatient(req, transaction);
-        if (!credit || (req.access?.scope !== 'tenant' && credit.get('structureId') !== req.access?.structureId)) {
-            return { error: 404, message: 'Credito non disponibile' };
-        }
-        const prior = await PatientCreditMovement.schema(req.tenantSchema!).findOne({ where: { idempotencyKey: key }, transaction });
-        if (prior) {
-            const priorTreasury = await TreasuryMovement.schema(req.tenantSchema!).findByPk(String(prior.get('treasuryMovementId')), { transaction });
-            return prior.get('creditId') === credit.get('id') && prior.get('type') === 'REFUND'
-                && Number(prior.get('amount')) === amount && priorTreasury?.get('accountId') === accountId
-                && priorTreasury?.get('paymentMethodId') === paymentMethodId
-                ? { movement: prior, reused: true }
-                : { error: 409, message: 'Identificativo già usato per un’altra operazione' };
-        }
-        const remaining = Number(credit.get('remainingAmount'));
-        if (credit.get('status') !== 'ACTIVE' || amount > remaining) return { error: 409, message: 'Credito residuo insufficiente' };
-        if (!await backingReceipt(req.tenantSchema!, credit, transaction)) {
-            return { error: 409, message: 'Credito non riconciliato con un incasso' };
-        }
-        const [account, method] = await Promise.all([
-            FinancialAccount.schema(req.tenantSchema!).findOne({ where: { id: accountId, isActive: true }, transaction }),
-            PaymentMethod.schema(req.tenantSchema!).findOne({ where: { id: paymentMethodId, isActive: true }, transaction })
-        ]);
-        if (!account || !method || (account.get('structureId') && account.get('structureId') !== credit.get('structureId'))) {
-            return { error: 422, message: 'Conto o metodo non disponibile per la sede' };
-        }
-        const movement = await PatientCreditMovement.schema(req.tenantSchema!).create({
-            creditId: credit.get('id'), type: 'REFUND', amount, idempotencyKey: key, createdByUserId: req.access!.userId
-        }, { transaction });
-        const treasury = await TreasuryMovement.schema(req.tenantSchema!).create({
-            accountId, structureId: credit.get('structureId'), direction: 'OUT', category: 'PATIENT_CREDIT_REFUND',
-            amount, occurredAt: new Date(), status: 'POSTED', paymentMethodId, description: 'Rimborso credito paziente',
-            sourceType: 'PATIENT_CREDIT_REFUND', sourceId: movement.get('id'), idempotencyKey: `credit-refund-${movement.get('id')}`,
-            createdByUserId: req.access!.userId
-        }, { transaction });
-        await movement.update({ treasuryMovementId: treasury.get('id') }, { transaction });
-        await credit.update({ remainingAmount: Math.round((remaining - amount) * 100) / 100,
-            status: remaining === amount ? 'EXHAUSTED' : 'ACTIVE' }, { transaction });
-        return { movement, reused: false };
-    });
-    if ('error' in result) return sendErrorResponse(res, result.error ?? 409, result.message ?? 'Credito non rimborsato');
-    return sendSuccessResponse(res, result.reused ? 200 : 201, result.movement, 'Rimborso registrato');
-});
-
+export const refundCredit = asyncHandler(async (req: Request, res: Response) =>
+    sendSuccessResponse(res, 201, await recordPatientRefund(req), 'Rimborso registrato'));
 export const reverseCreditApplication = asyncHandler(async (req: Request, res: Response) => {
     const key = String(req.header('Idempotency-Key') ?? '');
     if (!validKey(req)) return sendErrorResponse(res, 422, 'Identificativo operazione non valido');

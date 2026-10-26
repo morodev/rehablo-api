@@ -3,7 +3,8 @@ import { Request, Response } from 'express';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
-import { getUserId, patientScopeWhere, scopeWhere } from '../../../middleware/rbac.js';
+import { getGrantedPermissions, getSelectedStructureId, getUserId, patientScopeWhere, scopeWhere } from '../../../middleware/rbac.js';
+import {resolveGrantedScope} from '../../auth/rbac/permissions.js';
 import { sequelize } from '../../../config/database.js';
 import Invoice from '../models/invoice.model.js';
 import InvoiceProduct from '../models/invoiceProduct.model.js';
@@ -38,7 +39,9 @@ import { decorateInvoicesWithPayments, syncInvoicePaymentStatus } from '../servi
 import { appointmentPricesByEvent, ensureAppointmentPaymentHistory, isValidPaymentDate, linkAppointmentPayments } from '../services/appointmentPayment.service.js';
 import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
 import {packageToday, scopedCarePackage} from '../../administration/services/carePackage.service.js';
-import {treasuryError} from '../../administration/services/treasuryValidation.service.js';
+import {treasuryError, nullableTreasuryUuid, validateTreasuryMethod} from '../../administration/services/treasuryValidation.service.js';
+import {beginFinancialOperation, financialOperationKey} from '../../administration/services/financialOperation.service.js';
+import {InvoicePaymentCreateOptions} from '../../administration/services/invoicePaymentTreasury.service.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AGENDA_SCOPE_FIELDS = {
@@ -542,15 +545,25 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         appointments: requestedAppointments,
         agendaEventId,
         paymentDate,
+        accountId: requestedAccountId,
+        paymentMethodId: requestedMethodId,
+        paidAt: requestedPaidAt,
         status: requestedStatus,
         structureId: _clientStructureId,
         ...invoiceFields
     } = req.body;
+    const paidIntent = invoiceFields.documentType !== 'nota_di_credito' && String(requestedStatus ?? '').toLowerCase() === 'paid';
+    const paymentScope = paidIntent
+        ? req.user?.isSuperAdmin ? 'tenant' : resolveGrantedScope(getGrantedPermissions(req), 'payment', 'create')
+        : null;
+    if (paidIntent && (req.user?.actor === 'patient' || !paymentScope)) {
+        return sendErrorResponse(res, 403, 'Non hai il permesso di registrare incassi');
+    }
     if ((req.body.products !== undefined && !Array.isArray(req.body.products))
         || (req.body.services !== undefined && !Array.isArray(req.body.services))) {
         return sendErrorResponse(res, 400, 'Le righe prodotto e servizio devono essere elenchi validi');
     }
-    const requestedPaymentDate = paymentDate ?? String(invoiceFields.emissionDate ?? invoiceLocalDate(new Date())).slice(0, 10);
+    const requestedPaymentDate = paymentDate ?? requestedPaidAt ?? invoiceLocalDate(new Date());
     if (String(requestedStatus ?? '').toLowerCase() === 'paid' && invoiceFields.documentType !== 'nota_di_credito'
         && !isValidPaymentDate(requestedPaymentDate)) {
         return sendErrorResponse(res, 400, 'La data del saldo deve essere valida e non futura');
@@ -716,6 +729,23 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     if (invoiceFields.socialSecurityPricingMode !== undefined && fiscal.fields.isTaxWithholding && recipient?.kind !== 'BUSINESS')
         return sendErrorResponse(res, 422, 'La ritenuta richiede un destinatario sostituto d’imposta');
 
+    // Invoice creation and cash registration have independent scopes. Recheck the cash target
+    // before consulting the operation registry: a retry must not bypass revoked payment rights.
+    if (paidIntent && paymentScope !== 'tenant') {
+        const selected = getSelectedStructureId(req);
+        if (!selected || invoiceStructureId !== selected) {
+            return sendErrorResponse(res, 403, 'Non puoi registrare incassi per questa sede');
+        }
+        if (paymentScope === 'own') {
+            const paymentRequest = Object.assign(Object.create(req), {access: {...req.access,
+                resource: 'payment', action: 'create', scope: paymentScope, structureId: selected, userId: getUserId(req)}});
+            const payablePatient = invoiceFields.patientID ? await Patient.schema(schema).findOne({where: {[Op.and]: [
+                {id: invoiceFields.patientID, structureId: selected}, patientScopeWhere(paymentRequest, schema, 'id')
+            ]}}) : null;
+            if (!payablePatient) return sendErrorResponse(res, 403, 'Non puoi registrare incassi per questo paziente');
+        }
+    }
+
     const [unavailableProductId, unavailableServiceId] = await Promise.all([
         unavailableCatalogId(
             schema, requestedProducts.map((line: any) => line?.id).filter(Boolean),
@@ -737,6 +767,13 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     // se una qualsiasi parte fallisce, non deve restare un numero "bruciato" senza fattura, né
     // una fattura senza le sue righe.
     const transactionResult = await sequelize.transaction(async (t) => {
+        const operation = paidIntent ? await beginFinancialOperation(req, 'INVOICE_CREATE_PAID', invoiceStructureId ?? '', t) : null;
+        if (operation?.replay) {
+            const previous = await InvoiceScoped.findOne({where: {id: operation.replay.invoiceId,
+                ...patientScopeWhere(req, schema, 'patientID')}, transaction: t});
+            if (!previous) treasuryError('La fattura non è più accessibile', 404);
+            return {kind: 'created', invoice: previous} as const;
+        }
         if (invoiceFields.patientID) await lockPatientSettlement(schema, invoiceFields.patientID, t);
         const lockedPackage = packagePurchase ? await scopedCarePackage(req, packagePurchase.get('id'), t, true) : null;
         if (lockedPackage?.get('invoiceId')) return {kind: 'package-reused', invoiceId: String(lockedPackage.get('invoiceId'))} as const;
@@ -992,17 +1029,23 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                 }, [{ kind: 'INVOICE', targetId: invoiceId, amount: residualToRegister }], t);
             }
             const paidAt = requestedPaymentDate;
+            const paymentMethodId = nullableTreasuryUuid(requestedMethodId, 'Metodo di pagamento');
+            const method = await validateTreasuryMethod(schema, paymentMethodId, t);
+            if (!invoiceStructureId) treasuryError('Seleziona la sede dell’incasso', 422);
+            const paymentOptions: InvoicePaymentCreateOptions = {transaction: t, treasuryContext: {
+                structureId: invoiceStructureId, accountId: nullableTreasuryUuid(requestedAccountId, 'Conto') ?? undefined,
+                paymentMethodId, idempotencyKey: financialOperationKey(req)}};
             await InvoicePaymentScoped.create(
                 {
                     invoiceId,
                     amount: residualToRegister,
                     paidAt: new Date(`${paidAt}T12:00:00.000Z`),
-                    method: invoiceFields.paymentMethod ?? null,
+                    method: method ? String(method.get('label')) : invoiceFields.paymentMethod ?? null,
                     source: 'USER',
                     status: 'POSTED',
                     createdByUserId: getUserId(req)
                 },
-                { transaction: t }
+                paymentOptions
             );
         }
         if (appointmentPayments.length > 0 || residualToRegister > 0) {
@@ -1027,6 +1070,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             )));
         }
 
+        await operation?.complete({invoiceId});
         return { kind: 'created', invoice: createdInvoice } as const;
     });
 

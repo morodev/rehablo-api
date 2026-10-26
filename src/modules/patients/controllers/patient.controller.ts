@@ -454,9 +454,9 @@ export const update = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 409, 'Esiste già un paziente con questo codice fiscale');
     }
 
-    const [rowsUpdated] = await Patient.schema(schema).update(payload, {
-        where: { id, ...activePatientWhere(req) }
-    });
+    const [rowsUpdated] = await sequelize.transaction(transaction => Patient.schema(schema).update(payload, {
+        where: { id, ...activePatientWhere(req) }, transaction
+    }));
     if (rowsUpdated === 0) {
         return sendErrorResponse(res, 404, 'Paziente non trovato');
     }
@@ -628,4 +628,3 @@ export default {
     uploadPrivacyDocument,
     downloadPrivacyDocument
 };
-

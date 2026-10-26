@@ -241,6 +241,27 @@ describe('treasury readable list and filters', () => {
 });
 
 describe('treasury balance effects and appointment receipts', () => {
+    it('classifies package receipts before and after invoicing without exposing package details', async t => {
+        const f = fixture(t);
+        f.req.user.perms = ['treasury:read:tenant'];
+        f.movements[0].sourceId = uuid(210);
+        f.movements[0].invoiceId = null;
+        f.payments.push({id: uuid(210), carePackageId: uuid(211), source: 'PACKAGE_PURCHASE'});
+        let row = (await run(f.req)).body.data.items[0];
+        assert.equal(row.categoryLabel, 'Incasso pacchetto');
+        assert.equal(row.counterparty, null);
+        assert.equal(row.documentAccessible, false);
+        assert.equal(row.carePackageId, undefined);
+        assert.deepEqual(f.queries.payments[0].attributes, ['id', 'agendaEventId', 'carePackageId', 'source']);
+        assert.equal(f.queries.patients.length, 0);
+        f.movements[0].invoiceId = invoiceId;
+        row = (await run(f.req)).body.data.items[0];
+        assert.equal(row.categoryLabel, 'Incasso pacchetto');
+        assert.equal(row.documentAccessible, false);
+        f.movements[0].reversalOfId = uuid(212);
+        f.movements[0].sourceType = 'INVOICE_PAYMENT_VOID';
+        assert.equal((await run(f.req)).body.data.items[0].categoryLabel, 'Storno incasso pacchetto');
+    });
     it('includes legacy VOID originals with a valid posted reversal before period and status filters', async t => {
         const f = fixture(t);
         const original = f.movements[0];

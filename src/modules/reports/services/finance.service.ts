@@ -162,10 +162,10 @@ async function loadClinicalCash(schema: string, payments: Array<Record<string, a
     if (!ids.length) return clinicalCashFacts(payments);
     const credits = (await PatientCredit.schema(schema).findAll({ where: { sourceType: 'VOID_CREDIT', sourceId: { [Op.in]: ids } } })).map(plain);
     const refunds = credits.length ? (await PatientCreditMovement.schema(schema).findAll({
-        where: { creditId: { [Op.in]: credits.map(row => row.id) }, type: 'REFUND' }
+        where: { creditId: { [Op.in]: credits.map(row => row.id) }, type: {[Op.in]: ['REFUND', 'REVERSE_REFUND']} }
     })).map(plain) : [];
     const movements = (await TreasuryMovement.schema(schema).findAll({ where: { [Op.or]: [
-        { sourceType: { [Op.in]: ['INVOICE_PAYMENT', 'INVOICE_PAYMENT_VOID'] }, sourceId: { [Op.in]: ids } },
+        { sourceType: { [Op.in]: ['INVOICE_PAYMENT', 'INVOICE_PAYMENT_CORRECTION', 'INVOICE_PAYMENT_DATE_VOID', 'INVOICE_PAYMENT_VOID'] }, sourceId: { [Op.in]: ids } },
         ...(refunds.length ? [{ id: { [Op.in]: refunds.map(row => row.treasuryMovementId).filter(Boolean) } }] : [])
     ] } })).map(plain);
     return clinicalCashFacts(payments, movements, credits, refunds);

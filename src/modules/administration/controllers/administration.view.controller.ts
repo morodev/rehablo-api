@@ -20,6 +20,9 @@ import {
 } from '../services/administrationQuery.service.js';
 import { fiscalDocumentState, fiscalInvoiceScope, visibleRealFiscalSubmissions } from '../services/fiscalSimulation.service.js';
 import { balanceEffectiveMovements } from '../services/treasuryLedger.service.js';
+import {decorateExpensePayments} from '../services/financialOperations.service.js';
+import {creditCorrectionCapabilities} from '../services/financialCreditReversal.service.js';
+import {economicMovements} from '../services/financialMovementPolicy.service.js';
 import { administrationFinancialProjection, unassignedFinancialWarnings } from '../../reports/services/financialReporting.service.js';
 import { validIssuedDocument } from '../../reports/services/financialFacts.service.js';
 import { reportStructureWhere, resolveReportScope, ReportScope } from '../../reports/services/reportScope.service.js';
@@ -170,12 +173,13 @@ export const listCarePackages = asyncHandler(async (req, res) =>
 
 export const listPatientCredits = asyncHandler(async (req, res) => {
     const result = await patientEntityPage(req, PatientCredit);
+    const corrections = await creditCorrectionCapabilities(req, result.items);
     // patientEntityPage slices after filtering; the balance must cover every matching credit.
     const balance = await PatientCredit.schema(req.tenantSchema!).sum('remainingAmount', { where: {
         ...structureWhere(req), ...(req.query.patientId ? { patientId: req.query.patientId } : {}), status: 'ACTIVE',
         sourceType: { [Op.in]: ['TREASURY_ADVANCE', 'VOID_CREDIT'] }, sourceId: { [Op.not]: null }
     } });
-    return sendSuccessResponse(res, 200, { ...result,
+    return sendSuccessResponse(res, 200, { ...result, items: result.items.map((credit: Plain) => ({...credit, ...corrections.get(String(credit.id))})),
         balance: Math.round(Number(balance ?? 0) * 100) / 100 });
 });
 
@@ -252,7 +256,8 @@ async function supplierPage(req: Request, model: ModelStatic<Model>): Promise<Pl
     if (req.query.supplierId) where.supplierId = req.query.supplierId;
     const dateField = model === Expense ? 'incurredAt' : 'documentDate';
     Object.assign(where, range(req, dateField));
-    const rows = (await model.schema(req.tenantSchema!).findAll({ where, order: [[dateField, 'DESC']] })).map(plain);
+    const sourceRows = (await model.schema(req.tenantSchema!).findAll({ where, order: [[dateField, 'DESC']] })).map(plain);
+    const rows = model === Expense ? await decorateExpensePayments(req.tenantSchema!, sourceRows) : sourceRows;
     const [suppliers, methods] = await Promise.all([
         entitiesById(Supplier, req.tenantSchema!, rows.map(row => row.supplierId)),
         entitiesById(PaymentMethod, req.tenantSchema!, rows.map(row => row.paymentMethodId))
@@ -444,8 +449,9 @@ export const overview = asyncHandler(async (req, res) => {
     ].filter(row => new Date(`${String(row.date).slice(0, 10)}T12:00:00.000Z`) <= horizon).sort((a, b) => String(a.date).localeCompare(String(b.date))).slice(0, 6)
         .map(row => { const date = new Date(`${String(row.date).slice(0, 10)}T12:00:00.000Z`); return { ...row, day: String(date.getUTCDate()).padStart(2, '0'), month: new Intl.DateTimeFormat('it-IT', { month: 'short', timeZone: 'UTC' }).format(date) }; });
     const flags = (tenant?.get('featureFlags') ?? {}) as Plain;
-    const income = money(movements.filter(row => row.direction === 'IN').reduce((sum, row) => sum + Number(row.amount), 0));
-    const outcome = money(movements.filter(row => row.direction === 'OUT').reduce((sum, row) => sum + Number(row.amount), 0));
+    const economic = economicMovements(movements);
+    const income = money(economic.filter(row => row.direction === 'IN').reduce((sum, row) => sum + Number(row.amount), 0));
+    const outcome = money(economic.filter(row => row.direction === 'OUT').reduce((sum, row) => sum + Number(row.amount), 0));
     // Andamento del grafico: giornaliero per un periodo breve (tipicamente il mese selezionato),
     // così si vede un vero andamento invece di un singolo punto; mensile per periodi lunghi.
     const rangeDays = (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) / 86_400_000;
@@ -455,7 +461,7 @@ export const overview = asyncHandler(async (req, res) => {
             issued: money(validDocuments
                 .filter(row => String(row.emissionDate).slice(0, 10) === bucket.key)
                 .reduce((sum, row) => sum + (row.documentType === 'nota_di_credito' ? -1 : 1) * Number(row.invoiceTotal ?? 0), 0)),
-            collected: money(movements
+            collected: money(economic
                 .filter(row => row.direction === 'IN' && romeDay(row.occurredAt) === bucket.key)
                 .reduce((sum, row) => sum + Number(row.amount), 0)),
         }))

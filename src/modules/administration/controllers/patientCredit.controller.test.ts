@@ -4,6 +4,7 @@ import { Request, Response, NextFunction } from 'express';
 import { sequelize } from '../../../config/database.js';
 import { CarePackage, PatientCredit, TreasuryMovement } from '../models/administration.model.js';
 import { PatientCreditMovement } from '../models/patientCreditMovement.model.js';
+import {FinancialOperation} from '../models/financialOperation.model.js';
 import { applyCredit, refundCredit, reverseCreditApplication } from './patientCredit.controller.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
@@ -17,11 +18,11 @@ const structureId = 'aaaaaaaa-aaaa-4aaa-8aaa-000000000003';
 function legacyCredit() {
     const values: Record<string, unknown> = { id: creditId, patientId, structureId,
         amount: 80, remainingAmount: 80, status: 'ACTIVE', sourceType: 'ADVANCE', sourceId: null };
-    return { get: (key: string) => values[key] };
+    return { get: (key: string | object) => typeof key === 'string' ? values[key] : {...values} };
 }
 
 async function run(handler: (req: Request, res: Response, next: NextFunction) => void, body: Record<string, unknown>) {
-    const req: any = { tenantSchema: 'rehablo_test', params: { id: creditId }, body,
+    const req: any = { tenantSchema: 'rehablo_test', params: { id: creditId }, body, user: {sub: patientId, isSuperAdmin: true},
         access: { scope: 'tenant', userId: patientId },
         header: () => 'patient-credit-test-001' };
     return new Promise<number>(resolve => {
@@ -32,6 +33,7 @@ async function run(handler: (req: Request, res: Response, next: NextFunction) =>
 }
 
 function fixture(t: TestContext) {
+    t.mock.method(FinancialOperation, 'schema', (() => ({findOne: async () => null, create: async (value: any) => value})) as any);
     t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => []})) as any);
     t.mock.method(sequelize, 'transaction', (async (callback: any) => callback({ LOCK: { UPDATE: 'UPDATE' } })) as any);
     t.mock.method(PatientCredit, 'schema', (() => ({ findByPk: async () => legacyCredit() })) as any);

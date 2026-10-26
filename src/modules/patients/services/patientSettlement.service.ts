@@ -108,7 +108,6 @@ export function normalizePatientSettlementRequest(body: Record<string, any>): Pa
     if (cashAmount > 0 && !isValidPaymentDate(paidAt)) settlementFail(400, 'Inserisci una data di incasso valida e non futura');
     const accountId = optionalUuid(cash.accountId) ?? null;
     const paymentMethodId = optionalUuid(cash.paymentMethodId) ?? null;
-    if (paymentMethodId && !accountId) settlementFail(400, 'Seleziona il conto su cui registrare l’incasso');
     const total = paymentMoney(allocations.reduce((sum: number, row: PatientSettlementAllocation) => sum + row.amount, 0));
     if (Math.abs(total - paymentMoney(cashAmount + credits.reduce((sum: number, row: {amount: number}) => sum + row.amount, 0))) > 0.009) {
         settlementFail(400, 'Credito e nuovo denaro devono corrispondere al totale attribuito');

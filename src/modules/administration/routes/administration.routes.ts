@@ -14,6 +14,7 @@ import { getFiscalSettings, updateFiscalSettings, getStsCredentials, updateStsCr
 import { createAdvance, applyCredit, refundCredit, creditMovements, reverseCreditApplication } from '../controllers/patientCredit.controller.js';
 import * as carePackages from '../controllers/carePackage.controller.js';
 import {listEligibleCarePackages, listAppointmentCarePackageOptions} from '../../agenda/controllers/packageAssignment.controller.js';
+import * as financialOperations from '../controllers/financialOperations.controller.js';
 
 const router = Router();
 router.use(requireAuth, resolveTenantSchema);
@@ -87,11 +88,15 @@ router.get('/administration/patient-credits/:id/movements', requirePermission('q
 router.post('/administration/patient-credits/:id/apply', requirePermission('quote', 'update'), applyCredit);
 router.post('/administration/patient-credits/:id/refund', requirePermission('treasury', 'create'), refundCredit);
 router.post('/administration/patient-credits/:id/movements/:movementId/reverse', requirePermission('quote', 'update'), reverseCreditApplication);
+router.post('/administration/patient-credits/:id/advance/void', requirePermission('quote', 'update'), requirePermission('treasury', 'update'), financialOperations.reversePatientAdvance);
+router.post('/administration/patient-credits/:id/movements/:movementId/void', requirePermission('quote', 'update'), requirePermission('treasury', 'update'), financialOperations.reversePatientRefund);
 
 crud('/administration/payment-methods', 'paymentMethods', 'treasury');
 crud('/administration/financial-accounts', 'financialAccounts', 'treasury', views.listFinancialAccounts);
 crud('/administration/treasury-movements', 'treasuryMovements', 'treasury', views.listTreasuryMovements);
 router.post('/administration/treasury-movements/:id/void', requirePermission('treasury', 'update'), controller.voidMovement);
+router.post('/administration/transfers', requirePermission('treasury', 'create'), financialOperations.createTransfer);
+router.post('/administration/transfers/:id/void', requirePermission('treasury', 'update'), financialOperations.reverseTransfer);
 crud('/administration/payment-allocations', 'paymentAllocations', 'treasury');
 crud('/administration/daily-closings', 'dailyClosings', 'treasury', listDailyClosings);
 router.get('/administration/daily-closings/preview', requirePermission('treasury', 'read'), previewDailyClosing);
@@ -102,6 +107,8 @@ crud('/administration/suppliers', 'suppliers', 'supplier');
 crud('/administration/purchase-documents', 'purchaseDocuments', 'expense', views.listPurchaseDocuments);
 crud('/administration/expenses', 'expenses', 'expense', views.listExpenses);
 router.get('/administration/expenses/:id', requirePermission('expense', 'read'), getTreasuryExpense);
+router.post('/administration/expenses/:id/payments', requirePermission('expense', 'update'), requirePermission('treasury', 'create'), financialOperations.payExpense);
+router.post('/administration/expenses/:id/payments/:paymentId/void', requirePermission('expense', 'update'), requirePermission('treasury', 'update'), financialOperations.reverseExpensePayment);
 
 router.get('/administration/fiscal-submissions', requirePermission('fiscal_submission', 'read'), views.listFiscalSubmissions);
 router.post('/administration/fiscal-submissions/preview', requirePermission('fiscal_submission', 'create'), previewFiscalSubmission);

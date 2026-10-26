@@ -76,11 +76,13 @@ export async function ensureNoPendingQuoteDelivery(req: Request, quoteId: unknow
 }
 
 function assertShareable(quote: Model): void {
-    if (!['DRAFT', 'SENT'].includes(String(quote.get('status')))) throw new QuoteFlowError(409, 'Questo preventivo non è più condivisibile');
+    const status = String(quote.get('status'));
+    if (!['DRAFT', 'SENT', 'ACCEPTED'].includes(status)) throw new QuoteFlowError(409, 'Questo preventivo non è più condivisibile');
     const dateError = quoteDateError(quote.get('issuedAt'), quote.get('expiresAt'));
     if (dateError) throw new QuoteFlowError(422, dateError);
     const today = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Rome' }).format(new Date());
-    if (String(quote.get('expiresAt')) < today) throw new QuoteFlowError(409, 'Il preventivo è scaduto: aggiorna la scadenza prima di condividerlo');
+    // An accepted agreement is shared as a copy; its original offer dates stay unchanged.
+    if (status !== 'ACCEPTED' && String(quote.get('expiresAt')) < today) throw new QuoteFlowError(409, 'Il preventivo è scaduto: aggiorna la scadenza prima di condividerlo');
     if (!Array.isArray(quote.get('lines')) || !(quote.get('lines') as unknown[]).length) throw new QuoteFlowError(422, 'Aggiungi almeno una prestazione o un prodotto');
 }
 

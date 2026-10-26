@@ -100,12 +100,48 @@ function modelSchema(payment: InvoicePayment): unknown {
     return typeof table === 'object' ? table.schema : null;
 }
 
+const isCashPayment = (source: string) => !['PACKAGE', 'CREDIT', 'OPENING_BALANCE', 'LEGACY_IMPORT'].includes(source);
+function validHistoricalDate(value: unknown): boolean {
+    if (!value) return false;
+    const parsed = new Date(value as string);
+    if (!Number.isFinite(parsed.getTime())) return false;
+    const day = parsed.toISOString().slice(0, 10);
+    return (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(value) || day === value.slice(0,10))
+        && day <= new Date().toLocaleDateString('en-CA', {timeZone:'Europe/Rome'});
+}
+InvoicePayment.addHook('beforeCreate', 'requireCashTransaction', (payment, options) => {
+    const row = payment as InvoicePayment;
+    if (row.status === 'POSTED' && isCashPayment(row.source) && !options.transaction)
+        throw new Error('Un incasso deve essere registrato nella stessa transazione della prima nota');
+});
+InvoicePayment.addHook('beforeBulkCreate', 'requireIndividualCashHooks', (payments, options) => {
+    if (payments.some(row => isCashPayment((row as InvoicePayment).source)) && (!options.transaction || !options.individualHooks))
+        throw new Error('Gli incassi richiedono transazione e registrazione contabile individuale');
+});
+InvoicePayment.addHook('beforeUpdate', 'preserveCashLedger', (payment, options) => {
+    const row = payment as InvoicePayment;
+    if (['amount', 'source', 'agendaEventId', 'carePackageId'].some(field => row.changed(field as any)))
+        throw new Error('Importo e origine del pagamento sono immutabili');
+    if (row.changed('paidAt') && (!(options as {completeHistoricalDate?: boolean}).completeHistoricalDate || !options.transaction
+        || row.previous('paidAt') != null || !['USER', 'APPOINTMENT', 'LEGACY_IMPORT'].includes(row.source) || !validHistoricalDate(row.paidAt)))
+        throw new Error('La data del movimento è immutabile; completa solo una data storica mancante nella transazione autorizzata');
+    if (row.changed('status') && (isCashPayment(row.source) || row.source === 'LEGACY_IMPORT')) {
+        if (!options.transaction) throw new Error('Lo storno richiede la stessa transazione della prima nota');
+        if (row.previous('status') !== 'POSTED' || !['VOID', 'CREDIT'].includes(row.status))
+            throw new Error('Un incasso annullato non può essere ripristinato');
+    }
+});
+InvoicePayment.addHook('beforeBulkUpdate', 'preserveIndividualCashUpdates', options => {
+    if (['status', 'amount', 'paidAt', 'source', 'agendaEventId', 'carePackageId'].some(field => Object.hasOwn((options as any).attributes ?? {}, field))
+        && !options.individualHooks) throw new Error('I movimenti economici devono essere aggiornati individualmente');
+});
+
 // Mantiene la nuova prima nota allineata a ogni percorso di incasso esistente
 // (fattura, agenda e migrazione appuntamenti) senza duplicare logica nei controller.
 InvoicePayment.addHook('afterCreate', 'mirrorTreasuryMovement', async (payment, options) => {
     const typed = payment as InvoicePayment;
     // Package, credit and opening coverage settle a visit without a new cash receipt.
-    if (typed.status !== 'POSTED' || typed.source === 'PACKAGE' || typed.source === 'CREDIT' || typed.source === 'OPENING_BALANCE') return;
+    if (typed.status !== 'POSTED' || ['PACKAGE', 'CREDIT', 'OPENING_BALANCE', 'LEGACY_IMPORT'].includes(typed.source)) return;
     await mirrorInvoicePaymentToTreasury(modelSchema(typed), typed.get({ plain: true }) as any, options.transaction ?? undefined,
         (options as InvoicePaymentCreateOptions).treasuryContext);
 });
@@ -113,7 +149,7 @@ InvoicePayment.addHook('afterCreate', 'mirrorTreasuryMovement', async (payment, 
 InvoicePayment.addHook('afterUpdate', 'mirrorTreasuryVoid', async (payment, options) => {
     const typed = payment as InvoicePayment;
     if (!typed.changed('status') || typed.status !== 'VOID' || typed.previous('status') !== 'POSTED') return;
-    if (typed.source === 'PACKAGE' || typed.source === 'CREDIT' || typed.source === 'OPENING_BALANCE') return;
+    if (['PACKAGE', 'CREDIT', 'OPENING_BALANCE'].includes(typed.source)) return;
     await mirrorVoidedInvoicePaymentToTreasury(
         modelSchema(typed), typed.get({ plain: true }) as any, options.transaction ?? undefined
     );

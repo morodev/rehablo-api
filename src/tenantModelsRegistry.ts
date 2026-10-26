@@ -1,7 +1,9 @@
 import { registerTenantScopedModel } from './utils/tenantSchema.js';
 
 import Patient from './modules/patients/models/patient.model.js';
+import {PatientContactFollowUp} from './modules/patients/models/patientContactFollowUp.model.js';
 import {PatientSettlementOperation} from './modules/patients/models/patientSettlementOperation.model.js';
+import {FinancialOperation} from './modules/administration/models/financialOperation.model.js';
 import { registerProductsServicesAssociations, Category, Product, ProductStructure, Service, ServiceStructure } from './modules/products-services/models/index.js';
 import { registerInvoiceAssociations, Invoice, InvoiceProduct, InvoiceService, InvoicePayment, InvoiceAgendaEvent } from './modules/invoice/models/index.js';
 import EventType from './modules/agenda/models/eventType.model.js';
@@ -68,7 +70,9 @@ export function registerTenantModels(): void {
     registerActivitiesAssociations();
 
     registerTenantScopedModel(Patient);
+    registerTenantScopedModel(PatientContactFollowUp);
     registerTenantScopedModel(PatientSettlementOperation);
+    registerTenantScopedModel(FinancialOperation);
     // Evaluation references `patients` (FK) and is in turn referenced by the human-body instance
     // tables below (FK), so it must be synced right after Patient and before those tables.
     registerTenantScopedModel(Evaluation);

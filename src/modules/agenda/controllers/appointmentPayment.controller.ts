@@ -16,6 +16,9 @@ import {
 } from '../../invoice/services/appointmentPayment.service.js';
 import { patientPaymentPositionsByReferenceEvents } from '../services/patientPaymentPosition.service.js';
 import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
+import {beginFinancialOperation, financialOperationKey} from '../../administration/services/financialOperation.service.js';
+import {InvoicePaymentCreateOptions} from '../../administration/services/invoicePaymentTreasury.service.js';
+import {nullableTreasuryUuid, validateTreasuryMethod} from '../../administration/services/treasuryValidation.service.js';
 
 const SCOPE = { ownerField: 'calendarId', structureField: 'structureId', includeUnassigned: false };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -138,6 +141,9 @@ async function writePayment(req: Request, res: Response, cumulative: boolean, pr
             });
             if (!event) return fail(404, 'Appuntamento non trovato o non accessibile');
             if (patientIdOf(event.get({ plain: true })) !== lockedPatientId) fail(409, 'Il paziente della seduta è cambiato: ricarica la posizione');
+            const operation = pricingOnly ? null : await beginFinancialOperation(req, cumulative ? 'APPOINTMENT_PAYMENT_COMPAT' : 'APPOINTMENT_PAYMENT',
+                settlementContext(req, event).structureId, transaction);
+            if (operation?.replay) return operation.replay as any;
             const linkedInvoice = await getLinkedInvoiceId(schema, event.id, event.invoiceId);
             if (linkedInvoice) fail(409, 'Appuntamento fatturato: gestisci i pagamenti dalla fattura');
             if (event.recurrence || event.recurringEventId) fail(422, 'Separa la singola occorrenza dalla serie prima di registrare incassi');
@@ -218,20 +224,28 @@ async function writePayment(req: Request, res: Response, cumulative: boolean, pr
                     previous = summarizeAppointmentPayments(expected.amount, history.map(payment => payment.get({ plain: true })));
                 }
                 validateMovement(req.body);
+                const paymentMethodId = nullableTreasuryUuid(req.body.paymentMethodId, 'Metodo di pagamento');
+                const method = await validateTreasuryMethod(schema, paymentMethodId, transaction);
+                const options: InvoicePaymentCreateOptions = {transaction, treasuryContext: {
+                    structureId: settlementContext(req, event).structureId,
+                    accountId: nullableTreasuryUuid(req.body.accountId, 'Conto') ?? undefined,
+                    paymentMethodId, idempotencyKey: financialOperationKey(req)}};
                 payment = await InvoicePayment.schema(schema).create({
                     invoiceId: null, agendaEventId: event.id, amount,
                     paidAt: new Date(req.body.paidAt + 'T12:00:00.000Z'),
-                    method: req.body.method?.trim() || null, note: req.body.note?.trim() || null,
+                    method: method ? String(method.get('label')) : req.body.method?.trim() || null, note: req.body.note?.trim() || null,
                     source: 'APPOINTMENT', status: 'POSTED', createdByUserId: getUserId(req)
-                }, { transaction });
+                }, options);
             }
             if (!pricingOnly && req.body?.markCompleted === true) {
                 if (!canAccessAppointmentFinance(req, event.get({plain: true}), 'agenda', 'update')) fail(403, 'Non puoi modificare la presenza della seduta');
                 await completeAppointmentAfterPayment(event, getUserId(req), transaction);
             }
             const summary = await syncAppointmentPaymentStatus(schema, event, transaction, getUserId(req));
-            return { payment, summary, agendaEvent: { ...event.get({ plain: true }),
+            const result = { payment, summary, agendaEvent: { ...event.get({ plain: true }),
                 appointmentExpectedAmount: expected.amount, appointmentPriceSource: expected.source } };
+            await operation?.complete(result);
+            return result;
         });
         return sendSuccessResponse(res, cumulative || pricingOnly ? 200 : 201, cumulative ? result.agendaEvent : result,
             pricingOnly ? 'Prezzo della seduta aggiornato' : 'Incasso registrato');
@@ -286,6 +300,8 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
             const referencePatientId = patientIdOf(reference.get({ plain: true }));
             if (!referencePatientId) fail(422, 'L’incasso richiede una seduta con paziente');
             if (referencePatientId !== lockedPatientId) fail(409, 'Il paziente della seduta è cambiato: ricarica la posizione');
+            const operation = await beginFinancialOperation(req, 'APPOINTMENT_PAYMENTS_BULK', settlementContext(req, reference).structureId, transaction);
+            if (operation.replay) return operation.replay as any;
             const referenceTime = Date.parse(reference.start ?? '');
             if (!Number.isFinite(referenceTime)) fail(409, 'Data della seduta non valida');
             const histories = new Map<string, InvoicePayment[]>();
@@ -367,6 +383,9 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
                 transaction)).map(allocation => ({ agendaEventId: allocation.targetId, amount: allocation.amount }));
 
             const created: Array<{payment: InvoicePayment; summary: any; agendaEvent: Record<string, any>}> = [];
+            const paymentMethodId = nullableTreasuryUuid(req.body.paymentMethodId, 'Metodo di pagamento');
+            const method = await validateTreasuryMethod(schema, paymentMethodId, transaction);
+            const accountId = nullableTreasuryUuid(req.body.accountId, 'Conto');
             for (const allocation of orderedAllocations) {
                 const preparedItem = preparedById.get(allocation.agendaEventId)!;
                 const { event, history, previous } = preparedItem;
@@ -387,9 +406,11 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
                 const payment = await InvoicePayment.schema(schema).create({
                     invoiceId: null, agendaEventId: event.id, amount: allocation.amount,
                     paidAt: new Date(req.body.paidAt + 'T12:00:00.000Z'),
-                    method: req.body.method?.trim() || null, note: req.body.note?.trim() || null,
+                    method: method ? String(method.get('label')) : req.body.method?.trim() || null, note: req.body.note?.trim() || null,
                     source: 'APPOINTMENT', status: 'POSTED', createdByUserId: getUserId(req)
-                }, { transaction });
+                }, {transaction, treasuryContext: {structureId: settlementContext(req, reference).structureId,
+                    accountId: accountId ?? undefined, paymentMethodId,
+                    idempotencyKey: `${financialOperationKey(req)}_${event.id}`}} as InvoicePaymentCreateOptions);
                 if (req.body?.markReferenceCompleted === true && event.id === reference.id) {
                     if (!canAccessAppointmentFinance(req, event.get({plain: true}), 'agenda', 'update')) fail(403, 'Non puoi modificare la presenza della seduta');
                     await completeAppointmentAfterPayment(event, getUserId(req), transaction);
@@ -407,7 +428,7 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
             const referencePrice = (await appointmentPricesByEvent(schema, [reference.get({ plain: true })], transaction)).get(reference.id)!;
             const referenceSummary = referenceResult?.summary
                 ?? summarizeAppointmentPayments(referencePrice.amount, referenceHistory.map(payment => payment.get({ plain: true })));
-            return {
+            const result = {
                 allocations: created,
                 referenceSummary,
                 referenceAgendaEvent: referenceResult?.agendaEvent ?? {
@@ -416,6 +437,8 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
                     appointmentPriceSource: referencePrice.source
                 }
             };
+            await operation.complete(result);
+            return result;
         });
         return sendSuccessResponse(res, 201, result, allocations.length === 1
             ? 'Incasso registrato' : `${allocations.length} incassi registrati`);

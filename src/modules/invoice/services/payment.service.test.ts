@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { beforeEach, describe, it, TestContext } from 'node:test';
+import {randomUUID} from 'node:crypto';
+import {mockFinancialOperations} from '../../administration/services/financialOperation.fixture.js';
 import { summarizeInvoicePayments } from './payment.service.js';
 import {
     resolveAppointmentPrice, summarizeAppointmentPayments, ensureAppointmentPaymentHistory,
@@ -21,11 +23,13 @@ import InvoiceService from '../models/invoiceService.model.js';
 import InvoiceProduct from '../models/invoiceProduct.model.js';
 import Service from '../../products-services/models/service.model.js';
 import Product from '../../products-services/models/product.model.js';
+import {ProductStructure, ServiceStructure} from '../../products-services/models/index.js';
 import Patient from '../../patients/models/patient.model.js';
 import Tenant from '../../auth/models/tenant.model.js';
 import EventType from '../../agenda/models/eventType.model.js';
 import { getRolePermissions, RoleCode } from '../../auth/rbac/roles.js';
 import {CarePackage} from '../../administration/models/index.js';
+beforeEach(context => {mockFinancialOperations(context as TestContext);});
 
 describe('summarizeInvoicePayments', () => {
     it('derives unpaid, partial and paid states only from posted movements', () => {
@@ -163,7 +167,7 @@ describe('appointment ledger and agreed prices', () => {
         assert.equal(rows.length, 1);
         assert.equal(rows[0].paidAt, null);
         assert.equal(rows[0].invoiceId, null);
-        assert.equal(rows[0].source, 'APPOINTMENT');
+        assert.equal(rows[0].source, 'OPENING_BALANCE');
         rows[0].status = 'VOID';
         await ensureAppointmentPaymentHistory('tenant', event, transaction);
         assert.equal(rows.length, 1);
@@ -233,7 +237,7 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
         const invoke = (handler: any, body: any, paymentId?: string, own = false): Promise<any> => new Promise((resolve, reject) => {
             const response = { code: 0, status(code: number) { this.code = code; return this; },
                 json(payload: any) { resolve({ code: this.code, ...payload }); return this; } };
-            handler({ tenantSchema: 'rehablo_test', params: { agendaEventId: eventId, paymentId }, body,
+            handler({ tenantSchema: 'rehablo_test', header: () => randomUUID(), params: { agendaEventId: eventId, paymentId }, body,
                 user: { sub: 'recorder', role: RoleCode.OWNER, perms: getRolePermissions(RoleCode.OWNER) }, access: { scope: own ? 'own' : 'tenant', structureId, userId: 'someone-else', resource: 'agenda' } },
             response, (error: any) => error?.statusCode
                 ? resolve({code: error.statusCode, message: error.message}) : reject(error));
@@ -349,7 +353,7 @@ describe('appointment payment HTTP handlers with an in-memory ledger', () => {
         const response: any = await new Promise((resolve, reject) => {
             const res = {code: 0, status(code: number) { this.code = code; return this; },
                 json(payload: any) { resolve({code: this.code, ...payload}); return this; }};
-            createBulkAppointmentPayments({tenantSchema: 'rehablo_test', params: {agendaEventId: referenceId},
+            createBulkAppointmentPayments({tenantSchema: 'rehablo_test', header: () => 'bulk-test-123', params: {agendaEventId: referenceId},
                 body: {paidAt: '2026-02-01', method: 'Contanti', note: 'Tre sedute', markReferenceCompleted: true,
                     allocations: [{agendaEventId: previousId, amount: 40}, {agendaEventId: referenceId, amount: 40}]},
                 user: {sub: 'recorder', role: RoleCode.OWNER, perms: getRolePermissions(RoleCode.OWNER)}, access: {scope: 'tenant', structureId, userId: 'recorder', resource: 'agenda'}
@@ -403,7 +407,10 @@ describe('invoicing appointment concessions through the HTTP handlers', () => {
             : Object.fromEntries(Object.entries(this).filter(([, value]) => typeof value !== 'function')); },
         async update(values: any) { Object.assign(this, values); return this; }
     });
-    function setup(context: any, adjustment: 'DISCOUNT' | 'COMPLIMENTARY') {
+    function setup(context: any, adjustment: 'DISCOUNT' | 'COMPLIMENTARY', hasReceipt = true) {
+        context.mock.method(CarePackage, 'schema', () => ({findAll: async () => []}) as any);
+        context.mock.method(ServiceStructure, 'schema', () => ({findAll: async () => []}) as any);
+        context.mock.method(ProductStructure, 'schema', () => ({findAll: async () => []}) as any);
         const event = record({id: eventId, patientId, status: 'COMPLETED', start: '2026-01-05T10:00:00Z',
             calendarId: null, recurrence: null, invoiceId: null, eventTypeId: 'type',
             appointmentExpectedAmount: adjustment === 'DISCOUNT' ? 25 : 0, appointmentOriginalAmount: 50,
@@ -411,9 +418,10 @@ describe('invoicing appointment concessions through the HTTP handlers', () => {
             appointmentVatRate: 0, appointmentPaymentHistoryKnown: true});
         const tenant = record({id: 'tenant', businessName: 'Studio test', taxCode: 'TEST', address: 'Via Test 1',
             city: 'Milano', zipCode: '20100', taxRegime: 'RF01', lastDocumentNumberByYear: {}});
-        const receipts = adjustment === 'DISCOUNT' ? [record({id: 'cash', agendaEventId: eventId, invoiceId: null,
+        const receipts = adjustment === 'DISCOUNT' && hasReceipt ? [record({id: 'cash', agendaEventId: eventId, invoiceId: null,
             amount: 25, status: 'POSTED', source: 'APPOINTMENT', paidAt: '2026-01-05'})] : [];
         const lines: any[] = [];
+        const writeOptions: any[] = [];
         let created: any = null;
         context.mock.method(sequelize, 'transaction', async (callback: any) => callback({LOCK: {UPDATE: 'UPDATE'}}));
         context.mock.method(sequelize, 'query', async (sql: string) => {
@@ -422,7 +430,7 @@ describe('invoicing appointment concessions through the HTTP handlers', () => {
         });
         context.mock.method(Tenant, 'findByPk', async () => tenant);
         context.mock.method(AgendaEvent, 'schema', () => ({findAll: async () => [event]}));
-        context.mock.method(Patient, 'schema', () => ({findOne: async () => record({id: patientId})}));
+        context.mock.method(Patient, 'schema', () => ({findOne: async () => record({id: patientId, structureId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'})}));
         context.mock.method(EventType, 'schema', () => ({findAll: async () => [record({id: 'type', linkedServiceId: serviceId})]}));
         context.mock.method(Service, 'schema', () => ({findAll: async () => [record({id: serviceId, name: 'Terapia', sellingPrice: 80, productVat: 'N4', isActive: true})]}));
         context.mock.method(Product, 'schema', () => ({findAll: async () => []}));
@@ -430,22 +438,98 @@ describe('invoicing appointment concessions through the HTTP handlers', () => {
         context.mock.method(InvoiceService, 'schema', () => ({create: async (values: any) => {lines.push(values); return record(values);}}));
         context.mock.method(InvoiceAgendaEvent, 'schema', () => ({findAll: async () => [], create: async (values: any) => record(values)}));
         context.mock.method(Invoice, 'schema', () => ({
-            findOne: async () => null,
+            findOne: async (options: any) => options.where.id === 'invoice' ? created : null,
+            findAll: async () => created ? [created] : [],
             create: async (values: any) => {created = record({...values, id: 'invoice', services: lines}); return created;},
             findByPk: async () => created
         }));
         context.mock.method(InvoicePayment, 'schema', () => ({findAll: async () => receipts,
             update: async (values: any) => receipts.forEach(payment => Object.assign(payment, values)),
-            create: async () => {throw new Error('Invoice emission must not create another receipt');}
+            create: async (values: any, options: any) => {
+                if (hasReceipt) throw new Error('Invoice emission must not create another receipt');
+                writeOptions.push(options); const payment = record({...values, id: 'new-cash'}); receipts.push(payment); return payment;
+            }
         }));
+        const user: any = {sub: 'user', tenants: [{id: 'tenant'}], perms: ['invoice:create:tenant', 'payment:create:tenant']};
         const invoke = (handler: any, body: any) => new Promise<any>((resolve, reject) => {
             const response = {code: 0, status(code: number) {this.code = code; return this;},
                 json(data: any) {resolve({code: this.code, ...data}); return this;}};
-            handler({tenantSchema: 'rehablo_test', body, query: {patientId, through: '2026-01-31'},
-                user: {sub: 'user', tenants: [{id: 'tenant'}]}, access: {scope: 'tenant', resource: 'invoice'}}, response, reject);
+            handler({tenantSchema: 'rehablo_test', header: () => 'invoice-test-123', body, query: {patientId, through: '2026-01-31'},
+                user, access: {scope: 'tenant', resource: 'invoice'}}, response, reject);
         });
-        return {invoke, event, tenant, receipts, lines};
+        return {invoke, event, tenant, receipts, lines, writeOptions, user};
     }
+
+    it('requires independent payment creation rights before creating a paid invoice', async context => {
+        const state = setup(context, 'DISCOUNT', false);
+        state.user.perms = ['invoice:create:tenant'];
+        const response = await state.invoke(saveInvoice, {patientID: patientId, documentType: 'fattura',
+            emissionDate: '2026-01-10', status: 'paid', appointments: [{agendaEventId: eventId, serviceId}]});
+        assert.equal(response.code, 403);
+        assert.deepEqual(state.tenant.lastDocumentNumberByYear, {});
+        assert.equal(state.lines.length, 0); assert.equal(state.receipts.length, 0);
+    });
+
+    it('checks the payment site independently from tenant-wide invoice creation rights', async context => {
+        const state = setup(context, 'DISCOUNT', false);
+        state.user.perms = ['invoice:create:tenant', 'payment:create:structure'];
+        state.user.sid = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+        const payload = {patientID: patientId, documentType: 'fattura', emissionDate: '2026-01-10', status: 'paid',
+            appointments: [{agendaEventId: eventId, serviceId}]};
+        assert.equal((await state.invoke(saveInvoice, payload)).code, 403);
+        assert.deepEqual(state.tenant.lastDocumentNumberByYear, {}); assert.equal(state.receipts.length, 0);
+        state.user.sid = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+        assert.equal((await state.invoke(saveInvoice, payload)).code, 201);
+        assert.equal(state.receipts.length, 1);
+    });
+
+    it('rechecks payment rights before replaying a paid invoice and preserves the original receipt', async context => {
+        const state = setup(context, 'DISCOUNT', false);
+        const payload = {patientID: patientId, documentType: 'fattura', emissionDate: '2026-01-10', status: 'paid',
+            appointments: [{agendaEventId: eventId, serviceId}]};
+        assert.equal((await state.invoke(saveInvoice, payload)).code, 201);
+        state.user.perms = ['invoice:create:tenant'];
+        assert.equal((await state.invoke(saveInvoice, payload)).code, 403);
+        assert.equal(state.receipts.length, 1); assert.equal(state.lines.length, 1);
+        assert.equal(state.tenant.lastDocumentNumberByYear['2026'], 1);
+    });
+
+    it('allows ordinary invoice emission without cash creation rights', async context => {
+        const state = setup(context, 'DISCOUNT', false);
+        state.user.perms = ['invoice:create:tenant'];
+        const response = await state.invoke(saveInvoice, {patientID: patientId, documentType: 'fattura',
+            emissionDate: '2026-01-10', status: 'unpaid', appointments: [{agendaEventId: eventId, serviceId}]});
+        assert.equal(response.code, 201); assert.equal(state.receipts.length, 0);
+    });
+
+    it('keeps package invoice reuse without cash creation rights because it only links existing receipts', async context => {
+        const state = setup(context, 'DISCOUNT');
+        state.user.sid = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+        state.user.perms = ['invoice:create:tenant', 'care_package:read:tenant'];
+        const carePackageId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+        context.mock.method(CarePackage, 'schema', () => ({findOne: async () => record({id: carePackageId,
+            templateId: serviceId, invoiceId: 'existing-package-invoice', structureId: state.user.sid, patientId})}) as any);
+        const response = await state.invoke(saveInvoice, {carePackageId, status: 'paid'});
+        assert.equal(response.code, 200); assert.equal(response.data.invoiceId, 'existing-package-invoice');
+        assert.equal(state.receipts.length, 1); assert.equal(state.lines.length, 0);
+        assert.deepEqual(state.tenant.lastDocumentNumberByYear, {});
+    });
+
+    it('creates a paid invoice with one explicitly accounted receipt and replays without another document or cash row', async context => {
+        const state = setup(context, 'DISCOUNT', false);
+        const payload = {patientID: patientId, documentType: 'fattura', emissionDate: '2026-01-10', status: 'paid',
+            paymentDate: '2026-01-09', accountId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+            appointments: [{agendaEventId: eventId, serviceId}]};
+        const first = await state.invoke(saveInvoice, payload);
+        assert.equal(first.code, 201); assert.equal(first.data.balance, 0); assert.equal(state.receipts.length, 1);
+        assert.equal(state.receipts[0].amount, 25); assert.equal(state.receipts[0].paidAt.toISOString().slice(0, 10), '2026-01-09');
+        assert.equal(state.writeOptions[0].treasuryContext.accountId, payload.accountId);
+        assert.equal(state.writeOptions[0].treasuryContext.structureId, 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee');
+        assert.ok(state.writeOptions[0].transaction);
+        assert.equal((await state.invoke(saveInvoice, payload)).code, 201);
+        assert.equal(state.receipts.length, 1); assert.equal(state.lines.length, 1);
+        assert.equal(state.tenant.lastDocumentNumberByYear['2026'], 1);
+    });
 
     it('emits appointment invoices with a frozen declared TS profile and SP, without changing collection amounts', async context => {
         const state = setup(context, 'DISCOUNT');

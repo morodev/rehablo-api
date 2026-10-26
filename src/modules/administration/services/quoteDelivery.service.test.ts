@@ -225,6 +225,103 @@ describe('quote scope SQL regression', () => {
 });
 
 describe('quote deliveries without real network/database', () => {
+    it('emails an accepted agreement without changing its status, acceptance or document fields and replays without resending', async t => {
+        const f = fixture(t);
+        Object.assign(f.quote.data, {status: 'ACCEPTED', acceptedAt: '2026-01-03T10:00:00.000Z'});
+        const original = structuredClone(f.quote.data);
+        f.send.mock.mockImplementation(async () => {assert.deepEqual(f.quote.data, original);});
+        const sent = await deliverQuote(f.request, 'email');
+        assert.equal(sent.quoteStatus, 'ACCEPTED');
+        assert.equal(f.deliveries[0].data.status, 'SENT');
+        assert.deepEqual(f.quote.data, original);
+        const retry = await deliverQuote(f.request, 'email');
+        assert.equal(retry.url, sent.url);
+        assert.equal(f.send.mock.callCount(), 1);
+        assert.equal(f.deliveries.length, 1);
+        assert.deepEqual(f.quote.data, original);
+    });
+    for (const channel of ['email', 'whatsapp'] as const) {
+        it(`shares a past-expiry accepted copy over ${channel} with an independently valid immutable public link`, async t => {
+            const f = fixture(t);
+            Object.assign(f.quote.data, {status: 'ACCEPTED', acceptedAt: '2026-01-03T10:00:00.000Z', expiresAt: '2026-01-10'});
+            const original = structuredClone(f.quote.data);
+            const document = quoteDocument(original, f.patient.data, f.tenant.data);
+            const sent = await deliverQuote(f.request, channel);
+            assert.equal(sent.quoteStatus, 'ACCEPTED');
+            assert.equal(f.deliveries[0].data.status, channel === 'email' ? 'SENT' : 'READY');
+            assert.equal(f.send.mock.callCount(), channel === 'email' ? 1 : 0);
+            if (channel === 'whatsapp') {
+                f.request.params.deliveryId = f.deliveries[0].data.id;
+                const confirmed = await updateQuoteDelivery(f.request, 'confirm');
+                const sentAt = f.deliveries[0].data.sentAt;
+                await updateQuoteDelivery(f.request, 'confirm');
+                assert.equal(confirmed.quoteStatus, 'ACCEPTED');
+                assert.equal(f.deliveries[0].data.status, 'SENT');
+                assert.equal(f.deliveries[0].data.sentAt, sentAt);
+                assert.equal(f.deliveries[0].data.confirmedByUserId, userId);
+                assert.equal(f.send.mock.callCount(), 0);
+            }
+            assert.deepEqual(f.quote.data, original);
+            const token = quoteShareToken(tenantId, f.deliveries[0].data.id);
+            const publicCopy = await publicQuoteDocument(token);
+            assert.deepEqual(publicCopy.document, document);
+            assert.equal(publicCopy.document.expiresAt, '2026-01-10');
+            assert.ok(new Date(publicCopy.expiresAt as string).getTime() > Date.now());
+            assert.equal(await hasUnsharedQuoteChanges(f.request, document), false);
+        });
+    }
+    it('confirms a WhatsApp copy prepared before the agreement was accepted without downgrading it to SENT', async t => {
+        const f = fixture(t);
+        await deliverQuote(f.request, 'whatsapp');
+        Object.assign(f.quote.data, {status: 'ACCEPTED', acceptedAt: '2026-01-03T10:00:00.000Z'});
+        const original = structuredClone(f.quote.data);
+        f.request.params.deliveryId = f.deliveries[0].data.id;
+        const confirmed = await updateQuoteDelivery(f.request, 'confirm');
+        assert.equal(confirmed.quoteStatus, 'ACCEPTED');
+        assert.deepEqual(f.quote.data, original);
+        assert.equal(f.deliveries[0].data.status, 'SENT');
+        assert.equal(f.send.mock.callCount(), 0);
+    });
+    for (const status of ['REJECTED', 'EXPIRED']) {
+        it(`blocks new email and WhatsApp sharing and pending WhatsApp confirmation after ${status}`, async t => {
+            const f = fixture(t);
+            await deliverQuote(f.request, 'whatsapp');
+            f.quote.data.status = status;
+            const original = structuredClone(f.quote.data);
+            const fresh = {...f.request, header: () => 'request-0002'} as unknown as Request;
+            for (const channel of ['email', 'whatsapp'] as const) await assert.rejects(deliverQuote(fresh, channel), /non è più condivisibile/);
+            f.request.params.deliveryId = f.deliveries[0].data.id;
+            await assert.rejects(updateQuoteDelivery(f.request, 'confirm'), /non è più condivisibile/);
+            assert.deepEqual(f.quote.data, original);
+            assert.equal(f.deliveries.length, 1);
+            assert.equal(f.deliveries[0].data.status, 'READY');
+            assert.equal(f.send.mock.callCount(), 0);
+        });
+    }
+    for (const status of ['DRAFT', 'SENT']) {
+        it(`continues rejecting expired ${status} offers without sending or changing their dates`, async t => {
+            const f = fixture(t);
+            Object.assign(f.quote.data, {status, expiresAt: '2026-01-10'});
+            const original = structuredClone(f.quote.data);
+            for (const channel of ['email', 'whatsapp'] as const) await assert.rejects(deliverQuote(f.request, channel), /Il preventivo è scaduto/);
+            assert.deepEqual(f.quote.data, original);
+            assert.equal(f.deliveries.length, 0);
+            assert.equal(f.send.mock.callCount(), 0);
+        });
+    }
+    for (const invalid of [
+        {issuedAt: '2026-02-30'},
+        {expiresAt: '2026-01-01'},
+        {lines: []},
+    ]) {
+        it(`keeps document validation for accepted copies with ${Object.keys(invalid)[0]} invalid`, async t => {
+            const f = fixture(t);
+            Object.assign(f.quote.data, {status: 'ACCEPTED', acceptedAt: '2026-01-03T10:00:00.000Z', ...invalid});
+            await assert.rejects(deliverQuote(f.request, 'email'), (error: any) => error.statusCode === 422);
+            assert.equal(f.deliveries.length, 0);
+            assert.equal(f.send.mock.callCount(), 0);
+        });
+    }
     it('prepares WhatsApp without marking sent; confirmation is explicit and idempotent', async t => {
         const f = fixture(t);
         const result = await deliverQuote(f.request, 'whatsapp');

@@ -18,8 +18,10 @@ import {
     PriceListItem, PriceListVersion, PurchaseDocument, Quote, Reconciliation, Supplier,
     TreasuryMovement
 } from '../models/index.js';
-import { validateManualTreasuryMovement } from '../services/treasuryValidation.service.js';
-import { createTreasuryClosing, reverseTreasuryMovement } from '../services/treasuryLedger.service.js';
+import { treasuryError } from '../services/treasuryValidation.service.js';
+import {protectAccountChange, protectExpenseChange, recordManualMovement, voidManualMovement} from '../services/financialOperations.service.js';
+import {economicMovements, positiveFinancialAmount} from '../services/financialMovementPolicy.service.js';
+import { balanceEffectiveMovements, createTreasuryClosing } from '../services/treasuryLedger.service.js';
 import { submitFiscal } from './fiscalSimulation.controller.js';
 import { resolvePrice } from '../services/pricing.service.js';
 import { validateQuoteDraft } from '../services/quoteAccess.js';
@@ -160,6 +162,13 @@ function create(name: SpecName) {
         if (name === 'dailyClosings') return sendSuccessResponse(res, 201, await createTreasuryClosing(req, bodySource(req)), 'Chiusura cassa registrata');
         const payload = normalizePayload(req, spec);
         if (spec.structureScoped && !payload['structureId']) return sendErrorResponse(res, 400, 'Seleziona una sede');
+        if (name === 'treasuryMovements') return sendSuccessResponse(res, 201, await recordManualMovement(req, payload), 'Movimento registrato');
+        if (name === 'expenses') {
+            if (payload['paidAt'] || (payload['status'] && payload['status'] !== 'OPEN')) treasuryError('Crea la spesa aperta e usa Paga spesa per registrare il pagamento', 422);
+            payload['amount'] = positiveFinancialAmount(payload['amount']);
+            payload['status'] = 'OPEN'; payload['paidAt'] = null;
+        }
+        if (name === 'purchaseDocuments' && ['PAID', 'PARTIAL'].includes(String(payload['status'] ?? '').toUpperCase())) treasuryError('Registra il pagamento dalla spesa collegata', 422);
         if (name === 'quotes') {
             await validateQuoteDraft(req, payload);
             const year = Number(payload['year'] ?? new Date().getFullYear());
@@ -170,14 +179,6 @@ function create(name: SpecName) {
             if (linesError) return sendErrorResponse(res, 400, linesError);
             const pricingError = await snapshotQuotePriceList(req, payload);
             if (pricingError) return sendErrorResponse(res, 409, pricingError);
-        }
-        if (name === 'treasuryMovements') {
-            await validateManualTreasuryMovement(req, payload);
-            payload['idempotencyKey'] = req.header('Idempotency-Key') ?? payload['idempotencyKey'];
-            if (!payload['idempotencyKey']) return sendErrorResponse(res, 400, 'Identificativo della registrazione mancante');
-            const existing = await schemaModel(req, name).findOne({ where: { idempotencyKey: payload['idempotencyKey'] } });
-            if (existing) return sendSuccessResponse(res, 200, existing, 'Movimento gia registrato');
-            payload['status'] = 'POSTED';
         }
         const entity = await schemaModel(req, name).create(payload);
         if (name === 'priceLists' && payload['isDefault'] === true) {
@@ -262,12 +263,19 @@ function update(name: SpecName) {
         }
         const spec = specFor(name);
         if (spec.appendOnly) return sendErrorResponse(res, 409, 'Il registro e append-only: usa una operazione di storno');
+        if (name === 'financialAccounts' || name === 'expenses') {
+            const payload = normalizePayload(req, spec);
+            const entity = name === 'financialAccounts' ? await protectAccountChange(req, String(req.params.id), payload) : await protectExpenseChange(req, String(req.params.id), payload);
+            return sendSuccessResponse(res, 200, entity, 'Aggiornato');
+        }
         const entity = await schemaModel(req, name).findOne({ where: { id: req.params.id, ...structureWhere(req, spec) } });
         if (!entity) return sendErrorResponse(res, 404, 'Elemento non trovato');
         if (name === 'priceListVersions' && entity.get('status') === 'PUBLISHED') {
             return sendErrorResponse(res, 409, 'Una versione pubblicata e immutabile: creane una nuova');
         }
         const payload = normalizePayload(req, spec);
+        if (name === 'purchaseDocuments' && ['PAID', 'PARTIAL'].includes(String(payload['status'] ?? '').toUpperCase())
+            && payload['status'] !== entity.get('status')) treasuryError('Registra il pagamento dalla spesa collegata', 409);
         await entity.update(payload);
         return sendSuccessResponse(res, 200, entity, 'Aggiornato');
     });
@@ -275,6 +283,11 @@ function update(name: SpecName) {
 
 function remove(name: SpecName) {
     return asyncHandler(async (req, res) => {
+        if (name === 'financialAccounts' || name === 'expenses') {
+            if (name === 'financialAccounts') await protectAccountChange(req, String(req.params.id), null);
+            else await protectExpenseChange(req, String(req.params.id), null);
+            return sendSuccessResponse(res, 200, null, 'Eliminato');
+        }
         if (name === 'quotes') {
             await sequelize.transaction(async transaction => {
                 const quote = await loadScopedQuote(req, transaction);
@@ -500,22 +513,23 @@ async function settleAppointmentWithPackage(req: Request, agendaEventId: string,
 }
 
 const voidMovement = asyncHandler(async (req, res) => {
-    const result = await reverseTreasuryMovement(req, bodySource(req));
-    return sendSuccessResponse(res, result.created ? 201 : 200, result.row, 'Storno registrato');
+    return sendSuccessResponse(res, 200, await voidManualMovement(req, bodySource(req)), 'Storno registrato');
 });
 const overview = asyncHandler(async (req, res) => {
-    const movementWhere = { status: 'POSTED', ...structureWhere(req, SPECS.treasuryMovements) };
+    const movementWhere = structureWhere(req, SPECS.treasuryMovements);
     const expenseWhere = { ...structureWhere(req, SPECS.expenses) };
-    const [income, outcome, expenses, openQuotes, fiscalPending] = await Promise.all([
-        TreasuryMovement.schema(req.tenantSchema!).sum('amount', { where: { ...movementWhere, direction: 'IN' } }),
-        TreasuryMovement.schema(req.tenantSchema!).sum('amount', { where: { ...movementWhere, direction: 'OUT' } }),
+    const [movements, expenses, openQuotes, fiscalPending] = await Promise.all([
+        TreasuryMovement.schema(req.tenantSchema!).findAll({ where: movementWhere }),
         Expense.schema(req.tenantSchema!).sum('amount', { where: expenseWhere }),
         Quote.schema(req.tenantSchema!).count({ where: { ...structureWhere(req, SPECS.quotes), status: { [Op.in]: ['DRAFT','SENT'] } } }),
         FiscalSubmission.schema(req.tenantSchema!).count({ where: { status: { [Op.in]: ['QUEUED','PROCESSING','REJECTED'] } } })
     ]);
+    const economic = economicMovements(balanceEffectiveMovements(movements.map(row => row.get({plain: true}))));
+    const income = economic.filter(row => row.direction === 'IN').reduce((cents, row) => cents + Math.round(Number(row.amount) * 100), 0) / 100;
+    const outcome = economic.filter(row => row.direction === 'OUT').reduce((cents, row) => cents + Math.round(Number(row.amount) * 100), 0) / 100;
     return sendSuccessResponse(res, 200, {
         income: Number(income ?? 0), outcome: Number(outcome ?? 0), expenses: Number(expenses ?? 0),
-        cashFlow: Number(income ?? 0) - Number(outcome ?? 0), openQuotes, fiscalPending
+        cashFlow: Math.round((income - outcome) * 100) / 100, openQuotes, fiscalPending
     });
 });
 

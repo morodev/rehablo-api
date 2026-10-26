@@ -1,4 +1,5 @@
 export interface ScheduledReminder {
+    sourceType?: string | null;
     dueAt?: Date | null;
     remindAt?: Date | null;
     status: string;
@@ -14,6 +15,7 @@ export function dueExternalAlert(
     activatedAt: Date,
     now: Date
 ): Date | null {
+    if (reminder.sourceType === 'PATIENT_MISSING_CONTACTS') return null;
     if (reminder.status !== 'OPEN' && reminder.status !== 'SNOOZED') return null;
     const base = baseReminderAlert(reminder);
     if (!base) return null;
@@ -27,6 +29,7 @@ export function deliveryStillCurrent(
     snoozedUntil: Date | null,
     now: Date
 ): boolean {
+    if (reminder.sourceType === 'PATIENT_MISSING_CONTACTS') return false;
     if (reminder.status !== 'OPEN' && reminder.status !== 'SNOOZED') return false;
     const base = baseReminderAlert(reminder);
     return !!base && base.getTime() === baseScheduledFor.getTime()

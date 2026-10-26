@@ -8,6 +8,8 @@ import Patient from '../../patients/models/patient.model.js';
 import Reminder, {ReminderPriority, ReminderStatus} from '../models/reminder.model.js';
 import ReminderAlertState from '../models/reminderAlertState.model.js';
 import {enqueueSnoozedExternalAlert} from '../services/reminderExternalDelivery.service.js';
+import {contactReminderOccurrenceAt, dailyContactReminderAlertAt, isPatientContactReminder, sameRomeReminderDay} from '../services/patientContactReminder.policy.js';
+import {reconcilePatientContactReminders} from '../services/patientContactReminder.service.js';
 import {
     assignedReminderIds,
     assignableUsers,
@@ -56,6 +58,12 @@ function scheduleFor(reminder: Reminder): Date | null {
 
 export const getAssignableReminderUsers = asyncHandler(async (req: Request, res: Response) => {
     return sendSuccessResponse(res, 200, await assignableUsers(req), 'Operatori caricati correttamente');
+});
+export const getReminderById = asyncHandler(async (req: Request, res: Response) => {
+    const reminder = await findVisibleReminder(req, req.params.reminderId);
+    if (!reminder) return sendErrorResponse(res, 404, 'Promemoria non trovato');
+    await reconcilePatientContactReminders(req.tenantSchema!, [reminder]);
+    return sendReminder(res, req, 200, reminder, 'Promemoria caricato');
 });
 
 export const createReminder = asyncHandler(async (req: Request, res: Response) => {
@@ -109,19 +117,25 @@ export const getReminders = asyncHandler(async (req: Request, res: Response) => 
     if (assignedToMe === 'true') base.id = {[Op.in]: await assignedReminderIds(schema, req.access!.userId)};
     const fromDate = parseDate(from);
     const toDate = parseDate(to);
-    if (fromDate && toDate) base.dueAt = {[Op.between]: [fromDate, toDate]};
-    else if (fromDate) base.dueAt = {[Op.gte]: fromDate};
-    else if (toDate) base.dueAt = {[Op.lte]: toDate};
+    const dateRange = fromDate && toDate ? {[Op.between]: [fromDate, toDate]} : fromDate ? {[Op.gte]: fromDate} : toDate ? {[Op.lte]: toDate} : null;
 
     const search = textSearchWhere(['title', 'description'], q);
     const parts: any[] = [visibility, base];
+    if (dateRange) parts.push({[Op.or]: [{sourceType: 'PATIENT_MISSING_CONTACTS'}, {dueAt: dateRange}]});
     if (search) parts.push(search);
     const reminders = await Reminder.schema(schema).findAll({
         where: {[Op.and]: parts},
         order: [['status', 'ASC'], ['dueAt', 'ASC'], ['updatedAt', 'DESC']],
-        limit: 500
+        ...(dateRange ? {} : {limit: 500})
     });
-    return sendSuccessResponse(res, 200, await serializeReminders(req, reminders), 'Promemoria caricati correttamente');
+    await reconcilePatientContactReminders(schema, reminders);
+    const reference = fromDate ?? toDate ?? new Date();
+    const serialized = await serializeReminders(req, reminders, {reference});
+    const filtered = serialized.filter(row => {
+        const occurrence = row.occurrenceAt || row.dueAt ? new Date(row.occurrenceAt ?? row.dueAt) : null;
+        return (!status || row.status === status) && (!fromDate || (occurrence && occurrence >= fromDate)) && (!toDate || (occurrence && occurrence <= toDate));
+    }).sort((left, right) => Number(new Date(left.occurrenceAt ?? left.dueAt ?? 0)) - Number(new Date(right.occurrenceAt ?? right.dueAt ?? 0))).slice(0, 500);
+    return sendSuccessResponse(res, 200, filtered, 'Promemoria caricati correttamente');
 });
 
 export const updateReminder = asyncHandler(async (req: Request, res: Response) => {
@@ -129,6 +143,12 @@ export const updateReminder = asyncHandler(async (req: Request, res: Response) =
     const body = req.body?.reminder ?? req.body ?? {};
     const reminder = await findVisibleReminder(req, req.params.reminderId);
     if (!reminder) return sendErrorResponse(res, 404, 'Promemoria non trovato');
+    const automatic = isPatientContactReminder(reminder);
+    if (automatic) {
+        const protectedFields = ['patientId', 'agendaEventId', 'noteId', 'structureId', 'sourceType', 'assigneeUserId', 'assignedUserIds', 'dueAt', 'dueAllDay', 'remindAt'];
+        if (protectedFields.some(field => Object.hasOwn(body, field))) return sendErrorResponse(res, 422, 'Paziente, assegnazione e avviso quotidiano sono gestiti automaticamente');
+        if (body.status && body.status !== reminder.status && !['DONE', 'CANCELLED'].includes(body.status)) return sendErrorResponse(res, 422, 'Un sollecito concluso non può essere riaperto da questo editor');
+    }
 
     const currentUserId = req.access!.userId;
     const isCreator = reminder.createdByUserId === currentUserId;
@@ -167,12 +187,18 @@ export const updateReminder = asyncHandler(async (req: Request, res: Response) =
 
     const scheduleChanged = isCreator && ('dueAt' in body || 'remindAt' in body || 'dueAllDay' in body);
     const updated = await sequelize.transaction(async transaction => {
-        await reminder.update(update, {transaction});
+        const current = automatic ? await Reminder.schema(schema).findByPk(reminder.id, {transaction, lock: transaction.LOCK.UPDATE}) : reminder;
+        if (!current) throw Object.assign(new Error('Promemoria non trovato'), {statusCode: 404});
+        if (automatic && update.status && update.status !== current.status && !['DONE', 'CANCELLED'].includes(String(update.status))) {
+            throw Object.assign(new Error('Il sollecito è stato concluso: aggiorna il dettaglio'), {statusCode: 409});
+        }
+        if (automatic && ['DONE', 'CANCELLED'].includes(String(update.status))) update.completedAt = current.completedAt ?? new Date();
+        await current.update(update, {transaction});
         if (isCreator) await replaceReminderAssignments(schema, reminder.id, nextAssignedIds, currentUserId, transaction);
-        if (scheduleChanged || isCreator) {
+        if (!automatic && (scheduleChanged || isCreator)) {
             await ReminderAlertState.schema(schema).destroy({where: {reminderId: reminder.id}, transaction});
         }
-        return reminder;
+        return current;
     });
     return sendReminder(res, req, 200, updated, 'Promemoria aggiornato correttamente');
 });
@@ -201,16 +227,23 @@ export const snoozeReminderAlert = asyncHandler(async (req: Request, res: Respon
         return sendErrorResponse(res, 403, 'Solo un operatore assegnato può posticipare il proprio avviso');
     }
     const model = ReminderAlertState.schema(req.tenantSchema!);
-    await sequelize.transaction(async transaction => {
+    const updated = await sequelize.transaction(async transaction => {
+        if (isPatientContactReminder(reminder) && reminder.patientId) await Patient.schema(req.tenantSchema!).findByPk(reminder.patientId, {transaction, lock: transaction.LOCK.UPDATE, attributes: ['id']});
+        const locked = await Reminder.schema(req.tenantSchema!).findByPk(reminder.id, {transaction, lock: transaction.LOCK.UPDATE});
+        if (!locked || !['OPEN', 'SNOOZED'].includes(locked.status) || locked.structureId !== req.access!.structureId
+            || !(await reminderAssignmentIds(req.tenantSchema!, locked.id)).includes(userId)) throw Object.assign(new Error('Promemoria non disponibile per il posticipo'), {statusCode: 409});
+        const occurrence = contactReminderOccurrenceAt(locked);
+        if (occurrence && snoozedUntil < occurrence) throw Object.assign(new Error('Il posticipo non può precedere l’avviso previsto'), {statusCode: 422});
         const [state] = await model.findOrCreate({
             where: {reminderId: reminder.id, userId},
-            defaults: {reminderId: reminder.id, userId, scheduledFor: scheduleFor(reminder), deliveredAt: new Date(), snoozedUntil},
+            defaults: {reminderId: reminder.id, userId, scheduledFor: scheduleFor(locked), deliveredAt: new Date(), snoozedUntil},
             transaction
         });
-        await state.update({scheduledFor: scheduleFor(reminder), deliveredAt: new Date(), snoozedUntil}, {transaction});
-        await enqueueSnoozedExternalAlert(req.tenantSchema!, reminder, userId, snoozedUntil, transaction);
+        await state.update({scheduledFor: scheduleFor(locked), deliveredAt: new Date(), snoozedUntil}, {transaction});
+        await enqueueSnoozedExternalAlert(req.tenantSchema!, locked, userId, snoozedUntil, transaction);
+        return locked;
     });
-    return sendReminder(res, req, 200, reminder, 'Avviso posticipato');
+    return sendReminder(res, req, 200, updated, 'Avviso posticipato');
 });
 
 export const claimReminderAlerts = asyncHandler(async (req: Request, res: Response) => {
@@ -225,31 +258,40 @@ export const claimReminderAlerts = asyncHandler(async (req: Request, res: Respon
             structureId: req.access!.structureId,
             status: {[Op.in]: ['OPEN', 'SNOOZED']},
             [Op.or]: [
+                {sourceType: 'PATIENT_MISSING_CONTACTS'},
                 {remindAt: {[Op.lte]: now}},
                 {remindAt: null, dueAt: {[Op.lte]: now}}
             ]
         },
         order: [['remindAt', 'ASC'], ['dueAt', 'ASC']],
-        limit: 20
     });
 
     const claimed = await sequelize.transaction(async transaction => {
         const result: Reminder[] = [];
         const states = ReminderAlertState.schema(schema);
         for (const reminder of reminders) {
-            const scheduled = scheduleFor(reminder);
-            if (!scheduled) continue;
+            if (result.length >= 20) break;
+            // Contact writers lock the patient before completing its reminders; keep the same order.
+            if (isPatientContactReminder(reminder) && reminder.patientId) await Patient.schema(schema).findByPk(reminder.patientId, {transaction, lock: transaction.LOCK.UPDATE, attributes: ['id']});
+            const locked = await Reminder.schema(schema).findByPk(reminder.id, {transaction, lock: transaction.LOCK.UPDATE});
+            if (!locked || !['OPEN', 'SNOOZED'].includes(locked.status)) continue;
+            await reconcilePatientContactReminders(schema, [locked], transaction);
+            if (!['OPEN', 'SNOOZED'].includes(locked.status)) continue;
             let state = await states.findOne({where: {reminderId: reminder.id, userId}, transaction, lock: transaction.LOCK.UPDATE});
+            const automatic = isPatientContactReminder(locked);
+            if (state?.snoozedUntil && state.snoozedUntil > now) continue;
+            const scheduled = automatic ? state?.snoozedUntil ?? dailyContactReminderAlertAt(locked, now) : scheduleFor(locked);
+            if (!scheduled || (automatic && !state?.snoozedUntil && state?.deliveredAt && sameRomeReminderDay(state.deliveredAt, now))) continue;
             if (!state) {
                 state = await states.create({reminderId: reminder.id, userId, scheduledFor: scheduled, deliveredAt: now, snoozedUntil: null}, {transaction});
-                result.push(reminder);
+                result.push(locked);
                 continue;
             }
             const sameSchedule = state.scheduledFor?.getTime() === scheduled.getTime();
             if (state.snoozedUntil && state.snoozedUntil.getTime() > now.getTime()) continue;
             if (sameSchedule && state.deliveredAt && !state.snoozedUntil) continue;
             await state.update({scheduledFor: scheduled, deliveredAt: now, snoozedUntil: null}, {transaction});
-            result.push(reminder);
+            result.push(locked);
         }
         return result;
     });
@@ -267,6 +309,7 @@ export const deleteReminder = asyncHandler(async (req: Request, res: Response) =
 });
 
 export default {
+    getReminderById,
     createReminder,
     getReminders,
     updateReminder,

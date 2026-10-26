@@ -20,6 +20,7 @@ export async function validateTreasuryAccount(schema: string, accountId: unknown
     if (typeof structureId !== 'string' || !TREASURY_UUID.test(structureId)) treasuryError('Seleziona una sede valida');
     const account = await FinancialAccount.schema(schema).findOne({ where: { id: accountId, isActive: true }, transaction });
     if (!account) treasuryError('Il conto selezionato non è disponibile o non è attivo');
+    if ((account.get('currency') ?? 'EUR') !== 'EUR') treasuryError('Il conto deve essere in euro', 422);
     if (account.get('structureId') && account.get('structureId') !== structureId) {
         treasuryError('Il conto selezionato appartiene a un’altra sede');
     }

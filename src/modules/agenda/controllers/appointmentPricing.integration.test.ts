@@ -3,8 +3,9 @@ import {randomUUID} from 'node:crypto';
 import {after, before, test} from 'node:test';
 
 // Verify isolation before any application module initializes its database connection.
-const {requireActivitiesTestDatabase} = await import('../../../../scripts/activities-test-database.mjs');
-const target = requireActivitiesTestDatabase(process.env);
+const target = process.env.TEST_FINANCIAL_DATABASE_URL
+    ? (await import('../../../../scripts/financial-test-database.mjs')).requireFinancialTestDatabase(process.env)
+    : (await import('../../../../scripts/activities-test-database.mjs')).requireActivitiesTestDatabase(process.env);
 process.env.DATABASE_URL = target.databaseUrl;
 process.env.DB_SSL = 'false';
 process.env.NODE_ENV = 'test';
@@ -15,11 +16,13 @@ const {default: AgendaEvent} = await import('../models/agendaEvent.model.js');
 const {default: Invoice} = await import('../../invoice/models/invoice.model.js');
 const {default: InvoicePayment} = await import('../../invoice/models/invoicePayment.model.js');
 const {default: InvoiceAgendaEvent} = await import('../../invoice/models/invoiceAgendaEvent.model.js');
-const {CarePackage, FinancialAccount} = await import('../../administration/models/index.js');
+const {CarePackage, FinancialAccount, PaymentMethod, TreasuryMovement} = await import('../../administration/models/index.js');
+const {FinancialOperation} = await import('../../administration/models/financialOperation.model.js');
 const {updateAppointmentPricing, listAppointmentPayments, createAppointmentPayment} = await import('../controllers/appointmentPayment.controller.js');
 const {patientSettlementPositionView} = await import('../../patients/services/patientSettlementAccess.service.js');
 
-const schema = 'rehablo_' + randomUUID().replaceAll('-', '');
+const tenantId = randomUUID();
+const schema = 'rehablo_' + tenantId.replaceAll('-', '');
 const structureId = randomUUID(), userId = randomUUID();
 let created = false;
 before(async () => {
@@ -27,15 +30,21 @@ before(async () => {
     const [rows] = await sequelize.query('SELECT current_database() AS name');
     assert.equal((rows[0] as any).name, target.databaseName);
     await Tenant.sync({force: false, alter: false});
+    await Tenant.create({id: tenantId, license: 'synthetic-integration-test', idStripe: 'synthetic',
+        maxUserQuantity: 1, maxStructureQuantity: 1, administrationSettings: {}});
     assert.match(schema, /^rehablo_[a-f0-9]{32}$/);
     await sequelize.query(`CREATE SCHEMA "${schema}"`);
     created = true;
-    for (const model of [AgendaEvent, Invoice, InvoicePayment, InvoiceAgendaEvent, CarePackage, FinancialAccount]) {
+    for (const model of [AgendaEvent, Invoice, InvoicePayment, InvoiceAgendaEvent, CarePackage, FinancialAccount,
+        PaymentMethod, TreasuryMovement, FinancialOperation]) {
         await (model as any).schema(schema).sync({force: false, alter: false});
     }
 });
 after(async () => {
-    try {if (created) await sequelize.query(`DROP SCHEMA "${schema}" CASCADE`);} finally {await sequelize.close();}
+    try {
+        if (created) {assert.match(schema, /^rehablo_[a-f0-9]{32}$/); await sequelize.query(`DROP SCHEMA "${schema}" CASCADE`);}
+        await Tenant.destroy({where: {id: tenantId}});
+    } finally {await sequelize.close();}
 });
 
 async function event(extra: Record<string, any> = {}) {
@@ -44,7 +53,9 @@ async function event(extra: Record<string, any> = {}) {
         appointmentExpectedAmount: null, appointmentOriginalAmount: null, appointmentPaymentHistoryKnown: false, ...extra});
 }
 function request(record: any, body: Record<string, unknown> = {}): any {
+    const operationKey = randomUUID();
     return {tenantSchema: schema, params: {agendaEventId: record.id}, body,
+        header: (name: string) => name.toLowerCase() === 'idempotency-key' ? operationKey : undefined,
         user: {sub: userId, isSuperAdmin: true}, access: {scope: 'tenant', structureId, userId}};
 }
 function run(handler: any, req: any): Promise<{status: number; data: any; message: string}> {

@@ -9,6 +9,7 @@ import {CarePackage, PatientCredit} from '../../administration/models/index.js';
 import {packagePatient, packageSelectedStructure, packageUuid} from '../../administration/services/carePackage.service.js';
 import {treasuryError} from '../../administration/services/treasuryValidation.service.js';
 import {verifiedPatientCredits} from '../../administration/services/patientCreditBacking.service.js';
+import {creditCorrectionCapabilities} from '../../administration/services/financialCreditReversal.service.js';
 import {paymentMoney} from '../../invoice/services/appointmentPayment.service.js';
 import {CarePackageReadView, decorateCarePackages} from '../../administration/services/carePackageProjection.service.js';
 
@@ -18,7 +19,7 @@ export interface CoveragePackage extends CarePackageReadView {}
 export interface CoverageCredit {
     id: string; patientId: string; amount: number; remainingAmount: number; status: string;
     sourceType: string | null; sourceId: string | null; expiresAt: string | null;
-    backed: boolean; availableAmount: number; canUse: boolean; canRefund: boolean;
+    backed: boolean; availableAmount: number; canUse: boolean; canRefund: boolean; canVoidAdvance?: boolean;
 }
 export interface CoveragePosition {
     patientId: string; structureId: string;
@@ -93,6 +94,7 @@ export async function patientCoveragePosition(req: Request, context: CoverageCon
                 structureId: context.structureId}, order: [['createdAt', 'DESC'], ['id', 'ASC']], transaction}))
                 .map(model => model.get({plain: true}) as Plain);
             const verified = await verifiedPatientCredits(schema, credits, transaction);
+            const corrections = await creditCorrectionCapabilities(req, credits);
             result.credits = credits.map(credit => {
                 const backed = verified.get(String(credit.id)) === true;
                 const availableAmount = credit.status === 'ACTIVE' && backed ? paymentMoney(Math.max(0, Number(credit.remainingAmount))) : 0;
@@ -100,7 +102,8 @@ export async function patientCoveragePosition(req: Request, context: CoverageCon
                     status: credit.status, sourceType: credit.sourceType ?? null, sourceId: credit.sourceId ?? null,
                     expiresAt: credit.expiresAt ? String(credit.expiresAt).slice(0, 10) : null, backed, availableAmount,
                     canUse: availableAmount > 0 && creditAccess(req, context, 'quote', 'update'),
-                    canRefund: availableAmount > 0 && creditAccess(req, context, 'treasury', 'create')};
+                    canRefund: availableAmount > 0 && creditAccess(req, context, 'treasury', 'create'),
+                    canVoidAdvance: corrections.get(String(credit.id))?.canVoidAdvance === true};
             });
             result.creditsSummary = {verifiedRemaining: paymentMoney(result.credits.reduce((sum, credit) => sum + credit.availableAmount, 0)),
                 unverifiedCount: result.credits.filter(credit => credit.status === 'ACTIVE' && credit.remainingAmount > 0 && !credit.backed).length};

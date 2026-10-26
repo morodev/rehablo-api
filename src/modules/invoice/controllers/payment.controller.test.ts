@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it, TestContext } from 'node:test';
 import { Request, Response, NextFunction } from 'express';
 import { Op } from 'sequelize';
+import {randomUUID} from 'node:crypto';
 import { sequelize } from '../../../config/database.js';
 import Invoice from '../models/invoice.model.js';
 import InvoicePayment from '../models/invoicePayment.model.js';
@@ -12,7 +13,9 @@ import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import Tenant from '../../auth/models/tenant.model.js';
 import { Structure } from '../../auth/models/index.js';
 import administration from '../../administration/controllers/administration.controller.js';
-import { createPayment, voidPayment } from './payment.controller.js';
+import { createPayment, voidPayment, setLegacyPaymentDate } from './payment.controller.js';
+import {balanceEffectiveMovements, treasuryBalance} from '../../administration/services/treasuryLedger.service.js';
+import {mockFinancialOperations} from '../../administration/services/financialOperation.fixture.js';
 
 const id = '11111111-1111-4111-8111-111111111111';
 const structureId = '22222222-2222-4222-8222-222222222222';
@@ -38,6 +41,7 @@ function run(handler: (req: Request, res: Response, next: NextFunction) => void,
 }
 
 function fixture(t: TestContext) {
+    const operations = mockFinancialOperations(t);
     t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => []})) as any);
     const invoice = record({ id, structureId, patientID: userId, invoiceTotal: 100, status: 'unpaid', documentType: 'fattura',
         documentNumber: 1, emissionDate: '2025-01-01' });
@@ -50,13 +54,19 @@ function fixture(t: TestContext) {
     const queries: Array<{ sql: string; options: any }> = [];
     const invoiceWhere: any[] = [];
     let failMovement = false;
+    let failCorrection = false;
     let tail = Promise.resolve();
     t.mock.method(sequelize, 'transaction', ((work: any) => {
         const task = tail.then(async () => {
-            const counts = [payments.length, movements.length];
+            const counts = [payments.length, movements.length, operations.length, accounts.length];
             const status = invoice.status;
+            const previousPayments = payments.map(payment => ({...payment.get({plain:true})}));
+            const previousMovements = movements.map(movement => ({...movement.get({plain:true})}));
             try { return await work({ LOCK: { UPDATE: 'UPDATE' } }); }
-            catch (error) { payments.length = counts[0]; movements.length = counts[1]; invoice.status = status; throw error; }
+            catch (error) { payments.length = counts[0]; movements.length = counts[1]; operations.length = counts[2]; accounts.length = counts[3];
+                previousPayments.forEach((previous,index)=>payments[index]?.set(previous));
+                previousMovements.forEach((previous,index)=>Object.assign(movements[index],previous));
+                invoice.status = status; throw error; }
         });
         tail = task.then(() => undefined, () => undefined);
         return task;
@@ -80,7 +90,11 @@ function fixture(t: TestContext) {
             return payment;
         }
     })) as any);
-    t.mock.method(FinancialAccount, 'schema', (() => ({ findOne: async ({ where }: any) => accounts.find(account => account.id === where.id && account.isActive) })) as any);
+    t.mock.method(FinancialAccount, 'schema', (() => ({
+        findOne: async ({ where }: any) => accounts.find(account => account.id === where.id && account.isActive),
+        findAll: async () => accounts.filter(account => account.isActive && (!account.structureId || account.structureId === structureId)),
+        create: async (values: any) => {const account = record({id: accountId, ...values}); accounts.push(account); return account;}
+    })) as any);
     t.mock.method(PaymentMethod, 'schema', (() => ({ findOne: async ({ where }: any) => where.id === methodId ? record({ id: methodId, label: 'Bonifico', isActive: true }) : null })) as any);
     t.mock.method(Structure, 'findOne', (async ({ where }: any) => where.id === structureId && where.tenantId === tenantId ? record({ id: structureId, tenantId }) : null) as any);
     t.mock.method(TreasuryMovement, 'schema', (() => ({
@@ -88,7 +102,8 @@ function fixture(t: TestContext) {
             ? movement.sourceType === where.sourceType && movement.sourceId === where.sourceId && movement.status === where.status
             : movement.idempotencyKey === where.idempotencyKey),
         count: async ({ where }: any) => movements.filter(movement => movement.reversalOfId === where.reversalOfId && movement.status === where.status).length,
-        create: async (payload: any) => { const movement = record(payload); movements.push(movement); return movement; }
+        create: async (payload: any) => { if (failCorrection && payload.sourceType === 'INVOICE_PAYMENT_CORRECTION') throw new Error('simulated correction failure');
+            const movement = record({id:randomUUID(), ...payload}); movements.push(movement); return movement; }
     })) as any);
     t.mock.method(PatientCredit, 'schema', (() => ({
         create: async (payload: any) => { const credit = record(payload); credits.push(credit); return credit; }
@@ -97,12 +112,19 @@ function fixture(t: TestContext) {
         queries.push({ sql, options });
         if (sql.includes('pg_advisory_xact_lock')) return [[], {}];
         if (sql.startsWith('SELECT COALESCE')) return [[{ structureId }], {}];
+        if (sql.includes('FROM') && sql.includes('treasury_movements') && sql.includes('FOR UPDATE'))
+            return [movements.filter(row => ['INVOICE_PAYMENT','INVOICE_PAYMENT_CORRECTION'].includes(row.sourceType)
+                && row.status === 'POSTED' && row.sourceId === options.replacements.sourceId)
+                .sort((a,b)=>Number(b.sourceType==='INVOICE_PAYMENT_CORRECTION')-Number(a.sourceType==='INVOICE_PAYMENT_CORRECTION')).slice(0,1), {}];
         if (sql.startsWith('SELECT "id"')) return [[{ id: accountId }], {}];
         if (sql.includes('INSERT INTO') && sql.includes('treasury_movements')) {
             if (failMovement) throw new Error('simulated database failure');
             const values = options.replacements;
-            if (sql.includes("'INVOICE_PAYMENT_VOID'")) movements.push(record({ ...values, sourceType: 'INVOICE_PAYMENT_VOID', direction: 'OUT', status: 'POSTED' }));
-            else if (!movements.some(row => row.sourceId === values.sourceId)) movements.push(record({ ...values, sourceType: 'INVOICE_PAYMENT', status: 'POSTED' }));
+            if (sql.includes("'INVOICE_PAYMENT_VOID'")) {
+                const original=movements.find(row=>row.id===values.originalId);
+                movements.push(record({...original,...values,sourceType:'INVOICE_PAYMENT_VOID',reversalOfId:values.originalId,
+                    occurredAt:new Date(),direction:'OUT',status:'POSTED'}));
+            } else if (!movements.some(row => row.sourceId === values.sourceId)) movements.push(record({ ...values, sourceType: 'INVOICE_PAYMENT', direction:'IN', status: 'POSTED' }));
             return [[], {}];
         }
         throw new Error('Unexpected SQL: ' + sql);
@@ -114,7 +136,8 @@ function fixture(t: TestContext) {
         body: { amount: 60, paidAt: '2025-01-15', accountId, paymentMethodId: methodId, note: 'Acconto' },
         header: () => 'receipt-test-1'
     };
-    return { req, invoice, invoices, appointments, accounts, payments, movements, credits, queries, invoiceWhere, failMovement: () => { failMovement = true; } };
+    return { req, invoice, invoices, appointments, accounts, payments, movements, credits, queries, invoiceWhere, operations,
+        failMovement: () => { failMovement = true; }, failCorrection: () => {failCorrection = true;} };
 }
 
 describe('invoice receipt controller and treasury hook', () => {
@@ -287,15 +310,50 @@ describe('invoice receipt controller and treasury hook', () => {
         assert.equal((await run(createPayment, f.req)).status, 400);
         assert.equal(f.payments.length, 0);
     });
-    it('preserves legacy invoice callers and their automatic treasury mirroring', async t => {
+    it('auto-selects the unique account while preserving an explicit retry identity', async t => {
         const f = fixture(t);
         delete f.req.body.accountId;
         delete f.req.body.paymentMethodId;
-        f.req.header = () => undefined;
         assert.equal((await run(createPayment, f.req)).status, 201);
         assert.equal(f.movements.length, 1);
         assert.equal(f.movements[0].accountId, accountId);
-        assert.equal(f.movements[0].idempotencyKey, null);
+        assert.equal(f.movements[0].idempotencyKey, 'receipt-test-1');
+    });
+    it('creates a zero-opening site cash account atomically when no active account is available', async t => {
+        const f = fixture(t); f.accounts.length = 0;
+        delete f.req.body.accountId; delete f.req.body.paymentMethodId;
+        assert.equal((await run(createPayment, f.req)).status, 201);
+        assert.equal(f.accounts.length, 1); assert.equal(f.accounts[0].openingBalance, 0);
+        assert.equal(f.accounts[0].structureId, structureId); assert.equal(f.movements[0].accountId, accountId);
+        assert.equal((await run(createPayment, f.req)).status, 200);
+        assert.equal(f.accounts.length, 1); assert.equal(f.payments.length, 1);
+    });
+    it('rejects ambiguous accounts and leaves payment, balance and operation unchanged', async t => {
+        const f = fixture(t); f.accounts.push(record({id: methodId, structureId, isActive: true}));
+        delete f.req.body.accountId; delete f.req.body.paymentMethodId;
+        assert.equal((await run(createPayment, f.req)).status, 422);
+        assert.equal(f.payments.length, 0); assert.equal(f.movements.length, 0); assert.equal(f.invoice.status, 'unpaid');
+        f.req.body.accountId = methodId;
+        assert.equal((await run(createPayment, f.req)).status, 201);
+        assert.equal(f.movements[0].accountId, methodId);
+    });
+    it('rolls back automatic cash-account creation when the receipt ledger insert fails', async t => {
+        const f = fixture(t); f.accounts.length = 0; f.failMovement();
+        delete f.req.body.accountId; delete f.req.body.paymentMethodId;
+        assert.equal((await run(createPayment, f.req)).status, 500);
+        assert.equal(f.accounts.length, 0); assert.equal(f.payments.length, 0); assert.equal(f.movements.length, 0);
+    });
+    it('requires a retry identity before writing any money', async t => {
+        const f = fixture(t); f.req.header = () => undefined;
+        assert.equal((await run(createPayment, f.req)).status, 400);
+        assert.equal(f.payments.length, 0); assert.equal(f.movements.length, 0);
+    });
+    it('preserves retries created before operation records were introduced', async t => {
+        const f=fixture(t);
+        assert.equal((await run(createPayment,f.req)).status,201);
+        f.operations.length=0;
+        assert.equal((await run(createPayment,f.req)).status,200);
+        assert.equal(f.payments.length,1);assert.equal(f.movements.length,1);assert.equal(f.operations.length,1);
     });
     it('keeps the patient restriction in actual SQL for structure and own permission scopes', async t => {
         const f = fixture(t);
@@ -428,6 +486,7 @@ describe('manual treasury controller validation', () => {
     function manual(t: TestContext) {
         const f = fixture(t);
         f.req.body = { accountId, structureId, amount: 25, direction: 'IN', occurredAt: '2025-01-15T12:00:00.000Z', paymentMethodId: '', description: 'Versamento' };
+        f.req.user.isSuperAdmin = true;
         f.req.access.resource = 'treasury';
         return f;
     }
@@ -439,11 +498,11 @@ describe('manual treasury controller validation', () => {
         assert.deepEqual(insertion.bind, [null]);
         assert.doesNotMatch(insertion.query, /''/);
     });
-    for (const [field, value] of [['amount', 0], ['direction', 'TRANSFER'], ['occurredAt', '2025-02-30T12:00:00.000Z'], ['accountId', ''], ['paymentMethodId', 'invalid']]) {
+    for (const [field, value] of [['amount', 0], ['direction', 'TRANSFER'], ['occurredAt', '2025-02-30T12:00:00.000Z'], ['accountId', 'invalid'], ['paymentMethodId', 'invalid']]) {
         it('rejects invalid ' + field + ' before insert', async t => {
             const f = manual(t);
             f.req.body[field] = value;
-            assert.equal((await run(administration.create('treasuryMovements'), f.req)).status, 400);
+            assert.equal((await run(administration.create('treasuryMovements'), f.req)).status, ['amount', 'occurredAt'].includes(field as string) ? 422 : 400);
             assert.equal(f.movements.length, 0);
         });
     }
@@ -467,4 +526,49 @@ it('does not create retained cash credit from a previous opening balance', async
     assert.equal(f.credits.length, 0);
     assert.equal(f.movements.length, 0);
     assert.equal(previous.status, 'POSTED');
+});
+
+describe('completing legacy receipt dates without rewriting the posted ledger', () => {
+    async function legacy(t:TestContext) {
+        const f=fixture(t);
+        assert.equal((await run(createPayment,f.req)).status,201);
+        const payment=f.payments[0]; payment.set('source','LEGACY_IMPORT');payment.set('paidAt',null);
+        t.mock.method(payment,'update',(async(values:any,options:any)=>{
+            payment.set(values);await (ScopedPayment as any).runHooks('afterUpdate',payment,options);return payment;
+        }) as any);
+        f.req.params.paymentId=payment.id;f.req.body={paidAt:'2025-01-10'};
+        return {...f,payment};
+    }
+    it('appends an old-date offset and dated replacement on the same account, then replays without duplicates',async t=>{
+        const f=await legacy(t);const original=f.movements[0];const oldDate=original.occurredAt;
+        assert.equal((await run(setLegacyPaymentDate,f.req)).status,200);
+        assert.equal(f.movements.length,3);assert.equal(original.status,'VOID');assert.equal(original.occurredAt,oldDate);
+        const offset=f.movements[1],corrected=f.movements[2];
+        assert.equal(offset.sourceType,'INVOICE_PAYMENT_DATE_VOID');assert.equal(offset.reversalOfId,original.id);
+        assert.equal(corrected.sourceType,'INVOICE_PAYMENT_CORRECTION');
+        assert.ok([offset,corrected].every(row=>row.accountId===accountId&&row.paymentMethodId===methodId&&Number(row.amount)===60));
+        assert.equal(treasuryBalance(balanceEffectiveMovements(f.movements)),60);
+        const earlier=balanceEffectiveMovements(f.movements).filter(row=>new Date(row.occurredAt)<new Date('2025-01-12'));
+        assert.equal(treasuryBalance(earlier),60);
+        assert.equal((await run(setLegacyPaymentDate,f.req)).status,200);assert.equal(f.movements.length,3);
+        f.req.body.paidAt='2025-01-11';assert.equal((await run(setLegacyPaymentDate,f.req)).status,409);
+    });
+    it('rolls back the original status, both correction rows and payment date if the new entry fails',async t=>{
+        const f=await legacy(t);f.failCorrection();
+        assert.equal((await run(setLegacyPaymentDate,f.req)).status,500);
+        assert.equal(f.movements.length,1);assert.equal(f.movements[0].status,'POSTED');assert.equal(f.payment.paidAt,null);
+        assert.equal(treasuryBalance(balanceEffectiveMovements(f.movements)),60);
+    });
+    it('records an unknown historical date without inventing an account receipt',async t=>{
+        const f=await legacy(t);f.movements.length=0;
+        assert.equal((await run(setLegacyPaymentDate,f.req)).status,200);assert.equal(f.movements.length,0);
+        assert.equal(new Date(f.payment.paidAt).toISOString().slice(0,10),'2025-01-10');
+    });
+    it('voids the replacement receipt after a date correction and attributes the reversal to the current operator',async t=>{
+        const f=await legacy(t);assert.equal((await run(setLegacyPaymentDate,f.req)).status,200);
+        const corrected=f.movements[2];f.req.body={reason:'Rimborso effettivo'};
+        assert.equal((await run(voidPayment,f.req)).status,200);
+        assert.equal(f.movements[3].reversalOfId,corrected.id);assert.equal(f.movements[3].createdByUserId,userId);
+        assert.equal(treasuryBalance(balanceEffectiveMovements(f.movements)),0);
+    });
 });

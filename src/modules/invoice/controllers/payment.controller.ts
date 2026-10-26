@@ -15,6 +15,7 @@ import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import { syncInvoicePaymentStatus } from '../services/payment.service.js';
 import { syncAppointmentPaymentStatus } from '../services/appointmentPayment.service.js';
 import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
+import {beginFinancialOperation, financialOperationKey} from '../../administration/services/financialOperation.service.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
@@ -54,9 +55,7 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
     if (!UUID_REGEX.test(req.params.invoiceId)) return sendErrorResponse(res, 400, 'Fattura non valida');
     const accountId = nullableTreasuryUuid(req.body?.accountId, 'Conto');
     const paymentMethodId = nullableTreasuryUuid(req.body?.paymentMethodId, 'Metodo di pagamento');
-    const idempotencyKey = req.header('Idempotency-Key')?.trim() || null;
-    if (idempotencyKey && idempotencyKey.length > 128) return sendErrorResponse(res, 400, 'Identificativo della registrazione non valido');
-    if (!accountId && (paymentMethodId || idempotencyKey)) return sendErrorResponse(res, 400, 'Seleziona il conto su cui registrare l’incasso');
+    const idempotencyKey = financialOperationKey(req);
     const amount = Number(req.body?.amount);
     const paidAt = req.body?.paidAt;
     if (!Number.isFinite(amount) || Math.round(amount * 100) < 1) {
@@ -97,23 +96,6 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
         let structureId = invoice.structureId ?? req.access?.structureId;
         const method = typeof req.body?.method === 'string' ? req.body.method.trim() || null : null;
         const note = typeof req.body?.note === 'string' ? req.body.note.trim() || null : null;
-        if (idempotencyKey) {
-            const previous = await TreasuryMovement.schema(schema).findOne({ where: { idempotencyKey }, transaction });
-            if (previous) {
-                const sameMovement = previous.get('sourceType') === 'INVOICE_PAYMENT'
-                    && previous.get('invoiceId') === invoice.id && previous.get('accountId') === accountId
-                    && (previous.get('paymentMethodId') ?? null) === paymentMethodId
-                    && Number(previous.get('amount')) === Math.round(amount * 100) / 100
-                    && new Date(previous.get('occurredAt') as string).toISOString().slice(0, 10) === paidAt;
-                if (!sameMovement) treasuryError('Questa registrazione è già stata usata con dati diversi. Riapri il modulo per registrare un nuovo incasso', 409);
-                const payment = await InvoicePayment.schema(schema).findOne({ where: { id: previous.get('sourceId') as string, invoiceId: invoice.id }, transaction });
-                if (!payment || payment.status !== 'POSTED' || (payment.note ?? null) !== note
-                    || (!paymentMethodId && (payment.method ?? null) !== method)) {
-                    treasuryError('Questa registrazione è già stata usata o annullata. Riapri il modulo per registrare un nuovo incasso', 409);
-                }
-                return { kind: 'replayed', payment, summary: await syncInvoicePaymentStatus(schema, invoice.id, transaction) } as const;
-            }
-        }
         const selectedMethod = paymentMethodId ? await validateTreasuryMethod(schema, paymentMethodId, transaction) : null;
         if (accountId) {
             // A legacy invoice can have no site. Tenant-wide access may use the selected account's site.
@@ -128,10 +110,32 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
             });
             if (!structure) treasuryError('La sede selezionata non è disponibile');
         }
-        const createOptions: InvoicePaymentCreateOptions = { transaction };
-        if (accountId) createOptions.treasuryContext = {
-            accountId, structureId: structureId!, paymentMethodId, idempotencyKey
-        };
+        if (!structureId) treasuryError('Seleziona la sede dell’incasso', 422);
+        const operation = await beginFinancialOperation(req, 'INVOICE_PAYMENT', structureId, transaction);
+        if (operation.replay) {
+            const payment = await InvoicePayment.schema(schema).findOne({where: {id: operation.replay.paymentId, invoiceId: invoice.id}, transaction});
+            if (!payment || payment.status !== 'POSTED') treasuryError('L’incasso è stato modificato: aggiorna la posizione', 409);
+            return {kind: 'replayed', payment, summary: await syncInvoicePaymentStatus(schema, invoice.id, transaction)} as const;
+        }
+        // Preserve retries issued before the immutable operation registry was introduced.
+        const legacyReceipt = await TreasuryMovement.schema(schema).findOne({where: {idempotencyKey}, transaction});
+        if (legacyReceipt) {
+            const same = legacyReceipt.get('sourceType') === 'INVOICE_PAYMENT' && legacyReceipt.get('invoiceId') === invoice.id
+                && (!accountId || legacyReceipt.get('accountId') === accountId)
+                && (legacyReceipt.get('paymentMethodId') ?? null) === paymentMethodId
+                && Number(legacyReceipt.get('amount')) === Math.round(amount * 100) / 100
+                && new Date(legacyReceipt.get('occurredAt') as string).toISOString().slice(0, 10) === paidAt;
+            const payment = same ? await InvoicePayment.schema(schema).findOne({where: {
+                id: legacyReceipt.get('sourceId') as string, invoiceId: invoice.id}, transaction}) : null;
+            if (!payment || payment.status !== 'POSTED' || (payment.note ?? null) !== note
+                || (!paymentMethodId && (payment.method ?? null) !== method))
+                treasuryError('Questa registrazione è già stata usata o annullata', 409);
+            await operation.complete({paymentId: payment.id});
+            return {kind: 'replayed', payment, summary: await syncInvoicePaymentStatus(schema, invoice.id, transaction)} as const;
+        }
+        const createOptions: InvoicePaymentCreateOptions = { transaction, treasuryContext: {
+            accountId: accountId ?? undefined, structureId, paymentMethodId, idempotencyKey
+        }};
         const summary = await syncInvoicePaymentStatus(schema, invoice.id, transaction);
         if (amount > summary.balance + 0.009) {
             return { kind: 'overpayment', balance: summary.balance } as const;
@@ -158,6 +162,7 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
             createOptions
         );
         const updatedSummary = await syncInvoicePaymentStatus(schema, invoice.id, transaction);
+        await operation.complete({paymentId: payment.id});
         return { kind: 'created', payment, summary: updatedSummary } as const;
     });
 
@@ -209,6 +214,9 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
             if (!patientId || voidedAmount <= 0) return { kind: 'credit-unavailable' } as const;
             // A retained credit needs a real receipt that has not already been refunded.
             const receipt = await TreasuryMovement.schema(schema).findOne({
+                where: { sourceType: 'INVOICE_PAYMENT_CORRECTION', sourceId: payment.id, status: 'POSTED' },
+                transaction, lock: transaction.LOCK.UPDATE
+            }) ?? await TreasuryMovement.schema(schema).findOne({
                 where: { sourceType: 'INVOICE_PAYMENT', sourceId: payment.id, status: 'POSTED' },
                 transaction, lock: transaction.LOCK.UPDATE
             });
@@ -254,6 +262,7 @@ export const voidPayment = asyncHandler(async (req: Request, res: Response) => {
 });
 
 export const setLegacyPaymentDate = asyncHandler(async (req: Request, res: Response) => {
+    if (!UUID_REGEX.test(req.params.paymentId)) return sendErrorResponse(res, 400, 'Pagamento non valido');
     const paidAt = req.body?.paidAt;
     if (!isValidDateOnly(paidAt)) {
         return sendErrorResponse(res, 400, 'Data di pagamento non valida');
@@ -275,8 +284,31 @@ export const setLegacyPaymentDate = asyncHandler(async (req: Request, res: Respo
             where: { id: req.params.paymentId, invoiceId: invoice.id }, transaction, lock: transaction.LOCK.UPDATE
         });
         if (!payment) return { kind: 'missing' } as const;
-        if (payment.source !== 'LEGACY_IMPORT' || payment.paidAt || payment.status !== 'POSTED') return { kind: 'immutable' } as const;
-        await payment.update({ paidAt: new Date(`${paidAt}T12:00:00.000Z`) }, { transaction });
+        if (payment.source !== 'LEGACY_IMPORT' || payment.status !== 'POSTED') return { kind: 'immutable' } as const;
+        if (payment.paidAt) return new Date(payment.paidAt).toISOString().slice(0, 10) === paidAt
+            ? {kind: 'updated', payment} as const : {kind: 'immutable'} as const;
+        const original = await TreasuryMovement.schema(req.tenantSchema!).findOne({where: {
+            sourceType: 'INVOICE_PAYMENT', sourceId: payment.id, status: 'POSTED'}, transaction, lock: transaction.LOCK.UPDATE});
+        if (original) {
+            const originalDate = new Date(original.get('occurredAt') as string);
+            if (Number(original.get('amount')) !== Number(payment.amount) || !Number.isFinite(originalDate.getTime())
+                || await TreasuryMovement.schema(req.tenantSchema!).count({where: {reversalOfId: original.get('id'), status:'POSTED'}, transaction}))
+                treasuryError('L’incasso storico richiede riconciliazione prima di completare la data', 409);
+            if (originalDate.toLocaleDateString('en-CA', {timeZone:'Europe/Rome'}) !== paidAt) {
+                const common = {accountId: original.get('accountId'), structureId: original.get('structureId'),
+                    amount: original.get('amount'), invoiceId: original.get('invoiceId') ?? invoice.id,
+                    paymentMethodId: original.get('paymentMethodId') ?? null, counterparty: original.get('counterparty') ?? null,
+                    status: 'POSTED', sourceId: payment.id, createdByUserId: getUserId(req)};
+                await original.update({status:'VOID', voidReason:'Completamento data incasso storico'}, {transaction});
+                await TreasuryMovement.schema(req.tenantSchema!).create({...common, direction:'OUT', category:'PAYMENT_DATE_CORRECTION',
+                    occurredAt: original.get('occurredAt'), reversalOfId: original.get('id'), sourceType:'INVOICE_PAYMENT_DATE_VOID',
+                    description:'Rettifica data incasso precedente', idempotencyKey:`legacy_date_${payment.id}_void`}, {transaction});
+                await TreasuryMovement.schema(req.tenantSchema!).create({...common, direction:'IN', category:'INVOICE_PAYMENT',
+                    occurredAt:new Date(`${paidAt}T12:00:00.000Z`), sourceType:'INVOICE_PAYMENT_CORRECTION',
+                    description:'Data incasso precedente completata', idempotencyKey:`legacy_date_${payment.id}_corrected`}, {transaction});
+            }
+        }
+        await payment.update({ paidAt: new Date(`${paidAt}T12:00:00.000Z`) }, { transaction, completeHistoricalDate: true } as any);
         return { kind: 'updated', payment } as const;
     });
     if (result.kind === 'missing') return sendErrorResponse(res, 404, 'Pagamento non trovato');

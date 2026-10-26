@@ -39,6 +39,7 @@ router.get('/reminders', requirePermission('reminder', 'read'), reminderControll
 router.get('/reminder-assignees', requireAnyPermission(['reminder', 'create'], ['reminder', 'update']), reminderController.getAssignableReminderUsers);
 router.post('/reminder-alerts/claim', requirePermission('reminder', 'read'), reminderController.claimReminderAlerts);
 router.post('/reminders', requirePermission('reminder', 'create'), reminderController.createReminder);
+router.get('/reminders/:reminderId', requirePermission('reminder', 'read'), reminderController.getReminderById);
 router.patch('/reminders/:reminderId', requirePermission('reminder', 'update'), reminderController.updateReminder);
 router.patch('/reminders/:reminderId/complete', requirePermission('reminder', 'update'), reminderController.completeReminder);
 router.patch('/reminders/:reminderId/snooze', requirePermission('reminder', 'update'), reminderController.snoozeReminderAlert);

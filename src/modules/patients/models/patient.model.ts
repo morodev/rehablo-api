@@ -1,5 +1,6 @@
-import { DataTypes, Model, Optional } from 'sequelize';
+import { DataTypes, Model, Optional, Op } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
+import {completePatientContactReminders} from '../services/patientContactCompletion.service.js';
 
 export const PATIENT_COLORS = [
     'blue',
@@ -213,5 +214,30 @@ Patient.init(
     }
 );
 
+function scopedPatientSchema(model: typeof Patient): string | null {
+    const table = model.getTableName();
+    return typeof table === 'object' && /^rehablo_[a-f0-9]{32}$/i.test(table.schema) ? table.schema : null;
+}
+Patient.addHook('afterUpdate', 'completeContactFollowUps', async (patient, options) => {
+    if (!['emails', 'phoneNumbers', 'archivedAt'].some(field => patient.changed(field as any))) return;
+    const schema = scopedPatientSchema(patient.constructor as typeof Patient);
+    if (schema) await completePatientContactReminders(schema, patient.get({plain: true}), options.transaction ?? undefined);
+});
+Patient.addHook('beforeBulkUpdate', 'captureContactFollowUpPatients', async options => {
+    if (!['emails', 'phoneNumbers', 'archivedAt'].some(field => Object.hasOwn((options as any).attributes ?? {}, field))) return;
+    const model = ((options as any).model ?? Patient) as typeof Patient;
+    if (!scopedPatientSchema(model)) return;
+    const patients = await model.findAll({where: options.where, transaction: options.transaction, attributes: ['id']});
+    (options as any).contactFollowUpPatientIds = patients.map(patient => patient.id);
+});
+Patient.addHook('afterBulkUpdate', 'completeContactFollowUps', async options => {
+    if (!['emails', 'phoneNumbers', 'archivedAt'].some(field => Object.hasOwn((options as any).attributes ?? {}, field))) return;
+    const model = ((options as any).model ?? Patient) as typeof Patient, schema = scopedPatientSchema(model);
+    const ids = (options as any).contactFollowUpPatientIds as string[] | undefined;
+    if (!schema || !ids?.length) return;
+    const patients = await model.findAll({where: {id: {[Op.in]: ids}}, transaction: options.transaction,
+        attributes: ['id', 'emails', 'phoneNumbers', 'archivedAt']});
+    for (const patient of patients) await completePatientContactReminders(schema, patient.get({plain: true}), options.transaction ?? undefined);
+});
 export default Patient;
 

@@ -10,6 +10,8 @@ import Patient from '../../patients/models/patient.model.js';
 import { Expense, FinancialAccount, PaymentMethod, PurchaseDocument, Reconciliation, Supplier, TreasuryMovement } from '../models/index.js';
 import { AdministrationQueryError, parseAdministrationUuid, resolveAdministrationDateRange, resolveAdministrationStructure } from '../services/administrationQuery.service.js';
 import { balanceEffectiveMovements } from '../services/treasuryLedger.service.js';
+import {decorateExpensePayments} from '../services/financialOperations.service.js';
+import {economicMovements} from '../services/financialMovementPolicy.service.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 
@@ -19,7 +21,8 @@ const money = (value: number): number => Math.round(value * 100) / 100;
 const CATEGORY_LABELS: Record<string, string> = {
     COLLECTION: 'Incasso', INVOICE_PAYMENT: 'Incasso fattura', PAYMENT_VOID: 'Storno incasso',
     INVOICE_PAYMENT_VOID: 'Storno incasso fattura', SUPPLIER_PAYMENT: 'Pagamento fornitore',
-    REFUND: 'Rimborso', REVERSAL: 'Storno', OTHER: 'Altro'
+    REFUND: 'Rimborso', REVERSAL: 'Storno', OTHER: 'Altro', INTERNAL_TRANSFER: 'Trasferimento tra conti',
+    SUPPLIER_PAYMENT_VOID: 'Storno pagamento spesa', PATIENT_ADVANCE_VOID: 'Storno anticipo', PATIENT_REFUND_VOID: 'Storno rimborso'
 };
 const UUID_IN_TEXT = /\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi;
 
@@ -160,11 +163,13 @@ export const listTreasuryMovements = asyncHandler(async (req, res) => {
     // Resolve only the minimal display data, under the agenda and patient permissions.
     const agendaReq = relatedRequest(req, 'agenda');
     const patientReq = relatedRequest(req, 'patient');
-    const appointmentPayments = agendaReq ? await entities(InvoicePayment, schema,
-        rows.filter(row => !row.invoiceId && ['INVOICE_PAYMENT', 'INVOICE_PAYMENT_VOID'].includes(String(row.sourceType)))
-            .map(row => row.sourceId), {}, ['id', 'agendaEventId']) : new Map<string, Plain>();
+    // A receipt's origin is ledger metadata. Resolve only its classification here;
+    // patient and appointment details still require their independent read scope.
+    const receiptPayments = await entities(InvoicePayment, schema,
+        rows.filter(row => ['INVOICE_PAYMENT', 'INVOICE_PAYMENT_VOID', 'INVOICE_PAYMENT_CORRECTION'].includes(String(row.sourceType)))
+            .map(row => row.sourceId), {}, ['id', 'agendaEventId', 'carePackageId', 'source']);
     const appointments = agendaReq ? await entities(AgendaEvent, schema,
-        [...appointmentPayments.values()].map(row => row.agendaEventId),
+        [...receiptPayments.values()].map(row => row.agendaEventId),
         { [Op.and]: [scope, scopeWhere(agendaReq, { ownerField: 'calendarId', structureField: 'structureId' })] },
         ['id', 'start', 'patientId']) : new Map<string, Plain>();
     const appointmentPatients = patientReq ? await entities(Patient, schema,
@@ -177,7 +182,9 @@ export const listTreasuryMovements = asyncHandler(async (req, res) => {
         const invoice = invoices.get(String(row.invoiceId));
         const expense = expenses.get(String(row.expenseId));
         const patient = patients.get(String(invoice?.patientID));
-        const appointment = appointments.get(String(appointmentPayments.get(String(row.sourceId))?.agendaEventId));
+        const receipt = receiptPayments.get(String(row.sourceId));
+        const packageReceipt = Boolean(receipt?.carePackageId || receipt?.source === 'PACKAGE_PURCHASE');
+        const appointment = appointments.get(String(receipt?.agendaEventId));
         const appointmentPatient = appointmentPatients.get(String(appointment?.patientId));
         const supplier = suppliers.get(String(expense?.supplierId));
         const purchase = purchases.get(String(expense?.purchaseDocumentId));
@@ -191,7 +198,8 @@ export const listTreasuryMovements = asyncHandler(async (req, res) => {
             : supplier?.businessName || [appointmentPatient?.name, appointmentPatient?.surname].filter(Boolean).join(' ');
         return {
             ...row,
-            categoryLabel: appointment ? (row.reversalOfId ? 'Storno incasso seduta' : 'Incasso seduta')
+            categoryLabel: packageReceipt ? (row.reversalOfId ? 'Storno incasso pacchetto' : 'Incasso pacchetto')
+                : appointment ? (row.reversalOfId ? 'Storno incasso seduta' : 'Incasso seduta')
                 : CATEGORY_LABELS[String(row.category)] ?? String(row.category),
             accountName: accounts.get(String(row.accountId))?.name ?? null,
             paymentMethodName: methods.get(String(row.paymentMethodId))?.label ?? null,
@@ -213,7 +221,7 @@ export const listTreasuryMovements = asyncHandler(async (req, res) => {
         row.description, row.counterparty, row.documentLabel, row.accountName, row.paymentMethodName,
         row.structureName, row.categoryLabel
     ].some(value => String(value ?? '').toLocaleLowerCase('it').includes(filters.query!)));
-    const posted = enriched.filter(row => row.affectsBalance);
+    const posted = economicMovements(enriched.filter(row => row.affectsBalance));
     const income = posted.filter(row => row.direction === 'IN').reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0) / 100;
     const outcome = posted.filter(row => row.direction === 'OUT').reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0) / 100;
     return sendSuccessResponse(res, 200, {
@@ -237,7 +245,8 @@ export const getTreasuryExpense = asyncHandler(async (req, res) => {
         entities(Supplier, schema, [expense.supplierId], {}, ['id', 'businessName']),
         entities(PaymentMethod, schema, [expense.paymentMethodId], {}, ['id', 'label'])
     ]);
-    return sendSuccessResponse(res, 200, { ...expense,
+    const decorated = (await decorateExpensePayments(schema, [expense]))[0];
+    return sendSuccessResponse(res, 200, { ...decorated,
         supplierName: suppliers.get(String(expense.supplierId))?.businessName ?? null,
         paymentMethodName: methods.get(String(expense.paymentMethodId))?.label ?? null
     });

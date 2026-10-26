@@ -12,7 +12,8 @@ const cashSource = (row: Row) => !['PACKAGE', 'CREDIT', 'OPENING_BALANCE'].inclu
 /** A read projection only: never repairs dates, writes a mirror, or guesses a refund. */
 export function clinicalCashFacts(payments: Row[], movements: Row[] = [], credits: Row[] = [], creditMovements: Row[] = []) {
     const effective = balanceEffectiveMovements(movements);
-    const originals = new Map(effective.filter(row => row.sourceType === 'INVOICE_PAYMENT' && row.direction === 'IN')
+    const originals = new Map(effective.filter(row => ['INVOICE_PAYMENT', 'INVOICE_PAYMENT_CORRECTION'].includes(row.sourceType) && row.direction === 'IN')
+        .sort((left, right) => Number(left.sourceType === 'INVOICE_PAYMENT_CORRECTION') - Number(right.sourceType === 'INVOICE_PAYMENT_CORRECTION'))
         .map(row => [String(row.sourceId), row]));
     const facts: ClinicalCashFact[] = [];
     const warnings: FinancialWarning[] = [];
@@ -43,8 +44,17 @@ export function clinicalCashFacts(payments: Row[], movements: Row[] = [], credit
                 const cash = effective.find(row => row.id === refund.treasuryMovementId && row.direction === 'OUT'
                     && row.sourceType === 'PATIENT_CREDIT_REFUND' && row.sourceId === refund.id
                     && money(row.amount) === money(refund.amount));
-                if (cash) facts.push({ ...receipt, id: `treasury:${cash.id}`, sourceId: cash.id,
+                if (!cash) continue;
+                facts.push({ ...receipt, id: `treasury:${cash.id}`, sourceId: cash.id,
                     amount: -money(cash.amount), paidAt: cash.occurredAt, kind: 'refund' });
+                for (const reverse of creditMovements.filter(row => row.creditId === credit.id && row.type === 'REVERSE_REFUND'
+                    && row.reversalOfId === refund.id && money(row.amount) === money(refund.amount))) {
+                    const restored = effective.find(row => row.id === reverse.treasuryMovementId && row.direction === 'IN'
+                        && row.sourceType === 'PATIENT_REFUND_VOID' && row.sourceId === refund.id
+                        && row.reversalOfId === cash.id && row.accountId === cash.accountId && money(row.amount) === money(cash.amount));
+                    if (restored) facts.push({...receipt, id: `treasury:${restored.id}`, sourceId: restored.id,
+                        amount: money(restored.amount), paidAt: restored.occurredAt, kind: 'refund'});
+                }
             }
         }
     }

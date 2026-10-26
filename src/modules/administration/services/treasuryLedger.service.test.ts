@@ -303,6 +303,38 @@ it('overview cash totals include all selected movements rather than just the lat
     assert.equal(result.data.activities.length, 8);
 });
 
+it('overview includes compensated receipts and expense payments once and excludes transfers from economic totals', async t => {
+    fixture(t, [
+        original({status: 'VOID'}),
+        original({id: 'receipt-reversal', direction: 'OUT', reversalOfId: movementId}),
+        original({id: 'expense', direction: 'OUT', amount: 30, status: 'VOID', sourceType: 'EXPENSE_PAYMENT'}),
+        original({id: 'expense-reversal', amount: 30, reversalOfId: 'expense', sourceType: 'EXPENSE_PAYMENT_VOID'}),
+        original({id: 'unpaired-old-void', amount: 500, status: 'VOID'}),
+        original({id: 'transfer-out', direction: 'OUT', amount: 200, sourceType: 'TRANSFER_OUT'}),
+        original({id: 'transfer-in', amount: 200, sourceType: 'TRANSFER_IN'})
+    ]);
+    fiscalReadFixture(t);
+    const result = await runView(overview, {from: '2026-01-01', to: '2026-01-31'});
+    assert.equal(result.code, 200, result.error);
+    assert.equal(result.data.income, 130); assert.equal(result.data.outcome, 130); assert.equal(result.data.cashFlow, 0);
+    assert.equal(result.data.accounts[0].balance, 20);
+});
+
+it('overview resolves reversal pairs before period filtering and keeps their Rome calendar dates', async t => {
+    fixture(t, [
+        original({status: 'VOID', occurredAt: '2026-01-31T23:30:00Z'}),
+        original({id: otherId, direction: 'OUT', reversalOfId: movementId, occurredAt: '2026-03-01T12:00:00Z'})
+    ]);
+    fiscalReadFixture(t);
+    const receiptPeriod = await runView(overview, {from: '2026-02-01', to: '2026-02-28'});
+    assert.equal(receiptPeriod.code, 200, receiptPeriod.error);
+    assert.equal(receiptPeriod.data.income, 100); assert.equal(receiptPeriod.data.outcome, 0); assert.equal(receiptPeriod.data.cashFlow, 100);
+    const reversalPeriod = await runView(overview, {from: '2026-03-01', to: '2026-03-31'});
+    assert.equal(reversalPeriod.code, 200, reversalPeriod.error);
+    assert.equal(reversalPeriod.data.income, 0); assert.equal(reversalPeriod.data.outcome, 100); assert.equal(reversalPeriod.data.cashFlow, -100);
+    assert.equal(receiptPeriod.data.accounts[0].balance, 20); assert.equal(reversalPeriod.data.accounts[0].balance, 20);
+});
+
 it('a structure user cannot close a shared cash account or a cash account from another structure', async t => {
     const f = fixture(t), req = request(); req.access.scope = 'structure';
     f.account.structureId = null;

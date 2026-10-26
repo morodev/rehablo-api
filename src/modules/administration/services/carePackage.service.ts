@@ -12,7 +12,9 @@ import {syncInvoicePaymentStatus} from '../../invoice/services/payment.service.j
 import {isValidPaymentDate, paymentMoney} from '../../invoice/services/appointmentPayment.service.js';
 import {CarePackage, TreasuryMovement} from '../models/index.js';
 import {InvoicePaymentCreateOptions} from './invoicePaymentTreasury.service.js';
-import {TREASURY_UUID, treasuryError, validateTreasuryAccount, validateTreasuryMethod} from './treasuryValidation.service.js';
+import {TREASURY_UUID, treasuryError, nullableTreasuryUuid, validateTreasuryMethod} from './treasuryValidation.service.js';
+import {resolveFinancialAccount} from './financialAccountResolver.service.js';
+import {beginFinancialOperation} from './financialOperation.service.js';
 
 export const packageToday = () => new Date().toLocaleDateString('en-CA', {timeZone: 'Europe/Rome'});
 export function packageUuid(value: unknown, label = 'Identificativo'): string {
@@ -74,12 +76,12 @@ export function packageIdempotency(req: Request): string {
 export async function lockPackageOperation(schema: string, key: string, transaction: Transaction): Promise<void> {
     await sequelize.query('SELECT pg_advisory_xact_lock(hashtext(:schema), hashtext(:key))', {replacements: {schema, key}, transaction});
 }
-export interface PackageReceiptInput {amount: number; accountId: string; paymentMethodId: string; paidAt: string;}
+export interface PackageReceiptInput {amount: number; accountId: string | null; paymentMethodId: string | null; paidAt: string;}
 export function normalizePackageReceipt(value: Record<string, unknown>): PackageReceiptInput {
     const amount = Number(value?.amount), paidAt = String(value?.paidAt ?? packageToday());
     if (!Number.isFinite(amount) || amount <= 0 || Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-6) treasuryError('Importo incasso non valido');
     if (!isValidPaymentDate(paidAt)) treasuryError('La data dell’incasso deve essere valida e non futura');
-    return {amount: paymentMoney(amount), paidAt, accountId: packageUuid(value?.accountId, 'Conto'), paymentMethodId: packageUuid(value?.paymentMethodId, 'Metodo di pagamento')};
+    return {amount: paymentMoney(amount), paidAt, accountId: nullableTreasuryUuid(value?.accountId, 'Conto'), paymentMethodId: nullableTreasuryUuid(value?.paymentMethodId, 'Metodo di pagamento')};
 }
 export function packageMoneySummary(pack: Record<string, any>, payments: Array<Record<string, any>>) {
     const paidAmount = paymentMoney(payments.filter(payment => payment.status === 'POSTED')
@@ -91,27 +93,35 @@ export async function recordPackageReceipt(req: Request, pack: Model, input: Pac
     if (!pack.get('templateId')) treasuryError('Gli incassi dei pacchetti storici devono essere riconciliati nel percorso storico', 409);
     await packagePatient(req, pack.get('patientId'), 'payment', 'create', transaction);
     const schema = req.tenantSchema!, id = String(pack.get('id'));
+    const operation = await beginFinancialOperation(req, 'PACKAGE_RECEIPT', String(pack.get('structureId')), transaction);
+    if (operation.replay) {
+        const payment = await InvoicePayment.schema(schema).findOne({where: {id: operation.replay.paymentId, carePackageId: id}, transaction});
+        if (!payment) treasuryError('Registrazione del pacchetto non disponibile', 409);
+        return payment;
+    }
     const previous = await TreasuryMovement.schema(schema).findOne({where: {idempotencyKey: key}, transaction});
     if (previous) {
         const payment = await InvoicePayment.schema(schema).findOne({where: {id: String(previous.get('sourceId')), carePackageId: id}, transaction});
         if (!payment || payment.status !== 'POSTED' || previous.get('sourceType') !== 'INVOICE_PAYMENT'
             || Number(payment.amount) !== input.amount || String(payment.paidAt).slice(0, 10) !== input.paidAt
-            || previous.get('accountId') !== input.accountId || previous.get('paymentMethodId') !== input.paymentMethodId) {
+            || (input.accountId && previous.get('accountId') !== input.accountId) || (previous.get('paymentMethodId') ?? null) !== input.paymentMethodId) {
             treasuryError('Identificativo operazione già usato con dati diversi', 409);
         }
+        await operation.complete({paymentId: payment.id});
         return payment;
     }
-    await validateTreasuryAccount(schema, input.accountId, pack.get('structureId'), transaction);
+    const accountId = await resolveFinancialAccount(schema, String(pack.get('structureId')), input.accountId, transaction);
     const method = await validateTreasuryMethod(schema, input.paymentMethodId, transaction);
     const payments = await InvoicePayment.schema(schema).findAll({where: {carePackageId: id}, transaction});
     const summary = packageMoneySummary(pack.get({plain: true}), payments.map(row => row.get({plain: true})));
     if (input.amount > summary.balance + 0.009) treasuryError('L’incasso supera il residuo del pacchetto', 409);
-    const options: InvoicePaymentCreateOptions = {transaction, treasuryContext: {accountId: input.accountId,
+    const options: InvoicePaymentCreateOptions = {transaction, treasuryContext: {accountId,
         structureId: String(pack.get('structureId')), paymentMethodId: input.paymentMethodId, idempotencyKey: key}};
     const payment = await InvoicePayment.schema(schema).create({carePackageId: id, invoiceId: pack.get('invoiceId') as string | null,
-        agendaEventId: null, amount: input.amount, paidAt: new Date(input.paidAt + 'T12:00:00Z'), method: String(method!.get('label')),
+        agendaEventId: null, amount: input.amount, paidAt: new Date(input.paidAt + 'T12:00:00Z'), method: method ? String(method.get('label')) : null,
         source: 'PACKAGE_PURCHASE', status: 'POSTED', note: `Acquisto ${String(pack.get('name'))}`, createdByUserId: getUserId(req)}, options);
     if (pack.get('invoiceId')) await syncInvoicePaymentStatus(schema, String(pack.get('invoiceId')), transaction);
+    await operation.complete({paymentId: payment.id});
     return payment;
 }
 

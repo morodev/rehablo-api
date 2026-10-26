@@ -17,6 +17,7 @@ import ReminderNotificationActivation from '../models/reminderNotificationActiva
 import ReminderNotificationPreference from '../models/reminderNotificationPreference.model.js';
 import ReminderPushSubscription from '../models/reminderPushSubscription.model.js';
 import {baseReminderAlert, deliveryStillCurrent, dueExternalAlert} from './reminderExternalDelivery.policy.js';
+import {isPatientContactReminder} from './patientContactReminder.policy.js';
 
 const SWEEP_INTERVAL_MS = 60_000;
 const BATCH_SIZE = 20;
@@ -40,6 +41,7 @@ async function ensureActivation(): Promise<Date> {
 export async function enqueueSnoozedExternalAlert(
     schema: string, reminder: Reminder, userId: string, snoozedUntil: Date, transaction?: Transaction
 ): Promise<void> {
+    if (isPatientContactReminder(reminder)) return;
     const baseScheduledFor = baseReminderAlert(reminder);
     if (!baseScheduledFor) return;
     await ReminderExternalDelivery.schema(schema).findOrCreate({
@@ -59,9 +61,10 @@ async function discoverDueDeliveries(schema: string, activatedAt: Date, now: Dat
                 {remindAt: null, dueAt: {[Op.between]: [activatedAt, now]}}
             ]
         },
-        attributes: ['id', 'dueAt', 'remindAt', 'status']
+        attributes: ['id', 'dueAt', 'remindAt', 'status', 'sourceType']
     });
     for (const reminder of reminders) {
+        if (isPatientContactReminder(reminder)) continue;
         const baseScheduledFor = baseReminderAlert(reminder);
         if (!baseScheduledFor) continue;
         const assignments = await ReminderAssignment.schema(schema).findAll({

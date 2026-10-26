@@ -6,6 +6,7 @@ import patientController from '../controllers/patient.controller.js';
 import {createPatientSettlement, getPatientSettlementPosition} from '../controllers/patientSettlement.controller.js';
 import {getPatientCoveragePosition} from '../controllers/patientCoverage.controller.js';
 import {requireAdministrationFeature} from '../../administration/middleware/administrationFeature.js';
+import {getContactFollowUp, setContactFollowUp} from '../controllers/patientContactFollowUp.controller.js';
 
 const router = Router();
 
@@ -24,8 +25,9 @@ router.post('/patient/:patientId/privacy-document', requirePermission('patient',
 router.get('/patient/:patientId/privacy-document', requirePermission('patient', 'read'), patientController.downloadPrivacyDocument);
 router.patch('/patient/:patientId/default-event-type', requirePermission('patient', 'update'), patientController.setDefaultEventType);
 router.get('/patient/:patientId', requirePermission('patient', 'read'), patientController.findOne);
+router.get('/patient/:patientId/contact-follow-up', requirePermission('patient', 'read'), getContactFollowUp);
+router.put('/patient/:patientId/contact-follow-up', requirePermission('patient', 'read'), setContactFollowUp);
 router.put('/patient/:patientId', requirePermission('patient', 'update'), patientController.update);
 router.delete('/patient/:patientId', requirePermission('patient', 'delete'), patientController.deletePatient);
 
 export default router;
-

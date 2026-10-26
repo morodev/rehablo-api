@@ -1,4 +1,4 @@
-import { DataTypes, Model, Optional } from 'sequelize';
+import { DataTypes, Model, Optional, Op } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 
 export type ReminderStatus = 'OPEN' | 'DONE' | 'SNOOZED' | 'CANCELLED';
@@ -22,6 +22,7 @@ export interface ReminderAttributes {
     agendaEventId?: string | null;
     completedAt?: Date | null;
     snoozedUntil?: Date | null;
+    sourceType?: string | null;
 }
 
 export type ReminderCreationAttributes = Optional<
@@ -50,6 +51,7 @@ export class Reminder
     declare agendaEventId: string | null;
     declare completedAt: Date | null;
     declare snoozedUntil: Date | null;
+    declare sourceType: string | null;
 }
 
 Reminder.init(
@@ -78,13 +80,17 @@ Reminder.init(
         noteId: { type: DataTypes.UUID, allowNull: true },
         agendaEventId: { type: DataTypes.UUID, allowNull: true },
         completedAt: { type: DataTypes.DATE, allowNull: true },
-        snoozedUntil: { type: DataTypes.DATE, allowNull: true }
+        snoozedUntil: { type: DataTypes.DATE, allowNull: true },
+        sourceType: {type: DataTypes.STRING(40), allowNull: true}
     },
     {
         sequelize,
         modelName: 'reminder',
         tableName: 'reminders',
-        paranoid: true
+        paranoid: true,
+        indexes: [{name: 'reminders_personal_contacts_active_unique', unique: true,
+            fields: ['createdByUserId', 'patientId', 'structureId'],
+            where: {sourceType: 'PATIENT_MISSING_CONTACTS', status: {[Op.in]: ['OPEN', 'SNOOZED']}, deletedAt: null}}]
     }
 );
 

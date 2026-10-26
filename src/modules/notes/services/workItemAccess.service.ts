@@ -11,6 +11,8 @@ import Note from '../models/note.model.js';
 import NoteAssignment from '../models/noteAssignment.model.js';
 import Reminder from '../models/reminder.model.js';
 import ReminderAssignment from '../models/reminderAssignment.model.js';
+import ReminderAlertState from '../models/reminderAlertState.model.js';
+import {contactReminderOccurrenceAt, isPatientContactReminder, sameRomeReminderDay} from './patientContactReminder.policy.js';
 
 export interface WorkItemUserSummary {
     id: string;
@@ -193,10 +195,10 @@ export async function serializeNotes(req: Request, notes: Note[]): Promise<any[]
     });
 }
 
-export async function serializeReminders(req: Request, reminders: Reminder[]): Promise<any[]> {
+export async function serializeReminders(req: Request, reminders: Reminder[], options: {transaction?: Transaction; reference?: Date} = {}): Promise<any[]> {
     const ids = reminders.map(reminder => reminder.id);
     const rows = ids.length ? await ReminderAssignment.schema(req.tenantSchema!).findAll({
-        where: {reminderId: {[Op.in]: ids}}, raw: true
+        where: {reminderId: {[Op.in]: ids}}, raw: true, transaction: options.transaction
     }) : [];
     const byItem = new Map<string, string[]>();
     for (const row of rows as any[]) {
@@ -207,20 +209,31 @@ export async function serializeReminders(req: Request, reminders: Reminder[]): P
         ...reminders.flatMap(reminder => [reminder.createdByUserId, reminder.updatedByUserId ?? ''])
     ]);
     const currentUserId = req.access!.userId;
+    const automaticIds = reminders.filter(isPatientContactReminder).map(row => row.id);
+    const states = automaticIds.length ? await ReminderAlertState.schema(req.tenantSchema!).findAll({where: {reminderId: {[Op.in]: automaticIds}, userId: currentUserId}, transaction: options.transaction}) : [];
+    const statesById = new Map(states.map(state => [state.reminderId, state]));
     return reminders.map(reminder => {
         const assignedUserIds = byItem.get(reminder.id) ?? [];
         const isCreator = reminder.createdByUserId === currentUserId;
         const isAssigned = assignedUserIds.includes(currentUserId);
         const canUpdate = hasPermission(req, 'reminder', 'update');
+        const automatic = isPatientContactReminder(reminder);
+        const state = statesById.get(reminder.id), reference = options.reference ?? new Date();
+        let occurrence = contactReminderOccurrenceAt(reminder, reference);
+        if (automatic && ['OPEN', 'SNOOZED'].includes(reminder.status)) {
+            if (state?.snoozedUntil) occurrence = state.snoozedUntil;
+            else if (state?.scheduledFor && state.deliveredAt && sameRomeReminderDay(state.deliveredAt, reference)) occurrence = state.scheduledFor;
+        }
         return {
             ...reminder.get({plain: true}),
+            occurrenceAt: occurrence?.toISOString() ?? null,
             assignedUserIds,
             assignedUsers: assignedUserIds.map(id => people.get(id)).filter(Boolean),
             createdBy: people.get(reminder.createdByUserId) ?? null,
             updatedBy: reminder.updatedByUserId ? people.get(reminder.updatedByUserId) ?? null : null,
             capabilities: {
                 canEdit: (isCreator || isAssigned) && canUpdate,
-                canManageAssignments: isCreator && canUpdate,
+                canManageAssignments: !automatic && isCreator && canUpdate,
                 canDelete: isCreator && hasPermission(req, 'reminder', 'delete'),
                 canComplete: (isCreator || isAssigned) && canUpdate,
                 canSnooze: isAssigned && canUpdate

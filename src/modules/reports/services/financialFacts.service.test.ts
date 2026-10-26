@@ -41,6 +41,21 @@ describe('financial facts preserve monetary history without writes', () => {
         assert.equal(result.facts[1].kind, 'refund');
     });
 
+    it('keeps the refund and its correction in their respective periods without counting another receipt', () => {
+        const refund = {id: 'refund-cash', sourceType: 'PATIENT_CREDIT_REFUND', sourceId: 'refund', accountId: 'account',
+            amount: 30, direction: 'OUT', status: 'VOID', occurredAt: '2026-10-01T10:00:00Z'};
+        const restored = {id: 'refund-correction', sourceType: 'PATIENT_REFUND_VOID', sourceId: 'refund', accountId: 'account',
+            amount: 30, direction: 'IN', status: 'POSTED', reversalOfId: refund.id, occurredAt: '2026-11-01T10:00:00Z'};
+        const creditMovements = [{id: 'refund', type: 'REFUND', creditId: 'credit', treasuryMovementId: refund.id, amount: 30},
+            {id: 'reverse-refund', type: 'REVERSE_REFUND', creditId: 'credit', treasuryMovementId: restored.id, amount: 30, reversalOfId: 'refund'}];
+        const result = clinicalCashFacts([{...payment, status: 'CREDIT'}], [receipt, refund, restored],
+            [{id: 'credit', sourceType: 'VOID_CREDIT', sourceId: 'p'}], creditMovements);
+        assert.deepEqual(result.facts.map(row => [row.amount, row.kind]), [[100, 'receipt'], [-30, 'refund'], [30, 'refund']]);
+        const invalid = clinicalCashFacts([{...payment, status: 'CREDIT'}], [receipt, refund, {...restored, accountId: 'other'}],
+            [{id: 'credit', sourceType: 'VOID_CREDIT', sourceId: 'p'}], creditMovements);
+        assert.ok(invalid.facts.every(row => row.id !== 'treasury:' + restored.id));
+    });
+
     it('excludes preceding opening coverage from cash facts, daily totals and reconciliation warnings', () => {
         for (const paidAt of [null, '2026-09-10']) {
             const opening = {...payment, id: 'opening', source: 'OPENING_BALANCE', status: 'POSTED', paidAt};

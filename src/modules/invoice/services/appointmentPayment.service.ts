@@ -135,7 +135,7 @@ export async function ensureAppointmentPaymentHistory(schema: string, event: Age
             agendaEventId: event.id, invoiceId: event.invoiceId ?? null, amount,
             paidAt: event.appointmentPaidAt ? new Date(event.appointmentPaidAt + 'T12:00:00.000Z') : null,
             method: event.appointmentPaymentMethod, note: event.appointmentPaymentNote,
-            source: 'APPOINTMENT', status: 'POSTED', createdByUserId: event.appointmentPaymentRecordedBy
+            source: 'OPENING_BALANCE', status: 'POSTED', createdByUserId: event.appointmentPaymentRecordedBy
         }, { transaction });
         movements.push(movement);
     }

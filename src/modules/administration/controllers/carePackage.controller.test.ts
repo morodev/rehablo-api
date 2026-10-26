@@ -16,6 +16,7 @@ import InvoiceProduct from '../../invoice/models/invoiceProduct.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import {Tenant, Structure} from '../../auth/models/index.js';
+import {FinancialOperation} from '../models/financialOperation.model.js';
 import {createCarePackage, createPackagePayment, createPackageInvoice, voidPackagePayment, getCarePackage, listCarePackages, setupCarePackageBooking} from './carePackage.controller.js';
 import {packageMoneySummary, packagePatientWhere} from '../services/carePackage.service.js';
 
@@ -66,10 +67,10 @@ function fixture(t: TestContext) {
         serviceName: 'Fisioterapia', sessionCount: 10, totalPrice: 400, validityDays: null, isActive: true})]);
     const packages = install(CarePackage), events = install(AgendaEvent), invoices = install(Invoice), lines = install(InvoiceService), ledger = install(TreasuryMovement);
     const quotes = install(Quote);
-    install(PackageConsumption); install(InvoiceProduct); install(InvoiceAgendaEvent); install(ServiceStructure); install(ProductStructure); install(Product);
+    install(PackageConsumption); install(InvoiceProduct); install(InvoiceAgendaEvent); install(ServiceStructure); install(ProductStructure); install(Product); install(FinancialOperation);
     install(Patient, [record({id: patientId, name: 'Mario', surname: 'Rossi', structureId})]);
     const services = install(Service, [record({id: serviceId, name: 'Fisioterapia', sellingPrice: 70, productVat: 'N4', isActive: true, availabilityMode: 'ALL'})]);
-    install(FinancialAccount, [record({id: accountId, structureId, isActive: true})]);
+    const accounts = install(FinancialAccount, [record({id: accountId, name: 'Cassa', currency: 'EUR', type: 'CASH', structureId, isActive: true})]);
     install(PaymentMethod, [record({id: methodId, label: 'Contanti', isActive: true})]);
     const issuer = record({id: tenantId, businessName: 'Studio', VATNumber: '12345678901', address: 'Via Roma 1', city: 'Roma', zipCode: '00100', taxRegime: 'forfettario', lastDocumentNumberByYear: {}});
     t.mock.method(Tenant, 'findByPk', (async () => issuer) as any);
@@ -92,6 +93,7 @@ function fixture(t: TestContext) {
         update: async (changes: any, {where}: any) => {payments.filter(row => matches(row, where)).forEach(row => row.set(changes));}
     })) as any);
     t.mock.method(sequelize, 'query', (async (sql: string, options: any) => {
+        if (sql.trimStart().startsWith('SELECT') && sql.includes('treasury_movements')) return [ledger.filter(row => row.sourceId === options.replacements.sourceId && row.direction === 'IN' && row.status === 'POSTED').map(values), {}];
         if (sql.includes('INSERT INTO') && sql.includes('INVOICE_PAYMENT_VOID')) {
             const original = ledger.find(row => row.sourceId === options.replacements.sourceId && row.direction === 'IN');
             if (original && !ledger.some(row => row.reversalOfId === original.id)) ledger.push(record({id: randomUUID(), direction: 'OUT', amount: original.amount, reversalOfId: original.id}));
@@ -108,7 +110,7 @@ function fixture(t: TestContext) {
             }
         }); tail = task.then(() => undefined, () => undefined); return task;
     }) as any);
-    return {templates, packages, events, payments, ledger, invoices, lines, services, quotes, packagePages};
+    return {templates, packages, events, payments, ledger, invoices, lines, services, quotes, packagePages, accounts};
 }
 function request(body: object, params: object = {}, key = 'purchase-operation-001'): any {
     return {tenantSchema: schema, body, params, query: {}, header: () => key,
@@ -147,6 +149,26 @@ it('serializes concurrent purchase/receipt retries and rejects reused keys with 
         run(createPackagePayment, request(receipt(100), {id: packageId}, 'receipt-operation-001'))]);
     assert.deepEqual(receipts.map(row => row.status), [200, 200]); assert.equal(f.payments.length, 1); assert.equal(f.ledger.length, 1);
     assert.equal((await run(createPackagePayment, request(receipt(110), {id: packageId}, 'receipt-operation-001'))).status, 409);
+});
+it('uses the sole account automatically and permits an unspecified payment method', async t => {
+    const f = fixture(t);
+    const purchase = await run(createCarePackage, request({templateId, patientId, payment: {amount: 50, paidAt: '2026-01-01'}}));
+    assert.equal(purchase.status, 201, purchase.message);
+    assert.equal(f.ledger.length, 1); assert.equal(f.ledger[0].accountId, accountId);
+    assert.equal(f.payments[0].method, null);
+});
+it('creates a cash account only inside a successful initial receipt and requires choice when multiple exist', async t => {
+    const f = fixture(t); f.accounts.splice(0);
+    const body = {templateId, patientId, payment: {amount: 401, paidAt: '2026-01-01'}};
+    assert.equal((await run(createCarePackage, request(body))).status, 409);
+    assert.equal(f.accounts.length, 0); assert.equal(f.packages.length, 0);
+    body.payment.amount = 50;
+    const purchase = await run(createCarePackage, request(body));
+    assert.equal(purchase.status, 201, purchase.message); assert.equal(f.accounts.length, 1);
+    assert.equal(f.accounts[0].openingBalance, 0); assert.equal(f.ledger[0].accountId, f.accounts[0].id);
+    f.accounts.push(record({id: id(99), name: 'Banca', structureId, currency: 'EUR', isActive: true}));
+    const next = await run(createPackagePayment, request({amount: 20, paidAt: '2026-01-02'}, {id: purchase.data.id}, 'ambiguous-account-001'));
+    assert.equal(next.status, 422); assert.equal(f.ledger.length, 1);
 });
 it('rolls back acquisition and cash when the initial receipt exceeds the price', async t => {
     const f = fixture(t);

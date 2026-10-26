@@ -23,6 +23,7 @@ import { registerProtocolCatalogAssociations, syncProtocolCatalogModels } from '
 import { syncMeasurementCatalogModels, seedMeasurementCatalogData } from './modules/measurements/models/catalog/index.js';
 import { startAutomaticAppointmentCompletionSweep } from './modules/agenda/services/missedArrivalAutomation.service.js';
 import {startReminderExternalDeliverySweep} from './modules/notes/services/reminderExternalDelivery.service.js';
+import {startPatientContactReminderSweep} from './modules/notes/services/patientContactReminder.service.js';
 import {startActivityDeliverySweep} from './modules/activities/services/activityDelivery.service.js';
 import activityNotificationsRoutes from './modules/activities/routes/activityNotifications.routes.js';
 import {warmTenantSchemas} from './utils/tenantSchema.js';
@@ -44,6 +45,8 @@ import maintenanceRoutes from './modules/maintenance/routes/maintenance.routes.j
 import reportsRoutes from './modules/reports/routes/reports.routes.js';
 import patientPortalRoutes from './modules/patient-portal/routes/patientPortal.routes.js';
 import administrationRoutes from './modules/administration/routes/administration.routes.js';
+import financialOptionsRoutes from './modules/administration/routes/financialOptions.routes.js';
+import treasuryIntegrityRoutes from './modules/administration/routes/treasuryIntegrity.routes.js';
 import quoteShareRoutes from './modules/administration/routes/quoteShare.routes.js';
 import { syncQuotePublicModels } from './modules/administration/models/quoteDelivery.model.js';
 
@@ -99,6 +102,8 @@ async function bootstrap() {
     app.use(maintenanceRoutes);
     app.use(reportsRoutes);
     app.use(administrationRoutes);
+    app.use(financialOptionsRoutes);
+    app.use(treasuryIntegrityRoutes);
 
     app.use(notFoundHandler);
     app.use(errorHandler);
@@ -185,6 +190,7 @@ async function bootstrap() {
     // A fine appuntamento passa a COMPLETED se nessuno ha registrato un esito o
     // una segnalazione esplicita.
     startAutomaticAppointmentCompletionSweep();
+    startPatientContactReminderSweep();
     if (process.env.REMINDER_EXTERNAL_DELIVERY_ENABLED !== 'false') {
         await startReminderExternalDeliverySweep();
     }
