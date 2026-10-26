@@ -64,18 +64,17 @@ async function authorizePackage(req: Request, pkg: Record<string, any>, event: R
     }
 }
 
-/** Caller owns the patient and event locks. All package transitions lock packages in ID order. */
-export async function syncPackageAssignment(req: Request, event: AgendaEvent, patch: Record<string, any>, transaction: Transaction,
-    options: {newEvent?: boolean} = {}): Promise<void> {
-    const schema = req.tenantSchema!, previous = event.get({plain: true});
+/** Shared transition after the caller has acquired patient/event locks and chosen its authorization policy. */
+async function applyPackageAssignmentTransition(context: {schema: string; actorId?: string | null; consumptionNote: string},
+    authorize: (pkg: Record<string, any>, event: Record<string, any>) => Promise<void>, event: AgendaEvent,
+    patch: Record<string, any>, transaction: Transaction, options: {newEvent?: boolean} = {}): Promise<void> {
+    const schema = context.schema, previous = event.get({plain: true});
     const next = {...previous, ...patch};
     const previousId = previous.carePackageId || null;
     const requested = Object.prototype.hasOwnProperty.call(patch, 'carePackageId') ? patch.carePackageId : previousId;
     if (requested != null && (typeof requested !== 'string' || !uuid.test(requested))) fail('Pacchetto non valido.', 422);
     const targetId = requested || null;
     if (!previousId && !targetId) {patch.carePackageId = null; patch.carePackageServiceId = null; patch.packageReservationStatus = null; return;}
-    const quoteRead = req.user?.isSuperAdmin || !!resolveGrantedScope(getGrantedPermissions(req), 'quote', 'read');
-    if (!canAccessAppointmentFinance(req, next, 'care_package', 'read') && !quoteRead) fail('Non puoi gestire il pacchetto di questa seduta.', 403);
     const desired = targetId ? ['CANCELLED', 'NO_SHOW'].includes(String(next.status).toUpperCase()) ? 'RELEASED'
         : String(next.status).toUpperCase() === 'COMPLETED' ? 'CONSUMED' : 'RESERVED' : null;
     if (!options.newEvent && targetId && desired === 'CONSUMED' && previousId !== targetId && String(previous.status).toUpperCase() === 'COMPLETED') {
@@ -87,8 +86,8 @@ export async function syncPackageAssignment(req: Request, event: AgendaEvent, pa
     const target = targetId ? byId.get(targetId) : null;
     if (targetId && !target) fail('Pacchetto non disponibile.', 404);
     const old = previousId ? byId.get(previousId) : undefined;
-    if (old) await authorizePackage(req, old.get({plain: true}), previous, transaction);
-    if (target) await authorizePackage(req, target.get({plain: true}), next, transaction);
+    if (old) await authorize(old.get({plain: true}), previous);
+    if (target) await authorize(target.get({plain: true}), next);
     let targetServiceId: string | null = null;
     if (target && (desired !== 'RELEASED' || targetId !== previousId)) {
         if (next.invoiceId) fail('La seduta è già fatturata.');
@@ -103,7 +102,7 @@ export async function syncPackageAssignment(req: Request, event: AgendaEvent, pa
             const coverage = consumed ? null : await InvoicePayment.schema(schema).findOne({where: {agendaEventId: event.id, source: 'PACKAGE', status: 'POSTED'}, transaction});
             if (consumed || coverage) fail('Questa seduta è già stata utilizzata da un pacchetto. Correggi la registrazione esistente prima di assegnarla.');
         }
-        const booking = await ensurePackageBooking(target, transaction, req.access?.userId);
+        const booking = await ensurePackageBooking(target, transaction, context.actorId ?? undefined);
         if (booking.status !== 'READY') fail(booking.reason!);
     }
     const wasConsumed = previous.packageReservationStatus === 'CONSUMED';
@@ -119,9 +118,9 @@ export async function syncPackageAssignment(req: Request, event: AgendaEvent, pa
         if (!uuid.test(serviceId)) fail('Collega la prestazione della seduta prima di ripristinarla.');
         await original!.update({status: 'REVERSED'}, {transaction});
         await PackageConsumption.schema(schema).create({packageId: previousId, agendaEventId: event.id, units: 1, serviceId,
-            type: 'REVERSE', reversalOfId: original!.get('id'), status: 'POSTED', createdByUserId: req.access?.userId,
+            type: 'REVERSE', reversalOfId: original!.get('id'), status: 'POSTED', createdByUserId: context.actorId ?? null,
             note: 'Ripristino per correzione dell’esito in agenda'}, {transaction});
-        await changePackageBookingUnits(old!, serviceId, 1, transaction, req.access?.userId);
+        await changePackageBookingUnits(old!, serviceId, 1, transaction, context.actorId ?? undefined);
     }
     if (target && desired !== 'RELEASED' && !remainsConsumed) {
         const reserved = await reservedPackageUnits(schema, targetId!, transaction, event.id);
@@ -132,13 +131,54 @@ export async function syncPackageAssignment(req: Request, event: AgendaEvent, pa
         if (!service || service.remainingUnits - serviceReserved < 1) fail('Le sedute di questa prestazione sono già utilizzate o prenotate.');
         if (desired === 'CONSUMED') {
             await PackageConsumption.schema(schema).create({packageId: targetId, agendaEventId: event.id, units: 1, serviceId: targetServiceId,
-                type: 'CONSUME', status: 'POSTED', createdByUserId: req.access?.userId, note: 'Seduta effettuata in agenda'}, {transaction});
-            await changePackageBookingUnits(target, targetServiceId!, -1, transaction, req.access?.userId);
+                type: 'CONSUME', status: 'POSTED', createdByUserId: context.actorId ?? null, note: context.consumptionNote}, {transaction});
+            await changePackageBookingUnits(target, targetServiceId!, -1, transaction, context.actorId ?? undefined);
         }
     }
     patch.carePackageId = targetId;
     patch.carePackageServiceId = targetId ? targetServiceId ?? previous.carePackageServiceId ?? oldServiceId ?? null : null;
     patch.packageReservationStatus = desired;
+}
+
+/** Caller owns the patient/event locks; interactive changes retain the existing package permissions. */
+export async function syncPackageAssignment(req: Request, event: AgendaEvent, patch: Record<string, any>, transaction: Transaction,
+    options: {newEvent?: boolean} = {}): Promise<void> {
+    const previous = event.get({plain: true}), next = {...previous, ...patch};
+    const requested = Object.prototype.hasOwnProperty.call(patch, 'carePackageId') ? patch.carePackageId : previous.carePackageId;
+    if (requested != null && (typeof requested !== 'string' || !uuid.test(requested))) fail('Pacchetto non valido.', 422);
+    if (previous.carePackageId || requested) {
+        const quoteRead = req.user?.isSuperAdmin || !!resolveGrantedScope(getGrantedPermissions(req), 'quote', 'read');
+        if (!canAccessAppointmentFinance(req, next, 'care_package', 'read') && !quoteRead) fail('Non puoi gestire il pacchetto di questa seduta.', 403);
+    }
+    await applyPackageAssignmentTransition({schema: req.tenantSchema!, actorId: req.access?.userId,
+        consumptionNote: 'Seduta effettuata in agenda'}, (pkg, value) => authorizePackage(req, pkg, value, transaction), event, patch, transaction, options);
+}
+
+/** Trusted completion only: no request can use this path to assign or change package coverage. */
+export async function completeAssignedPackageAutomatically(schema: string, event: AgendaEvent, transaction: Transaction,
+    actorId: string | null = null): Promise<Record<string, any>> {
+    const previous = event.get({plain: true});
+    if (!previous.carePackageId || previous.packageReservationStatus !== 'RESERVED' || !uuid.test(String(previous.carePackageServiceId ?? ''))) {
+        fail('La prenotazione del pacchetto deve essere verificata prima del completamento automatico.');
+    }
+    let checkedUsage = false;
+    const validateAssignedPackage = async (pkg: Record<string, any>, value: Record<string, any>) => {
+        if (pkg.id !== previous.carePackageId || pkg.patientId !== (value.patientId ?? value.patient?.id) || pkg.structureId !== value.structureId) {
+            fail('Il pacchetto della seduta non corrisponde al paziente o alla sede.');
+        }
+        // Package locks are already held here, preserving patient -> event -> package -> usage order.
+        if (!checkedUsage) {
+            const consumed = await PackageConsumption.schema(schema).findOne({where: {agendaEventId: event.id, status: 'POSTED', type: 'CONSUME'},
+                transaction, lock: transaction.LOCK.UPDATE});
+            const legacyCoverage = consumed ? null : await InvoicePayment.schema(schema).findOne({where: {agendaEventId: event.id, source: 'PACKAGE', status: 'POSTED'}, transaction});
+            if (consumed || legacyCoverage) fail('La seduta ha già una registrazione di utilizzo del pacchetto da verificare.');
+            checkedUsage = true;
+        }
+    };
+    const patch: Record<string, any> = {status: 'COMPLETED'};
+    await applyPackageAssignmentTransition({schema, actorId, consumptionNote: 'Completamento automatico della seduta in agenda'},
+        validateAssignedPackage, event, patch, transaction);
+    return patch;
 }
 
 export async function eligibleCarePackages(schema: string, context: {patientId: string; structureId: string; eventTypeId: string; start: string;

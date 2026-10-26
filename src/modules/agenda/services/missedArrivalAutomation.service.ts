@@ -1,9 +1,10 @@
 import { Op, QueryTypes } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
-import AgendaEvent, { AgendaEventAttributes } from '../models/agendaEvent.model.js';
-
-export const AUTOMATIC_APPOINTMENT_COMPLETION_INTERVAL_MS = 30_000;
-export const AUTOMATIC_APPOINTMENT_COMPLETION_LOOKBACK_MS = 24 * 60 * 60_000;
+import AgendaEvent from '../models/agendaEvent.model.js';
+import {AUTOMATIC_APPOINTMENT_COMPLETION_INTERVAL_MS, AUTOMATIC_APPOINTMENT_COMPLETION_LOOKBACK_MS} from './appointmentCompletion.policy.js';
+import {completeUntouchedAppointmentById} from './automaticAppointmentCompletion.service.js';
+export {AUTOMATIC_APPOINTMENT_COMPLETION_INTERVAL_MS, AUTOMATIC_APPOINTMENT_COMPLETION_LOOKBACK_MS,
+    appointmentEndAt, shouldAutoCompleteAppointment, shouldOpenAttendanceCorrection} from './appointmentCompletion.policy.js';
 
 const TENANT_SCHEMA_PATTERN = /^rehablo_[a-z0-9]+$/i;
 const preparedSchemas = new Set<string>();
@@ -17,75 +18,6 @@ const MISSED_ARRIVAL_COLUMNS = {
     missedArrivalResolution: 'VARCHAR(24) NULL',
     noShowBillingDecision: 'VARCHAR(16) NULL'
 } as const;
-
-type AppointmentLike = Pick<
-    AgendaEventAttributes,
-    | 'start'
-    | 'end'
-    | 'duration'
-    | 'status'
-    | 'recurrence'
-    | 'recurringEventId'
-    | 'invoiceId'
-    | 'carePackageId'
-    | 'patientId'
-    | 'patient'
-    | 'missedArrivalReportedAt'
->;
-
-export function appointmentEndAt(event: AppointmentLike): Date | null {
-    const startAt = Date.parse(String(event.start ?? ''));
-    if (!Number.isFinite(startAt)) return null;
-
-    const explicitEndAt = Date.parse(String(event.end ?? ''));
-    if (Number.isFinite(explicitEndAt) && explicitEndAt > startAt) {
-        return new Date(explicitEndAt);
-    }
-
-    const durationMinutes = Number(event.duration);
-    return Number.isFinite(durationMinutes) && durationMinutes > 0
-        ? new Date(startAt + durationMinutes * 60_000)
-        : null;
-}
-
-/**
- * Decide se completare un appuntamento terminato che non ha ricevuto alcun esito
- * o segnalazione esplicita.
- */
-export function shouldAutoCompleteAppointment(
-    event: AppointmentLike,
-    now: Date = new Date()
-): boolean {
-    if (String(event.status ?? '').toUpperCase() !== 'CONFIRMED') return false;
-    if (event.carePackageId || event.invoiceId || event.recurrence || event.recurringEventId || event.missedArrivalReportedAt) return false;
-
-    const patient = event.patient as Record<string, unknown> | null | undefined;
-    if (!event.patientId && !patient?.id) return false;
-
-    const end = appointmentEndAt(event);
-    if (!end) return false;
-
-    const elapsed = now.getTime() - end.getTime();
-    return elapsed >= 0 && elapsed <= AUTOMATIC_APPOINTMENT_COMPLETION_LOOKBACK_MS;
-}
-
-/**
- * Riaprire manualmente una seduta gia' completata serve a correggerne la presenza.
- * La segnalazione impedisce al job automatico di completarla di nuovo prima che
- * l'operatore possa scegliere l'esito corretto.
- */
-export function shouldOpenAttendanceCorrection(
-    event: AppointmentLike,
-    nextStatus: string,
-    now: Date = new Date()
-): boolean {
-    if (String(event.status ?? '').toUpperCase() !== 'COMPLETED') return false;
-    if (String(nextStatus ?? '').toUpperCase() !== 'CONFIRMED') return false;
-    if (event.missedArrivalReportedAt) return false;
-
-    const end = appointmentEndAt(event);
-    return Boolean(end && now.getTime() >= end.getTime());
-}
 
 /**
  * Il job parte prima della prima richiesta autenticata, quindi non può dipendere
@@ -143,56 +75,21 @@ export async function autoCompleteEndedAppointmentsForSchema(
         ]
     };
 
-    const candidates = await TenantAgendaEvent.findAll({
-        // Alcuni tenant legacy non hanno ancora tutte le colonne più recenti del
-        // modello (per esempio patientId). Lo sweep usa solo i campi necessari e
-        // ricava il paziente anche dallo snapshot JSON storico.
-        attributes: [
-            'id',
-            'start',
-            'end',
-            'duration',
-            'status',
-            'recurrence',
-            'recurringEventId',
-            'invoiceId',
-            'carePackageId',
-            'patient',
-            'missedArrivalReportedAt'
-        ],
-        where: {
-            status: { [Op.iLike]: 'CONFIRMED' },
-            invoiceId: null,
-            carePackageId: null,
-            missedArrivalReportedAt: null,
-            start: { [Op.gte]: earliestCandidateStart, [Op.lte]: now.toISOString() },
-            ...singleAppointmentWhere
-        }
-    });
+    // IDs are only a work list. Every candidate is re-read under patient/event locks before any write.
+    const candidates = await TenantAgendaEvent.findAll({attributes: ['id'], where: {
+        status: { [Op.iLike]: 'CONFIRMED' }, invoiceId: null, missedArrivalReportedAt: null,
+        start: { [Op.gte]: earliestCandidateStart, [Op.lte]: now.toISOString() }, ...singleAppointmentWhere
+    }});
 
     let completed = 0;
     for (const candidate of candidates) {
-        const event = candidate.get({ plain: true }) as AgendaEventAttributes;
-        if (!shouldAutoCompleteAppointment(event, now)) continue;
-
-        const [updated] = await TenantAgendaEvent.update(
-            { status: 'COMPLETED' },
-            {
-                // Il filtro rende il job idempotente e impedisce di sovrascrivere
-                // un esito registrato mentre lo sweep era in corso.
-                where: {
-                    id: candidate.id,
-                    status: { [Op.iLike]: 'CONFIRMED' },
-                    invoiceId: null,
-                    carePackageId: null,
-                    missedArrivalReportedAt: null,
-                    ...singleAppointmentWhere
-                }
-            }
-        );
-        completed += updated;
+        try {
+            if (await completeUntouchedAppointmentById(schema, candidate.id, {now})) completed++;
+        } catch (error) {
+            // A package that needs verification stays unchanged and cannot stop the remaining appointments.
+            console.error('[agenda] completamento automatico fallito per ' + schema + '/' + candidate.id, error);
+        }
     }
-
     return completed;
 }
 
