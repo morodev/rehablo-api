@@ -34,11 +34,11 @@ import {
     reassignDeferredOperatorAppointments
 } from '../services/operatorReassignment.service.js';
 import {
-    shouldAutoCompleteAppointment,
     shouldOpenAttendanceCorrection
 } from '../services/missedArrivalAutomation.service.js';
 import { lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
 import {syncPackageAssignment} from '../services/packageAssignment.service.js';
+import {completeLockedUntouchedAppointment} from '../services/automaticAppointmentCompletion.service.js';
 import {PackageConsumption} from '../../administration/models/administration.model.js';
 
 async function lockAgendaPatients(schema: string, events: Array<Record<string, any>>, transaction: Transaction): Promise<void> {
@@ -143,6 +143,26 @@ function hasOpenMissedArrival(event: AgendaEvent): boolean {
     return normalizedStatus(event.get('status')) === 'CONFIRMED'
         && Boolean(event.get('missedArrivalReportedAt'))
         && !event.get('missedArrivalResolvedAt');
+}
+
+/** Eligibility for opening a verification, including a direct outcome with no prior report. */
+function missedArrivalReportError(event: AgendaEvent): {statusCode: number; message: string; data?: Record<string, unknown>} | null {
+    if (event.get('recurrence') || event.get('recurringEventId')) {
+        return {statusCode: 422, message: 'Il mancato arrivo va registrato su un appuntamento singolo'};
+    }
+    if (Number(event.appointmentPaidAmount) > 0.009) return {statusCode: 409, message: 'La seduta ha coperture registrate: correggile prima di registrare un nuovo esito'};
+    if (normalizedStatus(event.get('status')) !== 'CONFIRMED') {
+        return {statusCode: 409, message: 'Il mancato arrivo si può segnalare solo su un appuntamento confermato'};
+    }
+    const patient = event.get('patient') as Record<string, unknown> | null;
+    if (!event.get('patientId') && !patient?.id) {
+        return {statusCode: 422, message: 'La segnalazione richiede un appuntamento con paziente'};
+    }
+    const startAt = Date.parse(String(event.get('start') ?? ''));
+    if (!Number.isFinite(startAt)) return {statusCode: 422, message: 'Orario di inizio appuntamento non valido'};
+    const availableAt = startAt + MISSED_ARRIVAL_GRACE_MS;
+    if (Date.now() < availableAt) return {statusCode: 409, message: "Il mancato arrivo sarà segnalabile 15 minuti dopo l'inizio", data: {availableAt: new Date(availableAt).toISOString()}};
+    return null;
 }
 
 /**
@@ -1006,30 +1026,11 @@ export const reportMissedArrival = asyncHandler(async (req: Request, res: Respon
         if (!event) {
             return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
         }
-        if (event.get('recurrence')) {
-            return sendErrorResponse(res, 422, 'Il mancato arrivo va registrato su un appuntamento singolo');
-        }
-        if (Number(event.appointmentPaidAmount) > 0.009) return sendErrorResponse(res, 409, 'La seduta ha coperture registrate: correggile prima di registrare un nuovo esito');
+        const reportError = missedArrivalReportError(event);
+        if (reportError) return sendErrorResponse(res, reportError.statusCode, reportError.message, reportError.data);
         const linkedInvoiceId = await getLinkedInvoiceId(schema, event.id, event.get('invoiceId') as string | null);
         if (linkedInvoiceId) {
             return sendErrorResponse(res, 409, 'Appuntamento fatturato: segnalazione non consentita', { invoiceId: linkedInvoiceId });
-        }
-        if (normalizedStatus(event.get('status')) !== 'CONFIRMED') {
-            return sendErrorResponse(res, 409, 'Il mancato arrivo si può segnalare solo su un appuntamento confermato');
-        }
-        const patient = event.get('patient') as Record<string, unknown> | null;
-        if (!event.get('patientId') && !patient?.id) {
-            return sendErrorResponse(res, 422, 'La segnalazione richiede un appuntamento con paziente');
-        }
-        const startAt = Date.parse(String(event.get('start') ?? ''));
-        if (!Number.isFinite(startAt)) {
-            return sendErrorResponse(res, 422, 'Orario di inizio appuntamento non valido');
-        }
-        const availableAt = startAt + MISSED_ARRIVAL_GRACE_MS;
-        if (Date.now() < availableAt) {
-            return sendErrorResponse(res, 409, 'Il mancato arrivo sarà segnalabile 15 minuti dopo l\'inizio', {
-                availableAt: new Date(availableAt).toISOString()
-            });
         }
 
         if (!hasOpenMissedArrival(event)) {
@@ -1054,35 +1055,13 @@ export const completeAppointmentIfUntouched = asyncHandler(async (req: Request, 
         return sendErrorResponse(res, 400, 'Appuntamento non valido');
     }
 
-    const TenantAgendaEvent = AgendaEvent.schema(schema);
-    const scope = scopeWhere(req, AGENDA_SCOPE_FIELDS);
     return withLockedAttendanceEvent(req, res, id, 'Stato appuntamento verificato', async (event, transaction) => {
         if (!event) {
             return sendErrorResponse(res, 404, 'Appuntamento non trovato o non accessibile');
         }
 
-        if (shouldAutoCompleteAppointment(event.get({ plain: true }))) {
-            await TenantAgendaEvent.update(
-                { status: 'COMPLETED' },
-                {
-                    transaction, where: {
-                        id,
-                        ...scope,
-                        status: { [Op.iLike]: 'CONFIRMED' },
-                        invoiceId: null,
-                        carePackageId: null,
-                        missedArrivalReportedAt: null,
-                        [Op.and]: [
-                            { [Op.or]: [{ recurrence: null }, { recurrence: '' }] },
-                            { [Op.or]: [{ recurringEventId: null }, { recurringEventId: '' }] }
-                        ]
-                    }
-                }
-            );
-        }
-
-        const updated = await TenantAgendaEvent.findOne({ where: { id, ...scope }, transaction });
-        return updated;
+        await completeLockedUntouchedAppointment(schema, event, transaction, {actorId: req.access!.userId});
+        return event;
     });
 });
 
@@ -1091,6 +1070,10 @@ export const resolveMissedArrival = asyncHandler(async (req: Request, res: Respo
     const schema = req.tenantSchema!;
     const id = req.params.agendaEventId;
     const resolution = normalizedStatus(req.body.resolution);
+    if (req.body.reportIfMissing !== undefined && typeof req.body.reportIfMissing !== 'boolean') {
+        return sendErrorResponse(res, 400, 'Modalità di verifica arrivo non valida');
+    }
+    const reportIfMissing = req.body.reportIfMissing === true;
     if (!UUID_REGEX.test(id)) {
         return sendErrorResponse(res, 400, 'Appuntamento non valido');
     }
@@ -1106,8 +1089,11 @@ export const resolveMissedArrival = asyncHandler(async (req: Request, res: Respo
         if (linkedInvoiceId) {
             return sendErrorResponse(res, 409, 'Appuntamento fatturato: esito non modificabile', { invoiceId: linkedInvoiceId });
         }
-        if (!hasOpenMissedArrival(event)) {
-            return sendErrorResponse(res, 409, 'Non esiste una segnalazione di mancato arrivo aperta');
+        const reportOpen = hasOpenMissedArrival(event);
+        if (!reportOpen) {
+            if (!reportIfMissing) return sendErrorResponse(res, 409, 'Non esiste una segnalazione di mancato arrivo aperta');
+            const reportError = missedArrivalReportError(event);
+            if (reportError) return sendErrorResponse(res, reportError.statusCode, reportError.message, reportError.data);
         }
         if (Number(event.appointmentPaidAmount) > 0.009) return sendErrorResponse(res, 409, 'La seduta ha coperture registrate: correggile prima di cambiare l’esito');
 
@@ -1122,9 +1108,12 @@ export const resolveMissedArrival = asyncHandler(async (req: Request, res: Respo
             }
         }
         const status = resolution === 'ARRIVING' ? 'CONFIRMED' : resolution;
+        const resolvedAt = new Date();
         const attendancePatch = {
             status,
-            missedArrivalResolvedAt: new Date(),
+            // Opening and resolving are one explicit action, never an intermediate alert write.
+            ...(!reportOpen ? {missedArrivalReportedAt: resolvedAt, missedArrivalReportedBy: req.access!.userId} : {}),
+            missedArrivalResolvedAt: resolvedAt,
             missedArrivalResolvedBy: req.access!.userId,
             missedArrivalResolution: resolution,
             noShowBillingDecision

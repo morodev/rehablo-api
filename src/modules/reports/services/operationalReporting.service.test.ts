@@ -13,9 +13,9 @@ import {StructureAvailability, StructureUserAvailability, StructureUser, TenantU
 import TimeOffRequest from '../../agenda/models/timeOffRequest.model.js';
 import { CarePackage,PatientCredit, TreasuryMovement} from '../../administration/models/index.js';
 import Patient from '../../patients/models/patient.model.js';
-import {operationalDataset} from './operationalReporting.service.js';
+import {operationalDataset, operationalDiagnosticsDataset} from './operationalReporting.service.js';
 import {capacityValues, mergeIntervals, followupEligible} from './operationalMetrics.js';
-import {reportCsv} from './reporting.types.js';
+import {reportCsv, reportExportSnapshot} from './reporting.types.js';
 import {addDays, aggregateActivity, expandRecurringEvent, localDateKey, parseAnalyticsQuery, type AnalyticsQuery} from './analytics.service.js';
 
 beforeEach((t: any) => { t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => []})) as any); });
@@ -141,6 +141,10 @@ describe('unified operational dataset', () => {
         assert.equal(result.meta.dateBasis, 'appointment_and_issue');
         assert.equal(result.rows.find(row => row.eventTypeName === 'Prodotto')?.netRevenue, 30);
         assert.equal(result.rows.find(row => row.eventTypeName === 'Prodotto')?.quantity, 1);
+        assert.equal(result.rows.find(row => row.eventTypeName === 'Prodotto')?.kind, 'PRODUCT');
+        assert.equal(result.rows.find(row => row.eventTypeName === 'Prodotto')?.itemId, 'product');
+        assert.equal(result.rows.find(row => row.eventTypeName === 'Servizio')?.kind, 'SERVICE');
+        assert.equal(result.rows.find(row => row.eventTypeName === 'Servizio')?.itemId, 'service');
         assert.equal(result.rows.find(row => row.eventTypeName === 'Servizio')?.netRevenue, 40);
         assert.ok(result.rows.every(row => row.section === 'Catalogo fatturato'));
     });
@@ -236,5 +240,181 @@ describe('followup selection', () => {
         t.mock.method(Patient, 'schema', (() => ({findAll: async () => [{id: patientId, name: 'Mario', surname: 'Test'}]})) as any);
         const result = await operationalDataset(request(), 'patient-followups');
         assert.equal(result.rows.length, 0);
+    });
+});
+
+describe('unified statistics regressions', () => {
+    it('keeps personal session, service and attendance details clinical and skips every finance model', async t => {
+        const owner = '44444444-4444-4444-8444-444444444444';
+        const rows = [event('own', {calendarId: owner, status: 'NO_SHOW', invoiceId: 'private-invoice', noShowBillingDecision: 'WAIVED'})];
+        fixtures(t, rows);
+        t.mock.method(User, 'findAll', (async () => [{id: owner, name: 'Anna', surname: 'Test'}]) as any);
+        for (const model of [Invoice, InvoicePayment, InvoiceProduct, InvoiceService]) t.mock.method(model, 'schema', (() => {assert.fail('Personal reports must not load finance data');}) as any);
+        for (const dataset of ['activity-summary', 'sessions', 'services', 'attendance-slots']) {
+            const req = request(); (req as any).reportScope.operatorId = owner;
+            const result = await operationalDataset(req, dataset, {personal: true});
+            assert.equal(result.meta.effectiveFilters.operatorId, owner);
+            assert.ok(result.summary.every(row => row.format !== 'currency'));
+            for (const row of [...result.rows, ...(result.comparisonRows ?? []), ...(result.previousComparisonRows ?? [])]) {
+                for (const key of ['invoiceId', 'noShowBillingDecision', 'noShowInvoiced', 'noShowWaived', 'noShowPendingBilling', 'netRevenue', 'expectedAmount', 'balance', 'paidAmount']) assert.equal(key in row, false, dataset + ': ' + key);
+            }
+            if (dataset === 'sessions') assert.equal(result.rows[0].sourceId, 'own');
+            if (dataset === 'services') assert.equal(result.rows[0].kind, 'EVENT_TYPE');
+        }
+        await assert.rejects(operationalDataset(request(), 'operators', {personal: true}), /non disponibile/);
+        await assert.rejects(operationalDataset(request({paymentStatus: 'paid'}), 'sessions', {personal: true}), /filtri economici/);
+    });
+
+    it('preserves absence billing decisions with exact drilldown filters', async t => {
+        fixtures(t, [event('invoiced', {status: 'NO_SHOW', invoiceId: 'invoice'}), event('waived', {status: 'NO_SHOW', noShowBillingDecision: 'WAIVED'}), event('pending', {status: 'NO_SHOW', noShowBillingDecision: 'PENDING'})]);
+        const overview = await operationalDataset(request(), 'activity-summary');
+        for (const [key, decision, expected] of [['noShowInvoiced', 'INVOICED', 'invoiced'], ['noShowWaived', 'WAIVED', 'waived'], ['noShowPendingBilling', 'PENDING', 'pending']]) {
+            assert.equal(overview.summary.find(row => row.key === key)?.value, 1);
+            assert.equal(overview.summary.find(row => row.key === key)?.drilldown?.filters.noShowBillingDecision, decision);
+            const detail = await operationalDataset(request({noShowBillingDecision: decision}), 'sessions');
+            assert.deepEqual(detail.rows.map(row => row.id), [expected]);
+        }
+        await assert.rejects(operationalDataset(request({noShowBillingDecision: 'INVALID'}), 'sessions'), /Decisione/);
+    });
+
+    it('returns every previous-period service group independently from current-page pagination', async t => {
+        fixtures(t, [event('current', {title: 'Corrente'}), event('previous-a', {title: 'Precedente A', start: '2026-07-10T08:00:00Z', end: '2026-07-10T09:00:00Z'}), event('previous-b', {title: 'Precedente B', start: '2026-07-11T08:00:00Z', end: '2026-07-11T09:00:00Z'})]);
+        const result = await operationalDataset(request({compare: 'previous_period', size: '1'}), 'services');
+        assert.equal(result.rows.length, 1);
+        assert.equal(result.rows[0].eventTypeName, 'Corrente');
+        assert.deepEqual(result.previousComparisonRows!.map(row => row.eventTypeName).sort(), ['Precedente A', 'Precedente B']);
+        assert.deepEqual(result.comparisonRows!.map(row => row.eventTypeName), ['Corrente']);
+        assert.ok(result.comparisonRows!.every(row => row.kind === 'EVENT_TYPE'));
+    });
+
+    it('labels package-covered sessions consistently without inventing an unbilled invoice', async t => {
+        fixtures(t, [event('package', {carePackageId: 'package', packageReservationStatus: 'CONSUMED', appointmentPaymentHistoryKnown: true})]);
+        const result = await operationalDataset(request(), 'sessions');
+        assert.equal(result.rows[0].documentStatus, 'Gestita sul pacchetto');
+        assert.equal(result.rows[0].paymentStatusLabel, 'Inclusa nel pacchetto');
+    });
+});
+
+it('freezes the complete result and criteria into a versioned JSON export contract', async t => {
+    fixtures(t, Array.from({length: 125}, (_, i) => event(String(i))));
+    const result = await operationalDataset(request({page: '2', size: '10'}), 'sessions', {allRows: true});
+    const snapshot = reportExportSnapshot('sessions', result);
+    assert.equal(snapshot.version, 1); assert.equal(snapshot.dataset, 'sessions');
+    assert.equal(snapshot.title, 'Dettaglio sedute'); assert.equal(snapshot.rows.length, 125);
+    assert.equal(snapshot.generatedAt, result.meta.generatedAt);
+    assert.deepEqual(snapshot.filters, result.meta.effectiveFilters);
+    assert.equal('pagination' in snapshot, false);
+    assert.equal(snapshot.summary.find(row => row.key === 'completed')?.value, 125);
+    assert.ok(reportCsv(result).includes('Data seduta'));
+});
+
+it('returns the complete previous operator ranking even when a previous operator has no current sessions', async t => {
+    const owners = ['44444444-4444-4444-8444-444444444444', '55555555-5555-4555-8555-555555555555'];
+    fixtures(t, [event('current', {calendarId: owners[0]}), event('previous-a', {calendarId: owners[0], start: '2026-07-10T08:00:00Z', end: '2026-07-10T09:00:00Z'}), event('previous-b', {calendarId: owners[1], start: '2026-07-11T08:00:00Z', end: '2026-07-11T09:00:00Z'})]);
+    t.mock.method(User, 'findAll', (async () => owners.map((id, index) => ({id, name: 'Nome ' + index, surname: 'Test'}))) as any);
+    const result = await operationalDataset(request({compare: 'previous_period', size: '1'}), 'operators');
+    assert.equal(result.rows.length, 1); assert.equal(result.rows[0].operatorId, owners[0]);
+    assert.equal(result.previousComparisonRows!.length, 2);
+    assert.deepEqual(result.previousComparisonRows!.map(row => row.operatorId).sort(), owners);
+    assert.equal(result.previousComparisonRows!.find(row => row.operatorId === owners[1])!.completed, 1);
+    assert.equal(result.comparisonRows!.length, 1);
+    assert.equal(result.comparisonRows![0].operatorId, owners[0]);
+});
+
+it('always returns a full current grouped ranking across table pages, including without period comparison', async t => {
+    fixtures(t, [event('a', {title: 'A'}), event('b', {title: 'B'}), event('c', {title: 'C'})]);
+    const result = await operationalDataset(request({compare: 'none', size: '1', page: '2'}), 'services');
+    assert.equal(result.rows.length, 1); assert.equal(result.rows[0].eventTypeName, 'B');
+    assert.equal(result.comparisonRows!.length, 3);
+    assert.deepEqual(result.comparisonRows!.map(row => row.eventTypeName), ['A', 'B', 'C']);
+    assert.equal(result.previousComparisonRows, undefined);
+});
+
+const replayDiagnosticFilters = (filters: Record<string, unknown>): Record<string, string> => Object.fromEntries(Object.entries(filters)
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => [key, Array.isArray(value) ? value.join(',') : String(value)]));
+
+describe('operational warning diagnostics', () => {
+    it('replays the exact serialized warning scope across every source dataset without losing query, dates or recurring occurrences', async t => {
+        fixtures(t, [
+            event('series', {patientId: null, patient: null, title: 'Riabilitazione da associare', start: '2026-08-03T08:00:00Z', end: '2026-08-31T23:59:59Z', duration: 60, recurrence: 'FREQ=WEEKLY;COUNT=3;BYDAY=MO'}),
+            event('ordinary', {patientId: null, patient: null, title: 'Terapia da associare'}),
+            event('wrong-query', {patientId: null, patient: null, title: 'Altra attività'}),
+            event('wrong-status', {patientId: null, patient: null, title: 'Terapia da associare', status: 'CANCELLED'}),
+            event('linked', {title: 'Terapia da associare'}),
+        ]);
+        for (const sourceDataset of ['activity-summary', 'sessions', 'operators', 'services', 'attendance-slots']) {
+            const source = await operationalDataset(request({query: 'da associare', status: 'COMPLETED'}), sourceDataset);
+            const warning = source.meta.warnings.find((item: any) => item.code === 'UNLINKED_PATIENTS') as any;
+            assert.equal(warning.count, 4, sourceDataset);
+            assert.equal(warning.drilldown.dataset, 'operational-diagnostics');
+            const filters = replayDiagnosticFilters(warning.drilldown.filters);
+            assert.equal(filters.sourceDataset, sourceDataset); assert.equal(filters.query, 'da associare');
+            assert.equal(filters.from, '2026-08-01'); assert.equal(filters.to, '2026-08-31');
+            assert.equal('weekday' in filters, false); assert.equal('hour' in filters, false);
+            const result = await operationalDiagnosticsDataset(request(filters));
+            assert.equal(result.pagination.total, warning.count, sourceDataset);
+            assert.equal(result.summary[0].value, warning.count); assert.equal(result.meta.dateBasis, 'appointment');
+            assert.equal(result.rows.filter(row => row.sourceEventId === 'series').length, 3);
+            assert.equal(new Set(result.rows.map(row => row.id)).size, 4);
+            assert.ok(result.rows.every(row => row.occurrenceStart === row.date && row.patientId === null));
+            for (const row of result.rows) for (const key of ['amount', 'invoiceId', 'balance', 'paidAmount']) assert.equal(key in row, false);
+            const narrowed = await operationalDiagnosticsDataset(request({...filters, diagnosticSearch: 'Riabilitazione', size: '2', page: '2'}));
+            assert.equal(narrowed.summary[0].value, 4); assert.equal(narrowed.pagination.total, 3); assert.equal(narrowed.rows.length, 1);
+            assert.equal(narrowed.meta.effectiveFilters.query, 'da associare'); assert.equal(narrowed.meta.effectiveFilters.diagnosticSearch, 'Riabilitazione');
+            const exported = await operationalDiagnosticsDataset(request({...filters, diagnosticSearch: 'Riabilitazione', size: '1', page: '2'}), {allRows: true});
+            assert.equal(exported.rows.length, 3); assert.equal(exported.pagination.total, 3); assert.equal(exported.summary[0].value, 4);
+        }
+    });
+
+    it('retains zero-valued weekday and hour filters when replaying an occurrence warning', async t => {
+        fixtures(t, [event('midnight', {patientId: null, patient: null, start: '2026-08-09T22:30:00Z', end: '2026-08-09T23:00:00Z'})]);
+        const source = await operationalDataset(request({weekday: '0', hour: '0'}), 'activity-summary');
+        const warning = source.meta.warnings.find((item: any) => item.code === 'UNLINKED_PATIENTS') as any;
+        const filters = replayDiagnosticFilters(warning.drilldown.filters);
+        assert.equal(filters.weekday, '0'); assert.equal(filters.hour, '0');
+        const detail = await operationalDiagnosticsDataset(request(filters));
+        assert.equal(detail.pagination.total, warning.count); assert.equal(detail.rows[0].sourceId, 'midnight');
+    });
+
+    it('deduplicates invalid series by master record and preserves the affected followup cohort', async t => {
+        const past = new Date(Date.now() - 45 * 86400000);
+        const malformed = (id: string, title: string) => record(event(id, {start: past.toISOString(), end: new Date(Date.now() + 365 * 86400000).toISOString(), status: 'CONFIRMED', title, recurrence: 'FREQ=INVALID'}));
+        const first = malformed('first', 'Prima serie'), second = malformed('second', 'Seconda serie');
+        t.mock.method(AgendaEvent, 'schema', (() => ({findAll: async ({where}: any) => where[Op.or]
+            ? [record(event('past', {start: past.toISOString(), end: new Date(past.getTime() + 3600000).toISOString()}))]
+            : [first, first, second]})) as any);
+        t.mock.method(InvoiceAgendaEvent, 'schema', (() => ({findAll: async () => []})) as any);
+        t.mock.method(AgendaEventException, 'schema', (() => ({findAll: async () => []})) as any);
+        t.mock.method(Patient, 'schema', (() => ({findAll: async () => [record({id: patientId, name: 'Mario', surname: 'Test'})]})) as any);
+        const source = await operationalDataset(request(), 'patient-followups');
+        const warnings = source.meta.warnings.filter((item: any) => item.code === 'INVALID_RECURRENCE') as any[];
+        assert.equal(warnings.length, 1); assert.equal(warnings[0].count, 2); assert.equal(source.rows.length, 0);
+        const filters = replayDiagnosticFilters(warnings[0].drilldown.filters);
+        const result = await operationalDiagnosticsDataset(request(filters));
+        assert.equal(result.meta.dateBasis, 'current'); assert.equal(result.meta.effectiveFilters.lookbackDays, 180);
+        assert.equal(result.pagination.total, 2); assert.equal(result.summary[0].value, 2);
+        assert.deepEqual(result.rows.map(row => row.id).sort(), ['first', 'second']);
+        assert.ok(result.rows.every(row => row.patient === 'Mario Test' && !('amount' in row) && !('recurrence' in row)));
+        const narrowed = await operationalDiagnosticsDataset(request({...filters, diagnosticSearch: 'Seconda'}));
+        assert.equal(narrowed.summary[0].value, 2); assert.equal(narrowed.pagination.total, 1); assert.equal(narrowed.rows[0].id, 'second');
+    });
+
+    it('enriches raw session cash warnings using the shared financial diagnostic classifier', async t => {
+        fixtures(t, [event('cash')]);
+        t.mock.method(InvoicePayment, 'schema', (() => ({findAll: async () => [record({id: 'payment', agendaEventId: 'cash', source: 'APPOINTMENT', status: 'POSTED', amount: 60, paidAt: '2024-01-01'})]})) as any);
+        for (const model of [PatientCredit, TreasuryMovement]) t.mock.method(model, 'schema', (() => ({findAll: async () => []})) as any);
+        const result = await operationalDataset(request(), 'sessions');
+        const warning = result.meta.warnings.find((item: any) => item.code === 'unmirrored-payments') as any;
+        assert.equal(warning.count, 1); assert.equal(warning.drilldown.dataset, 'financial-diagnostics');
+        assert.equal(warning.drilldown.filters.sourceDataset, 'sessions'); assert.equal('from' in warning.drilldown.filters, false);
+    });
+
+    it('rejects unsupported codes, source datasets and malformed additional searches before reading data', async () => {
+        await assert.rejects(operationalDiagnosticsDataset(request({issueCode: 'UNKNOWN'})), /Verifica operativa/);
+        await assert.rejects(operationalDiagnosticsDataset(request({issueCode: 'UNLINKED_PATIENTS', sourceDataset: 'financial-summary'})), /Origine/);
+        await assert.rejects(operationalDiagnosticsDataset(request({issueCode: 'UNLINKED_PATIENTS', diagnosticSearch: ['invalid']})), /Ricerca/);
+        await assert.rejects(operationalDiagnosticsDataset(request({issueCode: 'INVALID_RECURRENCE'}), {personal: true}), (error: any) => error.statusCode === 403);
+        await assert.rejects(operationalDiagnosticsDataset(request({issueCode: 'UNLINKED_PATIENTS', sourceDataset: 'operators'}), {personal: true}), (error: any) => error.statusCode === 403);
     });
 });

@@ -1,5 +1,5 @@
 export type ReportFormat = 'currency' | 'number' | 'percent' | 'minutes';
-export interface ReportWarning { code: string; message?: string; count?: number; }
+export interface ReportWarning { code: string; message?: string; count?: number; drilldown?: {dataset: 'financial-diagnostics' | 'operational-diagnostics'; filters: Record<string, unknown>}; }
 export interface ReportMeta {
     effectiveFilters: Record<string, unknown>;
     generatedAt: string;
@@ -22,6 +22,44 @@ export interface ReportDatasetResponse {
     rows: Array<Record<string, any>>;
     pagination: {total: number; page: number; size: number};
     series?: ReportSeries[];
+    /** Complete current grouped ranking, independent of table pagination. */
+    comparisonRows?: Array<Record<string, any>>;
+    previousComparisonRows?: Array<Record<string, any>>;
+}
+
+export interface ReportExportSnapshot {
+    version: 1;
+    dataset: string;
+    title: string;
+    generatedAt: string;
+    filters: Record<string, unknown>;
+    dateBasis: string;
+    balanceAsOf?: string;
+    comparisonPeriod?: ReportMeta['comparisonPeriod'];
+    warnings: ReportMeta['warnings'];
+    summary: ReportSummaryItem[];
+    columns: ReportColumn[];
+    rows: Array<Record<string, any>>;
+    series?: ReportSeries[];
+    comparisonRows?: Array<Record<string, any>>;
+    previousComparisonRows?: Array<Record<string, any>>;
+}
+
+/** Snapshot of one allRows execution; rendering never reloads pages or recalculates totals. */
+export function reportExportSnapshot(dataset: string, result: ReportDatasetResponse): ReportExportSnapshot {
+    const titles: Record<string, string> = {
+        'operational-diagnostics': 'Elementi operativi da verificare', 'activity-summary': 'Andamento delle attività', sessions: 'Dettaglio sedute', operators: 'Attività dei professionisti',
+        services: 'Prestazioni e catalogo fatturato', 'attendance-slots': 'Presenze e assenze', capacity: 'Disponibilità',
+        'patient-followups': 'Pazienti senza prossima prenotazione', 'financial-summary': 'Prospetto economico', 'financial-diagnostics': 'Dati economici da verificare',
+        documents: 'Documenti emessi', payments: 'Incassi clinici', treasury: 'Movimenti di tesoreria', expenses: 'Spese', receivables: 'Residui e scadenze'
+    };
+    return {version: 1, dataset, title: titles[dataset] ?? dataset, generatedAt: result.meta.generatedAt,
+        filters: result.meta.effectiveFilters, dateBasis: result.meta.dateBasis,
+        ...(result.meta.balanceAsOf ? {balanceAsOf: result.meta.balanceAsOf} : {}),
+        ...(result.meta.comparisonPeriod !== undefined ? {comparisonPeriod: result.meta.comparisonPeriod} : {}),
+        warnings: result.meta.warnings, summary: result.summary, columns: result.columns, rows: result.rows,
+        ...(result.series ? {series: result.series} : {}), ...(result.comparisonRows ? {comparisonRows: result.comparisonRows} : {}),
+        ...(result.previousComparisonRows ? {previousComparisonRows: result.previousComparisonRows} : {})};
 }
 
 export function paginateReport(rows: Array<Record<string, any>>, page: number, size: number, allRows = false) {

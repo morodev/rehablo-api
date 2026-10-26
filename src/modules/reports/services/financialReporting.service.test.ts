@@ -155,3 +155,29 @@ it('filters current receivables without restricting them to the issue period', a
     const filtered = await financialDataset(req({ dueBucket: 'overdue' }), 'receivables');
     assert.equal(filtered.rows.length, 0);
 });
+
+it('preserves finance detail and reconciles package origins, balances, discounts and exact receivable drilldowns', async t => {
+    const invoices = [{id: 'bill', structureId: site, patientID: 'patient', emissionDate: '2026-01-10', invoiceTotal: 100, invoiceNet: 100,
+        sellingPrice: 120, discSellingPrice: 100, status: 'unpaid', documentType: 'fattura', paymentTerms: '2026-01-20'}];
+    const events = [{id: 'visit', structureId: site, patientId: 'patient', start: '2026-01-10T09:00:00Z', status: 'COMPLETED', appointmentExpectedAmount: 60, appointmentPaymentHistoryKnown: true}];
+    const packages = [{id: 'pack', structureId: site, patientId: 'patient', name: 'Pacchetto', totalPrice: 200, templateId: 'template'}];
+    const payments = [{id: 'deposit', carePackageId: 'pack', source: 'PACKAGE_PURCHASE', status: 'POSTED', amount: 50, paidAt: '2026-01-11'}];
+    t.mock.method(Invoice, 'schema', (() => ({findAll: async () => invoices.map(model)})) as any);
+    t.mock.method(AgendaEvent, 'schema', (() => ({findAll: async () => events.map(model)})) as any);
+    t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => packages.map(model)})) as any);
+    t.mock.method(InvoicePayment, 'schema', (() => ({findAll: async () => payments.map(model)})) as any);
+    for (const entity of [InvoiceAgendaEvent, Patient, PatientCredit, TreasuryMovement, Expense]) t.mock.method(entity, 'schema', (() => ({findAll: async () => []})) as any);
+    const result = await financialDataset(req(), 'financial-summary');
+    const values = Object.fromEntries(result.summary.map(row => [row.key, row.value]));
+    assert.equal(values.discounts, 20); assert.equal(values.collectedFromPackages, 50);
+    assert.equal(values.invoiceOutstanding, 100); assert.equal(values.appointmentOutstanding, 60); assert.equal(values.packageOutstanding, 150);
+    assert.equal(values.outstanding, 310); assert.equal(values.overdue, 100);
+    assert.equal(values.unbilledCompleted, 1); assert.equal(values.unbilledEstimatedValue, 60);
+    assert.equal(result.series!.find(row => row.key === 'collectedFromPackages')!.points.reduce((total, point) => total + point.value, 0), 50);
+    for (const [key, type] of [['invoiceOutstanding', 'invoice'], ['appointmentOutstanding', 'appointment'], ['packageOutstanding', 'package']]) {
+        const drilldown = result.summary.find(row => row.key === key)!.drilldown!;
+        assert.equal(drilldown.filters.receivableType, type);
+        const detail = await financialDataset(req({receivableType: type}), 'receivables');
+        assert.equal(detail.rows.length, 1); assert.equal(detail.summary[0].value, values[key]);
+    }
+});

@@ -1,10 +1,9 @@
 import { Request } from 'express';
+import {appointmentBalanceIssues, withFinancialDiagnosticDrilldowns} from './financialDiagnostics.service.js';
+import {unassignedFinancialWarnings} from './financialDiagnosticSelectors.service.js';
+export {unassignedFinancialWarnings} from './financialDiagnosticSelectors.service.js';
 import { Op } from 'sequelize';
 import { Expense, PaymentMethod, TreasuryMovement } from '../../administration/models/index.js';
-import { resolveAdministrationDateRange } from '../../administration/services/administrationQuery.service.js';
-import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
-import Invoice from '../../invoice/models/invoice.model.js';
-import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import Patient from '../../patients/models/patient.model.js';
 import { balanceEffectiveMovements } from '../../administration/services/treasuryLedger.service.js';
 import {economicMovements} from '../../administration/services/financialMovementPolicy.service.js';
@@ -22,40 +21,6 @@ const sum = (rows: Row[], field: string) => money(rows.reduce((total, row) => to
 const fail = (message: string): never => { throw Object.assign(new Error(message), { statusCode: 400 }); };
 const currency = (key: string, label: string, value: number, description?: string): ReportSummaryItem => ({ key, label, value, format: 'currency', description });
 const col = (key: string, label: string, type: ReportColumn['type'] = 'text'): ReportColumn => ({ key, label, type });
-
-/** Counts only, available to the owner when viewing every authorized site; never assigns orphan data. */
-export async function unassignedFinancialWarnings(req: Request, scope: ReportScope, from: string, to: string, dataset = 'financial-summary'): Promise<FinancialWarning[]> {
-    if (!(req.user?.isSuperAdmin || req.user?.role === 'OWNER') || scope.selectedStructureIds.length !== scope.allowedStructureIds.length) return [];
-    const period = resolveAdministrationDateRange(from, to);
-    const timestampRange = { [Op.between]: [period.fromInstant!, period.toInstant!] };
-    const dateRange = { [Op.between]: [from, to] };
-    const current = dataset === 'receivables';
-    const specs: Array<{ code: string; label: string; model: any; where: Row }> = [];
-    if (['financial-summary', 'documents', 'receivables'].includes(dataset)) specs.push({ code: 'documents', label: 'Documenti', model: Invoice,
-        where: { structureId: null, status: { [Op.notIn]: ['void', 'draft', 'cancelled'] }, documentType: { [Op.in]: ['fattura', 'ricevuta', 'nota_di_credito'] },
-            ...(current ? {} : { emissionDate: dateRange }) } });
-    if (['financial-summary', 'receivables'].includes(dataset)) specs.push({ code: 'appointments', label: 'Sedute', model: AgendaEvent,
-        where: { structureId: null, ...(current ? { start: { [Op.lte]: new Date() } } : { start: timestampRange }) } });
-    if (['financial-summary', 'treasury'].includes(dataset)) specs.push({ code: 'treasury', label: 'Movimenti di tesoreria', model: TreasuryMovement,
-        where: { structureId: null, occurredAt: timestampRange } });
-    if (['financial-summary', 'expenses'].includes(dataset)) specs.push({ code: 'expenses', label: 'Spese', model: Expense,
-        where: { structureId: null, incurredAt: dateRange } });
-    const counts = await Promise.all(specs.map(async spec => ({ ...spec, count: Number(await spec.model.schema(req.tenantSchema!).count({ where: spec.where })) })));
-    if (['financial-summary', 'payments'].includes(dataset)) {
-        const [invoices, events] = await Promise.all([
-            Invoice.schema(req.tenantSchema!).findAll({ where: { structureId: null }, attributes: ['id'] }),
-            AgendaEvent.schema(req.tenantSchema!).findAll({ where: { structureId: null }, attributes: ['id'] })
-        ]);
-        const count = await InvoicePayment.schema(req.tenantSchema!).count({ where: { paidAt: dateRange, carePackageId: null,
-            source: { [Op.notIn]: ['CREDIT', 'PACKAGE', 'OPENING_BALANCE'] }, [Op.and]: [
-                { [Op.or]: [{ invoiceId: null }, { invoiceId: { [Op.in]: invoices.map(row => row.get('id')) } }] },
-                { [Op.or]: [{ agendaEventId: null }, { agendaEventId: { [Op.in]: events.map(row => row.get('id')) } }] }
-            ] } });
-        counts.push({ code: 'payments', label: 'Registrazioni di incasso', model: InvoicePayment, where: {}, count });
-    }
-    return counts.filter(row => row.count > 0).map(row => ({ code: `unassigned-${row.code}`, count: row.count,
-        message: `${row.label} senza sede ${current ? 'nella situazione attuale' : 'nel periodo'}: esclusi dai totali; verificare l’attribuzione della sede.` }));
-}
 
 export function treasuryProjection(movements: Row[], expenses: Row[], from: string, to: string, filters: { accountId?: string | null; category?: string | null; paymentMethodIds?: Array<string | null>; direction?: string | null } = {}) {
     const rows = balanceEffectiveMovements(movements).filter(row => inFinancialPeriod(row.occurredAt, from, to)
@@ -114,7 +79,7 @@ export async function financialDataset(req: Request, dataset: string, options: {
     const scope: ReportScope = (req as any).reportScope ?? await resolveReportScope(req, { resource: 'analytics', action: 'read' });
     const scopedRequest = Object.assign(Object.create(req), { reportScope: scope }) as Request;
     const query: FinanceQuery = { ...parseAnalyticsQuery(scopedRequest), ...parseFinanceFilters(req) };
-    if (['accountId', 'category', 'direction', 'kind', 'dueBucket', 'overdue', 'page', 'size']
+    if (['accountId', 'category', 'direction', 'kind', 'dueBucket', 'overdue', 'receivableType', 'page', 'size']
         .some(key => req.query[key] != null && typeof req.query[key] !== 'string')) fail('Filtro del report non valido');
     if (query.statuses?.length || query.agendaEventIds) fail('I filtri delle singole sedute si applicano al report sedute');
     const contextual = !!(req.query.patientId || query.operatorId || query.eventTypeId || query.eventTypeIds?.length || (query.paymentMethod && dataset !== 'treasury')
@@ -125,6 +90,7 @@ export async function financialDataset(req: Request, dataset: string, options: {
     const direction = req.query.direction ? String(req.query.direction) : null;
     const kind = req.query.kind ? String(req.query.kind) : null;
     if (kind && (dataset !== 'payments' || !['receipt', 'reversal', 'refund'].includes(kind))) fail('Tipo movimento non valido per questo report');
+    if (req.query.receivableType && (dataset !== 'receivables' || !['invoice', 'appointment', 'package'].includes(String(req.query.receivableType)))) fail('Tipo residuo non valido');
     if ((req.query.dueBucket || req.query.overdue) && dataset !== 'receivables') fail('Il filtro scadenza si applica solo ai residui');
     if (req.query.query != null && (typeof req.query.query !== 'string' || req.query.query.length > 255)) fail('Ricerca non valida');
     const search = String(req.query.query ?? '').trim().toLocaleLowerCase('it');
@@ -163,8 +129,7 @@ export async function financialDataset(req: Request, dataset: string, options: {
         message: 'Documenti con prestazioni appartenenti a contesti diversi esclusi dall’attribuzione.' });
     if (contextual && dataset === 'financial-summary') warnings.push({ code: 'clinical-context', message: 'Tesoreria e spese non sono attribuite ai filtri clinici e non compaiono in questo riepilogo.' });
     if (selected && ['financial-summary', 'receivables'].includes(dataset)) {
-        const obligations = selected.events.filter(event => !event.invoiceId && event.appointmentPriceAdjustment !== 'COMPLIMENTARY')
-            .map(event => selected.financialByEvent.get(event.id)!).filter(financial => financial.eligible);
+        const obligations = appointmentBalanceIssues(selected).map(({financial}) => financial);
         const unknown = obligations.filter(financial => financial.paymentStatus === 'unknown').length;
         const estimated = obligations.filter(financial => financial.priceEstimated && Number(financial.balance) > 0).length;
         if (unknown) warnings.push({ code: 'unknown-appointment-balances', count: unknown,
@@ -201,7 +166,19 @@ export async function financialDataset(req: Request, dataset: string, options: {
             currency('collectionRefunds', 'Rimborsi incassi clinici', totals.collectionRefunds),
             currency('collected', 'Incassi clinici netti', totals.collected),
             currency('outstanding', 'Residuo attuale', totals.outstanding, 'Saldo attuale, indipendente dal periodo selezionato'),
-            currency('undatedLegacyPaid', 'Incassi senza data', totals.undatedLegacyPaid)];
+            currency('undatedLegacyPaid', 'Incassi senza data', totals.undatedLegacyPaid),
+            currency('discounts', 'Sconti sui documenti', totals.discounts),
+            currency('collectedFromAppointments', 'Incassi da sedute', totals.collectedFromAppointments),
+            currency('collectedFromInvoices', 'Incassi da documenti', totals.collectedFromInvoices),
+            currency('collectedFromPackages', 'Incassi da pacchetti', totals.collectedFromPackages),
+            currency('collectedUnbilled', 'Incassi ancora da fatturare', totals.collectedUnbilled, 'Situazione attuale degli incassi senza documento'),
+            currency('invoiceOutstanding', 'Residuo documenti', totals.invoiceOutstanding),
+            currency('appointmentOutstanding', 'Residuo sedute', totals.appointmentOutstanding),
+            currency('packageOutstanding', 'Residuo pacchetti', totals.packageOutstanding),
+            currency('overdue', 'Residuo documenti scaduti', totals.overdue),
+            currency('issuedOutstanding', 'Residuo dei documenti del periodo', totals.issuedOutstanding),
+            {key: 'unbilledCompleted', label: 'Sedute effettuate da fatturare', value: totals.unbilledCompleted, format: 'number'},
+            currency('unbilledEstimatedValue', 'Valore sedute da fatturare', totals.unbilledEstimatedValue, 'Prezzi noti, incluse tariffe stimate; prezzi mancanti esclusi')];
         if (needTreasury) summary.push(currency('income', 'Entrate di tesoreria', treasury.income), currency('outcome', 'Uscite di tesoreria', treasury.outcome),
             currency('cashFlow', 'Flusso netto di cassa', treasury.cashFlow), currency('advances', 'Anticipi ricevuti', treasury.advances),
             currency('creditRefunds', 'Rimborsi crediti pazienti', treasury.creditRefunds), currency('expenses', 'Spese sostenute', treasury.expenses));
@@ -209,6 +186,12 @@ export async function financialDataset(req: Request, dataset: string, options: {
             billedTotal: { dataset: 'documents', filters: {} }, collected: { dataset: 'payments', filters: {} },
             collectedGross: { dataset: 'payments', filters: { kind: 'receipt' } }, collectionReversals: { dataset: 'payments', filters: { kind: 'reversal' } },
             collectionRefunds: { dataset: 'payments', filters: { kind: 'refund' } }, outstanding: { dataset: 'receivables', filters: {} },
+            invoiceOutstanding: {dataset: 'receivables', filters: {receivableType: 'invoice'}},
+            appointmentOutstanding: {dataset: 'receivables', filters: {receivableType: 'appointment'}},
+            packageOutstanding: {dataset: 'receivables', filters: {receivableType: 'package'}},
+            overdue: {dataset: 'receivables', filters: {dueBucket: 'overdue'}},
+            unbilledCompleted: {dataset: 'sessions', filters: {status: 'COMPLETED', documentStatus: 'unbilled'}},
+            unbilledEstimatedValue: {dataset: 'sessions', filters: {status: 'COMPLETED', documentStatus: 'unbilled'}},
             income: { dataset: 'treasury', filters: { direction: 'IN' } }, outcome: { dataset: 'treasury', filters: { direction: 'OUT' } },
             cashFlow: { dataset: 'treasury', filters: {} }, expenses: { dataset: 'expenses', filters: {} },
             advances: { dataset: 'treasury', filters: { category: 'PATIENT_ADVANCE', direction: 'IN' } },
@@ -219,7 +202,7 @@ export async function financialDataset(req: Request, dataset: string, options: {
         if (previousQuery) {
             const previous = aggregateFinance(data!, { ...query, ...previousQuery }).totals as Row;
             const previousTreasury = treasuryProjection(movements, expenses, previousQuery.from, previousQuery.to) as Row;
-            for (const item of summary) if (!['outstanding', 'undatedLegacyPaid'].includes(item.key)) {
+            for (const item of summary) if (!['outstanding', 'undatedLegacyPaid', 'invoiceOutstanding', 'appointmentOutstanding', 'packageOutstanding', 'overdue', 'collectedUnbilled', 'issuedOutstanding'].includes(item.key)) {
                 item.previousValue = previous[item.key] ?? previousTreasury[item.key] ?? 0;
                 item.change = percentageChange(item.value ?? 0, item.previousValue ?? 0);
             }
@@ -278,7 +261,7 @@ export async function financialDataset(req: Request, dataset: string, options: {
             || dueBucket === 'overdue' && row.overdue || dueBucket === 'today' && dateOnly(row.dueDate) === today
             || dueBucket === 'next7' && dateOnly(row.dueDate) > today && dateOnly(row.dueDate) <= next7
             || dueBucket === 'future' && dateOnly(row.dueDate) > next7);
-        rows = rows.filter(matchesSearch);
+        rows = rows.filter(row => !req.query.receivableType || row.targetType === req.query.receivableType).filter(matchesSearch);
         columns = [col('patient', 'Paziente'), col('description', 'Documento / seduta'), col('dueDate', 'Scadenza', 'date'), col('amount', 'Residuo attuale', 'currency'), col('amountBasis', 'Criterio importo')];
         summary = [currency('outstanding', 'Residuo attuale', sum(rows, 'amount')), { key: 'count', label: 'Posizioni', value: rows.length, format: 'number' }];
     }
@@ -297,12 +280,15 @@ export async function financialDataset(req: Request, dataset: string, options: {
     rows.sort((a, b) => String(a.date ?? a.dueDate ?? '').localeCompare(String(b.date ?? b.dueDate ?? ''))
         || String(a.sourceId ?? a.metric ?? '').localeCompare(String(b.sourceId ?? b.metric ?? '')) || String(a.id ?? '').localeCompare(String(b.id ?? '')));
     return { meta: { effectiveFilters: { ...query, structureIds: scope.selectedStructureIds, ...(accountId ? { accountId } : {}), ...(category ? { category } : {}),
-        ...Object.fromEntries(['direction', 'kind', 'dueBucket', 'patientId', 'query'].filter(key => req.query[key]).map(key => [key, req.query[key]])) },
+        ...Object.fromEntries(['direction', 'kind', 'dueBucket', 'receivableType', 'patientId', 'query'].filter(key => req.query[key]).map(key => [key, req.query[key]])) },
         generatedAt: new Date().toISOString(), balanceAsOf: dateOnly(new Date()), dateBasis,
-        comparisonPeriod: comparison, warnings },
+        comparisonPeriod: comparison, warnings: withFinancialDiagnosticDrilldowns(warnings, scopedRequest, query, scope, dataset) },
         summary, columns, ...paginateReport(rows, page, size, options.allRows),
         ...(dataset === 'financial-summary' ? { series: [
             { key: 'billedTotal', label: 'Emesso dopo rettifiche', points: finance!.series.map(row => ({ label: row.bucket, value: row.billedTotal })) },
-            { key: 'collected', label: 'Incassi clinici netti', points: finance!.series.map(row => ({ label: row.bucket, value: row.collected })) }
+            { key: 'collected', label: 'Incassi clinici netti', points: finance!.series.map(row => ({ label: row.bucket, value: row.collected })) },
+            { key: 'collectedFromAppointments', label: 'Da sedute', points: finance!.series.map(row => ({ label: row.bucket, value: row.collectedFromAppointments })) },
+            { key: 'collectedFromInvoices', label: 'Da documenti', points: finance!.series.map(row => ({ label: row.bucket, value: row.collectedFromInvoices })) },
+            { key: 'collectedFromPackages', label: 'Da pacchetti', points: finance!.series.map(row => ({ label: row.bucket, value: row.collectedFromPackages })) }
         ] } : {}) };
 }

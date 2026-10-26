@@ -1,12 +1,13 @@
 import type {Request, Response} from 'express';
+import {financialDiagnosticsDataset} from '../services/financialDiagnostics.service.js';
 import {Op} from 'sequelize';
 import {asyncHandler} from '../../../utils/asyncHandler.js';
 import {sendErrorResponse, sendSuccessResponse} from '../../../utils/response.js';
 import {AnalyticsQueryError} from '../services/analytics.service.js';
 import {getReportAccess, resolveReportScope, resolvePersonalReportScope} from '../services/reportScope.service.js';
-import {operationalDataset, OPERATIONAL_DATASETS} from '../services/operationalReporting.service.js';
+import {operationalDataset, operationalDiagnosticsDataset, OPERATIONAL_DATASETS, PERSONAL_DATASETS} from '../services/operationalReporting.service.js';
 import {financialDataset, FINANCIAL_DATASETS} from '../services/financialReporting.service.js';
-import {reportCsv, type ReportDatasetResponse} from '../services/reporting.types.js';
+import {reportCsv, reportExportSnapshot, type ReportDatasetResponse} from '../services/reporting.types.js';
 import {StructureUser, User} from '../../auth/models/index.js';
 import EventType from '../../agenda/models/eventType.model.js';
 import EventTypeStructure from '../../agenda/models/eventTypeStructure.model.js';
@@ -17,6 +18,8 @@ import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import {methodKey} from '../services/finance.service.js';
 
 async function execute(req: Request, dataset: string, allRows: boolean): Promise<ReportDatasetResponse> {
+    if (dataset === 'financial-diagnostics') return financialDiagnosticsDataset(req, {allRows});
+    if (dataset === 'operational-diagnostics') return operationalDiagnosticsDataset(req, {allRows});
     if ((FINANCIAL_DATASETS as readonly string[]).includes(dataset)) return financialDataset(req, dataset, {allRows});
     if ((OPERATIONAL_DATASETS as readonly string[]).includes(dataset)) return operationalDataset(req, dataset, {allRows});
     throw new AnalyticsQueryError('Report non riconosciuto');
@@ -37,17 +40,23 @@ export const reportReadScope = asyncHandler(async (req, _res, next) => {
 });
 export const getDataset = endpoint(async (req, res) => sendSuccessResponse(res, 200, await execute(req, req.params.dataset, false)));
 export const exportDataset = endpoint(async (req, res) => {
-    if (req.query.format && req.query.format !== 'csv') throw new AnalyticsQueryError('Formato export non supportato');
+    if (req.query.format != null && (typeof req.query.format !== 'string' || !['csv', 'json'].includes(req.query.format))) throw new AnalyticsQueryError('Formato export non supportato');
     (req as any).reportScope = await resolveReportScope(req, {resource: 'analytics', action: 'export'});
     const result = await execute(req, req.params.dataset, true);
+    if (req.query.format === 'json') return sendSuccessResponse(res, 200, reportExportSnapshot(req.params.dataset, result));
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="report-${req.params.dataset}.csv"`);
     res.setHeader('X-Report-Generated-At', result.meta.generatedAt);
     return res.send(reportCsv(result));
 });
 export const getPersonal = endpoint(async (req, res) => {
+    const dataset = req.query.dataset ?? 'activity-summary';
+    if (typeof dataset !== 'string' || (dataset !== 'operational-diagnostics' && !(PERSONAL_DATASETS as readonly string[]).includes(dataset)) || (dataset === 'operational-diagnostics' && req.query.issueCode !== 'UNLINKED_PATIENTS')) {
+        return sendErrorResponse(res, 403, 'Report non disponibile nel contesto personale');
+    }
     (req as any).reportScope = await resolvePersonalReportScope(req);
-    return sendSuccessResponse(res, 200, await operationalDataset(req, 'activity-summary', {personal: true}));
+    return sendSuccessResponse(res, 200, dataset === 'operational-diagnostics'
+        ? await operationalDiagnosticsDataset(req, {personal: true}) : await operationalDataset(req, dataset, {personal: true}));
 });
 export const getAccess = endpoint(async (req, res) => {
     const access = await getReportAccess(req), ids = access.selectedStructureIds, schema = req.tenantSchema!;

@@ -12,7 +12,7 @@ import { appointmentPricesByEvent, isAppointmentPaymentHistoryKnown, summarizeAp
 import { AnalyticsQuery, AnalyticsQueryError, bucketKey, localDateKey, loadOccurrences } from './analytics.service.js';
 import { CarePackage, PatientCredit, TreasuryMovement } from '../../administration/models/index.js';
 import { PatientCreditMovement } from '../../administration/models/patientCreditMovement.model.js';
-import { clinicalCashFacts, ClinicalCashFact, dateOnly, FinancialWarning, validIssuedDocument } from './financialFacts.service.js';
+import { clinicalCashFacts, ClinicalCashFact, CashDiagnosticIssue, dateOnly, FinancialWarning, validIssuedDocument } from './financialFacts.service.js';
 import { reportStructureWhere, ReportScope } from './reportScope.service.js';
 
 export interface FinanceFilters {
@@ -63,7 +63,10 @@ export interface FinanceData {
     /** Safe whole-document attribution requires every linked therapy inside the selected sites. */
     scopeCompleteInvoiceIds?: Set<string>;
     excludedMixedInvoiceCount: number;
+    /** Exact all-history IDs behind the mixed-documents warning; no related-site details. */
+    excludedMixedInvoiceIds?: Set<string>;
     cashFacts?: ClinicalCashFact[];
+    cashIssues?: CashDiagnosticIssue[];
     warnings?: FinancialWarning[];
 }
 
@@ -152,9 +155,10 @@ export async function loadFinanceData(req: Request, query: FinanceQuery, scope: 
     const selectedEventIds = new Set(eventIds);
     const payments = paymentModels.map(plain);
     const cash = await loadClinicalCash(schema, payments);
-    return { events, invoices, packages, payments, cashFacts: cash.facts, warnings: cash.warnings, attributableInvoiceIds, scopeCompleteInvoiceIds,
-        excludedMixedInvoiceCount: invoices.filter((invoice) => !attributableInvoiceIds.has(invoice.id) && invoice.status !== 'void' &&
-            [...(idsByInvoice.get(invoice.id) ?? [])].some((id) => selectedEventIds.has(id))).length };
+    const excludedMixedInvoiceIds = new Set(invoices.filter(invoice => !attributableInvoiceIds.has(invoice.id) && invoice.status !== 'void'
+        && [...(idsByInvoice.get(invoice.id) ?? [])].some(id => selectedEventIds.has(id))).map(invoice => invoice.id));
+    return { events, invoices, packages, payments, cashFacts: cash.facts, cashIssues: cash.issues, warnings: cash.warnings, attributableInvoiceIds, scopeCompleteInvoiceIds,
+        excludedMixedInvoiceCount: excludedMixedInvoiceIds.size, excludedMixedInvoiceIds };
 }
 
 async function loadClinicalCash(schema: string, payments: Array<Record<string, any>>) {
@@ -334,7 +338,7 @@ export function aggregateFinance(data: FinanceData, query: FinanceQuery) {
     periodPayments.forEach((payment) => { const bucket = bucketFor(payment.paidAt); bucket.collected += Number(payment.amount); bucket[payment.source === 'PACKAGE_PURCHASE' ? 'collectedFromPackages' : payment.source === 'APPOINTMENT' ? 'collectedFromAppointments' : 'collectedFromInvoices'] += Number(payment.amount); });
     return { period: query, totals, warnings: data.warnings ?? [], balanceAsOf: today, attributionPolicy: 'whole_document_when_all_linked_therapies_match',
         series: [...series.values()].sort((a, b) => a.bucket.localeCompare(b.bucket)).map((row) => ({ ...row,
-            billedTotal: money(row.billedTotal), billedNet: money(row.billedNet), collected: money(row.collected), collectedFromAppointments: money(row.collectedFromAppointments), collectedFromInvoices: money(row.collectedFromInvoices) })) };
+            billedTotal: money(row.billedTotal), billedNet: money(row.billedNet), collected: money(row.collected), collectedFromAppointments: money(row.collectedFromAppointments), collectedFromInvoices: money(row.collectedFromInvoices), collectedFromPackages: money(row.collectedFromPackages) })) };
 }
 
 export function aggregateTherapyPayments(data: FinanceData, query: FinanceQuery, occurrences: Array<Record<string, any>>, page = 1, size = 25) {
