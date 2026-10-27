@@ -7,6 +7,7 @@ import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
 import { CarePackage, PatientCredit, TreasuryMovement } from '../../administration/models/index.js';
 import { aggregateFinance, aggregateTherapyPayments, FinanceData, FinanceQuery, invoiceMatchesContext, loadFinanceData, parseFinanceFilters } from './finance.service.js';
+import {projectPackageCoverage} from './packageCoverageReporting.service.js';
 
 beforeEach((t: any) => { t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => []})) as any); });
 
@@ -34,6 +35,75 @@ const data = (overrides: Partial<FinanceData> = {}): FinanceData => ({
 const occurrences = (events: Array<Record<string, any>>) => events.map((row) => ({
     ...row, sourceEventId: row.id, patientName: 'Mario Rossi', title: 'Seduta'
 }));
+
+describe('contractual package coverage in therapy reports', () => {
+    const agreement = {id: 'package-1', patientId: 'patient-1', structureId: 'site-1', name: 'Percorso', templateId: 'template-1',
+        serviceId: 'service-1', purchasedUnits: 10, totalPrice: 400, invoiceId: null};
+    const covered = (id: string, status: 'RESERVED' | 'CONSUMED' = 'RESERVED') => event({id, structureId: 'site-1', carePackageId: agreement.id,
+        carePackageServiceId: agreement.serviceId, packageReservationStatus: status, status: status === 'RESERVED' ? 'CONFIRMED' : 'COMPLETED'});
+    it('values reserved and consumed sessions even when the purchase receipt belongs to an earlier day', () => {
+        const events = [covered('reserved'), covered('consumed', 'CONSUMED')];
+        const deposit = payment({id: 'deposit', agendaEventId: null, carePackageId: agreement.id, source: 'PACKAGE_PURCHASE', paidAt: '2025-12-20', amount: 100});
+        const input = data({events, packages: [agreement], payments: [deposit],
+            packageCoverage: projectPackageCoverage(events, {packages: [agreement], payments: [deposit], consumptions: []})});
+        const result = aggregateTherapyPayments(input, query(), occurrences(events));
+        assert.equal(result.totals.count, 2); assert.equal(result.totals.packageCount, 2);
+        assert.equal(result.totals.packageReservedCount, 1); assert.equal(result.totals.packageConsumedCount, 1);
+        assert.equal(result.totals.packageValue, 80); assert.equal(result.totals.packageReservedValue, 40); assert.equal(result.totals.packageConsumedValue, 40);
+        assert.equal(result.totals.expectedAmount, 0); assert.equal(result.totals.collected, 0); assert.equal(result.totals.invoiceCollected, 0);
+        assert.ok(result.details.every(row => row.paymentScope === 'package' && row.expectedAmount === 0 && row.paidAmount === 0));
+        assert.ok(result.details.every(row => row.packageSummary?.paymentStatus === 'partial'));
+        assert.equal(aggregateFinance(input, query()).totals.collected, 0);
+        input.payments[0].paidAt = '2026-01-10';
+        assert.equal(aggregateFinance(input, query()).totals.collected, 100);
+        assert.equal(aggregateTherapyPayments(input, query(), occurrences(events)).totals.collected, 0);
+    });
+    it('filters package sessions by the purchase payment, document and method without counting its invoice multiple times', () => {
+        const events = [covered('a'), covered('b', 'CONSUMED')], pkg = {...agreement, invoiceId: 'invoice-1'};
+        const bill = invoice({carePackageId: agreement.id, patientID: agreement.patientId, structureId: agreement.structureId,
+            invoiceTotal: 400, invoiceNet: 400, status: 'partial', emissionDate: '2026-01-10'});
+        const deposit = payment({agendaEventId: null, carePackageId: agreement.id, invoiceId: bill.id, source: 'PACKAGE_PURCHASE', method: 'Carta', amount: 100});
+        const input = data({events, invoices: [bill], packages: [pkg], payments: [deposit], attributableInvoiceIds: new Set([bill.id]),
+            packageCoverage: projectPackageCoverage(events, {packages: [pkg], payments: [deposit], consumptions: [], purchaseInvoices: [bill], invoices: [bill],
+                invoiceReadablePatients: new Set(['patient-1:site-1'])})});
+        const filtered = aggregateTherapyPayments(input, query({paymentStatus: 'partial', documentStatus: 'invoiced', paymentMethod: 'Carta'}), occurrences(events));
+        assert.equal(filtered.totals.count, 2); assert.equal(filtered.totals.packageValue, 80);
+        assert.equal(filtered.totals.invoiceCount, 0); assert.equal(filtered.totals.invoiceCollected, 0); assert.equal(filtered.totals.collected, 0);
+        for (const filter of [{paymentStatus: 'paid' as const}, {documentStatus: 'unbilled' as const}, {paymentMethod: 'Contanti'}]) {
+            assert.equal(aggregateTherapyPayments(input, query(filter), occurrences(events)).totals.count, 0);
+        }
+        assert.deepEqual(filtered.paymentMethods, ['Carta']);
+    });
+    it('sums rounded row quotas and keeps totals over the complete filtered selection before pagination', () => {
+        const pkg = {...agreement, totalPrice: 100, purchasedUnits: 3};
+        const events = [covered('a'), covered('b', 'CONSUMED'), covered('c')];
+        const input = data({events, payments: [], packageCoverage: projectPackageCoverage(events, {packages: [pkg], consumptions: [], payments: []})});
+        const result = aggregateTherapyPayments(input, query(), occurrences(events), 2, 1);
+        assert.equal(result.details.length, 1); assert.equal(result.details[0].packageSessionValue, 33.33);
+        assert.equal(result.totals.packageCount, 3); assert.equal(result.totals.packageValue, 99.99);
+        assert.equal(result.totals.packageReservedValue, 66.66); assert.equal(result.totals.packageConsumedValue, 33.33);
+        assert.equal(result.totals.packageUnknownValueCount, 0); assert.equal(result.totals.expectedAmount, 0);
+    });
+    it('reports unavailable contract prices without treating them as a free session or a new cash receipt', () => {
+        const events = [covered('unknown')], pkg = {...agreement, totalPrice: null};
+        const input = data({events, payments: [], packageCoverage: projectPackageCoverage(events, {packages: [pkg], consumptions: [], payments: []})});
+        const result = aggregateTherapyPayments(input, query({paymentStatus: 'unknown'}), occurrences(events));
+        assert.equal(result.totals.packageCount, 1); assert.equal(result.totals.packageUnknownValueCount, 1); assert.equal(result.totals.packageValue, 0);
+        assert.equal(result.details[0].packageSessionValue, null); assert.ok(result.details[0].packageValueUnavailableReason);
+        assert.equal(result.details[0].packageSummary?.paymentStatus, 'unknown'); assert.equal(result.totals.collected, 0);
+    });
+    it('recognizes a verified historical consumption while leaving non-cash PACKAGE rows out of collections', () => {
+        const events = [event({id: 'legacy', structureId: 'site-1'})];
+        const legacy = {...agreement, templateId: null, quoteId: 'quote-1', lines: [{itemType: 'SERVICE', itemId: agreement.serviceId, quantity: 10, total: 400}]};
+        const coverage = payment({agendaEventId: 'legacy', source: 'PACKAGE', method: 'Pacchetto'});
+        const input = data({events, payments: [coverage], packageCoverage: projectPackageCoverage(events, {packages: [legacy], payments: [],
+            consumptions: [{id: 'consumed', packageId: agreement.id, serviceId: agreement.serviceId, agendaEventId: 'legacy', units: 1, status: 'POSTED', type: 'CONSUME'}]})});
+        const result = aggregateTherapyPayments(input, query(), occurrences(events));
+        assert.equal(result.details[0].paymentScope, 'package'); assert.equal(result.totals.packageConsumedCount, 1);
+        assert.equal(result.totals.packageValue, 40); assert.equal(result.totals.expectedAmount, 0); assert.equal(result.totals.collected, 0);
+        assert.equal(aggregateFinance(input, query()).totals.collected, 0);
+    });
+});
 
 describe('shared cash and document reporting', () => {
     it('keeps a package deposit and its debt stable through consumption and subsequent invoicing', () => {

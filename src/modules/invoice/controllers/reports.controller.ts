@@ -53,7 +53,8 @@ export const getOverview = asyncHandler(async (req: Request, res: Response) => {
     return sendSuccessResponse(res, 200, {
         day: reportDay,
         today: { billed: totals.billedTotal, collected: totals.collected, toCollect: totals.issuedOutstanding,
-            collectedFromAppointments: totals.collectedFromAppointments, collectedFromInvoices: totals.collectedFromInvoices },
+            collectedFromAppointments: totals.collectedFromAppointments, collectedFromInvoices: totals.collectedFromInvoices,
+            collectedFromPackages: totals.collectedFromPackages },
         monthly, outstanding: totals.outstanding, invoiceOutstanding: totals.invoiceOutstanding,
         appointmentOutstanding: totals.appointmentOutstanding, collectedUnbilled: totals.collectedUnbilled,
         undatedLegacyPaid: totals.undatedLegacyPaid, unknownAppointmentCount: totals.unknownAppointmentCount,

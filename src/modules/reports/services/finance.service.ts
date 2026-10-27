@@ -14,6 +14,7 @@ import { CarePackage, PatientCredit, TreasuryMovement } from '../../administrati
 import { PatientCreditMovement } from '../../administration/models/patientCreditMovement.model.js';
 import { clinicalCashFacts, ClinicalCashFact, CashDiagnosticIssue, dateOnly, FinancialWarning, validIssuedDocument } from './financialFacts.service.js';
 import { reportStructureWhere, ReportScope } from './reportScope.service.js';
+import {loadPackageCoverage, ReportPackageCoverage, unknownPackageCoverage} from './packageCoverageReporting.service.js';
 
 export interface FinanceFilters {
     paymentStatus: 'all' | 'paid' | 'partial' | 'unpaid' | 'unknown';
@@ -54,6 +55,8 @@ export function parseFinanceFilters(req: Request): FinanceFilters {
 }
 
 export interface FinanceData {
+    /** Optional therapy-only contract projection; never contributes payment rows to cash facts. */
+    packageCoverage?: Map<string, ReportPackageCoverage>;
     packages?: Array<Record<string, any>>;
     events: Array<Record<string, any>>;
     invoices: Array<Record<string, any>>;
@@ -194,12 +197,15 @@ function financialIndex(data: FinanceData) {
     return { payments, byEvent, byInvoice, invoiceById, summaries, invoiceIdByEvent };
 }
 
-function eventFinance(event: Record<string, any>, index: ReturnType<typeof financialIndex>) {
-    if (packageCoversAppointment(event)) return {
+function eventFinance(event: Record<string, any>, index: ReturnType<typeof financialIndex>, coverageByEvent?: Map<string, ReportPackageCoverage>) {
+    const coverage = coverageByEvent?.get(event.id) ?? (packageCoversAppointment(event) && !['CANCELLED', 'NO_SHOW'].includes(String(event.status).toUpperCase())
+        ? unknownPackageCoverage(event.carePackageId, event.packageReservationStatus) : null);
+    if (coverage) return {
+        ...coverage,
         expectedAmount: 0, priceEstimated: false, paidAmount: 0, balance: 0,
         paymentStatus: 'paid', invoicePaymentStatus: null, paymentScope: 'package',
-        packageCovered: true, carePackageId: event.carePackageId, invoiceId: null as string | null,
-        paymentMethods: [] as string[], eligible: false, payments: [] as Array<Record<string, any>>
+        packageCovered: true, invoiceId: null as string | null,
+        eligible: false, payments: [] as Array<Record<string, any>>
     };
     const history = index.byEvent.get(event.id) ?? [];
     const payments = history.filter((payment) => payment.status === 'POSTED');
@@ -219,6 +225,7 @@ function eventFinance(event: Record<string, any>, index: ReturnType<typeof finan
         ? 'unknown' : paid <= 0 && expected > 0 ? 'unpaid' : paid < expected ? 'partial' : 'paid';
     return { expectedAmount: expected, priceEstimated: !!event.priceEstimated, paidAmount: paymentScope === 'invoice' ? null : paid,
         packageCovered: false, carePackageId: null, invoiceId: invoiceId ?? null,
+        packageReservationStatus: null, packageSessionValue: null, packageSummary: null, packageValueUnavailableReason: undefined,
         issueKind: invoiceId && !invoice ? 'UNRESOLVED_INVOICE' : String(event.status).toUpperCase() === 'NO_SHOW' ? 'NO_SHOW'
             : !known ? 'UNKNOWN_PREVIOUS_PAYMENT' : expected === null || event.priceEstimated ? 'MISSING_PRICE' : null,
         balance: paymentStatus === 'unknown' ? null : money(Math.max((expected ?? 0) - paid, 0)),
@@ -228,6 +235,16 @@ function eventFinance(event: Record<string, any>, index: ReturnType<typeof finan
 }
 
 function matchesEvent(event: Record<string, any>, financial: ReturnType<typeof eventFinance>, query: FinanceFilters): boolean {
+    if (financial.paymentScope === 'package') {
+        const summary = financial.packageSummary;
+        const status = summary?.paymentStatus ?? 'unknown';
+        const document = summary?.invoiceStatus ?? 'unknown';
+        return (query.paymentStatus === 'all' || query.paymentStatus === status)
+            && (query.documentStatus === 'all' || query.documentStatus === 'invoiced' && document === 'issued'
+                || query.documentStatus === 'unbilled' && ['none', 'void'].includes(document))
+            && (!query.paymentMethod || financial.paymentMethods.includes(query.paymentMethod))
+            && (!query.statuses?.length || query.statuses.includes(String(event.status).toUpperCase()));
+    }
     const status = financial.paymentScope === 'invoice' && financial.invoicePaymentStatus && financial.invoicePaymentStatus !== 'void'
         ? financial.invoicePaymentStatus : financial.paymentStatus;
     return (query.paymentStatus === 'all' || (query.paymentStatus === 'unknown' ? financial.paymentStatus === 'unknown' : status === query.paymentStatus)) &&
@@ -241,7 +258,7 @@ function matchesEvent(event: Record<string, any>, financial: ReturnType<typeof e
 export function financialSelection(data: FinanceData, query: FinanceQuery) {
     const index = financialIndex(data);
     const eventById = new Map(data.events.map((event) => [event.id, event]));
-    const financialByEvent = new Map(data.events.map((event) => [event.id, eventFinance(event, index)]));
+    const financialByEvent = new Map(data.events.map((event) => [event.id, eventFinance(event, index, data.packageCoverage)]));
     const events = data.events.filter((event) => matchesEvent(event, financialByEvent.get(event.id)!, query));
     const eventIds = new Set(events.map((event) => event.id));
     const invoices = data.invoices.filter((invoice) => {
@@ -349,7 +366,7 @@ export function aggregateTherapyPayments(data: FinanceData, query: FinanceQuery,
         if (query.agendaEventIds && !query.agendaEventIds.includes(occurrence.id)) return [];
         const event = eventById.get(occurrence.sourceEventId ?? occurrence.id);
         if (!event) return [];
-        const financial = eventFinance(event, index);
+        const financial = eventFinance(event, index, data.packageCoverage);
         financial.paymentMethods.forEach((method) => availableMethods.add(method));
         if (!matchesEvent(event, financial, query)) return [];
         const { payments, eligible, ...fields } = financial;
@@ -361,8 +378,16 @@ export function aggregateTherapyPayments(data: FinanceData, query: FinanceQuery,
     const selectedEventIds = new Set(rows.map((row) => row.id));
     const selectedInvoiceIds = new Set(rows.map((row) => row.invoiceId).filter((id) => id && data.attributableInvoiceIds.has(id)));
     const matchingPayments = (data.cashFacts ?? clinicalCashFacts(index.payments).facts).filter((p) => (!query.paymentMethod || methodKey(p.method) === query.paymentMethod));
+    const covered = rows.filter(row => row.paymentScope === 'package');
+    const coveredValue = (status?: 'RESERVED' | 'CONSUMED') => money(covered.filter(row => !status || row.packageReservationStatus === status)
+        .reduce((sum, row) => sum + (row.packageSessionValue ?? 0), 0));
     const totals = {
         count: rows.length,
+        packageCount: covered.length,
+        packageReservedCount: covered.filter(row => row.packageReservationStatus === 'RESERVED').length,
+        packageConsumedCount: covered.filter(row => row.packageReservationStatus === 'CONSUMED').length,
+        packageValue: coveredValue(), packageReservedValue: coveredValue('RESERVED'), packageConsumedValue: coveredValue('CONSUMED'),
+        packageUnknownValueCount: covered.filter(row => row.packageSessionValue === null).length,
         expectedAmount: money(rows.reduce((sum, row) => sum + (row.expectedAmount ?? 0), 0)),
         estimatedPriceCount: rows.filter((row) => row.priceEstimated && row.expectedAmount !== null).length,
         unknownPriceCount: rows.filter((row) => row.expectedAmount === null).length,
@@ -381,5 +406,8 @@ export function aggregateTherapyPayments(data: FinanceData, query: FinanceQuery,
 
 export async function therapyPaymentsPayload(req: Request, query: FinanceQuery, page: number, size: number) {
     const [data, occurrences] = await Promise.all([loadFinanceData(req, query), loadOccurrences(req.tenantSchema!, query)]);
+    const selectedSourceIds = new Set(occurrences.filter(occurrence => !query.agendaEventIds || query.agendaEventIds.includes(occurrence.id))
+        .map(occurrence => occurrence.sourceEventId ?? occurrence.id));
+    data.packageCoverage = await loadPackageCoverage(req, data.events.filter(event => selectedSourceIds.has(event.id)), data.payments);
     return aggregateTherapyPayments(data, query, occurrences, page, size);
 }
