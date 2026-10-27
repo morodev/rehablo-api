@@ -78,7 +78,7 @@ export const env = {
         console.warn(`[env] TENANT_SCHEMA_SYNC="${raw}" non riconosciuto. Uso "additive".`);
         return 'additive' as const;
     })() as 'additive' | 'full' | 'off',
-    /** Numero massimo di tenant inizializzati insieme prima di aprire la porta HTTP. */
+    /** Numero massimo di tenant inizializzati insieme prima di abilitare le API. */
     tenantSchemaBootstrapConcurrency: positiveInt('TENANT_SCHEMA_BOOTSTRAP_CONCURRENCY', 2),
 
     jwtSecret: required('JWT_SECRET', 'change-me-please-use-a-long-random-string'),

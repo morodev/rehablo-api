@@ -32,7 +32,7 @@ services:
         value: "false"
       - key: JWT_SECRET
         generateValue: true
-      # Il processo apre la porta solo dopo aver aggiornato tutti gli schemi tenant.
+      # HTTP apre subito; /health e le API restano a 503 finche tutti i tenant sono pronti.
       - key: TENANT_SCHEMA_SYNC
         value: additive
       - key: TENANT_SCHEMA_BOOTSTRAP_CONCURRENCY

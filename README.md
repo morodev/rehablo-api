@@ -71,6 +71,25 @@ npm run dev             # tsx watch
 npm run build && npm start   # produzione
 ```
 
+## Avvio e health check su Render
+
+Il listener apre subito su `0.0.0.0` alla porta indicata da `PORT`. Durante il bootstrap,
+`GET /health` restituisce `503 {"status":"starting"}` e tutte le rotte applicative,
+compresi webhook Stripe e link pubblici, rispondono `503` senza eseguire i controller.
+Dopo connessione al database, migrazioni tenant e attivazioni obbligatorie, il servizio
+abilita le API e `/health` restituisce `200 {"status":"ok"}`. Un errore obbligatorio
+chiude il listener e termina il processo con codice 1.
+
+In Render, verificare che **Settings > Health Checks > Health Check Path** sia `/health`,
+come in `render.yaml`: il solo controllo TCP non verifica il completamento del bootstrap.
+La finestra per superare gli health check di un nuovo deploy è di 15 minuti.
+I log `[startup]` e `[tenant-schema]` indicano fase, tenant, modello o migrazione e durata;
+l'ultima fase avviata senza completamento identifica il passaggio da indagare.
+
+Verifiche locali: `npm run build` e `npm run test:startup`. Dopo il deploy, verificare
+nei log l'apertura immediata della porta, il completamento dei tenant e il messaggio
+`bootstrap complete; accepting application traffic`.
+
 ## Da fare prima del go-live
 
 1. Portare il dominio `human-body`.

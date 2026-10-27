@@ -54,12 +54,28 @@ function quotedSchema(schema: string): string {
     return '"' + schema + '"';
 }
 
+/** Log before awaiting database work so a stalled startup identifies its active phase. */
+export async function traceTenantSchemaPhase<T>(schema: string, phase: string, work: () => Promise<T>): Promise<T> {
+    const startedAt = Date.now();
+    console.log(`[tenant-schema] ${schema}: ${phase}: avvio`);
+    try {
+        const result = await work();
+        console.log(`[tenant-schema] ${schema}: ${phase}: completato (${Date.now() - startedAt} ms)`);
+        return result;
+    } catch (error) {
+        console.error(`[tenant-schema] ${schema}: ${phase}: fallito (${Date.now() - startedAt} ms)`);
+        throw error;
+    }
+}
+
 export async function lockTenantSchema(database: Sequelize, schema: string, transaction: Transaction): Promise<void> {
     quotedSchema(schema);
-    await database.query("SET LOCAL lock_timeout = '10s'", {transaction});
-    // The database lock also serializes different API instances, beyond the in-process cache.
-    await database.query('SELECT pg_advisory_xact_lock(hashtext(:schema), hashtext(:operation))', {
-        transaction, replacements: {schema, operation: 'tenant-schema-migrations'}
+    await traceTenantSchemaPhase(schema, 'lock migrazioni', async () => {
+        await database.query("SET LOCAL lock_timeout = '10s'", {transaction});
+        // The database lock also serializes different API instances, beyond the in-process cache.
+        await database.query('SELECT pg_advisory_xact_lock(hashtext(:schema), hashtext(:operation))', {
+            transaction, replacements: {schema, operation: 'tenant-schema-migrations'}
+        });
     });
 }
 
@@ -101,7 +117,7 @@ export async function runTenantMigrations(
     schema: string, repairHistoryKnown = false, database: Sequelize = sequelize, transaction?: Transaction
 ): Promise<string[]> {
     const prefix = quotedSchema(schema);
-    const migrate = async (currentTransaction: Transaction) => {
+    const migrate = async (currentTransaction: Transaction) => traceTenantSchemaPhase(schema, 'migrazioni tenant', async () => {
         await database.query(`CREATE TABLE IF NOT EXISTS ${prefix}."schema_migrations" (
             "version" VARCHAR(160) PRIMARY KEY, "appliedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )`, {transaction: currentTransaction});
@@ -112,17 +128,19 @@ export async function runTenantMigrations(
         const completed: string[] = [];
         for (const migration of tenantMigrations) {
             if (alreadyApplied.has(migration.version)) continue;
-            await migration.module.up(database.getQueryInterface(), {
-                schema, transaction: currentTransaction, repairHistoryKnown
-            });
-            // Each migration and its completion record belong to the caller's transaction.
-            await database.query(`INSERT INTO ${prefix}."schema_migrations" ("version") VALUES (:version)`, {
-                transaction: currentTransaction, replacements: {version: migration.version}
+            await traceTenantSchemaPhase(schema, `migrazione ${migration.version}`, async () => {
+                await migration.module.up(database.getQueryInterface(), {
+                    schema, transaction: currentTransaction, repairHistoryKnown
+                });
+                // Each migration and its completion record belong to the caller's transaction.
+                await database.query(`INSERT INTO ${prefix}."schema_migrations" ("version") VALUES (:version)`, {
+                    transaction: currentTransaction, replacements: {version: migration.version}
+                });
             });
             completed.push(migration.version);
         }
         return completed;
-    };
+    });
     if (transaction) return migrate(transaction);
     return database.transaction(async currentTransaction => {
         await lockTenantSchema(database, schema, currentTransaction);
@@ -146,11 +164,13 @@ export async function isTenantSchemaCurrent(
     schema: string, database: Sequelize = sequelize, transaction?: Transaction
 ): Promise<boolean> {
     const prefix = quotedSchema(schema);
-    const [tables] = await database.query('SELECT to_regclass(:registry) AS registry', {
-        transaction, replacements: {registry: prefix + '."schema_migrations"'}
+    return traceTenantSchemaPhase(schema, 'verifica versioni schema', async () => {
+        const [tables] = await database.query('SELECT to_regclass(:registry) AS registry', {
+            transaction, replacements: {registry: prefix + '."schema_migrations"'}
+        });
+        if (!(tables[0] as {registry?: string})?.registry) return false;
+        const [rows] = await database.query(`SELECT "version" FROM ${prefix}."schema_migrations"`, {transaction});
+        const applied = new Set((rows as Array<{version: string}>).map(row => row.version));
+        return requiredTenantSchemaVersions().every(version => applied.has(version));
     });
-    if (!(tables[0] as {registry?: string})?.registry) return false;
-    const [rows] = await database.query(`SELECT "version" FROM ${prefix}."schema_migrations"`, {transaction});
-    const applied = new Set((rows as Array<{version: string}>).map(row => row.version));
-    return requiredTenantSchemaVersions().every(version => applied.has(version));
 }

@@ -4,7 +4,7 @@ import { env } from '../config/env.js';
 import {ensureActivityDeliveryActivation} from '../modules/activities/services/activityDeliveryActivation.service.js';
 import {
     isTenantSchemaCurrent, lockTenantSchema, prepareTenantPaymentHistory,
-    recordTenantModelBaseline, runTenantMigrations
+    recordTenantModelBaseline, runTenantMigrations, traceTenantSchemaPhase
 } from './tenantMigrations.js';
 
 /**
@@ -88,13 +88,16 @@ export async function ensureTenantSchema(tenantId: string): Promise<string> {
 }
 
 async function syncTenantSchema(schemaName: string): Promise<string> {
-    const syncOptions = syncOptionsFor();
-    if (syncOptions && !await isTenantSchemaCurrent(schemaName)) {
-        await sequelize.transaction(transaction => initializeTenantSchema(schemaName, syncOptions, transaction, true));
-    }
-    await ensureActivityDeliveryActivation(schemaName);
-    ensuredSchemas.add(schemaName);
-    return schemaName;
+    return traceTenantSchemaPhase(schemaName, 'inizializzazione tenant', async () => {
+        const syncOptions = syncOptionsFor();
+        if (syncOptions && !await isTenantSchemaCurrent(schemaName)) {
+            await traceTenantSchemaPhase(schemaName, 'transazione schema', () =>
+                sequelize.transaction(transaction => initializeTenantSchema(schemaName, syncOptions, transaction, true)));
+        }
+        await traceTenantSchemaPhase(schemaName, 'attivazione notifiche', () => ensureActivityDeliveryActivation(schemaName));
+        ensuredSchemas.add(schemaName);
+        return schemaName;
+    });
 }
 
 async function initializeTenantSchema(
@@ -103,30 +106,38 @@ async function initializeTenantSchema(
     await lockTenantSchema(sequelize, schemaName, transaction);
     // A second API instance can complete the same tenant while this one waits for the lock.
     if (recheckCurrent && await isTenantSchemaCurrent(schemaName, sequelize, transaction)) return;
-    await sequelize.query(`CREATE SCHEMA IF NOT EXISTS "${schemaName}"`, {transaction});
-    const repairHistoryKnown = await prepareTenantPaymentHistory(schemaName, sequelize, transaction);
+    await traceTenantSchemaPhase(schemaName, 'creazione schema', () =>
+        sequelize.query(`CREATE SCHEMA IF NOT EXISTS "${schemaName}"`, {transaction}));
+    const repairHistoryKnown = await traceTenantSchemaPhase(schemaName, 'preparazione storico pagamenti', () =>
+        prepareTenantPaymentHistory(schemaName, sequelize, transaction));
     // Schema sync and versioned migrations commit together. A failure keeps the tenant out of
     // the ready cache and prevents requests from observing a partially upgraded schema.
     const transactionalSyncOptions = {...syncOptions, transaction} as SyncOptions;
-    for (const model of tenantScopedModels) {
+    for (const [index, model] of tenantScopedModels.entries()) {
         // Sequelize forwards unknown SyncOptions to every QueryInterface call; its v6 typings
         // omit `transaction`, although the runtime supports and propagates it.
-        await model.schema(schemaName).sync(transactionalSyncOptions);
+        const modelName = model.name || model.tableName || `#${index + 1}`;
+        await traceTenantSchemaPhase(schemaName, `sync modello ${modelName}`, () =>
+            model.schema(schemaName).sync(transactionalSyncOptions));
     }
     const completed = await runTenantMigrations(schemaName, repairHistoryKnown, sequelize, transaction);
     if (completed.length) {
         console.log(`[tenant-schema] ${schemaName}: migrazioni completate (${completed.join(', ')})`);
     }
-    await recordTenantModelBaseline(schemaName, sequelize, transaction);
-    await ensureActivityDeliveryActivation(schemaName, transaction);
+    await traceTenantSchemaPhase(schemaName, 'registrazione baseline modelli', () =>
+        recordTenantModelBaseline(schemaName, sequelize, transaction));
+    await traceTenantSchemaPhase(schemaName, 'attivazione notifiche nella transazione', () =>
+        ensureActivityDeliveryActivation(schemaName, transaction));
 }
 
 /** Provision a tenant in the caller's transaction, used during registration before it is returned. */
 export async function provisionTenantSchema(tenantId: string, transaction: Transaction): Promise<string> {
     const schemaName = getTenantSchemaName(tenantId);
-    const syncOptions = syncOptionsFor();
-    if (syncOptions) await initializeTenantSchema(schemaName, syncOptions, transaction);
-    return schemaName;
+    return traceTenantSchemaPhase(schemaName, 'provisioning tenant', async () => {
+        const syncOptions = syncOptionsFor();
+        if (syncOptions) await initializeTenantSchema(schemaName, syncOptions, transaction);
+        return schemaName;
+    });
 }
 
 /** Mark a schema provisioned in a transaction that has just committed successfully. */
@@ -135,7 +146,7 @@ export function markTenantSchemaReady(tenantId: string): void {
 }
 
 /**
- * Upgrade every existing tenant before the HTTP listener starts. Work is bounded to avoid
+ * Upgrade every existing tenant before HTTP traffic is accepted. Work is bounded to avoid
  * exhausting the Sequelize pool; a single failure rejects startup and therefore the deploy.
  */
 export async function warmTenantSchemas(tenantIds: string[], concurrency = 2): Promise<number> {

@@ -27,6 +27,7 @@ import {startPatientContactReminderSweep} from './modules/notes/services/patient
 import {startActivityDeliverySweep} from './modules/activities/services/activityDelivery.service.js';
 import activityNotificationsRoutes from './modules/activities/routes/activityNotifications.routes.js';
 import {warmTenantSchemas} from './utils/tenantSchema.js';
+import {createStartupReadiness, runStartupPhase, startHttpServer} from './utils/serverStartup.js';
 
 import authRoutes from './modules/auth/routes/auth.routes.js';
 import patientRoutes from './modules/patients/routes/patient.routes.js';
@@ -52,6 +53,7 @@ import { syncQuotePublicModels } from './modules/administration/models/quoteDeli
 
 async function bootstrap() {
     const app = express();
+    const readiness = createStartupReadiness();
 
     app.use(helmet());
     app.use(
@@ -70,12 +72,13 @@ async function bootstrap() {
         })
     );
     app.use(morgan(env.isProduction ? 'combined' : 'dev'));
+    app.get('/health', readiness.health);
+    // Include anonymous shares and Stripe: no controller or body parser runs during bootstrap.
+    app.use(readiness.requireReady);
     // Stripe signatures must be verified against the original bytes, before JSON parsing.
     app.post('/billing/webhook', express.raw({type: 'application/json', limit: '1mb'}), billingWebhook);
     app.use(bodyParser.urlencoded({ extended: false }));
     app.use(bodyParser.json());
-
-    app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
     // Keep the anonymous share endpoint before root-mounted authenticated routers.
     app.use(invoiceShareRoutes);
@@ -108,26 +111,30 @@ async function bootstrap() {
     app.use(notFoundHandler);
     app.use(errorHandler);
 
-    await connectDatabase();
+    await startHttpServer(app, env.port, readiness, initializeApplication);
+}
+
+async function initializeApplication(): Promise<void> {
+    await runStartupPhase('database connection', connectDatabase);
 
     // Public-schema models (tenants/users/structures/availabilities)
     registerAuthAssociations();
-    await syncAuthModels();
-    await syncBillingModels();
+    await runStartupPhase('public auth models', syncAuthModels);
+    await runStartupPhase('public billing models', syncBillingModels);
     // Il link di consegna della fattura vive in `public`: dev'essere risolvibile da una richiesta
     // anonima, che non ha un tenant da cui derivare lo schema.
-    await syncInvoicePublicModels();
-    await syncQuotePublicModels();
+    await runStartupPhase('public invoice models', syncInvoicePublicModels);
+    await runStartupPhase('public quote models', syncQuotePublicModels);
 
     // RBAC: allinea i ruoli delle membership preesistenti (vedi docs/RBAC_DESIGN.md)
-    await assignBootstrapRoles();
-    await migrateStructureCalendars();
+    await runStartupPhase('bootstrap roles', assignBootstrapRoles);
+    await runStartupPhase('structure calendars', migrateStructureCalendars);
 
     // RBAC: assegna la sede ai record che ne sono privi, così lo scope `structure` può
     // diventare stretto. Idempotente e non distruttivo (tocca solo `structureId IS NULL`),
     // quindi può girare a ogni avvio senza bisogno di interventi manuali sul server.
     try {
-        const backfill = await runStructureBackfill({ apply: true });
+        const backfill = await runStartupPhase('structure backfill', () => runStructureBackfill({ apply: true }));
         const updated = Object.entries(backfill.updated);
         if (updated.length > 0) {
             const detail = updated.map(([table, count]) => `${table}=${count}`).join(', ');
@@ -157,48 +164,45 @@ async function bootstrap() {
             console.error('[auth] purge dei refresh token fallita', err);
         }
     };
-    await purge();
+    await runStartupPhase('expired refresh tokens', purge);
     setInterval(purge, 24 * 60 * 60 * 1000).unref();
 
     // Public-schema human-body catalog (standardized scales/tests, shared by every tenant).
     // Seeded exactly once at boot here, instead of on every single GET request like the legacy
     // rehablo-human-body microservice used to do.
     registerCatalogAssociations();
-    await syncCatalogModels();
-    await seedCatalogData();
+    await runStartupPhase('human-body catalog models', syncCatalogModels);
+    await runStartupPhase('human-body catalog seed', seedCatalogData);
 
     // Public-schema rehabilitation protocols catalog (exercises + reusable protocol templates,
     // shared by every tenant). No seed data yet: managed via the /exercises and /protocol-templates CRUD.
     registerProtocolCatalogAssociations();
-    await syncProtocolCatalogModels();
+    await runStartupPhase('protocol catalog models', syncProtocolCatalogModels);
 
     // Public-schema measurement dictionary (Clinical Data Dictionary): definizioni metriche condivise
     // da tutti i tenant. È il fondamento del modello canonico (docs/REHABLO_OS_GAP_ANALYSIS.md §3).
-    await syncMeasurementCatalogModels();
-    await seedMeasurementCatalogData();
+    await runStartupPhase('measurement catalog models', syncMeasurementCatalogModels);
+    await runStartupPhase('measurement catalog seed', seedMeasurementCatalogData);
 
     // Register first, then upgrade every existing tenant before accepting traffic. This moves
     // DDL and data migrations out of the first user request after a deploy.
     registerTenantModels();
-    const tenantRows = await Tenant.findAll({attributes: ['id'], raw: true}) as unknown as Array<{id: string}>;
-    console.log(`[database] inizializzazione di ${tenantRows.length} tenant prima dell'apertura HTTP`);
-    const readyTenants = await warmTenantSchemas(
+    const tenantRows = await runStartupPhase('tenant discovery', () => Tenant.findAll({attributes: ['id'], raw: true})) as unknown as Array<{id: string}>;
+    console.log(`[database] inizializzazione di ${tenantRows.length} tenant prima di abilitare le API`);
+    const readyTenants = await runStartupPhase('tenant schemas', () => warmTenantSchemas(
         tenantRows.map(tenant => tenant.id), env.tenantSchemaBootstrapConcurrency
-    );
-    console.log(`[database] ${readyTenants} tenant pronti; apertura HTTP consentita`);
+    ));
+    console.log(`[database] ${readyTenants} tenant pronti`);
 
     // A fine appuntamento passa a COMPLETED se nessuno ha registrato un esito o
     // una segnalazione esplicita.
-    startAutomaticAppointmentCompletionSweep();
-    startPatientContactReminderSweep();
-    if (process.env.REMINDER_EXTERNAL_DELIVERY_ENABLED !== 'false') {
-        await startReminderExternalDeliverySweep();
-    }
-
-    await startActivityDeliverySweep();
-
-    app.listen(env.port, () => {
-        console.log(`[rehablo-api] listening on port ${env.port} (${env.nodeEnv})`);
+    await runStartupPhase('background delivery initialization', async () => {
+        startAutomaticAppointmentCompletionSweep();
+        startPatientContactReminderSweep();
+        if (process.env.REMINDER_EXTERNAL_DELIVERY_ENABLED !== 'false') {
+            await startReminderExternalDeliverySweep();
+        }
+        await startActivityDeliverySweep();
     });
 }
 
