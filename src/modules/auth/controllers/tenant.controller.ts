@@ -17,7 +17,7 @@ import { isTaxRegimeCode } from '../../invoice/utils/fiscalRegime.js';
 import { Tenant, TenantUser, User, Structure, StructureAvailability } from '../models/index.js';
 import { issueAccountActionToken } from '../services/accountActionToken.service.js';
 import { localStorageAdapter } from '../../measurements/storage/localStorageAdapter.js';
-import {markTenantSchemaReady, provisionTenantSchema} from '../../../utils/tenantSchema.js';
+import {beginTenantProvisioning, markTenantSchemaReady, provisionTenantSchema} from '../../../utils/tenantSchema.js';
 
 export const stripe = env.stripeSecretKey ? new Stripe(env.stripeSecretKey) : (null as unknown as Stripe);
 
@@ -73,6 +73,8 @@ export const createTenant = asyncHandler(async (req: Request, res: Response) => 
     // error unrelated to the email itself), nothing should be persisted, otherwise a retry
     // with the same email would incorrectly fail with "Email already registered".
     const { tenant, createdUser, verificationToken } = await sequelize.transaction(async (transaction) => {
+        // Global release lock precedes all public/tenant row locks to prevent a deploy/signup deadlock.
+        await beginTenantProvisioning(transaction);
         const tenant: any = await Tenant.create(
             {
                 userQuantity,

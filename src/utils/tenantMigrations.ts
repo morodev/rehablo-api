@@ -25,7 +25,7 @@ export const PATIENT_SETTLEMENTS_VERSION = '20261012-patient-settlements';
 export const ACTIVITIES_REVIEW_VERSION = '20261024-activities-review';
 export const ACTIVITIES_DELIVERY_VERSION = '20261011-activities-delivery';
 export const SOCIAL_SECURITY_PRICING_VERSION = '20261023-social-security-pricing';
-const tenantMigrations: Array<{version: string; module: MigrationModule}> = [
+export const tenantMigrations: Array<{version: string; module: MigrationModule}> = [
     {version: PATIENT_CONTACT_FOLLOW_UP_VERSION, module: require('../../migrations/20261026-patient-contact-follow-ups.js')},
     {version: SOCIAL_SECURITY_PRICING_VERSION, module: require('../../migrations/20261023-social-security-pricing.js')},
     {version: CARE_PACKAGE_PURCHASES_VERSION, module: require('../../migrations/20261022-care-package-purchases.js')},

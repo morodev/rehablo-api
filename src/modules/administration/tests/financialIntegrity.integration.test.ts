@@ -8,10 +8,16 @@ const target = requireFinancialTestDatabase(process.env);
 process.env.DATABASE_URL = target.databaseUrl;
 process.env.DB_SSL = 'false';
 process.env.NODE_ENV = 'test';
-process.env.TENANT_SCHEMA_SYNC = 'additive';
+process.env.DATABASE_MIGRATION_PHASE = 'managed';
+process.env.TENANT_SCHEMA_SYNC = 'off';
 const {sequelize} = await import('../../../config/database.js');
 (sequelize as any).options.logging = false;
 const {Tenant} = await import('../../auth/models/index.js');
+const {databaseManifest} = await import('../../../database/migrationManifest.js');
+const {migrateDatabase, runTenantMigrations} = await import('../../../database/releaseRunner.js');
+const {assertProvisioningRelease, lockProvisioning, recordTenantReady} = await import('../../../database/releaseControl.js');
+const {beginTenantProvisioning, provisionTenantSchema, markTenantSchemaReady, ensureTenantSchema, invalidateTenantSchemaCache} =
+    await import('../../../utils/tenantSchema.js');
 const {default: AgendaEvent} = await import('../../agenda/models/agendaEvent.model.js');
 const {default: Invoice} = await import('../../invoice/models/invoice.model.js');
 const {default: InvoicePayment} = await import('../../invoice/models/invoicePayment.model.js');
@@ -23,14 +29,11 @@ const {readFinancialOptions} = await import('../services/financialAccountResolve
 const {linkAppointmentPayments} = await import('../../invoice/services/appointmentPayment.service.js');
 const {syncInvoicePaymentStatus} = await import('../../invoice/services/payment.service.js');
 const {balanceEffectiveMovements, treasuryBalance} = await import('../services/treasuryLedger.service.js');
-const models = [AgendaEvent, Invoice, InvoicePayment, InvoiceAgendaEvent, CarePackage, FinancialAccount,
-    PaymentMethod, TreasuryMovement, FinancialOperation];
-
 before(async () => {
     await sequelize.authenticate();
     const [rows] = await sequelize.query('SELECT current_database() AS name');
     assert.equal((rows[0] as any).name, target.databaseName);
-    await Tenant.sync({force: false, alter: false});
+    await migrateDatabase(databaseManifest, {database: sequelize});
 });
 after(async () => {await sequelize.close();});
 
@@ -43,13 +46,23 @@ async function fixture(t: TestContext) {
         try {
             assert.match(schema, /^rehablo_[a-f0-9]{32}$/);
             if (schemaCreated) await sequelize.query(`DROP SCHEMA "${schema}" CASCADE`);
-        } finally {await Tenant.destroy({where: {id: tenantId}});}
+        } finally {
+            await sequelize.query('DELETE FROM public.tenant_schema_state WHERE "schemaName"=:schema', {replacements: {schema}});
+            invalidateTenantSchemaCache(tenantId);
+            await Tenant.destroy({where: {id: tenantId}});
+        }
     });
-    await Tenant.create({id: tenantId, license: 'synthetic-financial-integration', idStripe: 'synthetic',
-        maxUserQuantity: 1, maxStructureQuantity: 1, administrationSettings: {}});
-    await sequelize.query(`CREATE SCHEMA "${schema}"`);
+    await sequelize.transaction(async transaction => {
+        await beginTenantProvisioning(transaction);
+        await Tenant.create({id: tenantId, license: 'synthetic-financial-integration', idStripe: 'synthetic',
+            maxUserQuantity: 1, maxStructureQuantity: 1, administrationSettings: {}}, {transaction});
+        await provisionTenantSchema(tenantId, transaction);
+        // These receipt tests deliberately begin without any configured account. Remove only
+        // the fresh empty configuration account; historical cash and movements do not exist.
+        await FinancialAccount.schema(schema).destroy({where: {}, transaction});
+    });
     schemaCreated = true;
-    for (const model of models) await (model as any).schema(schema).sync({force: false, alter: false});
+    markTenantSchemaReady(tenantId);
     const event = (amount = 40) => AgendaEvent.schema(schema).create({patientId: randomUUID(), structureId,
         title: 'Synthetic financial integration', start: '2025-01-05T10:00:00Z', end: '2025-01-05T11:00:00Z',
         status: 'CONFIRMED', appointmentExpectedAmount: amount, appointmentOriginalAmount: amount,
@@ -186,11 +199,9 @@ test('historical balances, credit and package coverage do not create cash accoun
     assert.equal(await TreasuryMovement.schema(f.schema).count(), 0);
 });
 
-test('additive tenant bootstrap and a second run preserve historical data and install the financial registry once', async t => {
+test('explicit tenant migration and a second run preserve historical data and install the financial registry once', async t => {
     const f = await fixture(t);
-    const {requiredTenantSchemaVersions, FINANCIAL_INTEGRITY_VERSION, TENANT_MODEL_BASELINE_VERSION, isTenantSchemaCurrent} =
-        await import('../../../utils/tenantMigrations.js');
-    const {registerTenantScopedModel, ensureTenantSchema, invalidateTenantSchemaCache} = await import('../../../utils/tenantSchema.js');
+    const {FINANCIAL_INTEGRITY_VERSION} = await import('../../../utils/tenantMigrations.js');
     // Existing tenant: unrelated migrations are already recorded, financial operations are absent.
     await FinancialOperation.schema(f.schema).drop();
     const account = await FinancialAccount.schema(f.schema).create({structureId: f.structureId, name: 'Historic cash', openingBalance: 7});
@@ -199,16 +210,22 @@ test('additive tenant bootstrap and a second run preserve historical data and in
         source: 'LEGACY_IMPORT', status: 'POSTED', paidAt: null}, {hooks: false});
     await sequelize.query(`ALTER TABLE "${f.schema}"."financial_accounts" ADD COLUMN "legacyMemo" TEXT DEFAULT 'preserve me'`);
     await sequelize.query(`ALTER TABLE "${f.schema}"."financial_accounts" DROP COLUMN "metadata"`);
-    await sequelize.query(`CREATE TABLE "${f.schema}"."schema_migrations" ("version" VARCHAR(160) PRIMARY KEY, "appliedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
-    for (const version of requiredTenantSchemaVersions().filter(value => ![FINANCIAL_INTEGRITY_VERSION, TENANT_MODEL_BASELINE_VERSION].includes(value))) {
-        await sequelize.query(`INSERT INTO "${f.schema}"."schema_migrations" ("version") VALUES (:version)`, {replacements: {version}});
-    }
-    for (const model of models) registerTenantScopedModel(model as any);
-    assert.equal(await isTenantSchemaCurrent(f.schema), false);
-    assert.equal(await ensureTenantSchema(f.tenantId), f.schema);
+    await sequelize.query(`DELETE FROM "${f.schema}"."schema_migrations" WHERE "version" IN (:versions)`, {
+        replacements: {versions: ['20261028-tenant-schema-baseline-v1', FINANCIAL_INTEGRITY_VERSION, '20261028-tenant-schema-constraints-v1']}
+    });
+    await sequelize.query('DELETE FROM public.tenant_schema_state WHERE "schemaName"=:schema', {replacements: {schema: f.schema}});
     invalidateTenantSchemaCache(f.tenantId);
+    await assert.rejects(ensureTenantSchema(f.tenantId), /not ready/, 'runtime access cannot repair incomplete tenants');
+    const apply = () => sequelize.transaction(async transaction => {
+        await lockProvisioning(sequelize, transaction);
+        await assertProvisioningRelease(databaseManifest, sequelize, transaction);
+        const completed = await runTenantMigrations(databaseManifest, f.schema, sequelize, transaction);
+        await recordTenantReady(f.schema, databaseManifest, sequelize, transaction);
+        return completed;
+    });
+    assert.equal(await apply(), 3);
+    assert.equal(await apply(), 0, 'a second migration run cannot replay imports or schema work');
     assert.equal(await ensureTenantSchema(f.tenantId), f.schema);
-    assert.equal(await isTenantSchemaCurrent(f.schema), true);
     const [columns] = await sequelize.query(`SELECT "legacyMemo", "metadata", "openingBalance" FROM "${f.schema}"."financial_accounts" WHERE "id"=:id`, {replacements: {id: account.get('id')}});
     assert.equal((columns[0] as any).legacyMemo, 'preserve me');
     assert.deepEqual((columns[0] as any).metadata, {});

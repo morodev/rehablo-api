@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import type {Sequelize} from 'sequelize';
 import {
     appointmentEndAt,
     shouldAutoCompleteAppointment,
-    shouldOpenAttendanceCorrection
+    shouldOpenAttendanceCorrection,
+    ensureMissedArrivalWorkflowColumns
 } from './missedArrivalAutomation.service.js';
 
 const appointment = (overrides: Record<string, unknown> = {}) => ({
@@ -18,6 +20,36 @@ const appointment = (overrides: Record<string, unknown> = {}) => ({
     patient: null,
     missedArrivalReportedAt: null,
     ...overrides
+});
+
+describe('appointment schema readiness is read only', () => {
+    const columns = ['carePackageId', 'packageReservationStatus', 'missedArrivalReportedAt', 'missedArrivalReportedBy',
+        'missedArrivalResolvedAt', 'missedArrivalResolvedBy', 'missedArrivalResolution', 'noShowBillingDecision'];
+
+    it('rejects an incomplete schema without running DDL and retries after migration', async () => {
+        const queries: string[] = [];
+        let ready = false;
+        const database = {query: async (sql: string) => {
+            queries.push(sql);
+            return (ready ? columns : []).map(columnName => ({columnName}));
+        }} as unknown as Sequelize;
+        await assert.rejects(ensureMissedArrivalWorkflowColumns('rehablo_readinessmissing', database),
+            {statusCode: 503, code: 'TENANT_SCHEMA_NOT_READY'});
+        ready = true;
+        await ensureMissedArrivalWorkflowColumns('rehablo_readinessmissing', database);
+        assert.equal(queries.length, 2);
+        assert.ok(queries.every(sql => /^\s*SELECT\b/i.test(sql)));
+    });
+
+    it('caches only a complete contract and rejects invalid schema names before querying', async () => {
+        let queries = 0;
+        const database = {query: async () => {queries++; return columns.map(columnName => ({columnName}));}} as unknown as Sequelize;
+        await ensureMissedArrivalWorkflowColumns('rehablo_readinesscomplete', database);
+        await ensureMissedArrivalWorkflowColumns('rehablo_readinesscomplete', database);
+        assert.equal(queries, 1);
+        await assert.rejects(ensureMissedArrivalWorkflowColumns('public; DROP SCHEMA public', database));
+        assert.equal(queries, 1);
+    });
 });
 
 describe('automatic appointment completion eligibility', () => {

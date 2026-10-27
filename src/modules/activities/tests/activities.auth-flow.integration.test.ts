@@ -7,8 +7,6 @@ import {createActivitiesHarness, type ActivitiesHarness} from './activitiesTestH
 let harness: ActivitiesHarness;
 const password = 'Activities-test-only-password';
 before(async () => {harness = await createActivitiesHarness();
-    await harness.auth.StructureUserAvailability.sync();
-    await harness.auth.UserAvailability.sync();
     await harness.auth.User.update({password: await bcrypt.hash(password, 4)}, {where: {id: harness.ids.ownerA}});
 });
 after(async () => {if (harness) {

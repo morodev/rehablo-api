@@ -1,0 +1,71 @@
+# First transition release only. Retire all pre-bridge instances before the managed deployment.
+databases:
+  - name: rehablo-db
+    plan: free
+    region: frankfurt
+    databaseName: rehablo
+    user: rehablo
+
+services:
+  - type: web
+    name: rehablo-api
+    runtime: node
+    plan: 0.5c-512mb
+    region: frankfurt
+    branch: master
+    buildCommand: npm ci && npm run build
+    preDeployCommand: npm run db:migrate
+    startCommand: npm start
+    healthCheckPath: /health
+    disk:
+      name: rehablo-private-files
+      mountPath: /var/data/rehablo
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: 20.14.0
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: rehablo-db
+          property: connectionString
+      - key: DB_SSL
+        value: "false"
+      - key: JWT_SECRET
+        generateValue: true
+      # Migration runner completes before the managed API starts. See docs/DATABASE_MIGRATIONS.md.
+      - key: DATABASE_MIGRATION_PHASE
+        value: bridge
+      - key: MIGRATION_CONCURRENCY
+        value: "2"
+      - key: TENANT_SCHEMA_SYNC
+        value: additive
+      - key: TENANT_SCHEMA_BOOTSTRAP_CONCURRENCY
+        value: "2"
+      # Access token a vita breve: i permessi RBAC viaggiano nei claim, quindi un token
+      # longevo terrebbe in vita permessi gia revocati. La sessione e garantita dal refresh.
+      - key: JWT_EXPIRES_IN
+        value: 15m
+      - key: REFRESH_TOKEN_TTL_DAYS
+        value: "30"
+      - key: DEVICE_CREDENTIALS_SECRET
+        generateValue: true
+      - key: RAW_FILE_STORAGE_DIR
+        value: /var/data/rehablo/raw-files
+      - key: MAX_UPLOAD_SIZE_MB
+        value: "20"
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: EMAIL_HOST
+        sync: false
+      - key: EMAIL_PORT
+        value: "465"
+      - key: EMAIL_SECURE
+        value: "true"
+      - key: EMAIL_AUTH_USER
+        sync: false
+      - key: EMAIL_AUTH_PASS
+        sync: false

@@ -13,6 +13,7 @@ services:
     region: frankfurt
     branch: master
     buildCommand: npm ci && npm run build
+    preDeployCommand: npm run db:migrate
     startCommand: npm start
     healthCheckPath: /health
     disk:
@@ -32,9 +33,13 @@ services:
         value: "false"
       - key: JWT_SECRET
         generateValue: true
-      # HTTP apre subito; /health e le API restano a 503 finche tutti i tenant sono pronti.
+      # Migration runner completes before the managed API starts. See docs/DATABASE_MIGRATIONS.md.
+      - key: DATABASE_MIGRATION_PHASE
+        value: managed
+      - key: MIGRATION_CONCURRENCY
+        value: "2"
       - key: TENANT_SCHEMA_SYNC
-        value: additive
+        value: off
       - key: TENANT_SCHEMA_BOOTSTRAP_CONCURRENCY
         value: "2"
       # Access token a vita breve: i permessi RBAC viaggiano nei claim, quindi un token

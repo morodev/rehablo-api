@@ -297,11 +297,14 @@ export async function sweepActivityDeliveries(options: ActivityDeliverySweepOpti
 }
 
 let sweepRunning = false;
-export async function startActivityDeliverySweep(): Promise<void> {
+export async function startActivityDeliverySweep(options: {initializeExistingTenants?: boolean} = {}): Promise<void> {
     if (!activitiesDeliveryEnabled()) return;
-    const tenants = await Tenant.findAll({attributes: ['id']});
-    // Activation must exist before HTTP accepts an alert, including TENANT_SCHEMA_SYNC=off deployments.
-    for (const tenant of tenants) await ensureActivityDeliveryActivation(getTenantSchemaName(tenant.id));
+    if (options.initializeExistingTenants !== false) {
+        const tenants = await Tenant.findAll({attributes: ['id']});
+        // Bridge compatibility only. Managed provisioning and dispatcher work initialize activation
+        // when delivery is enabled, preserving the cutoff for notifications created while disabled.
+        for (const tenant of tenants) await ensureActivityDeliveryActivation(getTenantSchemaName(tenant.id));
+    }
     const run = async () => {
         if (sweepRunning) return;
         sweepRunning = true;

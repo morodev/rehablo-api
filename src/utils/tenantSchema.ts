@@ -1,6 +1,10 @@
 import { ModelStatic, SyncOptions, Transaction } from 'sequelize';
 import { sequelize } from '../config/database.js';
 import { env } from '../config/env.js';
+import {bridgeManifest, databaseManifest} from '../database/migrationManifest.js';
+import {assertProvisioningRelease, assertTenantReady, lockProvisioning, recordTenantReady, withSharedReleaseLock} from '../database/releaseControl.js';
+import {getDatabaseStatus, runTenantMigrations as applyVersionedTenantMigrations} from '../database/releaseRunner.js';
+import {SchemaReadinessError} from '../database/migrationTypes.js';
 import {ensureActivityDeliveryActivation} from '../modules/activities/services/activityDeliveryActivation.service.js';
 import {
     isTenantSchemaCurrent, lockTenantSchema, prepareTenantPaymentHistory,
@@ -17,14 +21,17 @@ export function getTenantSchemaName(tenantId: string): string {
 
 /**
  * Every module registers here the models that live in the per-tenant dynamic schema
- * (patients, products, services, invoices, agenda events...). They get synced automatically
- * the first time a tenant schema is created/accessed, instead of calling `.sync()` on every
- * single request like the legacy microservices used to do.
+ * (patients, products, services, invoices, agenda events...). Managed requests only check
+ * the central compatibility record. Model sync is confined to the ordered bridge release.
  */
 const tenantScopedModels: ModelStatic<any>[] = [];
 
 export function registerTenantScopedModel(model: ModelStatic<any>): void {
-    tenantScopedModels.push(model);
+    if (!tenantScopedModels.includes(model)) tenantScopedModels.push(model);
+}
+
+export function getTenantScopedModels(): readonly ModelStatic<any>[] {
+    return tenantScopedModels;
 }
 
 const ensuredSchemas = new Set<string>();
@@ -63,8 +70,7 @@ function syncOptionsFor(): SyncOptions | null {
 }
 
 /**
- * Ensures the tenant schema exists and all tenant-scoped models are synced into it.
- * Cached in-process so repeated requests don't hit Postgres with CREATE SCHEMA / sync every time.
+ * Checks tenant compatibility, cached in-process. Managed requests never repair or create tables.
  */
 export async function ensureTenantSchema(tenantId: string): Promise<string> {
     const schemaName = getTenantSchemaName(tenantId);
@@ -88,16 +94,32 @@ export async function ensureTenantSchema(tenantId: string): Promise<string> {
 }
 
 async function syncTenantSchema(schemaName: string): Promise<string> {
-    return traceTenantSchemaPhase(schemaName, 'inizializzazione tenant', async () => {
+    if (env.databaseMigrationPhase === 'managed') {
+        await assertTenantReady(schemaName, databaseManifest, sequelize);
+        ensuredSchemas.add(schemaName);
+        return schemaName;
+    }
+    return withSharedReleaseLock(sequelize, () => traceTenantSchemaPhase(schemaName, 'bridge tenant', async () => {
+        // A still-running bridge instance may serve existing tenants after the managed predeploy.
+        // It must never synchronize those schemas back to its legacy model baseline.
+        if ((await getDatabaseStatus(databaseManifest, sequelize)).ready) {
+            await assertTenantReady(schemaName, databaseManifest, sequelize);
+            ensuredSchemas.add(schemaName);
+            return schemaName;
+        }
         const syncOptions = syncOptionsFor();
+        if (!syncOptions && !await isTenantSchemaCurrent(schemaName)) {
+            throw new SchemaReadinessError(`Legacy tenant schema ${schemaName} is incomplete; use the release migration runner`);
+        }
         if (syncOptions && !await isTenantSchemaCurrent(schemaName)) {
             await traceTenantSchemaPhase(schemaName, 'transazione schema', () =>
                 sequelize.transaction(transaction => initializeTenantSchema(schemaName, syncOptions, transaction, true)));
         }
         await traceTenantSchemaPhase(schemaName, 'attivazione notifiche', () => ensureActivityDeliveryActivation(schemaName));
+        await sequelize.transaction(transaction => recordTenantReady(schemaName, bridgeManifest, sequelize, transaction));
         ensuredSchemas.add(schemaName);
         return schemaName;
-    });
+    }));
 }
 
 async function initializeTenantSchema(
@@ -131,11 +153,30 @@ async function initializeTenantSchema(
 }
 
 /** Provision a tenant in the caller's transaction, used during registration before it is returned. */
+export async function beginTenantProvisioning(transaction: Transaction): Promise<void> {
+    await lockProvisioning(sequelize, transaction);
+    if (env.databaseMigrationPhase === 'managed') {
+        await assertProvisioningRelease(databaseManifest, sequelize, transaction);
+    } else if ((await getDatabaseStatus(databaseManifest, sequelize)).ready) {
+        throw new SchemaReadinessError('Registration is waiting for the managed API release');
+    }
+}
+
 export async function provisionTenantSchema(tenantId: string, transaction: Transaction): Promise<string> {
     const schemaName = getTenantSchemaName(tenantId);
+    await beginTenantProvisioning(transaction);
+    if (env.databaseMigrationPhase === 'managed') {
+        await applyVersionedTenantMigrations(databaseManifest, schemaName, sequelize, transaction);
+        // Activation belongs to runtime enablement, not to migration time while delivery is disabled.
+        await ensureActivityDeliveryActivation(schemaName, transaction);
+        await recordTenantReady(schemaName, databaseManifest, sequelize, transaction);
+        return schemaName;
+    }
     return traceTenantSchemaPhase(schemaName, 'provisioning tenant', async () => {
         const syncOptions = syncOptionsFor();
-        if (syncOptions) await initializeTenantSchema(schemaName, syncOptions, transaction);
+        if (!syncOptions) throw new SchemaReadinessError('Bridge provisioning requires TENANT_SCHEMA_SYNC=additive');
+        await initializeTenantSchema(schemaName, syncOptions, transaction);
+        await recordTenantReady(schemaName, bridgeManifest, sequelize, transaction);
         return schemaName;
     });
 }
@@ -146,8 +187,7 @@ export function markTenantSchemaReady(tenantId: string): void {
 }
 
 /**
- * Upgrade every existing tenant before HTTP traffic is accepted. Work is bounded to avoid
- * exhausting the Sequelize pool; a single failure rejects startup and therefore the deploy.
+ * Bridge-only warmup. Managed startup does not call this function or enumerate tenant schemas.
  */
 export async function warmTenantSchemas(tenantIds: string[], concurrency = 2): Promise<number> {
     const uniqueTenantIds = [...new Set(tenantIds)];
@@ -164,8 +204,7 @@ export async function warmTenantSchemas(tenantIds: string[], concurrency = 2): P
 }
 
 /**
- * Invalida la cache: il prossimo accesso al tenant rieseguirà `CREATE SCHEMA` + sync.
- * Utile dopo una migration applicata a caldo, senza dover riavviare il processo.
+ * Invalidates the local compatibility cache; managed access repeats only the read-only check.
  */
 export function invalidateTenantSchemaCache(tenantId?: string): void {
     if (tenantId) {

@@ -1,4 +1,4 @@
-import { Op, QueryTypes } from 'sequelize';
+import { Op, QueryTypes, Sequelize } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 import AgendaEvent from '../models/agendaEvent.model.js';
 import {AUTOMATIC_APPOINTMENT_COMPLETION_INTERVAL_MS, AUTOMATIC_APPOINTMENT_COMPLETION_LOOKBACK_MS} from './appointmentCompletion.policy.js';
@@ -19,18 +19,14 @@ const MISSED_ARRIVAL_COLUMNS = {
     noShowBillingDecision: 'VARCHAR(16) NULL'
 } as const;
 
-/**
- * Il job parte prima della prima richiesta autenticata, quindi non può dipendere
- * dalla sincronizzazione lazy del tenant. Allinea in modo additivo soltanto le
- * colonne del workflow che usa, una volta per schema e per processo.
- */
-export async function ensureMissedArrivalWorkflowColumns(schema: string): Promise<void> {
+/** Runtime only verifies the contract; schema changes belong to the release runner. */
+export async function ensureMissedArrivalWorkflowColumns(schema: string, database: Sequelize = sequelize): Promise<void> {
     if (preparedSchemas.has(schema)) return;
     if (!TENANT_SCHEMA_PATTERN.test(schema)) {
         throw new Error(`Schema tenant non valido: ${schema}`);
     }
 
-    const existingColumns = await sequelize.query<{ columnName: string }>(
+    const existingColumns = await database.query<{ columnName: string }>(
         `SELECT column_name AS "columnName"
          FROM information_schema.columns
          WHERE table_schema = :schema
@@ -42,17 +38,10 @@ export async function ensureMissedArrivalWorkflowColumns(schema: string): Promis
         .filter(([column]) => !existing.has(column));
 
     if (missing.length > 0) {
-        const additions = missing
-            .map(([column, definition]) => `ADD COLUMN IF NOT EXISTS "${column}" ${definition}`)
-            .join(',\n                ');
-        await sequelize.query(
-            `ALTER TABLE "${schema}"."agenda_events"
-                ${additions}`
-        );
-        console.log(
-            `[agenda] ${schema}: aggiunte colonne workflow mancato arrivo -> ` +
-            missing.map(([column]) => column).join(', ')
-        );
+        throw Object.assign(new Error('Schema tenant non pronto per il workflow appuntamenti'), {
+            statusCode: 503, code: 'TENANT_SCHEMA_NOT_READY',
+            schema, missingColumns: missing.map(([column]) => column)
+        });
     }
 
     preparedSchemas.add(schema);

@@ -19,7 +19,8 @@ export async function createActivitiesHarness() {
     process.env.NODE_ENV = 'test';
     process.env.JWT_SECRET = randomBytes(32).toString('hex');
     process.env.DB_SSL = 'false';
-    process.env.TENANT_SCHEMA_SYNC = 'additive';
+    process.env.DATABASE_MIGRATION_PHASE = 'managed';
+    process.env.TENANT_SCHEMA_SYNC = 'off';
 
     const {sequelize} = await import('../../../config/database.js');
     (sequelize as Sequelize & {options: {logging: false | ((sql: string) => void)}}).options.logging = false;
@@ -30,6 +31,9 @@ export async function createActivitiesHarness() {
     const activities = await import('../models/index.js');
     const notes = await import('../../notes/models/index.js');
     const {registerTenantModels} = await import('../../../tenantModelsRegistry.js');
+    const {databaseManifest} = await import('../../../database/migrationManifest.js');
+    const releaseControl = await import('../../../database/releaseControl.js');
+    const {migrateDatabase} = await import('../../../database/releaseRunner.js');
 
     const run = randomUUID();
     const tenantA = randomUUID();
@@ -71,6 +75,9 @@ export async function createActivitiesHarness() {
                 assert.match(schema, /^rehablo_[a-f0-9]{32}$/);
                 await sequelize.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
             }
+            await sequelize.query('DELETE FROM public.tenant_schema_state WHERE "schemaName" IN (:schemas)', {
+                replacements: {schemas: [schemaA, schemaB, ...extraSchemas]}
+            });
             await auth.PatientPortalAccess.destroy({where: {id: patientAccessId}});
             await auth.StructureUser.destroy({where: {structureId: structureIds}});
             await auth.TenantUser.destroy({where: {tenantId: tenantIds}});
@@ -90,39 +97,38 @@ export async function createActivitiesHarness() {
         assert.equal((databaseRows[0] as {name: string}).name, safeDatabase.databaseName);
         verifiedDatabase = true;
         auth.registerAuthAssociations();
-        await auth.syncAuthModels();
-        const {syncBillingModels} = await import('../../billing/models/billing.model.js');
-        await syncBillingModels();
-        // Public calendar tables are normally provisioned by startup migration; this harness owns an isolated test DB.
-        await auth.StructureUserAvailability.sync();
-        await auth.CalendarPreference.sync();
         registerTenantModels();
-        for (const id of tenantIds) {
-            await auth.Tenant.create({id, businessName: `Activities test ${id}`, license: 'activities-integration-test',
-                idStripe: `activities-test-${id}`, isActive: true, maxUserQuantity: 10, maxStructureQuantity: 10});
-        }
-        for (const [id, tenantId] of [[structureA, tenantA], [structureA2, tenantA], [structureB, tenantB]]) {
-            await auth.Structure.create({id, tenantId, name: `Activities test ${id}`});
-        }
-        for (const id of userIds) {
-            await auth.User.create({id, email: `activities-${run}-${id}@example.invalid`, password: 'not-a-login-password',
-                name: 'Integration', surname: id.slice(0, 8), isActive: true});
-        }
-        await auth.TenantUser.bulkCreate([
-            {tenantId: tenantA, userId: ownerA, role: 'OWNER'},
-            {tenantId: tenantA, userId: therapistA, role: 'THERAPIST'},
-            {tenantId: tenantA, userId: viewerA, role: 'VIEWER'},
-            {tenantId: tenantA, userId: outsiderA, role: 'THERAPIST'},
-            {tenantId: tenantB, userId: ownerB, role: 'OWNER'}
-        ]);
-        await auth.StructureUser.bulkCreate([
-            {structureId: structureA, userId: ownerA}, {structureId: structureA2, userId: ownerA},
-            {structureId: structureA, userId: therapistA, calendarEnabled: false},
-            {structureId: structureA, userId: viewerA},
-            {structureId: structureA2, userId: outsiderA}, {structureId: structureB, userId: ownerB}
-        ]);
-        await tenantSchema.ensureTenantSchema(tenantA);
-        await tenantSchema.ensureTenantSchema(tenantB);
+        await migrateDatabase(databaseManifest, {database: sequelize});
+        await sequelize.transaction(async transaction => {
+            await tenantSchema.beginTenantProvisioning(transaction);
+            for (const id of tenantIds) {
+                await auth.Tenant.create({id, businessName: `Activities test ${id}`, license: 'activities-integration-test',
+                    idStripe: `activities-test-${id}`, isActive: true, maxUserQuantity: 10, maxStructureQuantity: 10}, {transaction});
+            }
+            for (const [id, tenantId] of [[structureA, tenantA], [structureA2, tenantA], [structureB, tenantB]]) {
+                await auth.Structure.create({id, tenantId, name: `Activities test ${id}`}, {transaction});
+            }
+            for (const id of userIds) {
+                await auth.User.create({id, email: `activities-${run}-${id}@example.invalid`, password: 'not-a-login-password',
+                    name: 'Integration', surname: id.slice(0, 8), isActive: true}, {transaction});
+            }
+            await auth.TenantUser.bulkCreate([
+                {tenantId: tenantA, userId: ownerA, role: 'OWNER'},
+                {tenantId: tenantA, userId: therapistA, role: 'THERAPIST'},
+                {tenantId: tenantA, userId: viewerA, role: 'VIEWER'},
+                {tenantId: tenantA, userId: outsiderA, role: 'THERAPIST'},
+                {tenantId: tenantB, userId: ownerB, role: 'OWNER'}
+            ], {transaction});
+            await auth.StructureUser.bulkCreate([
+                {structureId: structureA, userId: ownerA}, {structureId: structureA2, userId: ownerA},
+                {structureId: structureA, userId: therapistA, calendarEnabled: false},
+                {structureId: structureA, userId: viewerA},
+                {structureId: structureA2, userId: outsiderA}, {structureId: structureB, userId: ownerB}
+            ], {transaction});
+            await tenantSchema.provisionTenantSchema(tenantA, transaction);
+            await tenantSchema.provisionTenantSchema(tenantB, transaction);
+        });
+        for (const tenantId of tenantIds) tenantSchema.markTenantSchemaReady(tenantId);
 
         // A patient actor needs a real active portal context. Keep the same identity as
         // ownerA to exercise switching between staff and patient contexts (including device logout).
@@ -189,7 +195,7 @@ export async function createActivitiesHarness() {
         up(queryInterface: ReturnType<Sequelize['getQueryInterface']>, options: {schema: string; transaction?: any}): Promise<void>
     };
 
-    return {sequelize, auth, activities, notes, migrations, activitiesMigration, tenantSchema, actors, api, cleanup, baseUrl,
+    return {sequelize, auth, activities, notes, migrations, activitiesMigration, tenantSchema, databaseManifest, releaseControl, actors, api, cleanup, baseUrl,
         testDatabaseUrl: safeDatabase.databaseUrl,
         extraSchemas,
         trackStructure: (id: string) => {

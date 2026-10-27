@@ -175,7 +175,7 @@ test('a real tenant upgrade is additive, preserves notes/reminders and serialize
     assert.equal(await harness.activities.ActivityBoard.schema(schemas.b).count(), 1);
     assert.deepEqual((await notes.Note.schema(schemas.b).findByPk(note.id))!.get({plain: true}), oldNote);
     assert.deepEqual((await notes.Reminder.schema(schemas.b).findByPk(reminder.id))!.get({plain: true}), oldReminder);
-    assert.equal(await migrations.isTenantSchemaCurrent(schemas.b), true);
+    await harness.releaseControl.assertTenantReady(schemas.b, harness.databaseManifest, sequelize);
     assert.equal((await harness.activities.ActivityBoard.schema(schemas.b).findOne({where: {structureId: ids.structureB}}))!.id, boardBeforeReplay.id);
     const [versions] = await sequelize.query(`SELECT "version" FROM "${schemas.b}"."schema_migrations"
         WHERE "version" = :version`, {replacements: {version: migrations.ACTIVITIES_FOUNDATION_VERSION}});

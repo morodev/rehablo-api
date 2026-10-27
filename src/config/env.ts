@@ -52,6 +52,15 @@ export const env = {
     databaseUrl: required('DATABASE_URL', 'postgres://postgres:postgres@localhost:5432/rehablo'),
     dbSsl: process.env.DB_SSL === 'true',
 
+    /** Bridge is used for the first ordered rollout only; managed API processes never synchronize schemas. */
+    databaseMigrationPhase: (() => {
+        const phase = (process.env.DATABASE_MIGRATION_PHASE || 'managed').trim().toLowerCase();
+        if (phase !== 'bridge' && phase !== 'managed') throw new Error('DATABASE_MIGRATION_PHASE must be bridge or managed');
+        return phase;
+    })() as 'bridge' | 'managed',
+    migrationConcurrency: positiveInt('MIGRATION_CONCURRENCY', 2),
+    migrationStatementTimeoutMs: positiveInt('MIGRATION_STATEMENT_TIMEOUT_MS', 120000),
+
     /**
      * Strategia di allineamento degli schemi per-tenant (`rehablo_<tenantId>`), applicata da
      * al bootstrap per tutti i tenant e durante la registrazione per quelli nuovi.

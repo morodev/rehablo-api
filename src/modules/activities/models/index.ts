@@ -31,8 +31,9 @@ export function registerActivitiesAssociations(): void {
     ActivityDelivery.belongsTo(ActivityAlert, {foreignKey: 'alertId'});
     ActivityBoard.hasMany(ActivityOperation, {foreignKey: 'boardId', as: 'operations', onDelete: 'CASCADE'});
     ActivityOperation.belongsTo(ActivityBoard, {foreignKey: 'boardId'});
-    ActivityDelivery.hasMany(ActivityPushTarget, {foreignKey: 'deliveryId', as: 'pushTargets', onDelete: 'CASCADE'});
-    ActivityPushTarget.belongsTo(ActivityDelivery, {foreignKey: 'deliveryId'});
+    // Match the versioned delivery migration; delivery UUIDs are immutable.
+    ActivityDelivery.hasMany(ActivityPushTarget, {foreignKey: 'deliveryId', as: 'pushTargets', onDelete: 'CASCADE', onUpdate: 'NO ACTION'});
+    ActivityPushTarget.belongsTo(ActivityDelivery, {foreignKey: 'deliveryId', onDelete: 'CASCADE', onUpdate: 'NO ACTION'});
     associationsRegistered = true;
 }
 

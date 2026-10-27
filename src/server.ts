@@ -9,7 +9,9 @@ import morgan from 'morgan';
 import bodyParser from 'body-parser';
 
 import { env } from './config/env.js';
-import { connectDatabase } from './config/database.js';
+import { connectDatabase, sequelize } from './config/database.js';
+import {databaseManifest} from './database/migrationManifest.js';
+import {assertDatabaseReady, withSharedReleaseLock} from './database/releaseControl.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
 
 import { registerAuthAssociations, syncAuthModels, Tenant } from './modules/auth/models/index.js';
@@ -50,6 +52,8 @@ import financialOptionsRoutes from './modules/administration/routes/financialOpt
 import treasuryIntegrityRoutes from './modules/administration/routes/treasuryIntegrity.routes.js';
 import quoteShareRoutes from './modules/administration/routes/quoteShare.routes.js';
 import { syncQuotePublicModels } from './modules/administration/models/quoteDelivery.model.js';
+import {markBridgeComplete} from './database/schemaTransition.js';
+import {getDatabaseStatus} from './database/releaseRunner.js';
 
 async function bootstrap() {
     const app = express();
@@ -116,9 +120,30 @@ async function bootstrap() {
 
 async function initializeApplication(): Promise<void> {
     await runStartupPhase('database connection', connectDatabase);
-
-    // Public-schema models (tenants/users/structures/availabilities)
     registerAuthAssociations();
+    registerCatalogAssociations();
+    registerProtocolCatalogAssociations();
+    registerTenantModels();
+
+    if (env.databaseMigrationPhase === 'bridge') {
+        // The transition release participates in the same deployment lock as the new runner.
+        // The following managed release cannot migrate while this legacy bootstrap is active.
+        await withSharedReleaseLock(sequelize, async () => {
+            if ((await getDatabaseStatus(databaseManifest, sequelize)).ready) {
+                await assertDatabaseReady(databaseManifest, sequelize);
+            } else {
+                await initializeLegacySchema();
+                await markBridgeComplete(sequelize);
+            }
+        });
+    } else {
+        await runStartupPhase('database release compatibility', () => assertDatabaseReady(databaseManifest, sequelize));
+    }
+    await initializeBackgroundJobs();
+}
+
+/** Transitional bootstrap only; managed web processes never synchronize or migrate schemas. */
+async function initializeLegacySchema(): Promise<void> {
     await runStartupPhase('public auth models', syncAuthModels);
     await runStartupPhase('public billing models', syncBillingModels);
     // Il link di consegna della fattura vive in `public`: dev'essere risolvibile da una richiesta
@@ -154,8 +179,32 @@ async function initializeApplication(): Promise<void> {
         console.error('[rbac] backfill structureId fallito', err);
     }
 
-    // Con un refresh a ogni 15 minuti di utilizzo la tabella cresce in fretta: si ripulisce
-    // all'avvio e poi una volta al giorno. `unref()` evita che il timer tenga vivo il processo.
+    // Public-schema human-body catalog (standardized scales/tests, shared by every tenant).
+    // Seeded exactly once at boot here, instead of on every single GET request like the legacy
+    // rehablo-human-body microservice used to do.
+    await runStartupPhase('human-body catalog models', syncCatalogModels);
+    await runStartupPhase('human-body catalog seed', seedCatalogData);
+
+    // Public-schema rehabilitation protocols catalog (exercises + reusable protocol templates,
+    // shared by every tenant). No seed data yet: managed via the /exercises and /protocol-templates CRUD.
+    await runStartupPhase('protocol catalog models', syncProtocolCatalogModels);
+
+    // Public-schema measurement dictionary (Clinical Data Dictionary): definizioni metriche condivise
+    // da tutti i tenant. È il fondamento del modello canonico (docs/REHABLO_OS_GAP_ANALYSIS.md §3).
+    await runStartupPhase('measurement catalog models', syncMeasurementCatalogModels);
+    await runStartupPhase('measurement catalog seed', seedMeasurementCatalogData);
+
+    // Register first, then upgrade every existing tenant before accepting traffic. This moves
+    // DDL and data migrations out of the first user request after a deploy.
+    const tenantRows = await runStartupPhase('tenant discovery', () => Tenant.findAll({attributes: ['id'], raw: true})) as unknown as Array<{id: string}>;
+    console.log(`[database] inizializzazione di ${tenantRows.length} tenant prima di abilitare le API`);
+    const readyTenants = await runStartupPhase('tenant schemas', () => warmTenantSchemas(
+        tenantRows.map(tenant => tenant.id), env.tenantSchemaBootstrapConcurrency
+    ));
+    console.log(`[database] ${readyTenants} tenant pronti`);
+}
+
+async function initializeBackgroundJobs(): Promise<void> {
     const purge = async () => {
         try {
             const removed = await purgeExpiredRefreshTokens();
@@ -167,33 +216,6 @@ async function initializeApplication(): Promise<void> {
     await runStartupPhase('expired refresh tokens', purge);
     setInterval(purge, 24 * 60 * 60 * 1000).unref();
 
-    // Public-schema human-body catalog (standardized scales/tests, shared by every tenant).
-    // Seeded exactly once at boot here, instead of on every single GET request like the legacy
-    // rehablo-human-body microservice used to do.
-    registerCatalogAssociations();
-    await runStartupPhase('human-body catalog models', syncCatalogModels);
-    await runStartupPhase('human-body catalog seed', seedCatalogData);
-
-    // Public-schema rehabilitation protocols catalog (exercises + reusable protocol templates,
-    // shared by every tenant). No seed data yet: managed via the /exercises and /protocol-templates CRUD.
-    registerProtocolCatalogAssociations();
-    await runStartupPhase('protocol catalog models', syncProtocolCatalogModels);
-
-    // Public-schema measurement dictionary (Clinical Data Dictionary): definizioni metriche condivise
-    // da tutti i tenant. È il fondamento del modello canonico (docs/REHABLO_OS_GAP_ANALYSIS.md §3).
-    await runStartupPhase('measurement catalog models', syncMeasurementCatalogModels);
-    await runStartupPhase('measurement catalog seed', seedMeasurementCatalogData);
-
-    // Register first, then upgrade every existing tenant before accepting traffic. This moves
-    // DDL and data migrations out of the first user request after a deploy.
-    registerTenantModels();
-    const tenantRows = await runStartupPhase('tenant discovery', () => Tenant.findAll({attributes: ['id'], raw: true})) as unknown as Array<{id: string}>;
-    console.log(`[database] inizializzazione di ${tenantRows.length} tenant prima di abilitare le API`);
-    const readyTenants = await runStartupPhase('tenant schemas', () => warmTenantSchemas(
-        tenantRows.map(tenant => tenant.id), env.tenantSchemaBootstrapConcurrency
-    ));
-    console.log(`[database] ${readyTenants} tenant pronti`);
-
     // A fine appuntamento passa a COMPLETED se nessuno ha registrato un esito o
     // una segnalazione esplicita.
     await runStartupPhase('background delivery initialization', async () => {
@@ -202,7 +224,7 @@ async function initializeApplication(): Promise<void> {
         if (process.env.REMINDER_EXTERNAL_DELIVERY_ENABLED !== 'false') {
             await startReminderExternalDeliverySweep();
         }
-        await startActivityDeliverySweep();
+        await startActivityDeliverySweep({initializeExistingTenants: env.databaseMigrationPhase === 'bridge'});
     });
 }
 

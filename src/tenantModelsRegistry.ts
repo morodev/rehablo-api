@@ -52,9 +52,13 @@ import { ACTIVITIES_MODELS, registerActivitiesAssociations } from './modules/act
 
 /**
  * Registers every tenant-scoped model (i.e. living in the dynamic "rehablo_<tenantId>" schema)
- * so the startup bootstrap can prepare every existing tenant before HTTP traffic is accepted.
+ * for associations, explicit provisioning, and the one-time bridge bootstrap.
+ * Registration alone never changes a production schema.
  */
+let registered = false;
 export function registerTenantModels(): void {
+    if (registered) return;
+    registered = true;
     registerHumanBodyAssociations();
     registerProtocolAssociations();
     // Must run after `registerHumanBodyAssociations()`: it adds the `Evaluation` -> symptoms/

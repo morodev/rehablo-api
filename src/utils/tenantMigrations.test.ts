@@ -26,7 +26,10 @@ const extraVersions = new Set<string>();
 const original = {
     query: sequelize.query, transaction: sequelize.transaction, createSchema: sequelize.createSchema,
     migrate: migration.up, patientDefaultMigrate: patientDefaultMigration.up, pricingMigrate: pricingMigration.up,
-    catalogAvailabilityMigrate: catalogAvailabilityMigration.up, publicationMigrate: publicationMigration.up, mode: env.tenantSchemaSync
+    catalogAvailabilityMigrate: catalogAvailabilityMigration.up, publicationMigrate: publicationMigration.up, mode: env.tenantSchemaSync,
+    phase: env.databaseMigrationPhase,
+    getConnection: (sequelize.connectionManager as any).getConnection,
+    releaseConnection: (sequelize.connectionManager as any).releaseConnection
 };
 let queries: string[], order: string[], applied: boolean, patientDefaultApplied: boolean, syncs: number, migrations: number;
 let historyExists: boolean, agendaExists: boolean, transactionStarts: number, baselineApplied: boolean;
@@ -47,7 +50,10 @@ registerTenantScopedModel({schema: () => ({sync: async (options: any) => {
 beforeEach(() => {
     extraVersions.clear();
     invalidateTenantSchemaCache();
+    env.databaseMigrationPhase = 'bridge';
     env.tenantSchemaSync = 'additive';
+    (sequelize.connectionManager as any).getConnection = async () => ({query: async () => ({rows: []})});
+    (sequelize.connectionManager as any).releaseConnection = async () => {};
     queries = []; order = []; applied = false; patientDefaultApplied = false; syncs = 0; migrations = 0;
     historyExists = false; agendaExists = true; transactionStarts = 0; baselineApplied = false;
     legacyBaselineApplied = false;
@@ -161,10 +167,13 @@ after(() => {
     catalogAvailabilityMigration.up = original.catalogAvailabilityMigrate;
     publicationMigration.up = original.publicationMigrate;
     env.tenantSchemaSync = original.mode;
+    env.databaseMigrationPhase = original.phase;
+    (sequelize.connectionManager as any).getConnection = original.getConnection;
+    (sequelize.connectionManager as any).releaseConnection = original.releaseConnection;
     invalidateTenantSchemaCache();
 });
 
-describe('tenant schema bootstrap', () => {
+describe('bridge tenant schema bootstrap and preserved legacy migration policies', () => {
     it('preserves old history before model sync and records completion after migration', async () => {
         assert.equal(await ensureTenantSchema(tenant), schema);
         assert.deepEqual(order, ['preserve-history', 'sync', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version']);
@@ -184,7 +193,7 @@ describe('tenant schema bootstrap', () => {
         assert.equal(await warmTenantSchemas([tenant, tenant], 2), 1);
         assert.equal(syncs, 1);
         assert.equal(migrations, 5);
-        assert.equal(transactionStarts, 1);
+        assert.equal(transactionStarts, 2); // Legacy schema transaction followed by bridge readiness checkpoint.
     });
 
     it('provisions a new tenant inside the registration transaction', async () => {
@@ -224,7 +233,7 @@ describe('tenant schema bootstrap', () => {
         invalidateTenantSchemaCache();
         await ensureTenantSchema(tenant);
         assert.equal(syncs, 1); assert.equal(migrations, 5);
-        assert.equal(transactionStarts, 1);
+        assert.equal(transactionStarts, 3); // Legacy transaction once; bridge checkpoints on each uncached access.
     });
 
     it('resyncs an existing tenant when the registered model baseline changes', async () => {
@@ -240,13 +249,14 @@ describe('tenant schema bootstrap', () => {
         assert.equal(syncs, 1);
         assert.equal(migrations, 0);
         assert.equal(baselineApplied, true);
-        assert.equal(transactionStarts, 1);
+        assert.equal(transactionStarts, 2);
     });
 
-    it('respects explicit off mode for environments managed with manual migrations', async () => {
+    it('rejects incomplete legacy schemas in explicit bridge off mode without synchronizing them', async () => {
         env.tenantSchemaSync = 'off';
-        await ensureTenantSchema(tenant);
-        assert.equal(syncs, 0); assert.equal(migrations, 0); assert.equal(queries.length, 0);
+        await assert.rejects(ensureTenantSchema(tenant), /incomplete/);
+        assert.equal(syncs, 0); assert.equal(migrations, 0);
+        assert.ok(queries.every(sql => !/^(CREATE|ALTER|DROP)/.test(sql)));
     });
 
     it('does not classify a newly created tenant as historical', async () => {
