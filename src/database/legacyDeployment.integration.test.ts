@@ -52,14 +52,15 @@ Sequelize.prototype.sync = function() {throw new Error('Global model sync is for
         {schema: 'public', table: 'patient_portal_accesses', column: 'userId', target: 'users', update: 'NO ACTION'},
         {schema: 'public', table: 'patient_portal_accesses', column: 'tenantId', target: 'tenants', update: 'NO ACTION'},
         {schema: 'public', table: 'patient_portal_invitations', column: 'tenantId', target: 'tenants', update: 'NO ACTION'},
-        {schema, table: 'invoice_payments', column: 'invoiceId', target: 'invoices', update: 'CASCADE'}
+        {schema, table: 'invoice_payments', column: 'invoiceId', target: 'invoices', update: 'CASCADE'},
+        {schema, table: 'activity_push_targets', column: 'deliveryId', target: 'activity_deliveries', update: 'CASCADE'}
     ];
     const readForeignKey = async (key: typeof legacyForeignKeys[number], transaction?: Transaction) => {
         const [rows] = await database.query(`SELECT c.oid,c.conname,pg_get_constraintdef(c.oid) AS definition,
             n.nspname AS "targetSchema",t.relname AS "targetTable",c.confdeltype AS "onDelete",c.confupdtype AS "onUpdate"
             FROM pg_constraint c JOIN pg_class t ON t.oid=c.confrelid JOIN pg_namespace n ON n.oid=t.relnamespace
             WHERE c.contype='f' AND c.conrelid=to_regclass(:table)
-              AND c.conkey=ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid=c.conrelid AND attname=:column)]`,
+              AND c.conkey=ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid=c.conrelid AND attname=:column)] ORDER BY c.oid`,
         {transaction, replacements: {table: quote(key.schema) + '.' + quote(key.table), column: key.column}});
         return rows as Array<{oid: number; conname: string; definition: string; targetSchema: string; targetTable: string; onDelete: string; onUpdate: string}>;
     };
@@ -184,6 +185,11 @@ Sequelize.prototype.sync = function() {throw new Error('Global model sync is for
             await reconstructLegacyForeignKey(paymentKey, transaction);
             const originalPaymentForeignKey = await readForeignKey(paymentKey, transaction);
             await runTenantMigrations(schema, repair, database, transaction);
+            // Reconstruct the Sequelize-generated CASCADE key reported by Render. This fixture
+            // covers a single key; the baseline tests also cover both historical keys coexisting.
+            await database.query(`ALTER TABLE ${quote(schema)}.activity_push_targets
+                DROP CONSTRAINT activity_push_targets_delivery_fkey`, {transaction});
+            await reconstructLegacyForeignKey(legacyForeignKeys.find(key => key.table === 'activity_push_targets')!, transaction);
             const [nullable] = await database.query(`SELECT is_nullable FROM information_schema.columns
                 WHERE table_schema=:schema AND table_name='invoice_payments' AND column_name='invoiceId'`,
                 {transaction, replacements: {schema}});

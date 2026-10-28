@@ -31,7 +31,7 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
             n.nspname AS "targetSchema",t.relname AS "targetTable",c.confdeltype AS "onDelete",c.confupdtype AS "onUpdate"
             FROM pg_constraint c JOIN pg_class t ON t.oid=c.confrelid JOIN pg_namespace n ON n.oid=t.relnamespace
             WHERE c.contype='f' AND c.conrelid=to_regclass(:table)
-              AND c.conkey=ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid=c.conrelid AND attname=:column)]`,
+              AND c.conkey=ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid=c.conrelid AND attname=:column)] ORDER BY c.oid`,
         {transaction, replacements: {table: `"${schema}"."${table}"`, column}});
         return rows as Array<{oid: number; conname: string; definition: string; targetSchema: string; targetTable: string; onDelete: string; onUpdate: string}>;
     };
@@ -79,6 +79,90 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
                 assert.equal(keys[0].targetTable, target);
                 assert.equal(keys[0].onDelete, onDelete, 'Fresh foreign keys retain the frozen canonical actions');
                 assert.equal(keys[0].onUpdate, 'c');
+            }
+        }));
+
+        for (const includesSqlMigrationKey of [false, true]) {
+            await t.test(`adopts the historical push-delivery CASCADE key${includesSqlMigrationKey ? ' alongside its SQL migration key' : ''} without replacing receipts or constraints`, async () => withRollback(async transaction => {
+                const schema = randomSchema(), prefix = quoteTenantSchema(schema);
+                await applySchemaBaseline('public', 'public', database, transaction);
+                await applySchemaBaseline('tenant', schema, database, transaction);
+                const fresh = await readForeignKeys(schema, 'activity_push_targets', 'deliveryId', transaction);
+                assert.equal(fresh.length, 1);
+                assert.equal(fresh[0].onUpdate, 'a', 'New tenants retain the frozen NO ACTION contract');
+                // 98e86fd registered this association without onUpdate, so model sync used CASCADE.
+                // cb49df8 changed the model default but did not replace already-deployed constraints.
+                await database.query(`ALTER TABLE ${prefix}.activity_push_targets DROP CONSTRAINT "activity_push_targets_deliveryId_fkey"`, {transaction});
+                await database.query(`ALTER TABLE ${prefix}.activity_push_targets ADD CONSTRAINT "activity_push_targets_deliveryId_fkey"
+                    FOREIGN KEY ("deliveryId") REFERENCES ${prefix}.activity_deliveries(id) ON DELETE CASCADE ON UPDATE CASCADE`, {transaction});
+                if (includesSqlMigrationKey) {
+                    // 20261011-activities-delivery checks names, so its NO ACTION FK can coexist with sync's FK.
+                    await database.query(`ALTER TABLE ${prefix}.activity_push_targets ADD CONSTRAINT "activity_push_targets_delivery_fkey"
+                        FOREIGN KEY ("deliveryId") REFERENCES ${prefix}.activity_deliveries(id) ON DELETE CASCADE`, {transaction});
+                }
+                const ids = {board: randomUUID(), structure: randomUUID(), activity: randomUUID(), user: randomUUID(),
+                    alert: randomUUID(), delivery: randomUUID(), receipt: randomUUID(), subscription: randomUUID()};
+                const options = {transaction, replacements: ids};
+                await database.query(`INSERT INTO ${prefix}.activity_boards (id,"structureId","createdAt","updatedAt")
+                    VALUES (:board,:structure,NOW(),NOW())`, options);
+                await database.query(`INSERT INTO ${prefix}.activities (id,"boardId",title,"createdByUserId","createdAt","updatedAt")
+                    VALUES (:activity,:board,'Preserved activity',:user,NOW(),NOW())`, options);
+                await database.query(`INSERT INTO ${prefix}.activity_alerts (id,"activityId",enabled,channels,"createdAt","updatedAt")
+                    VALUES (:alert,:activity,true,ARRAY['push'],NOW(),NOW())`, options);
+                await database.query(`INSERT INTO ${prefix}.activity_deliveries
+                    (id,"alertId","recipientUserId","scheduleVersion",channel,status,"scheduledAt","nextAttemptAt","sentAt","createdAt","updatedAt")
+                    VALUES (:delivery,:alert,:user,2,'push','SENT','2026-10-11T10:00:00Z','2026-10-11T10:00:00Z','2026-10-11T10:00:01Z',NOW(),NOW())`, options);
+                await database.query(`INSERT INTO ${prefix}.activity_push_targets
+                    (id,"deliveryId","subscriptionId","endpointHash",status,attempts,"nextAttemptAt","providerReference","sentAt","createdAt","updatedAt")
+                    VALUES (:receipt,:delivery,:subscription,'historic-endpoint-hash','SENT',2,'2026-10-11T10:00:00Z',
+                        'historic-provider-receipt','2026-10-11T10:00:01Z',NOW(),NOW())`, options);
+                const beforeKeys = await readForeignKeys(schema, 'activity_push_targets', 'deliveryId', transaction);
+                assert.equal(beforeKeys.length, includesSqlMigrationKey ? 2 : 1);
+                const snapshot = async () => {
+                    const [deliveries] = await database.query(`SELECT * FROM ${prefix}.activity_deliveries WHERE id=:delivery`, options);
+                    const [receipts] = await database.query(`SELECT * FROM ${prefix}.activity_push_targets WHERE id=:receipt`, options);
+                    return {deliveries, receipts};
+                };
+                const beforeData = await snapshot();
+                for (let application = 0; application < 2; application++) {
+                    await applySchemaBaseline('tenant', schema, database, transaction);
+                    assert.deepEqual(await readForeignKeys(schema, 'activity_push_targets', 'deliveryId', transaction), beforeKeys,
+                        'Adoption must preserve every legacy FK OID, name, target and action without adding duplicates');
+                    assert.deepEqual(await snapshot(), beforeData, 'Delivery status, receipt and timestamps must remain unchanged');
+                }
+                if (!includesSqlMigrationKey) {
+                    const replacement = randomUUID();
+                    await database.query(`UPDATE ${prefix}.activity_deliveries SET id=:replacement WHERE id=:delivery`,
+                        {transaction, replacements: {...ids, replacement}});
+                    const [receipts] = await database.query(`SELECT "deliveryId" FROM ${prefix}.activity_push_targets WHERE id=:receipt`, options);
+                    assert.deepEqual(receipts, [{deliveryId: replacement}], 'The previously deployed UPDATE CASCADE behavior remains intact');
+                }
+            }));
+        }
+
+        await t.test('known push-delivery history does not allow unrelated targets or unknown referential actions', async () => withRollback(async transaction => {
+            const schema = randomSchema(), prefix = quoteTenantSchema(schema), foreignSchema = randomSchema();
+            await applySchemaBaseline('public', 'public', database, transaction);
+            await applySchemaBaseline('tenant', schema, database, transaction);
+            const canonical = await readForeignKeys(schema, 'activity_push_targets', 'deliveryId', transaction);
+            await database.query(`CREATE SCHEMA "${foreignSchema}"`, {transaction});
+            await database.query(`CREATE TABLE "${foreignSchema}".activity_deliveries(id UUID PRIMARY KEY)`, {transaction});
+            await database.query(`ALTER TABLE ${prefix}.activity_deliveries ADD COLUMN "alternateDeliveryId" UUID UNIQUE`, {transaction});
+            const incompatible = [
+                {name: 'wrong_push_tenant', target: `"${foreignSchema}".activity_deliveries(id)`, onDelete: 'CASCADE', onUpdate: 'CASCADE'},
+                {name: 'wrong_push_table', target: `${prefix}.patients(id)`, onDelete: 'CASCADE', onUpdate: 'CASCADE'},
+                {name: 'wrong_push_column', target: `${prefix}.activity_deliveries("alternateDeliveryId")`, onDelete: 'CASCADE', onUpdate: 'CASCADE'},
+                {name: 'wrong_push_delete', target: `${prefix}.activity_deliveries(id)`, onDelete: 'SET NULL', onUpdate: 'CASCADE'},
+                {name: 'wrong_push_update', target: `${prefix}.activity_deliveries(id)`, onDelete: 'CASCADE', onUpdate: 'RESTRICT'}
+            ];
+            for (const key of incompatible) {
+                await database.query(`ALTER TABLE ${prefix}.activity_push_targets ADD CONSTRAINT "${key.name}"
+                    FOREIGN KEY ("deliveryId") REFERENCES ${key.target} ON DELETE ${key.onDelete} ON UPDATE ${key.onUpdate}`, {transaction});
+                await assert.rejects(applySchemaBaseline('tenant', schema, database, transaction),
+                    /Incompatible foreign key: .*\.activity_push_targets\(deliveryId\)/,
+                    key.name + ': a valid constraint must not mask an unrelated or unsupported constraint');
+                await database.query(`ALTER TABLE ${prefix}.activity_push_targets DROP CONSTRAINT "${key.name}"`, {transaction});
+                assert.deepEqual(await readForeignKeys(schema, 'activity_push_targets', 'deliveryId', transaction), canonical);
             }
         }));
 

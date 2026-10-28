@@ -60,11 +60,15 @@ async function readConstraints(schema: string, database: Sequelize, transaction?
 }
 const sameColumns = (a: string[], b: string[]) => JSON.stringify(a) === JSON.stringify(b);
 const actions: Record<string, string> = {'NO ACTION': 'a', RESTRICT: 'r', CASCADE: 'c', 'SET NULL': 'n', 'SET DEFAULT': 'd'};
-/** Existing constraints retain their behavior; only variants evidenced by historical migrations are adopted. */
+/** Existing constraints retain their behavior; only variants evidenced by historical migrations or model sync are adopted. */
 const legacyForeignKeys = [
     // cc78bbc required invoiceId; 07a1ff4 / 20260907 only removed NOT NULL, retaining CASCADE.
     {scope: 'tenant', table: 'invoice_payments', column: 'invoiceId', target: 'invoices',
         expectedDelete: 'SET NULL', expectedUpdate: 'CASCADE', onDelete: 'c', onUpdate: 'c'},
+    // 98e86fd model sync used Sequelize's default UPDATE CASCADE. cb49df8 added NO ACTION
+    // to match the SQL delivery migration, without replacing already-deployed constraints.
+    {scope: 'tenant', table: 'activity_push_targets', column: 'deliveryId', target: 'activity_deliveries',
+        expectedDelete: 'CASCADE', expectedUpdate: 'NO ACTION', onDelete: 'c', onUpdate: 'c'},
     // 20260901-create-patient-portal specified DELETE CASCADE but omitted UPDATE (PostgreSQL NO ACTION).
     ...[
         {table: 'user_emails', column: 'userId', target: 'users'},
