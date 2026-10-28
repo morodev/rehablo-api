@@ -1,3 +1,4 @@
+import {setTimeout as delay} from 'node:timers/promises';
 import type {Sequelize, Transaction} from 'sequelize';
 import {type DatabaseManifest, SchemaReadinessError, quoteTenantSchema} from './migrationTypes.js';
 
@@ -21,7 +22,8 @@ export async function initializeControlTables(database: Sequelize, transaction: 
 
 /** Session lock owns its physical connection until unlock; returning it to the pool would leak the lock. */
 export async function withReleaseLock<T>(
-    database: Sequelize, work: () => Promise<T>, mode: 'exclusive' | 'shared' = 'exclusive', waitTimeoutMs = 10_000
+    database: Sequelize, work: () => Promise<T>, mode: 'exclusive' | 'shared' = 'exclusive', waitTimeoutMs = 10_000,
+    onWait?: (durationMs: number) => void
 ): Promise<T> {
     if (!Number.isInteger(waitTimeoutMs) || waitTimeoutMs < 1 || waitTimeoutMs > 300_000) {
         throw new Error('Release lock wait timeout must be between 1 and 300000 milliseconds');
@@ -31,25 +33,40 @@ export async function withReleaseLock<T>(
     const suffix = mode === 'shared' ? '_shared' : '';
     let locked = false;
     let unsafeConnection = false;
-    let previousTimeout: string | undefined;
+    const started = Date.now();
+    let lastNotice = -Infinity;
     try {
-        const settings = await connection.query('SHOW lock_timeout');
-        previousTimeout = settings?.rows?.[0]?.lock_timeout ?? '0';
-        await connection.query("SELECT set_config('lock_timeout', $1, false)", [String(waitTimeoutMs) + 'ms']);
-        await connection.query(`SELECT pg_advisory_lock${suffix}($1, $2)`, RELEASE_LOCK_KEYS);
-        locked = true;
+        // Do not queue an exclusive waiter: the preceding API can hold an outer shared
+        // bootstrap lock while another connection needs a nested shared tenant lock.
+        // A queued exclusive lock blocks that nested acquisition and prevents bootstrap finishing.
+        while (!locked) {
+            try {
+                const result = await connection.query(`SELECT pg_try_advisory_lock${suffix}($1, $2) AS locked`, RELEASE_LOCK_KEYS);
+                locked = result.rows[0].locked;
+            } catch (error) {
+                // A lost response can leave acquisition uncertain. Never reuse that session.
+                unsafeConnection = true;
+                throw error;
+            }
+            if (locked) break;
+            const elapsed = Date.now() - started;
+            if (elapsed >= waitTimeoutMs) {
+                throw new Error(`Database release lock timeout after ${waitTimeoutMs}ms (${mode} advisory lock ${RELEASE_LOCK_KEYS.join(', ')}); another migration, legacy bootstrap or tenant registration is still holding the lock. Retry after it finishes.`);
+            }
+            if (elapsed - lastNotice >= 5_000) {onWait?.(elapsed); lastNotice = elapsed;}
+            await delay(Math.min(100, waitTimeoutMs - elapsed));
+        }
         return await work();
     } finally {
         try {
             if (locked) await connection.query(`SELECT pg_advisory_unlock${suffix}($1, $2)`, RELEASE_LOCK_KEYS);
-            if (previousTimeout !== undefined) await connection.query("SELECT set_config('lock_timeout', $1, false)", [previousTimeout]);
         } catch (error) {
             unsafeConnection = true;
             // An unlock failure must never put a potentially locked connection back in the pool.
-            await manager.destroyConnection(connection);
             throw error;
         } finally {
-            if (!unsafeConnection) await manager.releaseConnection(connection);
+            if (unsafeConnection) await manager.destroyConnection(connection);
+            else await manager.releaseConnection(connection);
         }
     }
 }

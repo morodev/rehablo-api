@@ -8,6 +8,8 @@ export interface MigrationRunOptions {
     database?: Sequelize;
     concurrency?: number;
     lockTimeoutMs?: number;
+    /** Global release coordination can wait while the preceding API finishes bootstrap/provisioning. */
+    releaseLockTimeoutMs?: number;
     statementTimeoutMs?: number;
     timeoutMs?: number;
     /** Startup also adopts tenants created by the old API after a successful pre-deploy. */
@@ -120,6 +122,7 @@ export async function migrateDatabase(
         throw new Error(`Migration concurrency must leave one connection for the release lock (pool max ${poolCapacity})`);
     }
     const lockTimeoutMs = options.lockTimeoutMs ?? 10_000;
+    const releaseLockTimeoutMs = options.releaseLockTimeoutMs ?? options.lockTimeoutMs ?? 300_000;
     const statementTimeoutMs = options.statementTimeoutMs ?? 120_000;
     const timeoutMs = options.timeoutMs ?? 25 * 60_000;
     if (!Number.isInteger(statementTimeoutMs) || statementTimeoutMs < 1 || statementTimeoutMs > 120_000) {
@@ -152,7 +155,10 @@ export async function migrateDatabase(
             }
         });
     };
+    const lockStarted = Date.now();
+    options.onProgress?.({event: 'release-lock-acquiring'});
     return withReleaseLock(database, async () => {
+        options.onProgress?.({event: 'release-lock-acquired', durationMs: Date.now() - lockStarted});
         assertWithinDeadline();
         const before = await getDatabaseStatus(manifest, database);
         // A later, incomplete release may already have upgraded some tenant checkpoints.
@@ -172,12 +178,14 @@ export async function migrateDatabase(
             if (!(missing as any[]).length) return {release: manifest.id, noop: true, tenants: 0, migrations: 0};
         }
         if (!before.ready) await transaction(async current => {
+            options.onProgress?.({event: 'release-metadata-started'});
             await initializeControlTables(database, current);
             const [rows] = await database.query(`SELECT r."manifest" FROM public.schema_control c
                 JOIN public.schema_releases r ON r."id" = c."releaseId" WHERE c."singleton" = true`, {transaction: current});
             const row = (rows as any[])[0];
             if (row) assertAppendOnly(row.manifest, manifest);
         });
+        if (!before.ready) options.onProgress?.({event: 'release-metadata-ready'});
         if (!before.ready && options.preparePublic) await transaction(current => options.preparePublic!(database, current));
         // PostgreSQL requires a committed ALTER TYPE ADD VALUE before a later step can use
         // the new enum label. Every public step and its version row commit together.
@@ -237,5 +245,6 @@ export async function migrateDatabase(
             });
         });
         return {release: manifest.id, noop: false, tenants: tenants.length, migrations};
-    }, 'exclusive', lockTimeoutMs);
+    }, 'exclusive', Math.min(releaseLockTimeoutMs, timeoutMs),
+        durationMs => options.onProgress?.({event: 'release-lock-waiting', durationMs}));
 }

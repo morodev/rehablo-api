@@ -37,6 +37,8 @@ For every release, record the frontend/backend commit identifiers, newly require
 
 `MIGRATION_CONCURRENCY` defaults to 2. `MIGRATION_STATEMENT_TIMEOUT_MS` defaults to 120000 and applies inside migration transactions, not to ordinary API queries. For maintenance checks, `BACKGROUND_JOBS_ENABLED=false` skips background cleanup, completion, reconciliation and delivery jobs; jobs remain enabled by default. Migration scripts do not initialize notification activation cutoffs or send messages.
 
+Global release lock acquisition retries for up to five minutes, within the overall release deadline. It uses nonblocking advisory lock attempts so an overlapping legacy bootstrap can finish its nested shared-lock operations. Migration SQL retains its ten-second lock timeout and configured statement timeout; SQL failures still abort deployment. Progress distinguishes `release-lock-acquiring`, `release-lock-waiting`, `release-lock-acquired`, metadata initialization and individual migrations. A release lock timeout identifies the advisory lock and the coordination phase; it does not mean the migration named by the release ID has started.
+
 ## Recovery and verification
 
 Use the failed deployment's migration/schema details and `npm run db:status -- --tenants` to locate incomplete work. Correct the cause and retry the same artifact. Code rollback does not undo database migrations; use a new corrective migration, and coordinate destructive recovery with a database backup and compatible application versions.

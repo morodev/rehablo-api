@@ -9,7 +9,7 @@ const manifest: DatabaseManifest = {id: 'release-one', checksum: 'release-one-ch
 
 function lockingDatabase(query: (sql: string, options?: any) => Promise<any>) {
     const events: string[] = [];
-    const connection = {query: async (sql: string) => {events.push(sql);}};
+    const connection = {query: async (sql: string) => {events.push(sql); return {rows: [{locked: true}]};}};
     const database = {
         query,
         connectionManager: {
@@ -25,21 +25,47 @@ test('release lock remains on its reserved physical connection and unlocks when 
     const {database, events} = lockingDatabase(async () => {throw new Error('unexpected pooled query');});
     const failure = new Error('work failed');
     await assert.rejects(withReleaseLock(database, async () => {events.push('work'); throw failure;}), error => error === failure);
-    assert.deepEqual(events, ['acquire', 'SHOW lock_timeout', "SELECT set_config('lock_timeout', $1, false)",
-        'SELECT pg_advisory_lock($1, $2)', 'work', 'SELECT pg_advisory_unlock($1, $2)',
-        "SELECT set_config('lock_timeout', $1, false)", 'release']);
+    assert.deepEqual(events, ['acquire', 'SELECT pg_try_advisory_lock($1, $2) AS locked',
+        'work', 'SELECT pg_advisory_unlock($1, $2)', 'release']);
 });
 
 test('a physical connection whose unlock failed is destroyed rather than returned to pool', async () => {
     const {database, events, connection} = lockingDatabase(async () => [[]]);
     const original = connection.query;
     connection.query = async sql => {
-        await original(sql);
+        const result = await original(sql);
         if (sql.includes('unlock')) throw new Error('connection lost on unlock');
+        return result;
     };
     await assert.rejects(withReleaseLock(database, async () => undefined), /connection lost/);
     assert.equal(events.at(-1), 'destroy');
     assert.equal(events.includes('release'), false);
+});
+
+test('an occupied release lock times out with its phase identified and without entering migration work', async () => {
+    const {database, events, connection} = lockingDatabase(async () => {throw new Error('No pooled queries expected');});
+    connection.query = async sql => {events.push(sql); return {rows: [{locked: false}]};};
+    const notices: number[] = [];
+    await assert.rejects(withReleaseLock(database, async () => {assert.fail('Occupied lock must not run migrations');},
+        'exclusive', 30, duration => notices.push(duration)), /release lock timeout.*exclusive advisory lock.*1380270671, 18700/);
+    assert.equal(notices.length, 1);
+    assert.equal(events.at(-1), 'release');
+    assert.ok(events.filter(sql => sql.startsWith('SELECT')).every(sql => sql.includes('pg_try_advisory_lock')));
+});
+
+test('an uncertain release lock acquisition destroys its physical connection', async () => {
+    const {database, events, connection} = lockingDatabase(async () => [[]]);
+    connection.query = async () => {throw new Error('connection lost during acquisition');};
+    await assert.rejects(withReleaseLock(database, async () => {assert.fail('Work must not run');}), /connection lost during acquisition/);
+    assert.equal(events.at(-1), 'destroy');
+    assert.equal(events.includes('release'), false);
+});
+
+test('shared session coordination uses a nonblocking shared lock and matching unlock', async () => {
+    const {database, events} = lockingDatabase(async () => [[]]);
+    await withReleaseLock(database, async () => {events.push('work');}, 'shared');
+    assert.deepEqual(events, ['acquire', 'SELECT pg_try_advisory_lock_shared($1, $2) AS locked',
+        'work', 'SELECT pg_advisory_unlock_shared($1, $2)', 'release']);
 });
 
 test('completed database releases take a constant read-only no-op path even with a newer target', async () => {

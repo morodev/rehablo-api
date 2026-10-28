@@ -76,6 +76,16 @@ test('PostgreSQL release migration transactions, resumability and provisioning l
         const promise = new Promise<void>(done => {resolve = done;});
         return {promise, resolve};
     };
+    const waitForLockPoll = async (waiting: Promise<void>, running: Promise<unknown>) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            await Promise.race([waiting,
+                running.then(() => {throw new Error('Release completed before waiting for its occupied lock');}),
+                new Promise<never>((_resolve, reject) => {
+                    timer = setTimeout(() => reject(new Error('Release did not report an occupied lock')), 5000);
+                })]);
+        } finally {if (timer) clearTimeout(timer);}
+    };
     const waitForReleaseWaiter = async () => {
         const end = Date.now() + 5000;
         while (Date.now() < end) {
@@ -284,11 +294,13 @@ test('PostgreSQL release migration transactions, resumability and provisioning l
             });
             // Observe provisioning failure even if it occurs before the rendezvous.
             await Promise.race([provisioned.promise, provisioning.then(() => {throw new Error('Provisioning completed before its gate');})]);
-            const release = apply(fourth, 2);
+            const releaseWaiting = deferred();
+            const release = migrateDatabase(fourth, {database, concurrency: 2, prepareTenant,
+                onProgress: event => {if (event.event === 'release-lock-waiting') releaseWaiting.resolve();}});
             void release.catch(() => {});
             let checkFailure: unknown;
             try {
-                await waitForReleaseWaiter();
+                await waitForLockPoll(releaseWaiting.promise, release);
                 assert.equal((await getDatabaseStatus(fourth, database)).ready, false);
             } catch (error) {checkFailure = error;}
             finally {commitProvisioning.resolve();}
@@ -328,11 +340,51 @@ test('PostgreSQL release migration transactions, resumability and provisioning l
             await assertDatabaseReady(fifth, database);
         });
 
+        await t.test('a pending release lets the legacy bootstrap acquire nested shared locks before it finishes', async () => {
+            const outer = await database.transaction();
+            let nested: Transaction | undefined;
+            let release: ReturnType<typeof migrateDatabase> | undefined;
+            const waiting = deferred();
+            let acquired = false;
+            try {
+                await lockProvisioning(database, outer);
+                release = migrateDatabase(base, {database, releaseLockTimeoutMs: 5000,
+                    onProgress: event => {
+                        if (event.event === 'release-lock-waiting') waiting.resolve();
+                        if (event.event === 'release-lock-acquired') acquired = true;
+                    }});
+                void release.catch(() => {});
+                await waitForLockPoll(waiting.promise, release);
+                nested = await database.transaction();
+                await database.query("SET LOCAL lock_timeout = '200ms'", {transaction: nested});
+                await database.query('SELECT pg_advisory_xact_lock_shared(1380270671,18700)', {transaction: nested});
+                assert.equal(acquired, false, 'The release cannot start while legacy shared locks are held');
+                const [queued] = await database.query(`SELECT COUNT(*)::int AS count FROM pg_locks
+                    WHERE locktype='advisory' AND NOT granted AND mode='ExclusiveLock'
+                    AND classid=1380270671::oid AND objid=18700::oid`);
+                assert.equal((queued[0] as any).count, 0, 'An exclusive waiter must not block the nested legacy shared lock');
+                await outer.rollback();
+                assert.equal(acquired, false, 'The nested bootstrap lock must also be released before migration');
+                await nested.rollback();
+                assert.equal((await release).noop, true);
+                assert.equal(acquired, true);
+            } finally {
+                if (!(nested as any)?.finished) await nested?.rollback();
+                if (!(outer as any).finished) await outer.rollback();
+                if (release) await release.catch(() => {});
+            }
+            const [remaining] = await database.query(`SELECT COUNT(*)::int AS count FROM pg_locks
+                WHERE locktype='advisory' AND classid=1380270671::oid AND objid=18700::oid`);
+            assert.equal((remaining[0] as any).count, 0, 'The runner must not leave session locks in the pool');
+        });
+
         await t.test('an occupied shared release lock fails within its deadline and leaves the connection usable', async () => {
             const transaction = await database.transaction();
             try {
                 await lockProvisioning(database, transaction);
-                await assert.rejects(migrateDatabase(base, {database, lockTimeoutMs: 50}), /lock timeout|canceling statement/i);
+                const started = Date.now();
+                await assert.rejects(migrateDatabase(base, {database, releaseLockTimeoutMs: 50}), /release lock timeout/i);
+                assert.ok(Date.now() - started < 2000, 'An occupied lock must obey the configured release wait deadline');
             } finally {await transaction.rollback();}
             assert.equal((await apply(base)).noop, true);
             await database.query('SELECT 1');

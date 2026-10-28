@@ -40,12 +40,13 @@ test('compiled deployment CLI, managed provisioning and constant readiness queri
     const knownEnums = new Set<string>(schemaBaseline.public.flatMap((table: {enums: string[]}) => table.enums.flatMap(sql =>
         [...sql.matchAll(/CREATE TYPE "public"\."([^"]+)"/g)].map(match => match[1]))));
     let ownsDatabaseObjects = false;
-    const runCli = async (action: 'migrate' | 'status' | 'check'): Promise<string> => {
+    const runCli = async (action: 'migrate' | 'status' | 'check', onOutput?: (output: string) => void): Promise<string> => {
         const child = spawn(process.execPath, [cli, action], {cwd: directory, env: {...process.env}, windowsHide: true,
             stdio: ['ignore','pipe','pipe']});
         let output = '';
-        child.stdout!.on('data', chunk => {output += String(chunk);});
-        child.stderr!.on('data', chunk => {output += String(chunk);});
+        const observe = (chunk: Buffer) => {output += String(chunk); onOutput?.(output);};
+        child.stdout!.on('data', observe);
+        child.stderr!.on('data', observe);
         const timer = setTimeout(() => child.kill(), 45000);
         try {
             await new Promise<void>((resolve, reject) => {
@@ -115,9 +116,37 @@ test('compiled deployment CLI, managed provisioning and constant readiness queri
             assert.match(output, /\[database-release\] failed:/);
         });
 
-        await t.test('the compiled CLI executes the complete public release on a fresh database and reports no-op on retry', async () => {
-            const first = await runCli('migrate');
+        await t.test('the compiled CLI waits for the old API lock, applies the complete release once and reports no-op on retry', async () => {
+            const blocker = await database.transaction();
+            let running: Promise<string> | undefined;
+            let first = '';
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+                await database.query('SELECT pg_advisory_xact_lock_shared(1380270671,18700)', {transaction: blocker});
+                let reportWaiting!: () => void;
+                const waiting = new Promise<void>(resolve => {reportWaiting = resolve;});
+                running = runCli('migrate', output => {
+                    if (output.includes('"event":"release-lock-waiting"')) reportWaiting();
+                });
+                void running.catch(() => {});
+                await Promise.race([waiting,
+                    running.then(() => {throw new Error('CLI completed while the old API still held its shared lock');}),
+                    new Promise<never>((_resolve, reject) => {
+                        timer = setTimeout(() => reject(new Error('CLI did not identify its release lock wait')), 10000);
+                    })]);
+                const [before] = await database.query("SELECT to_regclass('public.schema_control') AS control");
+                assert.equal((before[0] as any).control, null, 'The waiting CLI must not start schema changes');
+                await blocker.rollback();
+                first = await running;
+            } finally {
+                if (timer) clearTimeout(timer);
+                if (!(blocker as any).finished) await blocker.rollback();
+                if (running) await running.catch(() => {});
+            }
             assert.match(first, /"noop":false/);
+            assert.match(first, /"event":"release-lock-acquiring"/);
+            assert.match(first, /"event":"release-lock-waiting"/);
+            assert.match(first, /"event":"release-lock-acquired"/);
             assert.equal((await getDatabaseStatus(databaseManifest, database)).ready, true);
             assert.match(await runCli('check'), /"ready":true/);
             assert.match(await runCli('migrate'), /"noop":true/);
@@ -165,7 +194,9 @@ test('compiled deployment CLI, managed provisioning and constant readiness queri
             assert.deepEqual(rows[0], {tenant: false, state: false, schema: null});
         });
 
-        await t.test('the compiled managed server becomes healthy without tenant schema sync or migration phases', async () => {
+        await t.test('the compiled server stays unavailable during a release lock wait and becomes healthy after it clears', async () => {
+            const blocker = await database.transaction();
+            await database.query('SELECT pg_advisory_xact_lock_shared(1380270671,18700)', {transaction: blocker});
             const server = spawn(process.execPath, ['dist/server.js'], {cwd: directory,
                 env: {...process.env, PORT: '0'}, windowsHide: true, stdio: ['ignore','pipe','pipe']});
             let output = '', port = 0;
@@ -177,6 +208,12 @@ test('compiled deployment CLI, managed provisioning and constant readiness queri
             server.stdout!.on('data', observe); server.stderr!.on('data', observe);
             try {
                 const deadline = Date.now() + 20000;
+                while (Date.now() < deadline && server.exitCode === null &&
+                    (!port || !output.includes('"event":"release-lock-waiting"'))) await delay(50);
+                assert.ok(port && output.includes('"event":"release-lock-waiting"'), 'Startup did not reach its occupied release lock: ' + output);
+                assert.equal((await httpHealth(port)).status, 503, 'The API must remain unavailable while its release lock is occupied');
+                assert.doesNotMatch(output, /"event":"release-lock-acquired"/);
+                await blocker.rollback();
                 let healthy = false;
                 while (Date.now() < deadline && server.exitCode === null) {
                     if (port) {
@@ -190,7 +227,10 @@ test('compiled deployment CLI, managed provisioning and constant readiness queri
                 assert.equal(healthy, true, 'Compiled managed startup failed: ' + output);
                 assert.match(output, /database release compatibility: completed/);
                 assert.doesNotMatch(output, /\[tenant-schema\]|sync modello|public auth models|catalog seed|tenant discovery|tenant schemas:|structure backfill/);
-            } finally {await stopChild(server);}
+            } finally {
+                if (!(blocker as any).finished) await blocker.rollback();
+                await stopChild(server);
+            }
         });
 
         await t.test('readiness and an unchanged release use the same query count with 4 and 1000 tenant metadata records', async () => {
