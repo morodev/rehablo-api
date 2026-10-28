@@ -26,6 +26,15 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
         try {await work(transaction);} finally {await transaction.rollback();}
     };
     const randomSchema = () => 'rehablo_' + randomUUID().replaceAll('-', '');
+    const readForeignKeys = async (schema: string, table: string, column: string, transaction: Transaction) => {
+        const [rows] = await database.query(`SELECT c.oid,c.conname,pg_get_constraintdef(c.oid) AS definition,
+            n.nspname AS "targetSchema",t.relname AS "targetTable",c.confdeltype AS "onDelete",c.confupdtype AS "onUpdate"
+            FROM pg_constraint c JOIN pg_class t ON t.oid=c.confrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+            WHERE c.contype='f' AND c.conrelid=to_regclass(:table)
+              AND c.conkey=ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid=c.conrelid AND attname=:column)]`,
+        {transaction, replacements: {table: `"${schema}"."${table}"`, column}});
+        return rows as Array<{oid: number; conname: string; definition: string; targetSchema: string; targetTable: string; onDelete: string; onUpdate: string}>;
+    };
     try {
         await database.authenticate();
         const [names] = await database.query('SELECT current_database() AS name');
@@ -57,6 +66,20 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
             // Semantic index/constraint recognition must make a second baseline application harmless.
             await applySchemaBaseline('public', 'public', database, transaction);
             await applySchemaBaseline('tenant', schema, database, transaction);
+            for (const [keySchema, table, column, target, onDelete] of [
+                ['public', 'user_emails', 'userId', 'users', 'c'],
+                ['public', 'patient_portal_accesses', 'userId', 'users', 'c'],
+                ['public', 'patient_portal_accesses', 'tenantId', 'tenants', 'c'],
+                ['public', 'patient_portal_invitations', 'tenantId', 'tenants', 'c'],
+                [schema, 'invoice_payments', 'invoiceId', 'invoices', 'n']
+            ]) {
+                const keys = await readForeignKeys(keySchema, table, column, transaction);
+                assert.equal(keys.length, 1);
+                assert.equal(keys[0].targetSchema, keySchema);
+                assert.equal(keys[0].targetTable, target);
+                assert.equal(keys[0].onDelete, onDelete, 'Fresh foreign keys retain the frozen canonical actions');
+                assert.equal(keys[0].onUpdate, 'c');
+            }
         }));
 
         await t.test('initial tenant adoption captures payment evidence and preserves old migration markers', async () => withRollback(async transaction => {
@@ -68,6 +91,12 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
             // Reconstruct a real pre-upgrade shape while retaining all unrelated legacy columns.
             await database.query(`ALTER TABLE ${prefix}.agenda_events DROP COLUMN "appointmentPaymentHistoryKnown"`, {transaction});
             await database.query(`ALTER TABLE ${prefix}.invoice_payments ALTER COLUMN "invoiceId" SET NOT NULL`, {transaction});
+            // Historical required invoiceId inferred CASCADE in Sequelize; the later ledger
+            // migration only removes NOT NULL, leaving this deployed constraint in place.
+            await database.query(`ALTER TABLE ${prefix}.invoice_payments ADD CONSTRAINT "historical_invoice_payment_fk"
+                FOREIGN KEY ("invoiceId") REFERENCES ${prefix}.invoices(id) ON DELETE CASCADE ON UPDATE CASCADE`, {transaction});
+            const historicalPaymentKey = await readForeignKeys(schema, 'invoice_payments', 'invoiceId', transaction);
+            assert.equal(historicalPaymentKey.length, 1);
             await database.query(`ALTER TABLE ${prefix}.patients DROP COLUMN color`, {transaction});
             const eventId = randomUUID(), patientId = randomUUID(), evaluationId = randomUUID();
             await database.query(`INSERT INTO ${prefix}.agenda_events (id,status,"createdAt","updatedAt")
@@ -83,6 +112,12 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
                 VALUES ('20260924-backfill-patient-publication','2026-09-24T00:00:00Z')`, {transaction});
             await provisionTenantSchema(database, schema, transaction);
             await verifySchemaBaseline('tenant', schema, database, transaction);
+            assert.deepEqual(await readForeignKeys(schema, 'invoice_payments', 'invoiceId', transaction), historicalPaymentKey,
+                'Adoption must retain the historical FK identity, target and CASCADE actions');
+            const [nullable] = await database.query(`SELECT is_nullable FROM information_schema.columns
+                WHERE table_schema=:schema AND table_name='invoice_payments' AND column_name='invoiceId'`,
+                {transaction, replacements: {schema}});
+            assert.deepEqual(nullable, [{is_nullable: 'YES'}]);
             const [oldEvents] = await database.query(`SELECT "appointmentPaymentHistoryKnown" FROM ${prefix}.agenda_events WHERE id=:id`,
                 {transaction, replacements: {id: eventId}});
             assert.equal((oldEvents[0] as any).appointmentPaymentHistoryKnown, false, 'Existing appointments without evidence cannot become verified');
@@ -101,9 +136,38 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
                 WHERE version='20260924-backfill-patient-publication'`, {transaction});
             assert.equal(new Date((markers[0] as any).appliedAt).toISOString(), '2026-09-24T00:00:00.000Z');
             await provisionTenantSchema(database, schema, transaction);
+            assert.deepEqual(await readForeignKeys(schema, 'invoice_payments', 'invoiceId', transaction), historicalPaymentKey,
+                'A no-op replay must not replace or duplicate historical foreign keys');
             const [completed] = await database.query(`SELECT name FROM ${prefix}."SequelizeMeta" ORDER BY name`, {transaction});
             assert.deepEqual((completed as Array<{name: string}>).map(row => row.name), requiredMigrationNames,
                 'Repeated adoption must retain exactly the two standard migration markers');
+        }));
+
+        await t.test('an equivalent foreign key cannot hide an additional incompatible target or action', async () => withRollback(async transaction => {
+            const schema = randomSchema(), prefix = quoteTenantSchema(schema), foreignSchema = randomSchema();
+            await applySchemaBaseline('public', 'public', database, transaction);
+            await applySchemaBaseline('tenant', schema, database, transaction);
+            const canonical = await readForeignKeys(schema, 'invoice_payments', 'invoiceId', transaction);
+            await database.query(`CREATE SCHEMA "${foreignSchema}"`, {transaction});
+            await database.query(`CREATE TABLE "${foreignSchema}".invoices(id UUID PRIMARY KEY)`, {transaction});
+            await database.query(`ALTER TABLE ${prefix}.invoices ADD COLUMN "alternateInvoiceId" UUID UNIQUE`, {transaction});
+            const incompatible = [
+                {name: 'wrong_tenant_target', target: `"${foreignSchema}".invoices(id)`, onDelete: 'SET NULL', onUpdate: 'CASCADE'},
+                {name: 'wrong_table_target', target: `${prefix}.patients(id)`, onDelete: 'SET NULL', onUpdate: 'CASCADE'},
+                {name: 'wrong_column_target', target: `${prefix}.invoices("alternateInvoiceId")`, onDelete: 'SET NULL', onUpdate: 'CASCADE'},
+                {name: 'unknown_update_action', target: `${prefix}.invoices(id)`, onDelete: 'CASCADE', onUpdate: 'NO ACTION'},
+                {name: 'unknown_delete_action', target: `${prefix}.invoices(id)`, onDelete: 'RESTRICT', onUpdate: 'CASCADE'}
+            ];
+            for (const key of incompatible) {
+                await database.query(`ALTER TABLE ${prefix}.invoice_payments ADD CONSTRAINT "${key.name}"
+                    FOREIGN KEY ("invoiceId") REFERENCES ${key.target} ON DELETE ${key.onDelete} ON UPDATE ${key.onUpdate}`, {transaction});
+                await assert.rejects(applySchemaBaseline('tenant', schema, database, transaction),
+                    /Incompatible foreign key: .*\.invoice_payments\(invoiceId\)/,
+                    key.name + ': a matching canonical FK must not mask another incompatible constraint');
+                await database.query(`ALTER TABLE ${prefix}.invoice_payments DROP CONSTRAINT "${key.name}"`, {transaction});
+                assert.deepEqual(await readForeignKeys(schema, 'invoice_payments', 'invoiceId', transaction), canonical,
+                    'Validation must not rewrite the existing canonical constraint');
+            }
         }));
 
         await t.test('public preparation repairs unrecoverable availability before the baseline adds columns', async () => withRollback(async transaction => {

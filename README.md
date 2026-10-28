@@ -67,9 +67,15 @@ Il modulo `invoice` di questo monolite unisce: modello fiscale di v2 + relazioni
 ```bash
 cp .env.example .env   # configura DATABASE_URL, JWT_SECRET, SMTP, Stripe
 npm install
+npm run build           # compila anche le implementazioni delle migrazioni
+npm run db:migrate      # applica le migrazioni al database configurato in .env
 npm run dev             # tsx watch
-npm run build && npm start   # produzione
+# In alternativa, avvio dalla build: npm start
 ```
+
+Ripetere build e migrazione dopo un pull che introduce migrazioni pendenti: i file già
+eseguiti vengono saltati. `npm run dev` controlla lo stato del database all'avvio e non
+applica migrazioni automaticamente. Dettagli in [Database migrations](docs/DATABASE_MIGRATIONS.md).
 
 ## Avvio e health check su Render
 

@@ -42,10 +42,11 @@ async function readColumns(schema: string, database: Sequelize, transaction?: Tr
     return new Map((rows as ColumnRow[]).map(row => [row.tableName + '.' + row.columnName, row]));
 }
 
-type ConstraintRow = {tableName: string; kind: string; columns: string[]; targetSchema: string | null;
+type ConstraintRow = {name: string; definition: string; tableName: string; kind: string; columns: string[]; targetSchema: string | null;
     targetTable: string | null; targetColumns: string[] | null; onDelete: string; onUpdate: string};
 async function readConstraints(schema: string, database: Sequelize, transaction?: Transaction): Promise<ConstraintRow[]> {
-    const [rows] = await database.query(`SELECT t.relname AS "tableName",c.contype AS kind,
+    const [rows] = await database.query(`SELECT c.conname AS name,pg_get_constraintdef(c.oid) AS definition,
+        t.relname AS "tableName",c.contype AS kind,
         ARRAY(SELECT a.attname::text FROM unnest(c.conkey) WITH ORDINALITY k(num,ord)
             JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=k.num ORDER BY k.ord) AS columns,
         rn.nspname AS "targetSchema",rt.relname AS "targetTable",
@@ -59,11 +60,30 @@ async function readConstraints(schema: string, database: Sequelize, transaction?
 }
 const sameColumns = (a: string[], b: string[]) => JSON.stringify(a) === JSON.stringify(b);
 const actions: Record<string, string> = {'NO ACTION': 'a', RESTRICT: 'r', CASCADE: 'c', 'SET NULL': 'n', 'SET DEFAULT': 'd'};
+/** Existing constraints retain their behavior; only variants evidenced by historical migrations are adopted. */
+const legacyForeignKeys = [
+    // cc78bbc required invoiceId; 07a1ff4 / 20260907 only removed NOT NULL, retaining CASCADE.
+    {scope: 'tenant', table: 'invoice_payments', column: 'invoiceId', target: 'invoices',
+        expectedDelete: 'SET NULL', expectedUpdate: 'CASCADE', onDelete: 'c', onUpdate: 'c'},
+    // 20260901-create-patient-portal specified DELETE CASCADE but omitted UPDATE (PostgreSQL NO ACTION).
+    ...[
+        {table: 'user_emails', column: 'userId', target: 'users'},
+        {table: 'patient_portal_accesses', column: 'userId', target: 'users'},
+        {table: 'patient_portal_accesses', column: 'tenantId', target: 'tenants'},
+        {table: 'patient_portal_invitations', column: 'tenantId', target: 'tenants'}
+    ].map(key => ({...key, scope: 'public', expectedDelete: 'CASCADE', expectedUpdate: 'CASCADE', onDelete: 'c', onUpdate: 'a'}))
+];
 function matchesForeignKey(row: ConstraintRow, table: BaselineTable, foreignKey: BaselineForeignKey, schema: string): boolean {
-    return row.tableName === table.name && row.kind === 'f' && sameColumns(row.columns, foreignKey.columns)
+    const sameReference = row.tableName === table.name && row.kind === 'f' && sameColumns(row.columns, foreignKey.columns)
         && row.targetSchema === render(foreignKey.targetSchema, schema) && row.targetTable === foreignKey.targetTable
-        && sameColumns(row.targetColumns ?? [], foreignKey.targetColumns)
-        && row.onDelete === actions[foreignKey.onDelete] && row.onUpdate === actions[foreignKey.onUpdate];
+        && sameColumns(row.targetColumns ?? [], foreignKey.targetColumns);
+    if (!sameReference) return false;
+    if (row.onDelete === actions[foreignKey.onDelete] && row.onUpdate === actions[foreignKey.onUpdate]) return true;
+    return row.targetSchema === schema && sameColumns(foreignKey.targetColumns, ['id'])
+        && legacyForeignKeys.some(key => key.scope === (schema === 'public' ? 'public' : 'tenant')
+            && key.table === table.name && sameColumns(foreignKey.columns, [key.column]) && key.target === foreignKey.targetTable
+            && key.expectedDelete === foreignKey.onDelete && key.expectedUpdate === foreignKey.onUpdate
+            && key.onDelete === row.onDelete && key.onUpdate === row.onUpdate);
 }
 
 /** Compare index behavior rather than its legacy-generated name, avoiding duplicate equivalent indexes. */
@@ -114,10 +134,15 @@ async function applyConstraints(scope: 'public' | 'tenant', schema: string, data
             await database.query(`ALTER TABLE ${qualified} ADD UNIQUE (${columns.map(quote).join(',')})`, {transaction});
         }
         for (const foreignKey of table.foreignKeys) {
-            if (constraints.some(row => matchesForeignKey(row, table, foreignKey, schema))) continue;
-            if (constraints.some(row => row.tableName === table.name && row.kind === 'f' && sameColumns(row.columns, foreignKey.columns))) {
-                throw new Error(`Incompatible foreign key: ${schema}.${table.name}(${foreignKey.columns.join(',')}); an explicit migration is required`);
+            const existing = constraints.filter(row => row.tableName === table.name && row.kind === 'f' && sameColumns(row.columns, foreignKey.columns));
+            const incompatible = existing.filter(row => !matchesForeignKey(row, table, foreignKey, schema));
+            if (incompatible.length) {
+                throw new Error(`Incompatible foreign key: ${schema}.${table.name}(${foreignKey.columns.join(',')}); `
+                    + `found ${incompatible.map(row => quote(row.name) + ': ' + row.definition).join('; ')}; `
+                    + `expected REFERENCES ${render(foreignKey.targetSchema, schema)}.${foreignKey.targetTable}(${foreignKey.targetColumns.join(',')}) `
+                    + `ON DELETE ${foreignKey.onDelete} ON UPDATE ${foreignKey.onUpdate} or a documented legacy variant; an explicit migration is required`);
             }
+            if (existing.length) continue;
             await database.query(render(foreignKey.sql, schema), {transaction});
         }
         for (const index of table.indexes) {

@@ -18,6 +18,10 @@ The CLI uses the same `DATABASE_URL`, local fallback and `DB_SSL` interpretation
 
 Run one migration process at a time. Render serializes deployments for this service; do not launch another CLI migration against the same database during its pre-deploy. There is no application-wide advisory lock or custom database release ledger in the active migration path.
 
+## Local development
+
+After installing dependencies, configuring the local `.env` and starting PostgreSQL, run `npm run build`, then `npm run db:migrate`, then `npm run dev`. The build supplies the compiled implementation imported by the CLI migration files. Repeat build and migration after pulling changes with pending migrations; the CLI skips completed files. `npm run dev` watches the application and checks migration status on startup. It does not apply pending migrations, so `DATABASE_SCHEMA_NOT_READY` requires running the migration command before restarting development.
+
 ## Existing installations and tenants
 
 `202610280001-initial-schema.js` creates or adopts the initial public and tenant schema using the existing historical migration records. Existing `schema_migrations` versions and timestamps are preserved, and completed historical data migrations are not replayed. `202610280002-appointment-reminders.js` adds appointment reminder delivery storage. Both call the compiled migration implementation through the CLI's own database connection.

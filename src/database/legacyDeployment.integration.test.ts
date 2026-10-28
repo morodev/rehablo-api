@@ -8,7 +8,7 @@ import {join} from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {test} from 'node:test';
-import type {Sequelize} from 'sequelize';
+import type {Sequelize, Transaction} from 'sequelize';
 import {requireMigrationsTestDatabase} from '../../scripts/test-database-migrations-integration.mjs';
 
 test('legacy deployments upgrade directly and preserve existing business data', {timeout: 180000}, async t => {
@@ -44,8 +44,34 @@ Sequelize.prototype.sync = function() {throw new Error('Global model sync is for
 `);
     const tenantId = randomUUID(), patientId = randomUUID(), structureId = randomUUID();
     const eventId = randomUUID(), evaluationId = randomUUID(), accountId = randomUUID();
+    const invoiceId = randomUUID(), paymentId = randomUUID();
     const schema = 'rehablo_' + tenantId.replaceAll('-', '');
     const quote = (value: string) => '"' + value.replaceAll('"', '""') + '"';
+    const legacyForeignKeys = [
+        {schema: 'public', table: 'user_emails', column: 'userId', target: 'users', update: 'NO ACTION'},
+        {schema: 'public', table: 'patient_portal_accesses', column: 'userId', target: 'users', update: 'NO ACTION'},
+        {schema: 'public', table: 'patient_portal_accesses', column: 'tenantId', target: 'tenants', update: 'NO ACTION'},
+        {schema: 'public', table: 'patient_portal_invitations', column: 'tenantId', target: 'tenants', update: 'NO ACTION'},
+        {schema, table: 'invoice_payments', column: 'invoiceId', target: 'invoices', update: 'CASCADE'}
+    ];
+    const readForeignKey = async (key: typeof legacyForeignKeys[number], transaction?: Transaction) => {
+        const [rows] = await database.query(`SELECT c.oid,c.conname,pg_get_constraintdef(c.oid) AS definition,
+            n.nspname AS "targetSchema",t.relname AS "targetTable",c.confdeltype AS "onDelete",c.confupdtype AS "onUpdate"
+            FROM pg_constraint c JOIN pg_class t ON t.oid=c.confrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+            WHERE c.contype='f' AND c.conrelid=to_regclass(:table)
+              AND c.conkey=ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid=c.conrelid AND attname=:column)]`,
+        {transaction, replacements: {table: quote(key.schema) + '.' + quote(key.table), column: key.column}});
+        return rows as Array<{oid: number; conname: string; definition: string; targetSchema: string; targetTable: string; onDelete: string; onUpdate: string}>;
+    };
+    const reconstructLegacyForeignKey = async (key: typeof legacyForeignKeys[number], transaction?: Transaction) => {
+        const existing = await readForeignKey(key, transaction);
+        assert.equal(existing.length, 1, 'Fixture starts with exactly one model-generated foreign key');
+        const table = quote(key.schema) + '.' + quote(key.table);
+        await database.query(`ALTER TABLE ${table} DROP CONSTRAINT ${quote(existing[0].conname)}`, {transaction});
+        await database.query(`ALTER TABLE ${table} ADD CONSTRAINT ${quote(existing[0].conname)}
+            FOREIGN KEY (${quote(key.column)}) REFERENCES ${quote(key.schema)}.${quote(key.target)}(id)
+            ON DELETE CASCADE ON UPDATE ${key.update}`, {transaction});
+    };
     const schemas = new Set([schema]);
     const knownTables = new Set([...schemaBaseline.public.map(table => table.name),
         'SequelizeMeta','schema_migrations','schema_control','schema_releases','tenant_schema_state','platform_schema_migrations','schema_transition',
@@ -108,9 +134,12 @@ Sequelize.prototype.sync = function() {throw new Error('Global model sync is for
             FROM ${quote(schema)}.agenda_events WHERE id=:id`, {replacements: {id: eventId}});
         const [evaluations] = await connection.query(`SELECT id,"publishedToPatient" FROM ${quote(schema)}.evaluations WHERE id=:id`, {replacements: {id: evaluationId}});
         const [accounts] = await connection.query(`SELECT id,name,"openingBalance" FROM ${quote(schema)}.financial_accounts WHERE id=:id`, {replacements: {id: accountId}});
+        const [invoices] = await connection.query(`SELECT * FROM ${quote(schema)}.invoices WHERE id=:id`, {replacements: {id: invoiceId}});
+        const [payments] = await connection.query(`SELECT * FROM ${quote(schema)}.invoice_payments WHERE id=:id`, {replacements: {id: paymentId}});
         const [versions] = await connection.query(`SELECT version,"appliedAt" FROM ${quote(schema)}.schema_migrations
             WHERE version IN (:versions) ORDER BY version`, {replacements: {versions: [...tenantMigrations.map(step => step.version), '20261026-tenant-model-baseline-v21']}});
-        return {patients, events, evaluations, accounts, versions};
+        const foreignKeys = await Promise.all(legacyForeignKeys.map(key => readForeignKey(key)));
+        return {patients, events, evaluations, accounts, invoices, payments, versions, foreignKeys};
     };
     const insertTenant = (id: string) => database.query(`INSERT INTO public.tenants
         (id,license,"idStripe","maxUserQuantity","maxStructureQuantity","createdAt","updatedAt")
@@ -135,6 +164,9 @@ Sequelize.prototype.sync = function() {throw new Error('Global model sync is for
         const {syncMeasurementCatalogModels} = await import('../modules/measurements/models/catalog/index.js');
         for (const setup of [syncAuthModels,syncBillingModels,syncInvoicePublicModels,syncQuotePublicModels,
             syncCatalogModels,syncProtocolCatalogModels,syncMeasurementCatalogModels]) await setup();
+        // The 20260901 portal SQL used ON DELETE CASCADE and omitted ON UPDATE.
+        // Reconstruct those deployed constraints instead of inheriting today's model defaults.
+        for (const key of legacyForeignKeys.filter(key => key.schema === 'public')) await reconstructLegacyForeignKey(key);
         await insertTenant(tenantId);
         await database.query(`INSERT INTO public.structures(id,"tenantId",name,"createdAt","updatedAt")
             VALUES (:id,:tenant,'Synthetic legacy structure',NOW(),NOW())`, {replacements: {id: structureId, tenant: tenantId}});
@@ -145,7 +177,19 @@ Sequelize.prototype.sync = function() {throw new Error('Global model sync is for
                 if (model.tableName === 'appointment_reminder_deliveries') continue;
                 await model.schema(schema).sync({alter: {drop: false}, transaction} as any);
             }
+            // cc78bbc required invoiceId: Sequelize inferred DELETE/UPDATE CASCADE.
+            // 07a1ff4 made it nullable; the ledger migration drops NOT NULL without replacing this FK.
+            await database.query(`ALTER TABLE ${quote(schema)}.invoice_payments ALTER COLUMN "invoiceId" SET NOT NULL`, {transaction});
+            const paymentKey = legacyForeignKeys.find(key => key.table === 'invoice_payments')!;
+            await reconstructLegacyForeignKey(paymentKey, transaction);
+            const originalPaymentForeignKey = await readForeignKey(paymentKey, transaction);
             await runTenantMigrations(schema, repair, database, transaction);
+            const [nullable] = await database.query(`SELECT is_nullable FROM information_schema.columns
+                WHERE table_schema=:schema AND table_name='invoice_payments' AND column_name='invoiceId'`,
+                {transaction, replacements: {schema}});
+            assert.deepEqual(nullable, [{is_nullable: 'YES'}], 'The real historical ledger migration must remove NOT NULL');
+            assert.deepEqual(await readForeignKey(paymentKey, transaction), originalPaymentForeignKey,
+                'The historical nullable transition must preserve the original CASCADE foreign key and its OID');
             await database.query(`INSERT INTO ${quote(schema)}.schema_migrations(version,"appliedAt")
                 VALUES ('20261026-tenant-model-baseline-v21','2026-10-26T00:00:00Z')`, {transaction});
         });
@@ -164,14 +208,29 @@ Sequelize.prototype.sync = function() {throw new Error('Global model sync is for
             VALUES (:id,:patient,:user,NOW(),'COMPLETED',false,NOW(),NOW())`, {replacements: {id: evaluationId, patient: patientId, user: randomUUID()}});
         await database.query(`INSERT INTO ${quote(schema)}.financial_accounts(id,"structureId",name,"openingBalance","createdAt","updatedAt")
             VALUES (:id,:structure,'Preserve historical account',123.45,NOW(),NOW())`, {replacements: {id: accountId, structure: structureId}});
+        await database.query(`INSERT INTO ${quote(schema)}.invoices(id,"structureId","invoiceTotal",status,"createdAt","updatedAt")
+            VALUES (:id,:structure,80.50,'issued','2026-09-01T10:00:00Z','2026-09-01T10:00:00Z')`,
+            {replacements: {id: invoiceId, structure: structureId}});
+        await database.query(`INSERT INTO ${quote(schema)}.invoice_payments
+            (id,"invoiceId",amount,"paidAt",source,status,note,"createdAt","updatedAt")
+            VALUES (:id,:invoice,35.25,'2026-09-02','LEGACY_IMPORT','POSTED','Preserve historical receipt',
+                '2026-09-02T10:00:00Z','2026-09-02T10:00:00Z')`, {replacements: {id: paymentId, invoice: invoiceId}});
         const before = await snapshotBusinessData();
+        for (const [index, key] of legacyForeignKeys.entries()) {
+            assert.equal(before.foreignKeys[index].length, 1);
+            const actual = before.foreignKeys[index][0];
+            assert.equal(actual.targetSchema, key.schema);
+            assert.equal(actual.targetTable, key.target);
+            assert.equal(actual.onDelete, 'c');
+            assert.equal(actual.onUpdate, key.update === 'CASCADE' ? 'c' : 'a');
+        }
         const additionalTenants = [randomUUID(), randomUUID()];
         for (const additional of additionalTenants) {
             schemas.add('rehablo_' + additional.replaceAll('-', ''));
             await insertTenant(additional);
         }
 
-        await t.test('existing tenants migrate directly despite stale bridge env and keep historical state', async () => {
+        await t.test('official CLI adopts historical foreign keys without rewriting their OIDs, actions or business data', async () => {
             const output = await runCli();
             assert.match(output, /== 202610280001-initial-schema: migrated/);
             assert.doesNotMatch(output, /Deploy the bridge configuration first|bridge metadata ready/);
