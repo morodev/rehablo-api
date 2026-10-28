@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {spawn, type ChildProcess} from 'node:child_process';
 import {randomBytes, randomUUID} from 'node:crypto';
-import {existsSync, mkdtempSync, rmdirSync, unlinkSync, writeFileSync} from 'node:fs';
+import {existsSync, mkdtempSync, readFileSync, rmdirSync, unlinkSync, writeFileSync} from 'node:fs';
 import {get} from 'node:http';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -18,13 +18,16 @@ test('legacy deployments upgrade directly and preserve existing business data', 
         JWT_SECRET: randomBytes(32).toString('hex'), DEVICE_CREDENTIALS_SECRET: randomBytes(32).toString('hex'),
         BACKGROUND_JOBS_ENABLED: 'false', ACTIVITIES_DELIVERY_ENABLED: 'false', REMINDER_EXTERNAL_DELIVERY_ENABLED: 'false'});
     const directory = fileURLToPath(new URL('../..', import.meta.url));
-    const cli = fileURLToPath(new URL('../../dist/scripts/databaseMigrations.js', import.meta.url));
+    const cli = join(directory, 'node_modules/sequelize-cli/lib/sequelize');
+    const script = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8')).scripts['db:migrate'];
+    const command: string[] = script.match(/"[^"]*"|'[^']*'|[^\s]+/g).map((argument: string) => argument.replace(/^(['"])(.*)\1$/, '$2'));
+    assert.ok(['sequelize', 'sequelize-cli'].includes(command.shift()!), 'db:migrate must invoke the official CLI');
     assert.ok(existsSync(cli), 'Build the deployment artifact before running legacy deployment tests');
     const {sequelize: database} = await import('../config/database.js');
     const {registerDatabaseModels} = await import('./registerModels.js');
     const {getTenantScopedModels} = await import('../utils/tenantSchema.js');
     const {tenantMigrations, prepareTenantPaymentHistory, runTenantMigrations} = await import('../utils/tenantMigrations.js');
-    const {databaseManifest} = await import('./migrationManifest.js');
+    const {requiredMigrationNames} = await import('./standardMigrations.js');
     const {schemaBaseline} = await import('./schemaBaseline.js');
     registerDatabaseModels();
     const temporaryDirectory = mkdtempSync(join(tmpdir(), 'rehablo-legacy-deployment-'));
@@ -32,9 +35,12 @@ test('legacy deployments upgrade directly and preserve existing business data', 
     writeFileSync(noSyncGuard, `import {createRequire} from 'node:module';
 const require = createRequire(${JSON.stringify(join(directory, 'package.json'))});
 const {Model, Sequelize} = require('sequelize');
-const forbidden = () => {throw new Error('Runtime model sync is forbidden in release regression tests');};
-Model.sync = forbidden;
-Sequelize.prototype.sync = forbidden;
+const originalSync = Model.sync;
+Model.sync = function(options) {
+    if (this.tableName !== 'SequelizeMeta') throw new Error('Business model sync is forbidden: ' + this.tableName);
+    return originalSync.call(this, options);
+};
+Sequelize.prototype.sync = function() {throw new Error('Global model sync is forbidden');};
 `);
     const tenantId = randomUUID(), patientId = randomUUID(), structureId = randomUUID();
     const eventId = randomUUID(), evaluationId = randomUUID(), accountId = randomUUID();
@@ -42,7 +48,7 @@ Sequelize.prototype.sync = forbidden;
     const quote = (value: string) => '"' + value.replaceAll('"', '""') + '"';
     const schemas = new Set([schema]);
     const knownTables = new Set([...schemaBaseline.public.map(table => table.name),
-        'schema_control','schema_releases','tenant_schema_state','platform_schema_migrations','schema_transition',
+        'SequelizeMeta','schema_migrations','schema_control','schema_releases','tenant_schema_state','platform_schema_migrations','schema_transition',
         'auth_schema_migrations','auth_security_migrations','activity_notification_migrations','activity_notification_preferences','account_action_tokens']);
     const knownEnums = new Set(schemaBaseline.public.flatMap(table => table.enums.flatMap(sql =>
         [...sql.matchAll(/CREATE TYPE "public"\."([^"]+)"/g)].map(match => match[1]))));
@@ -63,7 +69,7 @@ Sequelize.prototype.sync = forbidden;
         await closed;
     };
     const runCli = async () => {
-        const {child, output} = spawnArtifact(cli, ['migrate']);
+        const {child, output} = spawnArtifact(cli, command);
         const timer = setTimeout(() => child.kill(), 60000);
         try {
             const code = await new Promise<number | null>((resolve, reject) => {
@@ -92,7 +98,7 @@ Sequelize.prototype.sync = forbidden;
                 await delay(50);
             }
             assert.equal(ready, true, 'Application failed to become ready: ' + output());
-            assert.doesNotMatch(output(), /sync modello|public auth models|Runtime model sync is forbidden/);
+            assert.doesNotMatch(output(), /sync modello|public auth models|Business model sync is forbidden|Global model sync is forbidden/);
             return output();
         } finally {await stop(child);}
     };
@@ -159,19 +165,29 @@ Sequelize.prototype.sync = forbidden;
         await database.query(`INSERT INTO ${quote(schema)}.financial_accounts(id,"structureId",name,"openingBalance","createdAt","updatedAt")
             VALUES (:id,:structure,'Preserve historical account',123.45,NOW(),NOW())`, {replacements: {id: accountId, structure: structureId}});
         const before = await snapshotBusinessData();
+        const additionalTenants = [randomUUID(), randomUUID()];
+        for (const additional of additionalTenants) {
+            schemas.add('rehablo_' + additional.replaceAll('-', ''));
+            await insertTenant(additional);
+        }
 
         await t.test('existing tenants migrate directly despite stale bridge env and keep historical state', async () => {
             const output = await runCli();
-            assert.match(output, /"noop":false/);
+            assert.match(output, /== 202610280001-initial-schema: migrated/);
             assert.doesNotMatch(output, /Deploy the bridge configuration first|bridge metadata ready/);
             assert.deepEqual(await snapshotBusinessData(), before);
             const [reminders] = await database.query('SELECT to_regclass(:table) AS name', {replacements: {table: schema + '.appointment_reminder_deliveries'}});
             assert.ok((reminders[0] as any).name, 'The new reminder migration must be applied');
-            const [versions] = await database.query(`SELECT version FROM ${quote(schema)}.schema_migrations`);
-            assert.ok((versions as Array<{version: string}>).some(row => row.version === '20261028-appointment-reminders-v1'));
+            const [versions] = await database.query(`SELECT name FROM ${quote(schema)}."SequelizeMeta" ORDER BY name`);
+            assert.deepEqual((versions as Array<{name: string}>).map(row => row.name), requiredMigrationNames);
+            for (const additional of additionalTenants) {
+                const additionalSchema = 'rehablo_' + additional.replaceAll('-', '');
+                const [markers] = await database.query(`SELECT name FROM ${quote(additionalSchema)}."SequelizeMeta" ORDER BY name`);
+                assert.deepEqual((markers as Array<{name: string}>).map(row => row.name), requiredMigrationNames);
+            }
         });
         await t.test('unchanged redeploys skip completed work and preserve legacy migration timestamps', async () => {
-            assert.match(await runCli(), /"noop":true/);
+            await runCli();
             assert.deepEqual(await snapshotBusinessData(), before);
         });
         await t.test('startup reconciles a tenant registered by old code after pre-deploy without another manual command', async () => {
@@ -179,37 +195,28 @@ Sequelize.prototype.sync = forbidden;
             schemas.add(lateSchema);
             await insertTenant(lateTenantId);
             const output = await runServer();
-            assert.match(output, /"tenants":1/);
-            const [rows] = await database.query('SELECT "releaseId" FROM public.tenant_schema_state WHERE "schemaName"=:schema', {replacements: {schema: lateSchema}});
-            assert.equal((rows[0] as any)?.releaseId, databaseManifest.id);
+            assert.doesNotMatch(output, /Business model sync is forbidden|Global model sync is forbidden/);
+            const [rows] = await database.query(`SELECT name FROM ${quote(lateSchema)}."SequelizeMeta" ORDER BY name`);
+            assert.deepEqual((rows as Array<{name: string}>).map(row => row.name), requiredMigrationNames);
             assert.deepEqual(await snapshotBusinessData(), before);
         });
-        await t.test('startup applies pending migrations without any pre-deploy configuration', async () => {
-            // Reconstruct a pending tenant step and its missing compatibility checkpoint, as on an interrupted upgrade.
-            // All previously recorded business migrations and the other tenant's committed checkpoint remain intact.
-            await database.transaction(async transaction => {
-                await database.query(`DROP TABLE ${quote(schema)}.appointment_reminder_deliveries`, {transaction});
-                await database.query(`DELETE FROM ${quote(schema)}.schema_migrations WHERE version='20261028-appointment-reminders-v1'`, {transaction});
-                await database.query('DELETE FROM public.tenant_schema_state WHERE "schemaName"=:schema', {transaction, replacements: {schema}});
-                await database.query('DELETE FROM public.schema_control', {transaction});
-                await database.query('DELETE FROM public.schema_releases WHERE id=:id', {transaction, replacements: {id: databaseManifest.id}});
-            });
-            const previousPhase = process.env.DATABASE_MIGRATION_PHASE;
-            delete process.env.DATABASE_MIGRATION_PHASE;
+        await t.test('startup rejects pending global migrations instead of applying them itself', async () => {
+            await database.query('DELETE FROM public."SequelizeMeta" WHERE name=:name', {replacements: {name: requiredMigrationNames[1]}});
+            const {child, output} = spawnArtifact(fileURLToPath(new URL('../../dist/server.js', import.meta.url)));
+            const timer = setTimeout(() => child.kill(), 15000);
             try {
-                const output = await runServer();
-                assert.match(output, /"noop":false/);
-                assert.match(output, /20261028-appointment-reminders-v1/);
-            } finally {
-                if (previousPhase === undefined) delete process.env.DATABASE_MIGRATION_PHASE;
-                else process.env.DATABASE_MIGRATION_PHASE = previousPhase;
-            }
-            const [tables] = await database.query('SELECT to_regclass(:table) AS name', {replacements: {table: schema + '.appointment_reminder_deliveries'}});
-            assert.ok((tables[0] as any).name, 'Startup must apply the pending reminder DDL before serving traffic');
-            const [versions] = await database.query(`SELECT version FROM ${quote(schema)}.schema_migrations WHERE version='20261028-appointment-reminders-v1'`);
-            assert.equal(versions.length, 1, 'Startup must record the actual applied migration');
+                const code = await new Promise<number | null>((resolve, reject) => {
+                    child.once('error', reject); child.once('close', resolve);
+                });
+                assert.equal(code, 1, 'Startup must fail while a global migration is pending: ' + output());
+                const [markers] = await database.query('SELECT name FROM public."SequelizeMeta" ORDER BY name');
+                assert.deepEqual((markers as Array<{name: string}>).map(row => row.name), [requiredMigrationNames[0]]);
+                assert.deepEqual(await snapshotBusinessData(), before);
+            } finally {clearTimeout(timer); await stop(child);}
+            await runCli();
             assert.deepEqual(await snapshotBusinessData(), before);
         });
+
     } finally {
         try {
             if (ownsFixture) {

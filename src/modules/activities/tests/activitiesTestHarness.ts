@@ -31,9 +31,8 @@ export async function createActivitiesHarness() {
     const activities = await import('../models/index.js');
     const notes = await import('../../notes/models/index.js');
     const {registerTenantModels} = await import('../../../tenantModelsRegistry.js');
-    const {databaseManifest} = await import('../../../database/migrationManifest.js');
-    const releaseControl = await import('../../../database/releaseControl.js');
-    const {migrateDatabase} = await import('../../../database/releaseRunner.js');
+    const migrationStatus = await import('../../../database/migrationStatus.js');
+    const {runStandardMigrations} = await import('../../../../scripts/standard-migrations-test-setup.mjs');
 
     const run = randomUUID();
     const tenantA = randomUUID();
@@ -75,9 +74,6 @@ export async function createActivitiesHarness() {
                 assert.match(schema, /^rehablo_[a-f0-9]{32}$/);
                 await sequelize.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
             }
-            await sequelize.query('DELETE FROM public.tenant_schema_state WHERE "schemaName" IN (:schemas)', {
-                replacements: {schemas: [schemaA, schemaB, ...extraSchemas]}
-            });
             await auth.PatientPortalAccess.destroy({where: {id: patientAccessId}});
             await auth.StructureUser.destroy({where: {structureId: structureIds}});
             await auth.TenantUser.destroy({where: {tenantId: tenantIds}});
@@ -98,7 +94,7 @@ export async function createActivitiesHarness() {
         verifiedDatabase = true;
         auth.registerAuthAssociations();
         registerTenantModels();
-        await migrateDatabase(databaseManifest, {database: sequelize});
+        await runStandardMigrations(safeDatabase.databaseUrl);
         await sequelize.transaction(async transaction => {
             await tenantSchema.beginTenantProvisioning(transaction);
             for (const id of tenantIds) {
@@ -195,7 +191,7 @@ export async function createActivitiesHarness() {
         up(queryInterface: ReturnType<Sequelize['getQueryInterface']>, options: {schema: string; transaction?: any}): Promise<void>
     };
 
-    return {sequelize, auth, activities, notes, migrations, activitiesMigration, tenantSchema, databaseManifest, releaseControl, actors, api, cleanup, baseUrl,
+    return {sequelize, auth, activities, notes, migrations, activitiesMigration, tenantSchema, migrationStatus, actors, api, cleanup, baseUrl,
         testDatabaseUrl: safeDatabase.databaseUrl,
         extraSchemas,
         trackStructure: (id: string) => {

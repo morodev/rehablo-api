@@ -52,44 +52,7 @@ export const env = {
     databaseUrl: required('DATABASE_URL', 'postgres://postgres:postgres@localhost:5432/rehablo'),
     dbSsl: process.env.DB_SSL === 'true',
 
-    /** Kept for compatibility with old configuration; migrations no longer have deployment phases. */
-    databaseMigrationPhase: (() => {
-        if (process.env.DATABASE_MIGRATION_PHASE) {
-            console.warn('[database-release] DATABASE_MIGRATION_PHASE is obsolete; pending migrations are applied automatically, without a bridge deployment.');
-        }
-        return 'managed';
-    })() as 'bridge' | 'managed',
-    migrationConcurrency: positiveInt('MIGRATION_CONCURRENCY', 2),
     migrationStatementTimeoutMs: positiveInt('MIGRATION_STATEMENT_TIMEOUT_MS', 120000),
-
-    /**
-     * Strategia di allineamento degli schemi per-tenant (`rehablo_<tenantId>`), applicata da
-     * al bootstrap per tutti i tenant e durante la registrazione per quelli nuovi.
-     *
-     * - `additive` (DEFAULT): crea le tabelle mancanti e aggiunge le colonne nuove. Non tocca
-     *   colonne esistenti né vincoli.
-     * - `full`: `alter: true` di Sequelize. Allinea anche i tipi delle colonne, MA elimina le
-     *   colonne non più presenti nel modello e ricrea le foreign key. Da usare solo in finestra
-     *   di manutenzione e su un database di cui si ha un backup fresco.
-     * - `off`: nessun sync (schemi gestiti esclusivamente via migration).
-     *
-     * Perché `full` NON è il default: `Model.sync({ alter: true })` risolve le foreign key con
-     * `SELECT oid FROM pg_class WHERE relname = '<tabella>' LIMIT 1` (sequelize v6,
-     * `postgres/query-generator.js`), SENZA filtrare per schema. In un'installazione multi-tenant
-     * dove la stessa tabella esiste in decine di schemi, Sequelize legge i vincoli di un tenant
-     * arbitrario e prova a droppare quei nomi sullo schema corrente, dove non esistono:
-     * `SequelizeUnknownConstraintError` (42704) e schema di quel tenant non più inizializzabile.
-     */
-    tenantSchemaSync: (() => {
-        const raw = (process.env.TENANT_SCHEMA_SYNC || 'additive').trim().toLowerCase();
-        if (raw === 'additive' || raw === 'full' || raw === 'off') {
-            return raw;
-        }
-        console.warn(`[env] TENANT_SCHEMA_SYNC="${raw}" non riconosciuto. Uso "additive".`);
-        return 'additive' as const;
-    })() as 'additive' | 'full' | 'off',
-    /** Numero massimo di tenant inizializzati insieme prima di abilitare le API. */
-    tenantSchemaBootstrapConcurrency: positiveInt('TENANT_SCHEMA_BOOTSTRAP_CONCURRENCY', 2),
 
     jwtSecret: required('JWT_SECRET', 'change-me-please-use-a-long-random-string'),
     /**

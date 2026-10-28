@@ -74,7 +74,7 @@ test('migrations add receipts and consent flags without an activation row or any
     await tenantMigration.up(h.sequelize.getQueryInterface(), {schema: h.schemas.a});
     assert.equal(await h.activities.ActivityNotificationActivation.schema(h.schemas.a).count(), 0);
     assert.equal(await h.activities.ActivityDelivery.schema(h.schemas.a).count(), 0);
-    await h.releaseControl.assertTenantReady(h.schemas.a, h.databaseManifest, h.sequelize);
+    await h.migrationStatus.assertTenantReady(h.schemas.a, h.sequelize);
 });
 test('first activation skips the backlog, while future alerts recover after a later outage', async () => {
     const skipped = await makeAlert(['inApp'], h.actors.ownerB);

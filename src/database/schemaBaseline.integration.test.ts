@@ -14,7 +14,7 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
     const {applySchemaBaseline, verifySchemaBaseline, schemaBaseline, canonicalIndex} = await import('./schemaBaseline.js');
     const {databaseManifest} = await import('./migrationManifest.js');
     const {publicMigrationSteps} = await import('./publicMigrations.js');
-    const {runTenantMigrations} = await import('./releaseRunner.js');
+    const {provisionTenantSchema, requiredMigrationNames} = await import('./standardMigrations.js');
     const {quoteTenantSchema} = await import('./migrationTypes.js');
     const {registerDatabaseModels} = await import('./registerModels.js');
     const {sequelize: modelDatabase} = await import('../config/database.js');
@@ -59,7 +59,7 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
             await applySchemaBaseline('tenant', schema, database, transaction);
         }));
 
-        await t.test('the manifest captures legacy payment evidence before adding current defaults and preserves old migration markers', async () => withRollback(async transaction => {
+        await t.test('initial tenant adoption captures payment evidence and preserves old migration markers', async () => withRollback(async transaction => {
             const tenantId = randomUUID(), schema = 'rehablo_' + tenantId.replaceAll('-', ''), prefix = quoteTenantSchema(schema);
             await applySchemaBaseline('public', 'public', database, transaction);
             await database.query(`INSERT INTO public.tenants (id,license,"idStripe","maxUserQuantity","maxStructureQuantity","createdAt","updatedAt")
@@ -81,7 +81,7 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
             await database.query(`CREATE TABLE ${prefix}.schema_migrations (version VARCHAR(160) PRIMARY KEY,"appliedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW())`, {transaction});
             await database.query(`INSERT INTO ${prefix}.schema_migrations (version,"appliedAt")
                 VALUES ('20260924-backfill-patient-publication','2026-09-24T00:00:00Z')`, {transaction});
-            await runTenantMigrations(databaseManifest, schema, database, transaction);
+            await provisionTenantSchema(database, schema, transaction);
             await verifySchemaBaseline('tenant', schema, database, transaction);
             const [oldEvents] = await database.query(`SELECT "appointmentPaymentHistoryKnown" FROM ${prefix}.agenda_events WHERE id=:id`,
                 {transaction, replacements: {id: eventId}});
@@ -100,8 +100,10 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
             const [markers] = await database.query(`SELECT "appliedAt" FROM ${prefix}.schema_migrations
                 WHERE version='20260924-backfill-patient-publication'`, {transaction});
             assert.equal(new Date((markers[0] as any).appliedAt).toISOString(), '2026-09-24T00:00:00.000Z');
-            const applied = await runTenantMigrations(databaseManifest, schema, database, transaction);
-            assert.equal(applied, 0, 'The completed tenant migration sequence is not replayed');
+            await provisionTenantSchema(database, schema, transaction);
+            const [completed] = await database.query(`SELECT name FROM ${prefix}."SequelizeMeta" ORDER BY name`, {transaction});
+            assert.deepEqual((completed as Array<{name: string}>).map(row => row.name), requiredMigrationNames,
+                'Repeated adoption must retain exactly the two standard migration markers');
         }));
 
         await t.test('public preparation repairs unrecoverable availability before the baseline adds columns', async () => withRollback(async transaction => {
@@ -118,15 +120,15 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
             assert.deepEqual(rows[0], {enabled: false, rangeOneStart: null, rangeOneFinish: null});
         }));
 
-        await t.test('a fresh provision runs the complete tenant manifest in the caller transaction', async () => withRollback(async transaction => {
+        await t.test('a fresh provision records both standard tenant migrations in the caller transaction', async () => withRollback(async transaction => {
             const tenantId = randomUUID(), schema = 'rehablo_' + tenantId.replaceAll('-', '');
             await applySchemaBaseline('public', 'public', database, transaction);
             await database.query(`INSERT INTO public.tenants (id,license,"idStripe","maxUserQuantity","maxStructureQuantity","createdAt","updatedAt")
                 VALUES (:id,'synthetic-new-tenant','synthetic',1,1,NOW(),NOW())`, {transaction, replacements: {id: tenantId}});
-            assert.equal(await runTenantMigrations(databaseManifest, schema, database, transaction), databaseManifest.tenantMigrations.length);
+            await provisionTenantSchema(database, schema, transaction);
             await verifySchemaBaseline('tenant', schema, database, transaction);
-            const [markers] = await database.query(`SELECT version FROM ${quoteTenantSchema(schema)}.schema_migrations`, {transaction});
-            assert.deepEqual((markers as Array<{version: string}>).map(row => row.version).sort(), databaseManifest.tenantMigrations.map(step => step.name).sort());
+            const [markers] = await database.query(`SELECT name FROM ${quoteTenantSchema(schema)}."SequelizeMeta" ORDER BY name`, {transaction});
+            assert.deepEqual((markers as Array<{name: string}>).map(row => row.name), requiredMigrationNames);
         }));
 
         await t.test('existing incompatible index predicates and column types require an explicit migration', async () => withRollback(async transaction => {

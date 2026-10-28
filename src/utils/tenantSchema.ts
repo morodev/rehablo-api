@@ -1,8 +1,7 @@
 import type { ModelStatic, Transaction } from 'sequelize';
 import { sequelize } from '../config/database.js';
-import {databaseManifest} from '../database/migrationManifest.js';
-import {assertProvisioningRelease, assertTenantReady, lockProvisioning, recordTenantReady} from '../database/releaseControl.js';
-import {runTenantMigrations as applyVersionedTenantMigrations} from '../database/releaseRunner.js';
+import {assertProvisioningReady, assertTenantReady} from '../database/migrationStatus.js';
+import {provisionTenantSchema as applyTenantMigrations} from '../database/standardMigrations.js';
 import {ensureActivityDeliveryActivation} from '../modules/activities/services/activityDeliveryActivation.service.js';
 
 /**
@@ -16,7 +15,7 @@ export function getTenantSchemaName(tenantId: string): string {
 /**
  * Every module registers here the models that live in the per-tenant dynamic schema
  * (patients, products, services, invoices, agenda events...). Managed requests only check
- * the central compatibility record. Schema changes belong to versioned migrations.
+ * the tenant migration history. Schema changes belong to explicit migrations.
  */
 const tenantScopedModels: ModelStatic<any>[] = [];
 
@@ -32,7 +31,7 @@ const ensuredSchemas = new Set<string>();
 
 /**
  * Share the readiness lookup between simultaneous requests. Cache a schema only after its
- * persisted compatibility record has been verified successfully.
+ * persisted migration history has been verified successfully.
  */
 const inFlightSchemas = new Map<string, Promise<string>>();
 
@@ -61,24 +60,22 @@ export async function ensureTenantSchema(tenantId: string): Promise<string> {
 }
 
 async function checkTenantSchema(schemaName: string): Promise<string> {
-    await assertTenantReady(schemaName, databaseManifest, sequelize);
+    await assertTenantReady(schemaName, sequelize);
     ensuredSchemas.add(schemaName);
     return schemaName;
 }
 
 /** Provision a tenant in the caller's transaction, used during registration before it is returned. */
 export async function beginTenantProvisioning(transaction: Transaction): Promise<void> {
-    await lockProvisioning(sequelize, transaction);
-    await assertProvisioningRelease(databaseManifest, sequelize, transaction);
+    await assertProvisioningReady(sequelize, transaction);
 }
 
 export async function provisionTenantSchema(tenantId: string, transaction: Transaction): Promise<string> {
     const schemaName = getTenantSchemaName(tenantId);
     await beginTenantProvisioning(transaction);
-    await applyVersionedTenantMigrations(databaseManifest, schemaName, sequelize, transaction);
+    await applyTenantMigrations(sequelize, schemaName, transaction);
     // Activation belongs to runtime enablement, not to migration time while delivery is disabled.
     await ensureActivityDeliveryActivation(schemaName, transaction);
-    await recordTenantReady(schemaName, databaseManifest, sequelize, transaction);
     return schemaName;
 }
 
@@ -88,8 +85,8 @@ export function markTenantSchemaReady(tenantId: string): void {
 }
 
 /**
- * Read-only compatibility checks for a known tenant list. Startup migration discovery is
- * handled by the release runner, so this helper never synchronizes or changes schemas.
+ * Read-only migration checks for a known tenant list. This helper never synchronizes
+ * or changes schemas.
  */
 export async function warmTenantSchemas(tenantIds: string[], concurrency = 2): Promise<number> {
     const uniqueTenantIds = [...new Set(tenantIds)];

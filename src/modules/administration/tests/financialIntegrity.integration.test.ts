@@ -13,9 +13,8 @@ process.env.TENANT_SCHEMA_SYNC = 'off';
 const {sequelize} = await import('../../../config/database.js');
 (sequelize as any).options.logging = false;
 const {Tenant} = await import('../../auth/models/index.js');
-const {databaseManifest} = await import('../../../database/migrationManifest.js');
-const {migrateDatabase, runTenantMigrations} = await import('../../../database/releaseRunner.js');
-const {assertProvisioningRelease, lockProvisioning, recordTenantReady} = await import('../../../database/releaseControl.js');
+const {requiredMigrationNames} = await import('../../../database/standardMigrations.js');
+const {runStandardMigrations} = await import('../../../../scripts/standard-migrations-test-setup.mjs');
 const {beginTenantProvisioning, provisionTenantSchema, markTenantSchemaReady, ensureTenantSchema, invalidateTenantSchemaCache} =
     await import('../../../utils/tenantSchema.js');
 const {default: AgendaEvent} = await import('../../agenda/models/agendaEvent.model.js');
@@ -33,7 +32,7 @@ before(async () => {
     await sequelize.authenticate();
     const [rows] = await sequelize.query('SELECT current_database() AS name');
     assert.equal((rows[0] as any).name, target.databaseName);
-    await migrateDatabase(databaseManifest, {database: sequelize});
+    await runStandardMigrations(target.databaseUrl);
 });
 after(async () => {await sequelize.close();});
 
@@ -47,7 +46,6 @@ async function fixture(t: TestContext) {
             assert.match(schema, /^rehablo_[a-f0-9]{32}$/);
             if (schemaCreated) await sequelize.query(`DROP SCHEMA "${schema}" CASCADE`);
         } finally {
-            await sequelize.query('DELETE FROM public.tenant_schema_state WHERE "schemaName"=:schema', {replacements: {schema}});
             invalidateTenantSchemaCache(tenantId);
             await Tenant.destroy({where: {id: tenantId}});
         }
@@ -213,18 +211,15 @@ test('explicit tenant migration and a second run preserve historical data and in
     await sequelize.query(`DELETE FROM "${f.schema}"."schema_migrations" WHERE "version" IN (:versions)`, {
         replacements: {versions: ['20261028-tenant-schema-baseline-v1', FINANCIAL_INTEGRITY_VERSION, '20261028-tenant-schema-constraints-v1']}
     });
-    await sequelize.query('DELETE FROM public.tenant_schema_state WHERE "schemaName"=:schema', {replacements: {schema: f.schema}});
+    await sequelize.query(`DELETE FROM "${f.schema}"."SequelizeMeta" WHERE name=:name`, {replacements: {name: requiredMigrationNames[0]}});
     invalidateTenantSchemaCache(f.tenantId);
-    await assert.rejects(ensureTenantSchema(f.tenantId), /not ready/, 'runtime access cannot repair incomplete tenants');
-    const apply = () => sequelize.transaction(async transaction => {
-        await lockProvisioning(sequelize, transaction);
-        await assertProvisioningRelease(databaseManifest, sequelize, transaction);
-        const completed = await runTenantMigrations(databaseManifest, f.schema, sequelize, transaction);
-        await recordTenantReady(f.schema, databaseManifest, sequelize, transaction);
-        return completed;
-    });
-    assert.equal(await apply(), 3);
-    assert.equal(await apply(), 0, 'a second migration run cannot replay imports or schema work');
+    await assert.rejects(ensureTenantSchema(f.tenantId), /pending migrations/, 'runtime access cannot repair incomplete tenants');
+    const apply = () => sequelize.transaction(transaction => provisionTenantSchema(f.tenantId, transaction));
+    assert.equal(await apply(), f.schema);
+    const [firstHistory] = await sequelize.query(`SELECT version,"appliedAt" FROM "${f.schema}"."schema_migrations" ORDER BY version`);
+    assert.equal(await apply(), f.schema);
+    const [secondHistory] = await sequelize.query(`SELECT version,"appliedAt" FROM "${f.schema}"."schema_migrations" ORDER BY version`);
+    assert.deepEqual(secondHistory, firstHistory, 'A second run cannot replay imports or rewrite completed migration timestamps');
     assert.equal(await ensureTenantSchema(f.tenantId), f.schema);
     const [columns] = await sequelize.query(`SELECT "legacyMemo", "metadata", "openingBalance" FROM "${f.schema}"."financial_accounts" WHERE "id"=:id`, {replacements: {id: account.get('id')}});
     assert.equal((columns[0] as any).legacyMemo, 'preserve me');

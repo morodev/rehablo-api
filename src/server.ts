@@ -8,10 +8,9 @@ import bodyParser from 'body-parser';
 
 import { env } from './config/env.js';
 import { connectDatabase, sequelize } from './config/database.js';
-import {databaseManifest} from './database/migrationManifest.js';
-import {assertDatabaseReady} from './database/releaseControl.js';
+import {assertDatabaseReady} from './database/migrationStatus.js';
 import {registerDatabaseModels} from './database/registerModels.js';
-import {migrateDatabase} from './database/releaseRunner.js';
+import {reconcileTenantSchemas} from './database/standardMigrations.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
 
 import { purgeExpiredRefreshTokens } from './modules/auth/services/refreshToken.service.js';
@@ -109,17 +108,9 @@ async function bootstrap() {
 async function initializeApplication(): Promise<void> {
     await runStartupPhase('database connection', connectDatabase);
     registerDatabaseModels();
-    await runStartupPhase('database release migrations', async () => {
-        const result = await migrateDatabase(databaseManifest, {
-            database: sequelize,
-            concurrency: env.migrationConcurrency,
-            statementTimeoutMs: env.migrationStatementTimeoutMs,
-            reconcileMissingTenants: true,
-            onProgress: event => console.log('[database-migration] ' + JSON.stringify({release: databaseManifest.id, ...event}))
-        });
-        console.log('[database-release] ' + JSON.stringify(result));
-    });
-    await runStartupPhase('database release compatibility', () => assertDatabaseReady(databaseManifest, sequelize));
+    await runStartupPhase('database migration status', () => assertDatabaseReady(sequelize));
+    // A tenant created by the preceding API after pre-deploy still needs its local metadata.
+    await runStartupPhase('tenant migration reconciliation', () => reconcileTenantSchemas(sequelize));
     await initializeBackgroundJobs();
 }
 
