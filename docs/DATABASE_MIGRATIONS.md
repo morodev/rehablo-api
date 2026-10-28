@@ -25,6 +25,8 @@ Source and compiled runtimes load the same immutable migration modules and froze
 
 The initial versioned baseline is explicit DDL for new databases and tenants. Existing tenant baselines are adopted only after their prerequisites have been verified. New tenants use the same manifest and version history as release migrations; provisioning must finish before registration publishes the tenant. Registering another model or changing its TypeScript definition does not change a production table. Add a versioned migration for every database change.
 
+For maintenance bootstrap and health checks, set `BACKGROUND_JOBS_ENABLED=false` to skip token cleanup, automatic appointment completion, contact reminder reconciliation, and reminder/activity dispatchers. Jobs remain enabled by default. During bridge maintenance, also set `ACTIVITIES_DELIVERY_ENABLED=false` to avoid initializing delivery activation records while warming tenant schemas.
+
 ## Recovery and diagnostics
 
 Use deployment errors to locate a failed tenant/migration, and `npm run db:status -- --tenants` to compare committed tenant checkpoints with the target release. Fix a failure before retrying the deployment. Successful tenant transactions need not be repeated, and an unchanged release performs no tenant DDL, historical import, repair, model sync, or tenant enumeration.

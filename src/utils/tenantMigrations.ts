@@ -16,7 +16,7 @@ export const ADMINISTRATION_SEED_VERSION = '20260922-seed-administration';
 export const WORK_ITEM_ASSIGNEES_VERSION = '20261010-work-item-assignees';
 export const ACTIVITIES_FOUNDATION_VERSION = '20261011-activities-foundation';
 // Increment this whenever the tenant model registry changes, so existing schemas run model sync.
-export const TENANT_MODEL_BASELINE_VERSION = '20261026-tenant-model-baseline-v21';
+export const TENANT_MODEL_BASELINE_VERSION = '20261028-tenant-model-baseline-v22';
 export const PATIENT_CONTACT_FOLLOW_UP_VERSION = '20261026-patient-contact-follow-ups';
 export const FINANCIAL_INTEGRITY_VERSION = '20261025-financial-integrity';
 export const PACKAGE_BOOKING_SERVICES_VERSION = '20261025-package-booking-services';

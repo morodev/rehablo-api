@@ -6,6 +6,8 @@ import agendaController from '../controllers/agenda.controller.js';
 import eventTypeController from '../controllers/eventType.controller.js';
 import timeOffController from '../controllers/timeOff.controller.js';
 import { listAppointmentPayments, createAppointmentPayment, createBulkAppointmentPayments, voidAppointmentPayment, updateAppointmentPricing } from '../controllers/appointmentPayment.controller.js';
+import {getAppointmentReminderSummaries, emailAppointmentReminder,
+    prepareWhatsAppAppointmentReminder, openedWhatsAppAppointmentReminder} from '../controllers/appointmentReminder.controller.js';
 
 const router = Router();
 
@@ -17,6 +19,10 @@ router.get('/agenda-dashboard', requirePermission('agenda', 'read'), agendaContr
 router.get('/agenda-events-by-users', requirePermission('agenda', 'read'), agendaController.findAgendaEventsByUsers);
 router.get('/agenda-events-patient', requirePermission('agenda', 'read'), agendaController.findAppointmentsForPatientById);
 router.get('/agenda-events/search', requirePermission('agenda', 'read'), agendaController.searchAgendaEvents);
+router.post('/agenda-reminders/status', requirePermission('agenda', 'read'), getAppointmentReminderSummaries);
+router.post('/agenda-event/:agendaEventId/reminders/email', requirePermission('agenda', 'update'), emailAppointmentReminder);
+router.post('/agenda-event/:agendaEventId/reminders/whatsapp/prepare', requirePermission('agenda', 'update'), prepareWhatsAppAppointmentReminder);
+router.post('/agenda-event/:agendaEventId/reminders/whatsapp/:deliveryId/opened', requirePermission('agenda', 'update'), openedWhatsAppAppointmentReminder);
 router.get('/agenda-events-holidays', requirePermission('agenda', 'read'), agendaController.findAllHolidays);
 router.post('/agenda-event', requirePermission('agenda', 'create'), agendaController.saveAgendaEvent);
 router.patch('/agenda-event', requirePermission('agenda', 'update'), agendaController.updateAgendaEvent);

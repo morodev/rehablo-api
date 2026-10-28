@@ -20,7 +20,7 @@ function handle(action: (req: Request) => Promise<unknown> | unknown) {
         });
 }
 export const catalog = handle(() => billingCatalog());
-export const summary = handle(req => billingSummary(principal(req)));
+export const summary = handle(req => billingSummary(principal(req), req.query.refresh !== 'false'));
 export const preview = handle(req => previewBilling(principal(req), { users: req.body?.users, structures: req.body?.structures }));
 export const change = handle(req => changeBilling(principal(req), req.body?.quoteId, req.body?.operationId, req.body?.returnTo));
 export const checkout = handle(req => checkoutBilling(principal(req), req.body?.operationId, req.body?.returnTo));

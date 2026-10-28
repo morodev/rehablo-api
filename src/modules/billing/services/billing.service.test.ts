@@ -7,6 +7,7 @@ import { TenantUser } from '../../auth/models/tenantUser.model.js';
 import { Structure } from '../../auth/models/structure.model.js';
 import { RoleCode } from '../../auth/rbac/roles.js';
 import { BillingAccount, BillingOperation, BillingQuote } from '../models/billing.model.js';
+import { summary as billingSummaryHandler } from '../controllers/billing.controller.js';
 import { billingReturnUrl, stripeBilling } from './billingConfig.service.js';
 import { billingJournal } from './billingJournal.service.js';
 import { billingSummary, changeBilling, checkoutBilling, handleBillingWebhook, previewBilling, releaseBillingSchedule } from './billing.service.js';
@@ -218,4 +219,49 @@ test('failure to durably save payment intent never starts the Stripe mutation', 
     await assert.rejects(changeBilling(principal, quote.id, operationId, 'team'), /journal unavailable/);
     assert.equal(update.mock.callCount(), 0);
     assert.equal(operations.get(operationId).state, 'processing');
+});
+
+
+async function getBillingSummary(query: Record<string, unknown> = {}) {
+    const result: {status: number; body: any; headers: Record<string, string>} = {status: 200, body: null, headers: {}};
+    const res: any = {
+        setHeader(name: string, value: string) { result.headers[name] = value; },
+        status(code: number) { result.status = code; return this; },
+        json(body: any) { result.body = body; return this; }
+    };
+    await billingSummaryHandler({user: {sub: principal.userId, tid: principal.tenantId, actor: 'staff'}, query} as any,
+        res, error => { throw error; });
+    return result;
+}
+
+test('GET /billing?refresh=false reads persisted subscription state without contacting Stripe or locking the tenant', async t => {
+    const {account, stripe} = setup(t);
+    const retrieve = t.mock.method(stripe.subscriptions, 'retrieve', async () => { throw new Error('must not call Stripe'); });
+    const checkout = t.mock.method(stripe.checkout.sessions, 'retrieve', async () => { throw new Error('must not call Stripe'); });
+    const transaction = t.mock.method(sequelize, 'transaction', async () => { throw new Error('must not lock the tenant'); });
+    const result = await getBillingSummary({refresh: 'false'});
+    assert.equal(result.status, 200);
+    assert.equal(result.headers['Cache-Control'], 'no-store');
+    assert.equal(result.body.data.status, account.status);
+    assert.equal(result.body.data.users.limit, account.usersLimit);
+    assert.equal(result.body.data.users.used, 1);
+    assert.equal(result.body.data.canManage, true);
+    assert.equal(retrieve.mock.callCount(), 0);
+    assert.equal(checkout.mock.callCount(), 0);
+    assert.equal(transaction.mock.callCount(), 0);
+});
+
+test('GET /billing keeps refreshing Stripe by default and only the literal false query string opts out', async t => {
+    const {account, sub, stripe} = setup(t);
+    sub.status = 'past_due';
+    const retrieve = t.mock.method(stripe.subscriptions, 'retrieve', async () => sub);
+    const queries = [{}, {refresh: 'true'}, {refresh: 'False'}, {refresh: '0'}, {refresh: ''},
+        {refresh: false}, {refresh: ['false', 'false']}, {refresh: {value: 'false'}}];
+    for (const query of queries) {
+        account.status = 'active';
+        const result = await getBillingSummary(query);
+        assert.equal(result.status, 200);
+        assert.equal(result.body.data.status, 'past_due');
+    }
+    assert.equal(retrieve.mock.callCount(), queries.length);
 });

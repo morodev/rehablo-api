@@ -55,7 +55,10 @@ const tenantSteps: MigrationStep[] = [
         });
     }),
     step('20261028-tenant-schema-constraints-v1', 'tenant', baselineChecksum,
-        (database, schema, transaction) => applySchemaBaseline('tenant', schema, database, transaction))
+        (database, schema, transaction) => applySchemaBaseline('tenant', schema, database, transaction)),
+    step('20261028-appointment-reminders-v1', 'tenant', digest(migrationSource('20261028-appointment-reminders.js')),
+        (database, schema, transaction) => require('../../migrations/20261028-appointment-reminders.js')
+            .up(database.getQueryInterface(), {schema, transaction}))
 ];
 
 const manifestContent = {publicMigrations: publicMigrations.map(({name, checksum}) => ({name, checksum})),
@@ -63,7 +66,7 @@ const manifestContent = {publicMigrations: publicMigrations.map(({name, checksum
 
 /** Immutable DB revision, independent of application commit/build number. Append migrations for future releases. */
 export const databaseManifest: DatabaseManifest = {
-    id: '20261028-versioned-schema-v1', checksum: digest(JSON.stringify(manifestContent)),
+    id: '20261028-appointment-reminders-v1', checksum: digest(JSON.stringify(manifestContent)),
     publicMigrations, tenantMigrations: tenantSteps
 };
 

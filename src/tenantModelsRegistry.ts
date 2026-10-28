@@ -9,6 +9,7 @@ import { registerInvoiceAssociations, Invoice, InvoiceProduct, InvoiceService, I
 import EventType from './modules/agenda/models/eventType.model.js';
 import EventTypeStructure from './modules/agenda/models/eventTypeStructure.model.js';
 import AgendaEvent from './modules/agenda/models/agendaEvent.model.js';
+import AppointmentReminderDelivery from './modules/agenda/models/appointmentReminderDelivery.model.js';
 import AgendaEventException from './modules/agenda/models/agendaEventException.model.js';
 import TimeOffRequest from './modules/agenda/models/timeOffRequest.model.js';
 import TimeOffStatusHistory from './modules/agenda/models/timeOffStatusHistory.model.js';
@@ -114,6 +115,7 @@ export function registerTenantModels(): void {
     registerTenantScopedModel(EventType);
     registerTenantScopedModel(EventTypeStructure);
     registerTenantScopedModel(AgendaEvent);
+    registerTenantScopedModel(AppointmentReminderDelivery);
     registerTenantScopedModel(AgendaEventException);
     registerTenantScopedModel(TimeOffRequest);
     registerTenantScopedModel(TimeOffStatusHistory);

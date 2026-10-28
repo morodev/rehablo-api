@@ -205,6 +205,10 @@ async function initializeLegacySchema(): Promise<void> {
 }
 
 async function initializeBackgroundJobs(): Promise<void> {
+    if (process.env.BACKGROUND_JOBS_ENABLED === 'false') {
+        console.log('[startup] background jobs disabled (BACKGROUND_JOBS_ENABLED=false)');
+        return;
+    }
     const purge = async () => {
         try {
             const removed = await purgeExpiredRefreshTokens();
