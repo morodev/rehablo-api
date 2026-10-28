@@ -1,7 +1,5 @@
 import billingRoutes from './modules/billing/routes/billing.routes.js';
 import {billingWebhook} from './modules/billing/controllers/billing.controller.js';
-import {syncBillingModels} from './modules/billing/models/billing.model.js';
-import { migrateStructureCalendars } from './modules/auth/services/structureCalendarMigration.service.js';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -11,24 +9,17 @@ import bodyParser from 'body-parser';
 import { env } from './config/env.js';
 import { connectDatabase, sequelize } from './config/database.js';
 import {databaseManifest} from './database/migrationManifest.js';
-import {assertDatabaseReady, withSharedReleaseLock} from './database/releaseControl.js';
+import {assertDatabaseReady} from './database/releaseControl.js';
+import {registerDatabaseModels} from './database/registerModels.js';
+import {migrateDatabase} from './database/releaseRunner.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
 
-import { registerAuthAssociations, syncAuthModels, Tenant } from './modules/auth/models/index.js';
-import { syncInvoicePublicModels } from './modules/invoice/models/index.js';
-import { assignBootstrapRoles } from './modules/auth/rbac/bootstrap.js';
 import { purgeExpiredRefreshTokens } from './modules/auth/services/refreshToken.service.js';
-import { runStructureBackfill } from './modules/auth/services/structureBackfill.service.js';
-import { registerTenantModels } from './tenantModelsRegistry.js';
-import { registerCatalogAssociations, syncCatalogModels, seedCatalogData } from './modules/human-body/models/catalog/index.js';
-import { registerProtocolCatalogAssociations, syncProtocolCatalogModels } from './modules/protocols/models/catalog/index.js';
-import { syncMeasurementCatalogModels, seedMeasurementCatalogData } from './modules/measurements/models/catalog/index.js';
 import { startAutomaticAppointmentCompletionSweep } from './modules/agenda/services/missedArrivalAutomation.service.js';
 import {startReminderExternalDeliverySweep} from './modules/notes/services/reminderExternalDelivery.service.js';
 import {startPatientContactReminderSweep} from './modules/notes/services/patientContactReminder.service.js';
 import {startActivityDeliverySweep} from './modules/activities/services/activityDelivery.service.js';
 import activityNotificationsRoutes from './modules/activities/routes/activityNotifications.routes.js';
-import {warmTenantSchemas} from './utils/tenantSchema.js';
 import {createStartupReadiness, runStartupPhase, startHttpServer} from './utils/serverStartup.js';
 
 import authRoutes from './modules/auth/routes/auth.routes.js';
@@ -51,9 +42,6 @@ import administrationRoutes from './modules/administration/routes/administration
 import financialOptionsRoutes from './modules/administration/routes/financialOptions.routes.js';
 import treasuryIntegrityRoutes from './modules/administration/routes/treasuryIntegrity.routes.js';
 import quoteShareRoutes from './modules/administration/routes/quoteShare.routes.js';
-import { syncQuotePublicModels } from './modules/administration/models/quoteDelivery.model.js';
-import {markBridgeComplete} from './database/schemaTransition.js';
-import {getDatabaseStatus} from './database/releaseRunner.js';
 
 async function bootstrap() {
     const app = express();
@@ -93,7 +81,7 @@ async function bootstrap() {
     app.use(billingRoutes);
     app.use(authRoutes);
     app.use(patientPortalRoutes);
-    // Handle Activities before legacy routers whose root middleware performs lazy schema sync.
+    // Handle Activities before the root-mounted routers for the other domains.
     app.use(activityNotificationsRoutes);
     app.use(activitiesRoutes);
     app.use(patientRoutes);
@@ -120,88 +108,19 @@ async function bootstrap() {
 
 async function initializeApplication(): Promise<void> {
     await runStartupPhase('database connection', connectDatabase);
-    registerAuthAssociations();
-    registerCatalogAssociations();
-    registerProtocolCatalogAssociations();
-    registerTenantModels();
-
-    if (env.databaseMigrationPhase === 'bridge') {
-        // The transition release participates in the same deployment lock as the new runner.
-        // The following managed release cannot migrate while this legacy bootstrap is active.
-        await withSharedReleaseLock(sequelize, async () => {
-            if ((await getDatabaseStatus(databaseManifest, sequelize)).ready) {
-                await assertDatabaseReady(databaseManifest, sequelize);
-            } else {
-                await initializeLegacySchema();
-                await markBridgeComplete(sequelize);
-            }
+    registerDatabaseModels();
+    await runStartupPhase('database release migrations', async () => {
+        const result = await migrateDatabase(databaseManifest, {
+            database: sequelize,
+            concurrency: env.migrationConcurrency,
+            statementTimeoutMs: env.migrationStatementTimeoutMs,
+            reconcileMissingTenants: true,
+            onProgress: event => console.log('[database-migration] ' + JSON.stringify({release: databaseManifest.id, ...event}))
         });
-    } else {
-        await runStartupPhase('database release compatibility', () => assertDatabaseReady(databaseManifest, sequelize));
-    }
+        console.log('[database-release] ' + JSON.stringify(result));
+    });
+    await runStartupPhase('database release compatibility', () => assertDatabaseReady(databaseManifest, sequelize));
     await initializeBackgroundJobs();
-}
-
-/** Transitional bootstrap only; managed web processes never synchronize or migrate schemas. */
-async function initializeLegacySchema(): Promise<void> {
-    await runStartupPhase('public auth models', syncAuthModels);
-    await runStartupPhase('public billing models', syncBillingModels);
-    // Il link di consegna della fattura vive in `public`: dev'essere risolvibile da una richiesta
-    // anonima, che non ha un tenant da cui derivare lo schema.
-    await runStartupPhase('public invoice models', syncInvoicePublicModels);
-    await runStartupPhase('public quote models', syncQuotePublicModels);
-
-    // RBAC: allinea i ruoli delle membership preesistenti (vedi docs/RBAC_DESIGN.md)
-    await runStartupPhase('bootstrap roles', assignBootstrapRoles);
-    await runStartupPhase('structure calendars', migrateStructureCalendars);
-
-    // RBAC: assegna la sede ai record che ne sono privi, così lo scope `structure` può
-    // diventare stretto. Idempotente e non distruttivo (tocca solo `structureId IS NULL`),
-    // quindi può girare a ogni avvio senza bisogno di interventi manuali sul server.
-    try {
-        const backfill = await runStartupPhase('structure backfill', () => runStructureBackfill({ apply: true }));
-        const updated = Object.entries(backfill.updated);
-        if (updated.length > 0) {
-            const detail = updated.map(([table, count]) => `${table}=${count}`).join(', ');
-            console.log(`[rbac] backfill structureId completato: ${detail}`);
-        }
-        const ambiguous = Object.entries(backfill.ambiguous);
-        if (ambiguous.length > 0) {
-            const detail = ambiguous.map(([table, count]) => `${table}=${count}`).join(', ');
-            console.warn(
-                `[rbac] backfill structureId: record senza sede non assegnabili automaticamente (${detail}). ` +
-                    'Restano esclusi dalle API operative finche non viene assegnata manualmente una sede.'
-            );
-        }
-    } catch (err) {
-        // Un problema qui non deve impedire l'avvio. Per sicurezza i record senza sede
-        // restano esclusi dalle API operative, evitando visibilita cross-sede.
-        console.error('[rbac] backfill structureId fallito', err);
-    }
-
-    // Public-schema human-body catalog (standardized scales/tests, shared by every tenant).
-    // Seeded exactly once at boot here, instead of on every single GET request like the legacy
-    // rehablo-human-body microservice used to do.
-    await runStartupPhase('human-body catalog models', syncCatalogModels);
-    await runStartupPhase('human-body catalog seed', seedCatalogData);
-
-    // Public-schema rehabilitation protocols catalog (exercises + reusable protocol templates,
-    // shared by every tenant). No seed data yet: managed via the /exercises and /protocol-templates CRUD.
-    await runStartupPhase('protocol catalog models', syncProtocolCatalogModels);
-
-    // Public-schema measurement dictionary (Clinical Data Dictionary): definizioni metriche condivise
-    // da tutti i tenant. È il fondamento del modello canonico (docs/REHABLO_OS_GAP_ANALYSIS.md §3).
-    await runStartupPhase('measurement catalog models', syncMeasurementCatalogModels);
-    await runStartupPhase('measurement catalog seed', seedMeasurementCatalogData);
-
-    // Register first, then upgrade every existing tenant before accepting traffic. This moves
-    // DDL and data migrations out of the first user request after a deploy.
-    const tenantRows = await runStartupPhase('tenant discovery', () => Tenant.findAll({attributes: ['id'], raw: true})) as unknown as Array<{id: string}>;
-    console.log(`[database] inizializzazione di ${tenantRows.length} tenant prima di abilitare le API`);
-    const readyTenants = await runStartupPhase('tenant schemas', () => warmTenantSchemas(
-        tenantRows.map(tenant => tenant.id), env.tenantSchemaBootstrapConcurrency
-    ));
-    console.log(`[database] ${readyTenants} tenant pronti`);
 }
 
 async function initializeBackgroundJobs(): Promise<void> {
@@ -228,7 +147,7 @@ async function initializeBackgroundJobs(): Promise<void> {
         if (process.env.REMINDER_EXTERNAL_DELIVERY_ENABLED !== 'false') {
             await startReminderExternalDeliverySweep();
         }
-        await startActivityDeliverySweep({initializeExistingTenants: env.databaseMigrationPhase === 'bridge'});
+        await startActivityDeliverySweep({initializeExistingTenants: false});
     });
 }
 

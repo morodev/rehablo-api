@@ -1,292 +1,183 @@
 import assert from 'node:assert/strict';
-import {createRequire} from 'node:module';
-import {after, beforeEach, describe, it} from 'node:test';
-import {sequelize} from '../config/database.js';
-import {env} from '../config/env.js';
+import {afterEach, beforeEach, describe, it} from 'node:test';
+import type {Sequelize, Transaction} from 'sequelize';
 import {
-    ensureTenantSchema, invalidateTenantSchemaCache, provisionTenantSchema,
-    registerTenantScopedModel, warmTenantSchemas
-} from './tenantSchema.js';
-import {
-    PACKAGE_BOOKING_SERVICES_VERSION, SOCIAL_SECURITY_PRICING_VERSION, ACTIVITIES_REVIEW_VERSION, APPOINTMENT_LEDGER_VERSION, prepareTenantPaymentHistory, runTenantMigrations,
-    PATIENT_DEFAULT_EVENT_TYPE_VERSION, TENANT_MODEL_BASELINE_VERSION, APPOINTMENT_PRICE_ADJUSTMENTS_VERSION,
-    CATALOG_STRUCTURE_AVAILABILITY_VERSION, ADMINISTRATION_SEED_VERSION, FINANCIAL_INTEGRITY_VERSION, PATIENT_CONTACT_FOLLOW_UP_VERSION, WORK_ITEM_ASSIGNEES_VERSION,
-    ACTIVITIES_FOUNDATION_VERSION, ACTIVITIES_DELIVERY_VERSION, PATIENT_SETTLEMENTS_VERSION, CARE_PACKAGE_PURCHASES_VERSION
+    ADMINISTRATION_SEED_VERSION, APPOINTMENT_LEDGER_VERSION, prepareTenantPaymentHistory,
+    runTenantMigrations, tenantMigrations
 } from './tenantMigrations.js';
 
-const require = createRequire(import.meta.url);
-const migration = require('../../migrations/20260907-unify-appointment-payment-ledger.js');
-const patientDefaultMigration = require('../../migrations/20260908-add-patient-default-event-type.js');
-const pricingMigration = require('../../migrations/20260908-add-appointment-price-adjustments.js');
-const catalogAvailabilityMigration = require('../../migrations/20260919-add-catalog-structure-availability.js');
-const publicationMigration = require('../../migrations/20260924-backfill-patient-publication.js');
-const tenant = '00000000-0000-4000-8000-000000000001';
-const schema = 'rehablo_' + tenant.replaceAll('-', '');
-const extraVersions = new Set<string>();
-const original = {
-    query: sequelize.query, transaction: sequelize.transaction, createSchema: sequelize.createSchema,
-    migrate: migration.up, patientDefaultMigrate: patientDefaultMigration.up, pricingMigrate: pricingMigration.up,
-    catalogAvailabilityMigrate: catalogAvailabilityMigration.up, publicationMigrate: publicationMigration.up, mode: env.tenantSchemaSync,
-    phase: env.databaseMigrationPhase,
-    getConnection: (sequelize.connectionManager as any).getConnection,
-    releaseConnection: (sequelize.connectionManager as any).releaseConnection
-};
-let queries: string[], order: string[], applied: boolean, patientDefaultApplied: boolean, syncs: number, migrations: number;
-let historyExists: boolean, agendaExists: boolean, transactionStarts: number, baselineApplied: boolean;
-let legacyBaselineApplied: boolean;
-let lastSyncOptions: any;
-let pricingApplied: boolean;
-let catalogAvailabilityApplied: boolean, administrationApplied: boolean, publicationApplied: boolean;
-let workItemAssignmentsApplied: boolean, activitiesApplied: boolean, activitiesDeliveryApplied: boolean;
-let patientSettlementsApplied: boolean;
-let packagePurchasesApplied: boolean;
-let migrationWork: (options: any) => Promise<void>;
-const transaction = {id: 'test-transaction'};
-
-registerTenantScopedModel({schema: () => ({sync: async (options: any) => {
-    lastSyncOptions = options; order.push('sync'); syncs++; historyExists = true;
-}})} as any);
+const schema = 'rehablo_00000000000040008000000000000001';
+const transaction = {id: 'migration-transaction'} as unknown as Transaction;
+const originalMigrations = tenantMigrations.map(migration => ({version: migration.version, module: migration.module, up: migration.module.up}));
+let queries: Array<{sql: string; options?: any}>;
+let applied: Map<string, string>;
+let calls: string[];
+let transactionStarts: number;
+let agendaExists: boolean;
+let historyExists: boolean;
+let invoiceNullable: boolean;
+let migrationWork: (version: string) => Promise<void>;
+let database: Sequelize;
 
 beforeEach(() => {
-    extraVersions.clear();
-    invalidateTenantSchemaCache();
-    env.databaseMigrationPhase = 'bridge';
-    env.tenantSchemaSync = 'additive';
-    (sequelize.connectionManager as any).getConnection = async () => ({query: async () => ({rows: []})});
-    (sequelize.connectionManager as any).releaseConnection = async () => {};
-    queries = []; order = []; applied = false; patientDefaultApplied = false; syncs = 0; migrations = 0;
-    historyExists = false; agendaExists = true; transactionStarts = 0; baselineApplied = false;
-    legacyBaselineApplied = false;
-    lastSyncOptions = undefined;
-    pricingApplied = false;
-    catalogAvailabilityApplied = false; administrationApplied = false; publicationApplied = false;
-    workItemAssignmentsApplied = false; activitiesApplied = false; activitiesDeliveryApplied = false;
-    patientSettlementsApplied = false;
-    packagePurchasesApplied = false;
+    queries = [];
+    applied = new Map();
+    calls = [];
+    transactionStarts = 0;
+    agendaExists = true;
+    historyExists = false;
+    invoiceNullable = false;
     migrationWork = async () => {};
-    sequelize.createSchema = (async () => {}) as any;
-    sequelize.transaction = (async (callback: any) => {
-        transactionStarts++;
-        const previouslyApplied = applied, previousBaseline = baselineApplied, previousSettlements = patientSettlementsApplied;
-        const previousPackages = packagePurchasesApplied;
-        try {return await callback(transaction);} catch (error) {
-            applied = previouslyApplied; baselineApplied = previousBaseline; patientSettlementsApplied = previousSettlements;
-            packagePurchasesApplied = previousPackages; throw error;
-        }
-    }) as any;
-    sequelize.query = (async (sql: string, options?: any) => {
-        queries.push(sql);
-        if (sql.includes('to_regclass') && options?.replacements?.registry) {
-            return [[{registry: baselineApplied || legacyBaselineApplied ? schema + '.schema_migrations' : null}]];
-        }
-        if (sql.includes('to_regclass')) return [[{agenda: agendaExists ? schema + '.agenda_events' : null}]];
-        if (sql.includes('information_schema.columns')) return [[
-            {table_name: 'invoice_payments', column_name: 'invoiceId', is_nullable: 'NO'},
-            ...(historyExists ? [{table_name: 'agenda_events', column_name: 'appointmentPaymentHistoryKnown', is_nullable: 'NO'}] : [])
-        ]];
-        if (sql.includes('ADD COLUMN IF NOT EXISTS "appointmentPaymentHistoryKnown"')) {order.push('preserve-history'); historyExists = true;}
-        if (sql.startsWith('SELECT "version"')) return [[
-            ...[...extraVersions].map(version => ({version})),
-            ...(applied ? [{version: APPOINTMENT_LEDGER_VERSION}] : []),
-            ...(patientDefaultApplied ? [{version: PATIENT_DEFAULT_EVENT_TYPE_VERSION}] : []),
-            ...(pricingApplied ? [{version: APPOINTMENT_PRICE_ADJUSTMENTS_VERSION}] : []),
-            ...(catalogAvailabilityApplied ? [{version: CATALOG_STRUCTURE_AVAILABILITY_VERSION}] : []),
-            ...(administrationApplied ? [{version: ADMINISTRATION_SEED_VERSION}] : []),
-            ...(publicationApplied ? [{version: '20260924-backfill-patient-publication'}] : []),
-            ...(workItemAssignmentsApplied ? [{version: WORK_ITEM_ASSIGNEES_VERSION}] : []),
-            ...(activitiesApplied ? [{version: ACTIVITIES_FOUNDATION_VERSION}] : []),
-            ...(activitiesDeliveryApplied ? [{version: ACTIVITIES_DELIVERY_VERSION}] : []),
-            ...(patientSettlementsApplied ? [{version: PATIENT_SETTLEMENTS_VERSION}] : []),
-            ...(packagePurchasesApplied ? [{version: CARE_PACKAGE_PURCHASES_VERSION}] : []),
-            ...(legacyBaselineApplied ? [{version: '20260907-tenant-model-baseline-v1'}] : []),
-            ...(baselineApplied ? [{version: TENANT_MODEL_BASELINE_VERSION}] : [])
-        ]];
-        if (sql.startsWith('INSERT INTO') && [PATIENT_CONTACT_FOLLOW_UP_VERSION, FINANCIAL_INTEGRITY_VERSION, PACKAGE_BOOKING_SERVICES_VERSION, SOCIAL_SECURITY_PRICING_VERSION, ACTIVITIES_REVIEW_VERSION].includes(options?.replacements?.version)) {
-            extraVersions.add(options.replacements.version);
-        }
-        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === APPOINTMENT_LEDGER_VERSION) {
-            applied = true; order.push('record-version');
-        }
-        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === PATIENT_DEFAULT_EVENT_TYPE_VERSION) {
-            patientDefaultApplied = true; order.push('record-version');
-        }
-        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === TENANT_MODEL_BASELINE_VERSION) {
-            baselineApplied = true;
-        }
-        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === APPOINTMENT_PRICE_ADJUSTMENTS_VERSION) {
-            pricingApplied = true; order.push('record-version');
-        }
-        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === CATALOG_STRUCTURE_AVAILABILITY_VERSION) {
-            catalogAvailabilityApplied = true; order.push('record-version');
-        }
-        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === ADMINISTRATION_SEED_VERSION) {
-            administrationApplied = true;
-        }
-        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === '20260924-backfill-patient-publication') {
-            publicationApplied = true; order.push('record-version');
-        }
-        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === WORK_ITEM_ASSIGNEES_VERSION) {
-            workItemAssignmentsApplied = true;
-        }
-        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === ACTIVITIES_FOUNDATION_VERSION) {
-            activitiesApplied = true;
-        }
-        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === ACTIVITIES_DELIVERY_VERSION) {
-            activitiesDeliveryApplied = true;
-        }
-        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === PATIENT_SETTLEMENTS_VERSION) {
-            patientSettlementsApplied = true;
-        }
-        if (sql.startsWith('INSERT INTO') && options?.replacements?.version === CARE_PACKAGE_PURCHASES_VERSION) {
-            packagePurchasesApplied = true;
-        }
-        return [[]];
-    }) as any;
-    migration.up = async (_queryInterface: any, options: any) => {
-        assert.equal(options.schema, schema);
-        assert.equal(options.transaction, transaction);
-        assert.equal(options.repairHistoryKnown, true);
-        migrations++; order.push('migrate');
-        await migrationWork(options);
-    };
-    patientDefaultMigration.up = async (_queryInterface: any, options: any) => {
-        assert.equal(options.schema, schema);
-        assert.equal(options.transaction, transaction);
-        migrations++; order.push('migrate');
-    };
-    pricingMigration.up = patientDefaultMigration.up;
-    catalogAvailabilityMigration.up = patientDefaultMigration.up;
-    publicationMigration.up = patientDefaultMigration.up;
-});
-
-after(() => {
-    sequelize.query = original.query; sequelize.transaction = original.transaction;
-    sequelize.createSchema = original.createSchema; migration.up = original.migrate;
-    patientDefaultMigration.up = original.patientDefaultMigrate;
-    pricingMigration.up = original.pricingMigrate;
-    catalogAvailabilityMigration.up = original.catalogAvailabilityMigrate;
-    publicationMigration.up = original.publicationMigrate;
-    env.tenantSchemaSync = original.mode;
-    env.databaseMigrationPhase = original.phase;
-    (sequelize.connectionManager as any).getConnection = original.getConnection;
-    (sequelize.connectionManager as any).releaseConnection = original.releaseConnection;
-    invalidateTenantSchemaCache();
-});
-
-describe('bridge tenant schema bootstrap and preserved legacy migration policies', () => {
-    it('preserves old history before model sync and records completion after migration', async () => {
-        assert.equal(await ensureTenantSchema(tenant), schema);
-        assert.deepEqual(order, ['preserve-history', 'sync', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version']);
-        assert.equal(applied, true);
-        assert.equal(patientDefaultApplied, true);
-        assert.equal(patientSettlementsApplied, true);
-        assert.ok(queries.some(sql => sql.includes('CREATE TABLE IF NOT EXISTS') && sql.includes('patient_settlement_operations')));
-        assert.equal(lastSyncOptions.transaction, transaction);
-        assert.ok(queries.some(sql => sql.includes('DEFAULT false')));
-        assert.ok(queries.some(sql => sql.includes('pg_advisory_xact_lock')));
-        const count = queries.length;
-        await ensureTenantSchema(tenant);
-        assert.equal(queries.length, count);
-    });
-
-    it('warms each existing tenant once before HTTP startup', async () => {
-        assert.equal(await warmTenantSchemas([tenant, tenant], 2), 1);
-        assert.equal(syncs, 1);
-        assert.equal(migrations, 5);
-        assert.equal(transactionStarts, 2); // Legacy schema transaction followed by bridge readiness checkpoint.
-    });
-
-    it('provisions a new tenant inside the registration transaction', async () => {
-        assert.equal(await provisionTenantSchema(tenant, transaction as any), schema);
-        assert.equal(transactionStarts, 0);
-        assert.equal(lastSyncOptions.transaction, transaction);
-        assert.deepEqual(order, ['preserve-history', 'sync', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version', 'migrate', 'record-version']);
-    });
-
-    it('shares initialization between simultaneous requests and waits for migration completion', async () => {
-        let release!: () => void;
-        let started!: () => void;
-        const migrationStarted = new Promise<void>(resolve => {started = resolve;});
-        const blocked = new Promise<void>(resolve => {release = resolve;});
-        migrationWork = async () => {started(); await blocked;};
-        let finished = 0;
-        const first = ensureTenantSchema(tenant).then(() => {finished++;});
-        const second = ensureTenantSchema(tenant).then(() => {finished++;});
-        await migrationStarted;
-        assert.equal(finished, 0);
-        assert.equal(syncs, 1); assert.equal(migrations, 1);
-        release(); await Promise.all([first, second]);
-        assert.equal(finished, 2); assert.equal(migrations, 5);
-    });
-
-    it('retries failed migrations without caching the tenant or saving completion', async () => {
-        migrationWork = async () => {throw new Error('Migration failed');};
-        await assert.rejects(ensureTenantSchema(tenant), /Migration failed/);
-        assert.equal(applied, false);
-        migrationWork = async () => {};
-        await ensureTenantSchema(tenant);
-        assert.equal(migrations, 6); assert.equal(applied, true); assert.equal(patientDefaultApplied, true); assert.equal(pricingApplied, true);
-    });
-
-    it('uses the persisted version after process-cache invalidation instead of importing again', async () => {
-        await ensureTenantSchema(tenant);
-        invalidateTenantSchemaCache();
-        await ensureTenantSchema(tenant);
-        assert.equal(syncs, 1); assert.equal(migrations, 5);
-        assert.equal(transactionStarts, 3); // Legacy transaction once; bridge checkpoints on each uncached access.
-    });
-
-    it('resyncs an existing tenant when the registered model baseline changes', async () => {
-        applied = true;
-        patientDefaultApplied = true;
-        pricingApplied = true;
-        catalogAvailabilityApplied = true;
-        publicationApplied = true;
-        legacyBaselineApplied = true;
-
-        await ensureTenantSchema(tenant);
-
-        assert.equal(syncs, 1);
-        assert.equal(migrations, 0);
-        assert.equal(baselineApplied, true);
-        assert.equal(transactionStarts, 2);
-    });
-
-    it('rejects incomplete legacy schemas in explicit bridge off mode without synchronizing them', async () => {
-        env.tenantSchemaSync = 'off';
-        await assert.rejects(ensureTenantSchema(tenant), /incomplete/);
-        assert.equal(syncs, 0); assert.equal(migrations, 0);
-        assert.ok(queries.every(sql => !/^(CREATE|ALTER|DROP)/.test(sql)));
-    });
-
-    it('does not classify a newly created tenant as historical', async () => {
-        agendaExists = false;
-        assert.equal(await prepareTenantPaymentHistory(schema), false);
-        assert.ok(queries.every(sql => !sql.startsWith('ALTER TABLE')));
-    });
-
-    it('rejects invalid tenant names before accessing the database', async () => {
-        await assert.rejects(runTenantMigrations('public'), /Invalid tenant schema/);
-        await assert.rejects(prepareTenantPaymentHistory('rehablo_bad"'), /Invalid tenant schema/);
-        assert.equal(queries.length, 0);
-    });
-
-    it('adds the patient preference with an indexed SET NULL foreign key', async () => {
-        const migrationQueries: string[] = [];
-        const queryInterface = {
-            sequelize: {
-                query: async (sql: string) => {
-                    migrationQueries.push(sql);
-                    if (sql.includes('to_regclass')) {
-                        return [[{patients: schema + '.patients', eventTypes: schema + '.event_types'}]];
-                    }
-                    if (sql.includes('FROM pg_constraint')) return [[]];
-                    return [[]];
-                }
+    database = {
+        getQueryInterface: () => ({sequelize: database}),
+        transaction: async (work: (current: Transaction) => Promise<unknown>) => {
+            transactionStarts++;
+            const previous = new Map(applied);
+            try {return await work(transaction);}
+            catch (error) {applied = previous; throw error;}
+        },
+        query: async (sql: string, options?: any) => {
+            queries.push({sql, options});
+            if (sql.includes('to_regclass')) return [[{agenda: agendaExists ? schema + '.agenda_events' : null}]];
+            if (sql.includes('information_schema.columns')) return [[
+                {table_name: 'invoice_payments', column_name: 'invoiceId', is_nullable: invoiceNullable ? 'YES' : 'NO'},
+                ...(historyExists ? [{table_name: 'agenda_events', column_name: 'appointmentPaymentHistoryKnown'}] : [])
+            ]];
+            if (sql.startsWith('SELECT "version"')) return [[...applied.keys()].map(version => ({version}))];
+            if (sql.startsWith('INSERT INTO') && options?.replacements?.version) {
+                applied.set(options.replacements.version, 'new-migration-timestamp');
             }
+            return [[]];
+        }
+    } as unknown as Sequelize;
+    for (const migration of tenantMigrations) {
+        migration.module.up = async (queryInterface, options) => {
+            assert.equal(queryInterface.sequelize, database);
+            assert.equal(options.schema, schema);
+            assert.equal(options.transaction, transaction);
+            calls.push(migration.version);
+            await migrationWork(migration.version);
+        };
+    }
+});
+
+afterEach(() => {
+    for (const original of originalMigrations) original.module.up = original.up;
+});
+
+describe('tenant migration history and transactions', () => {
+    it('preserves completed cash imports and publication migrations while applying only pending versions', async () => {
+        const completed = [APPOINTMENT_LEDGER_VERSION, ADMINISTRATION_SEED_VERSION, '20260924-backfill-patient-publication'];
+        for (const version of [...completed, 'historic-model-baseline']) applied.set(version, 'original-timestamp');
+
+        const result = await runTenantMigrations(schema, true, database);
+
+        const pending = tenantMigrations.map(migration => migration.version).filter(version => !completed.includes(version));
+        assert.deepEqual(result, pending);
+        assert.deepEqual(calls, pending);
+        for (const version of [...completed, 'historic-model-baseline']) assert.equal(applied.get(version), 'original-timestamp');
+        assert.equal(transactionStarts, 1);
+        assert.ok(queries.every(query => query.options?.transaction === transaction));
+    });
+
+    it('does not rerun migrations or overwrite their timestamps when all registered versions are complete', async () => {
+        for (const migration of tenantMigrations) applied.set(migration.version, 'original-timestamp');
+
+        assert.deepEqual(await runTenantMigrations(schema, false, database), []);
+
+        assert.deepEqual(calls, []);
+        assert.ok(queries.every(query => !query.sql.startsWith('INSERT INTO')));
+        assert.ok([...applied.values()].every(timestamp => timestamp === 'original-timestamp'));
+    });
+
+    it('passes the historical evidence and caller transaction through migration and completion recording', async () => {
+        for (const migration of tenantMigrations) {
+            if (migration.version !== APPOINTMENT_LEDGER_VERSION) applied.set(migration.version, 'original-timestamp');
+        }
+        const ledger = tenantMigrations.find(migration => migration.version === APPOINTMENT_LEDGER_VERSION)!;
+        let completedWork = false;
+        ledger.module.up = async (_queryInterface, options) => {
+            assert.equal(options.schema, schema);
+            assert.equal(options.transaction, transaction);
+            assert.equal(options.repairHistoryKnown, true);
+            assert.equal(applied.has(APPOINTMENT_LEDGER_VERSION), false, 'Completion must follow successful work');
+            completedWork = true;
         };
 
-        await original.patientDefaultMigrate(queryInterface as any, {schema, transaction});
+        assert.deepEqual(await runTenantMigrations(schema, true, database, transaction), [APPOINTMENT_LEDGER_VERSION]);
+
+        assert.equal(completedWork, true);
+        assert.equal(transactionStarts, 0, 'The caller owns the transaction');
+        assert.equal(applied.has(APPOINTMENT_LEDGER_VERSION), true);
+        assert.ok(queries.every(query => query.options?.transaction === transaction));
+    });
+
+    it('rolls back earlier completion records on failure and retries the unfinished transaction', async () => {
+        const [first, second] = tenantMigrations;
+        for (const migration of tenantMigrations.slice(2)) applied.set(migration.version, 'original-timestamp');
+        migrationWork = async version => {if (version === second.version) throw new Error('Migration failed');};
+
+        await assert.rejects(runTenantMigrations(schema, false, database), /Migration failed/);
+        assert.equal(applied.has(first.version), false);
+        assert.equal(applied.has(second.version), false);
+
+        migrationWork = async () => {};
+        assert.deepEqual(await runTenantMigrations(schema, false, database), [first.version, second.version]);
+        assert.deepEqual(await runTenantMigrations(schema, false, database), []);
+        assert.deepEqual(calls, [first.version, second.version, first.version, second.version]);
+        assert.equal(transactionStarts, 3);
+    });
+});
+
+describe('historical payment evidence before schema migration', () => {
+    it('marks existing history unknown before setting the default for future appointments', async () => {
+        assert.equal(await prepareTenantPaymentHistory(schema, database, transaction), true);
+
+        const changes = queries.filter(query => query.sql.startsWith('ALTER TABLE'));
+        assert.equal(changes.length, 2);
+        assert.match(changes[0].sql, /ADD COLUMN IF NOT EXISTS "appointmentPaymentHistoryKnown" BOOLEAN NOT NULL DEFAULT false/);
+        assert.match(changes[1].sql, /ALTER COLUMN "appointmentPaymentHistoryKnown" SET DEFAULT true/);
+        assert.ok(queries.every(query => query.options?.transaction === transaction));
+        assert.equal(transactionStarts, 0);
+    });
+
+    it('preserves existing historical flags when the ledger already accepts appointment payments', async () => {
+        historyExists = true;
+        invoiceNullable = true;
+
+        assert.equal(await prepareTenantPaymentHistory(schema, database, transaction), false);
+
+        assert.ok(queries.every(query => !/^(ALTER|UPDATE|INSERT|DELETE)/.test(query.sql)));
+    });
+
+    it('does not classify a new tenant without agenda data as historical', async () => {
+        agendaExists = false;
+
+        assert.equal(await prepareTenantPaymentHistory(schema, database), false);
+
+        assert.ok(queries.every(query => !query.sql.startsWith('ALTER TABLE')));
+        assert.equal(transactionStarts, 1);
+    });
+
+    it('rejects invalid schema names before accessing the database', async () => {
+        await assert.rejects(runTenantMigrations('public', false, database), /Invalid tenant schema/);
+        await assert.rejects(prepareTenantPaymentHistory('rehablo_bad"', database), /Invalid tenant schema/);
+        assert.equal(queries.length, 0);
+        assert.equal(transactionStarts, 0);
+    });
+});
+
+describe('preserved tenant data migration policies', () => {
+    it('adds the patient preference with an indexed SET NULL foreign key', async () => {
+        const migrationQueries: string[] = [];
+        const queryInterface = {sequelize: {query: async (sql: string) => {
+            migrationQueries.push(sql);
+            if (sql.includes('to_regclass')) return [[{patients: schema + '.patients', eventTypes: schema + '.event_types'}]];
+            return [[]];
+        }}};
+        const migration = originalMigrations.find(item => item.version === '20260908-add-patient-default-event-type')!;
+
+        await migration.up(queryInterface as any, {schema, transaction});
 
         assert.ok(migrationQueries.some(sql => sql.includes('ADD COLUMN IF NOT EXISTS "defaultEventTypeId" UUID NULL')));
         assert.ok(migrationQueries.some(sql => sql.includes('patients_default_event_type_idx')));
@@ -295,13 +186,18 @@ describe('bridge tenant schema bootstrap and preserved legacy migration policies
     });
 
     it('adds optional price snapshots without changing existing appointment amounts', async () => {
-        const queries: string[] = [];
-        await original.pricingMigrate({sequelize: {query: async (sql: string, options: any) => {
-            assert.equal(options.transaction, transaction); queries.push(sql); return [[]];
-        }}}, {schema, transaction});
-        assert.equal(queries.length, 6);
-        assert.ok(queries.every(sql => sql.startsWith(`ALTER TABLE "${schema}".`) && sql.includes('ADD COLUMN IF NOT EXISTS')));
-        assert.ok(queries.some(sql => sql.includes('"originalServicePrice"')));
-        await assert.rejects(original.pricingMigrate({}, {schema: 'public'}), /Invalid tenant schema/);
+        const migrationQueries: string[] = [];
+        const migration = originalMigrations.find(item => item.version === '20260908-add-appointment-price-adjustments')!;
+
+        await migration.up({sequelize: {query: async (sql: string, options: any) => {
+            assert.equal(options.transaction, transaction);
+            migrationQueries.push(sql);
+            return [[]];
+        }}} as any, {schema, transaction});
+
+        assert.equal(migrationQueries.length, 6);
+        assert.ok(migrationQueries.every(sql => sql.startsWith(`ALTER TABLE "${schema}".`) && sql.includes('ADD COLUMN IF NOT EXISTS')));
+        assert.ok(migrationQueries.some(sql => sql.includes('"originalServicePrice"')));
+        await assert.rejects(migration.up({} as any, {schema: 'public', transaction}), /Invalid tenant schema/);
     });
 });

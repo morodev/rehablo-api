@@ -125,34 +125,28 @@ test('a previous API release cannot start provisioning after database target adv
     assert.ok(queries.every(({sql}) => !/^(CREATE|ALTER|INSERT|UPDATE|DELETE)/.test(sql)));
 });
 
-test('a still-running bridge instance switches to read-only tenant checks after the managed release completes', async () => {
-    env.databaseMigrationPhase = 'bridge';
-    const manager = sequelize.connectionManager as any;
-    const originalGet = manager.getConnection;
-    const originalRelease = manager.releaseConnection;
-    const locks: string[] = [];
-    manager.getConnection = async () => ({query: async (sql: string) => {locks.push(sql); return {rows: []};}});
-    manager.releaseConnection = async () => {};
-    const query = sequelize.query;
-    sequelize.query = (async (sql: string, options?: any) => {
-        if (sql.includes('to_regclass')) {
-            queries.push({sql, options});
-            return [[{control: 'schema_control', releases: 'schema_releases', tenants: 'tenant_schema_state'}]];
-        }
-        if (sql.includes('FROM public.schema_control c LEFT JOIN')) {
-            queries.push({sql, options});
-            return [[{releaseId: databaseManifest.id, checksum: databaseManifest.checksum}]];
-        }
-        return (query as any)(sql, options);
-    }) as any;
-    try {
-        assert.equal(await ensureTenantSchema(tenantId), schema);
-        assert.equal(migrationRuns, 0);
-        assert.ok(queries.every(({sql}) => sql.startsWith('SELECT')));
-        assert.ok(locks.some(sql => sql.includes('pg_advisory_lock_shared')));
-        assert.ok(locks.some(sql => sql.includes('pg_advisory_unlock_shared')));
-    } finally {
-        manager.getConnection = originalGet;
-        manager.releaseConnection = originalRelease;
-    }
+test('legacy bridge and full-sync settings never enable request-time schema changes', async () => {
+    Object.assign(env, {databaseMigrationPhase: 'bridge', tenantSchemaSync: 'full'});
+    assert.equal(await ensureTenantSchema(tenantId), schema);
+    assert.equal(queries.length, 1);
+    assert.ok(queries.every(({sql}) => sql.startsWith('SELECT')));
+    assert.equal(migrationRuns, 0);
+
+    invalidateTenantSchemaCache();
+    compatible = false;
+    await assert.rejects(ensureTenantSchema(tenantId), (error: any) => error.statusCode === 503);
+    assert.equal(queries.length, 2);
+    assert.ok(queries.every(({sql}) => sql.startsWith('SELECT')));
+    assert.equal(migrationRuns, 0);
+});
+
+test('legacy phase settings preserve versioned transactional provisioning and release checks', async () => {
+    Object.assign(env, {databaseMigrationPhase: 'bridge', tenantSchemaSync: 'additive'});
+    assert.equal(await provisionTenantSchema(tenantId, transaction), schema);
+    assert.equal(migrationRuns, 1);
+    assert.ok(queries.every(query => query.options?.transaction === transaction));
+
+    currentRelease = 'a-newer-database-release';
+    await assert.rejects(beginTenantProvisioning(transaction), (error: any) => error.statusCode === 503);
+    assert.equal(migrationRuns, 1);
 });

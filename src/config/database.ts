@@ -13,7 +13,6 @@ export const sequelize = new Sequelize(env.databaseUrl, {
     protocol: 'postgres',
     logging: env.isProduction ? false : console.log,
     dialectOptions: {
-        statement_timeout: env.migrationStatementTimeoutMs,
         ssl: env.dbSsl ? { require: true, rejectUnauthorized: false } : false
     },
     pool: {max: 5, min: 0, acquire: 30000, idle: 10000}

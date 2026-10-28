@@ -18,7 +18,7 @@ test('compiled deployment CLI, managed provisioning and constant readiness queri
     Object.assign(process.env, {DATABASE_URL: target.databaseUrl, NODE_ENV: 'production', DB_SSL: 'false',
         DATABASE_MIGRATION_PHASE: 'managed', TENANT_SCHEMA_SYNC: 'off', JWT_SECRET: randomBytes(32).toString('hex'),
         REMINDER_EXTERNAL_DELIVERY_ENABLED: 'false', ACTIVITIES_DELIVERY_ENABLED: 'false'});
-    // Import the same compiled manifest as the CLI and server: source and compiled checksums differ intentionally.
+    // Source tooling, CLI and server must agree on the same immutable migration artifacts.
     const compiled = (name: string) => import(new URL('../../dist/' + name + '.js', import.meta.url).href);
     const {sequelize: database}: {sequelize: Sequelize} = await compiled('config/database');
     const {databaseManifest}: {databaseManifest: DatabaseManifest} = await compiled('database/migrationManifest');
@@ -98,6 +98,21 @@ test('compiled deployment CLI, managed provisioning and constant readiness queri
                 assert.deepEqual(sourceManifest[scope].map(({name, checksum}) => ({name, checksum})),
                     databaseManifest[scope].map(({name, checksum}) => ({name, checksum})));
             }
+        });
+
+        await t.test('configuration import errors are reported by the compiled CLI before opening a database connection', async () => {
+            const child = spawn(process.execPath, [cli, 'migrate'], {cwd: directory,
+                env: {...process.env, DATABASE_URL: 'not-a-postgres-url'}, windowsHide: true,
+                stdio: ['ignore', 'pipe', 'pipe']});
+            let output = '';
+            child.stdout!.on('data', chunk => {output += String(chunk);});
+            child.stderr!.on('data', chunk => {output += String(chunk);});
+            const code = await new Promise<number | null>((resolve, reject) => {
+                child.once('error', reject);
+                child.once('close', resolve);
+            });
+            assert.equal(code, 1);
+            assert.match(output, /\[database-release\] failed:/);
         });
 
         await t.test('the compiled CLI executes the complete public release on a fresh database and reports no-op on retry', async () => {

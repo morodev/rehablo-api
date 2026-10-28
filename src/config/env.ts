@@ -52,11 +52,12 @@ export const env = {
     databaseUrl: required('DATABASE_URL', 'postgres://postgres:postgres@localhost:5432/rehablo'),
     dbSsl: process.env.DB_SSL === 'true',
 
-    /** Bridge is used for the first ordered rollout only; managed API processes never synchronize schemas. */
+    /** Kept for compatibility with old configuration; migrations no longer have deployment phases. */
     databaseMigrationPhase: (() => {
-        const phase = (process.env.DATABASE_MIGRATION_PHASE || 'managed').trim().toLowerCase();
-        if (phase !== 'bridge' && phase !== 'managed') throw new Error('DATABASE_MIGRATION_PHASE must be bridge or managed');
-        return phase;
+        if (process.env.DATABASE_MIGRATION_PHASE) {
+            console.warn('[database-release] DATABASE_MIGRATION_PHASE is obsolete; pending migrations are applied automatically, without a bridge deployment.');
+        }
+        return 'managed';
     })() as 'bridge' | 'managed',
     migrationConcurrency: positiveInt('MIGRATION_CONCURRENCY', 2),
     migrationStatementTimeoutMs: positiveInt('MIGRATION_STATEMENT_TIMEOUT_MS', 120000),

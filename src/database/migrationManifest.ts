@@ -4,7 +4,7 @@ import {createRequire} from 'node:module';
 import type {Sequelize, Transaction} from 'sequelize';
 import {prepareTenantPaymentHistory, tenantMigrations} from '../utils/tenantMigrations.js';
 import {publicMigrationSteps} from './publicMigrations.js';
-import {applySchemaBaseline, schemaBaseline} from './schemaBaseline.js';
+import {applySchemaBaseline} from './schemaBaseline.js';
 import type {DatabaseManifest, MigrationStep} from './migrationTypes.js';
 
 const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
@@ -68,10 +68,4 @@ const manifestContent = {publicMigrations: publicMigrations.map(({name, checksum
 export const databaseManifest: DatabaseManifest = {
     id: '20261028-appointment-reminders-v1', checksum: digest(JSON.stringify(manifestContent)),
     publicMigrations, tenantMigrations: tenantSteps
-};
-
-/** Bridge state is deliberately distinct: legacy model sync does not prove the explicit baseline was verified. */
-export const bridgeManifest: DatabaseManifest = {
-    id: '20261028-schema-bridge-v1', checksum: digest('bridge-v1:' + schemaBaseline.version),
-    publicMigrations: [], tenantMigrations: []
 };

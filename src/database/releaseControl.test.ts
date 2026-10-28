@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type {Sequelize, Transaction} from 'sequelize';
 import {type DatabaseManifest, validateManifest} from './migrationTypes.js';
-import {assertProvisioningRelease, assertTenantReady, withReleaseLock, withSharedReleaseLock} from './releaseControl.js';
+import {assertProvisioningRelease, assertTenantReady, withReleaseLock} from './releaseControl.js';
 import {getDatabaseStatus, migrateDatabase} from './releaseRunner.js';
 
 const manifest: DatabaseManifest = {id: 'release-one', checksum: 'release-one-checksum', publicMigrations: [], tenantMigrations: []};
@@ -28,13 +28,6 @@ test('release lock remains on its reserved physical connection and unlocks when 
     assert.deepEqual(events, ['acquire', 'SHOW lock_timeout', "SELECT set_config('lock_timeout', $1, false)",
         'SELECT pg_advisory_lock($1, $2)', 'work', 'SELECT pg_advisory_unlock($1, $2)',
         "SELECT set_config('lock_timeout', $1, false)", 'release']);
-});
-
-test('bridge holds the corresponding shared session lock', async () => {
-    const {database, events} = lockingDatabase(async () => [[]]);
-    assert.equal(await withSharedReleaseLock(database, async () => 42), 42);
-    assert.ok(events.includes('SELECT pg_advisory_lock_shared($1, $2)'));
-    assert.ok(events.includes('SELECT pg_advisory_unlock_shared($1, $2)'));
 });
 
 test('a physical connection whose unlock failed is destroyed rather than returned to pool', async () => {
@@ -68,6 +61,31 @@ test('read-only status reports uninitialized schema without creating control met
         return [[{control: null, releases: null, tenants: null}]];
     });
     assert.deepEqual(await getDatabaseStatus(manifest, database), {ready: false, currentRelease: null, release: manifest.id});
+});
+
+test('startup reconciliation of a ready release uses only reads when all tenants are ready', async () => {
+    const statements: string[] = [];
+    const {database} = lockingDatabase(async sql => {
+        statements.push(sql);
+        if (sql.includes('to_regclass')) return [[{control: 'yes', releases: 'yes', tenants: 'yes'}]];
+        if (sql.includes('FROM public.schema_control c LEFT JOIN')) return [[{releaseId: manifest.id, checksum: manifest.checksum}]];
+        if (sql.includes('FROM public.tenants') && sql.includes('LIMIT 1')) return [[]];
+        throw new Error('Ready startup must not execute migrations');
+    });
+    database.transaction = (async () => {throw new Error('Ready startup must not start a transaction');}) as any;
+    assert.equal((await migrateDatabase(manifest, {database, reconcileMissingTenants: true})).noop, true);
+    assert.equal(statements.length, 3);
+    assert.ok(statements.every(sql => sql.startsWith('SELECT')));
+});
+
+test('startup of a previously completed compatible version cannot reconcile a newer release backwards', async () => {
+    const {database} = lockingDatabase(async sql => {
+        if (sql.includes('to_regclass')) return [[{control: 'yes', releases: 'yes', tenants: 'yes'}]];
+        if (sql.includes('FROM public.schema_control c LEFT JOIN')) return [[{releaseId: 'newer-release', checksum: manifest.checksum}]];
+        throw new Error('An older version must not enumerate or migrate newer tenants');
+    });
+    database.transaction = (async () => {throw new Error('Older startup must not start a transaction');}) as any;
+    assert.equal((await migrateDatabase(manifest, {database, reconcileMissingTenants: true})).noop, true);
 });
 
 test('same release ID with changed content fails before starting migrations', async () => {

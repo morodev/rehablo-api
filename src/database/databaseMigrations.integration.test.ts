@@ -29,7 +29,6 @@ test('PostgreSQL release migration transactions, resumability and provisioning l
     process.env.JWT_SECRET = randomBytes(32).toString('hex');
     const {migrateDatabase, getDatabaseStatus, runTenantMigrations} = await import('./releaseRunner.js');
     const {assertDatabaseReady, assertTenantReady, assertProvisioningRelease, lockProvisioning, recordTenantReady} = await import('./releaseControl.js');
-    const {initializeBridge, markBridgeComplete, requireBridgeComplete} = await import('./schemaTransition.js');
     const {SchemaReadinessError, quoteTenantSchema} = await import('./migrationTypes.js');
     const database = new Sequelize(safeDatabase.databaseUrl, {dialect: 'postgres', logging: false,
         dialectOptions: {ssl: false}, pool: {max: 8, min: 0, acquire: 15000}});
@@ -95,28 +94,16 @@ test('PostgreSQL release migration transactions, resumability and provisioning l
         const occupied = await database.query<{name: string}>(`SELECT tablename AS name FROM pg_tables
             WHERE schemaname = 'public' AND tablename IN (:tables)`, {type: QueryTypes.SELECT, replacements: {tables: fixtureTables}});
         assert.equal(occupied.length, 0, 'Use an empty dedicated migration test database: existing control or tenant fixture tables will not be removed');
-        // A fresh database may enter managed mode without the compatibility rollout.
-        await requireBridgeComplete(database);
         await database.query('CREATE TABLE public.tenants (id UUID PRIMARY KEY)');
         fixtureOwned = true;
-        await requireBridgeComplete(database);
         for (const id of ids) await database.query('INSERT INTO public.tenants (id) VALUES (:id)', {replacements: {id}});
 
-        await t.test('existing tenants require completed bridge bootstrap rather than transition metadata alone', async () => {
-            await assert.rejects(requireBridgeComplete(database), SchemaReadinessError);
-            await database.transaction(transaction => initializeBridge(database, transaction));
-            await assert.rejects(requireBridgeComplete(database), SchemaReadinessError);
-            await markBridgeComplete(database);
-            await requireBridgeComplete(database);
-            await markBridgeComplete(database);
-            const rows = await database.query<{count: number}>('SELECT COUNT(*)::int AS count FROM public.schema_transition', {type: QueryTypes.SELECT});
-            assert.equal(rows[0].count, 1);
-            assert.equal((await getDatabaseStatus(base, database)).ready, false, 'Bridge handshake must not mark the managed release ready');
-        });
-
-        await t.test('readiness/status are read-only before initialization, then fresh tenants share one release', async () => {
+        await t.test('existing tenants upgrade directly without transition markers and status stays read-only', async () => {
             assert.deepEqual(await getDatabaseStatus(base, database, true), {ready: false, currentRelease: null, release: base.id, tenants: []});
             await assert.rejects(assertDatabaseReady(base, database), SchemaReadinessError);
+            const transitionBefore = await database.query<{transition: string | null}>(
+                "SELECT to_regclass('public.schema_transition') AS transition", {type: QueryTypes.SELECT});
+            assert.equal(transitionBefore[0].transition, null);
             const result = await apply(base, 2);
             assert.equal(result.noop, false); assert.equal(result.tenants, 2); assert.equal(result.migrations, 3);
             await assertDatabaseReady(base, database);
@@ -126,6 +113,9 @@ test('PostgreSQL release migration transactions, resumability and provisioning l
                 await assertTenantReady(schema, base, database);
                 assert.equal(await eventCount(schema, 'v1'), 1);
             }
+            const transitionAfter = await database.query<{transition: string | null}>(
+                "SELECT to_regclass('public.schema_transition') AS transition", {type: QueryTypes.SELECT});
+            assert.equal(transitionAfter[0].transition, null, 'A direct upgrade must not require or manufacture a transition handshake');
         });
 
         await t.test('an unchanged release does no DDL, data writes, preparation or per-tenant migration work', async () => {
@@ -169,6 +159,23 @@ test('PostgreSQL release migration transactions, resumability and provisioning l
             await assert.rejects(assertDatabaseReady(second, database), SchemaReadinessError);
             await assertDatabaseReady(base, database);
         });
+        await t.test('startup on the serving release preserves tenant checkpoints completed by a newer interrupted release', async () => {
+            const before = await getDatabaseStatus(second, database, true);
+            const statements: string[] = [];
+            (database as any).options.logging = (sql: string) => statements.push(sql);
+            try {
+                assert.deepEqual(await migrateDatabase(base, {database, reconcileMissingTenants: true,
+                    preparePublic: async () => {assert.fail('The serving release must not replay public work');},
+                    prepareTenant: async () => {assert.fail('Existing newer tenant checkpoints must remain intact');}}),
+                {release: base.id, noop: true, tenants: 0, migrations: 0});
+            } finally {(database as any).options.logging = false;}
+            assert.deepEqual(await getDatabaseStatus(second, database, true), before);
+            assert.ok(statements.every(sql => !/\b(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE)\b/i.test(sql)), statements.join('\n'));
+            const rows = await database.query<{revision: number}>(
+                `SELECT revision FROM ${quoteTenantSchema(firstSchema)}.migration_fixture`, {type: QueryTypes.SELECT});
+            assert.equal(rows[0].revision, 2);
+            assert.equal(await eventCount(firstSchema, 'v2'), 1);
+        });
         await t.test('retry applies only incomplete tenant work and preserves additive rollback compatibility', async () => {
             failTenant = false;
             const result = await apply(second);
@@ -203,6 +210,60 @@ test('PostgreSQL release migration transactions, resumability and provisioning l
             assert.equal((await getDatabaseStatus(third, database)).currentRelease, third.id);
         });
 
+        await t.test('startup reconciles tenants created after pre-deploy without replaying completed tenants or publishing the release twice', async () => {
+            const lateTenant = randomUUID(), lateSchema = schemaOf(lateTenant);
+            await database.query('INSERT INTO public.tenants (id) VALUES (:id)', {replacements: {id: lateTenant}});
+            const prepared: string[] = [];
+            const result = await migrateDatabase(third, {database, concurrency: 2, reconcileMissingTenants: true,
+                preparePublic: async () => {assert.fail('An already published release must not repeat public preparation');},
+                prepareTenant: async (schema, db, transaction) => {
+                    prepared.push(schema);
+                    await prepareTenant(schema, db, transaction);
+                }});
+
+            assert.deepEqual(result, {release: third.id, noop: false, tenants: 1, migrations: 3});
+            assert.deepEqual(prepared, [lateSchema]);
+            await assertTenantReady(lateSchema, third, database);
+            for (const schema of [...ids.map(schemaOf), lateSchema]) {
+                for (const version of ['v1', 'v2', 'v3']) assert.equal(await eventCount(schema, version), 1);
+            }
+            const published = await database.query<{count: number}>(
+                'SELECT COUNT(*)::int AS count FROM public.schema_releases WHERE id = :id',
+                {type: QueryTypes.SELECT, replacements: {id: third.id}});
+            assert.equal(published[0].count, 1);
+            ids.push(lateTenant);
+        });
+
+        await t.test('startup reconciliation of a complete release performs no DDL, data writes or migration preparation', async () => {
+            const statements: string[] = [];
+            (database as any).options.logging = (sql: string) => statements.push(sql);
+            try {
+                assert.deepEqual(await migrateDatabase(third, {database, concurrency: 2, reconcileMissingTenants: true,
+                    preparePublic: async () => {assert.fail('Complete release must skip public preparation');},
+                    prepareTenant: async () => {assert.fail('Complete tenants must skip preparation');}}),
+                {release: third.id, noop: true, tenants: 0, migrations: 0});
+            } finally {(database as any).options.logging = false;}
+            assert.ok(statements.every(sql => !/\b(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE)\b/i.test(sql)), statements.join('\n'));
+            const tenantChecks = statements.filter(sql => sql.includes('public.tenants'));
+            assert.equal(tenantChecks.length, 1);
+            assert.match(tenantChecks[0], /LIMIT 1/i);
+        });
+
+        await t.test('a compatible older API does not downgrade tenant checkpoints or reconcile with an older manifest', async () => {
+            const before = await getDatabaseStatus(third, database, true);
+            const statements: string[] = [];
+            (database as any).options.logging = (sql: string) => statements.push(sql);
+            try {
+                assert.deepEqual(await migrateDatabase(base, {database, reconcileMissingTenants: true,
+                    preparePublic: async () => {assert.fail('Older releases must not prepare public data');},
+                    prepareTenant: async () => {assert.fail('Older releases must not change tenant schemas');}}),
+                {release: base.id, noop: true, tenants: 0, migrations: 0});
+            } finally {(database as any).options.logging = false;}
+            assert.deepEqual(await getDatabaseStatus(third, database, true), before);
+            assert.ok(statements.every(sql => !/\b(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE)\b/i.test(sql)), statements.join('\n'));
+            assert.ok(statements.every(sql => !sql.includes('public.tenants')), 'An older API must not enumerate tenants for its obsolete revision');
+        });
+
         const tenantV4 = step('integration-tenant-v4', 'tenant', async (db, schema, transaction) => {
             await db.query(`UPDATE ${quoteTenantSchema(schema)}.migration_fixture SET revision = 4`, {transaction});
             await logStep(db, schema, 'v4', transaction);
@@ -234,10 +295,10 @@ test('PostgreSQL release migration transactions, resumability and provisioning l
             await provisioning;
             const result = await release;
             if (checkFailure) throw checkFailure;
-            assert.equal(result.tenants, 3);
+            assert.equal(result.tenants, ids.length + 1);
             await assertTenantReady(schema, fourth, database);
             assert.equal(await eventCount(schema, 'v1'), 1); assert.equal(await eventCount(schema, 'v4'), 1);
-            assert.equal((await getDatabaseStatus(fourth, database, true)).tenants!.length, 3);
+            assert.equal((await getDatabaseStatus(fourth, database, true)).tenants!.length, ids.length + 1);
         });
 
         await t.test('provisioning blocked by a release rechecks compatibility before writing tenant data', async () => {

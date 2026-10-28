@@ -1,7 +1,7 @@
 import type {Sequelize, Transaction} from 'sequelize';
 import {type DatabaseManifest, SchemaReadinessError, quoteTenantSchema} from './migrationTypes.js';
 
-// Two fixed int32 keys: every release runner, bridge bootstrap and provisioning transaction shares them.
+// Two fixed int32 keys shared by every release runner and provisioning transaction.
 const RELEASE_LOCK_KEYS = [1380270671, 18700];
 
 export async function initializeControlTables(database: Sequelize, transaction: Transaction): Promise<void> {
@@ -52,10 +52,6 @@ export async function withReleaseLock<T>(
             if (!unsafeConnection) await manager.releaseConnection(connection);
         }
     }
-}
-
-export function withSharedReleaseLock<T>(database: Sequelize, work: () => Promise<T>): Promise<T> {
-    return withReleaseLock(database, work, 'shared');
 }
 
 export async function lockProvisioning(database: Sequelize, transaction: Transaction): Promise<void> {

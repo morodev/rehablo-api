@@ -10,6 +10,8 @@ export interface MigrationRunOptions {
     lockTimeoutMs?: number;
     statementTimeoutMs?: number;
     timeoutMs?: number;
+    /** Startup also adopts tenants created by the old API after a successful pre-deploy. */
+    reconcileMissingTenants?: boolean;
     onProgress?(event: {event: string; schema?: string; migration?: string; durationMs?: number; completedTenants?: number; totalTenants?: number}): void;
     preparePublic?(database: Sequelize, transaction: Transaction): Promise<void>;
     prepareTenant?(schema: string, database: Sequelize, transaction: Transaction): Promise<void>;
@@ -153,24 +155,39 @@ export async function migrateDatabase(
     return withReleaseLock(database, async () => {
         assertWithinDeadline();
         const before = await getDatabaseStatus(manifest, database);
-        if (before.ready) return {release: manifest.id, noop: true, tenants: 0, migrations: 0};
-        await transaction(async current => {
+        // A later, incomplete release may already have upgraded some tenant checkpoints.
+        // An older ready API may adopt an unregistered tenant, but must not rewrite those checkpoints.
+        const pendingCondition = before.ready ? 's."schemaName" IS NULL'
+            : 's."releaseId" IS DISTINCT FROM :release OR s."checksum" IS DISTINCT FROM :checksum';
+        if (before.ready) {
+            // A compatible older API must never provision or downgrade a newer database release.
+            if (!options.reconcileMissingTenants || before.currentRelease !== manifest.id) {
+                return {release: manifest.id, noop: true, tenants: 0, migrations: 0};
+            }
+            const [missing] = await database.query(`SELECT t."id" FROM public.tenants t
+                LEFT JOIN public.tenant_schema_state s ON s."schemaName" = 'rehablo_' || replace(t."id"::text, '-', '')
+                WHERE ${pendingCondition} LIMIT 1`, {
+                replacements: {release: manifest.id, checksum: manifest.checksum}
+            });
+            if (!(missing as any[]).length) return {release: manifest.id, noop: true, tenants: 0, migrations: 0};
+        }
+        if (!before.ready) await transaction(async current => {
             await initializeControlTables(database, current);
             const [rows] = await database.query(`SELECT r."manifest" FROM public.schema_control c
                 JOIN public.schema_releases r ON r."id" = c."releaseId" WHERE c."singleton" = true`, {transaction: current});
             const row = (rows as any[])[0];
             if (row) assertAppendOnly(row.manifest, manifest);
         });
-        if (options.preparePublic) await transaction(current => options.preparePublic!(database, current));
+        if (!before.ready && options.preparePublic) await transaction(current => options.preparePublic!(database, current));
         // PostgreSQL requires a committed ALTER TYPE ADD VALUE before a later step can use
         // the new enum label. Every public step and its version row commit together.
         let migrations = 0;
-        for (const step of manifest.publicMigrations) migrations += await transaction(current =>
+        for (const step of before.ready ? [] : manifest.publicMigrations) migrations += await transaction(current =>
             runSteps([step], 'public', 'public', database, current, assertWithinDeadline, options.onProgress));
         assertWithinDeadline();
         const [pending] = await database.query(`SELECT t."id" FROM public.tenants t
             LEFT JOIN public.tenant_schema_state s ON s."schemaName" = 'rehablo_' || replace(t."id"::text, '-', '')
-            WHERE s."releaseId" IS DISTINCT FROM :release OR s."checksum" IS DISTINCT FROM :checksum
+            WHERE ${pendingCondition}
             ORDER BY t."id"`, {replacements: {release: manifest.id, checksum: manifest.checksum}});
         const tenants = pending as Array<{id: string}>;
         let cursor = 0;
@@ -203,10 +220,12 @@ export async function migrateDatabase(
         await transaction(async current => {
             const [rows] = await database.query(`SELECT t."id" FROM public.tenants t
                 LEFT JOIN public.tenant_schema_state s ON s."schemaName" = 'rehablo_' || replace(t."id"::text, '-', '')
-                WHERE s."releaseId" IS DISTINCT FROM :release OR s."checksum" IS DISTINCT FROM :checksum LIMIT 1`, {
+                WHERE ${pendingCondition} LIMIT 1`, {
                 transaction: current, replacements: {release: manifest.id, checksum: manifest.checksum}
             });
             if ((rows as any[]).length) throw new Error('Database release has tenants that are not ready');
+            // Reconciliation updates only missing tenant checkpoints, not the published release.
+            if (before.ready) return;
             await database.query(`INSERT INTO public.schema_releases ("id", "checksum", "manifest")
                 VALUES (:release, :checksum, CAST(:manifest AS jsonb))`, {
                 transaction: current, replacements: {release: manifest.id, checksum: manifest.checksum, manifest: JSON.stringify(manifestRecord(manifest))}

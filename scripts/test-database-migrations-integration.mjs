@@ -42,7 +42,8 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
         const child = spawn(process.execPath, [require.resolve('tsx/cli'), '--test', '--test-concurrency=1',
             'src/database/databaseMigrations.integration.test.ts',
             'src/database/schemaBaseline.integration.test.ts',
-            'src/database/deployment.integration.test.ts'], {
+            'src/database/deployment.integration.test.ts',
+            'src/database/legacyDeployment.integration.test.ts'], {
             cwd: fileURLToPath(new URL('..', import.meta.url)), stdio: 'inherit',
             env: {...process.env, NODE_ENV: 'test', DB_SSL: 'false'}
         });

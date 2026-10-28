@@ -53,7 +53,7 @@ import { ACTIVITIES_MODELS, registerActivitiesAssociations } from './modules/act
 
 /**
  * Registers every tenant-scoped model (i.e. living in the dynamic "rehablo_<tenantId>" schema)
- * for associations, explicit provisioning, and the one-time bridge bootstrap.
+ * for associations, explicit provisioning, and schema verification tooling.
  * Registration alone never changes a production schema.
  */
 let registered = false;

@@ -33,9 +33,7 @@ services:
         value: "false"
       - key: JWT_SECRET
         generateValue: true
-      # Migration runner completes before the managed API starts. See docs/DATABASE_MIGRATIONS.md.
-      - key: DATABASE_MIGRATION_PHASE
-        value: managed
+      # Pending migrations run before readiness; pre-deploy anticipates the same work.
       - key: MIGRATION_CONCURRENCY
         value: "2"
       - key: TENANT_SCHEMA_SYNC
