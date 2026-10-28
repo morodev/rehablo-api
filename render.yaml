@@ -13,7 +13,6 @@ services:
     region: frankfurt
     branch: master
     buildCommand: npm ci && npm run build
-    preDeployCommand: npm run db:migrate
     startCommand: npm start
     healthCheckPath: /health
     disk:
@@ -33,7 +32,7 @@ services:
         value: "false"
       - key: JWT_SECRET
         generateValue: true
-      # Sequelize CLI applies migrations in pre-deploy; startup checks SequelizeMeta.
+      # npm start runs migrations after Render stops the previous disk-backed instance.
       # Access token a vita breve: i permessi RBAC viaggiano nei claim, quindi un token
       # longevo terrebbe in vita permessi gia revocati. La sessione e garantita dal refresh.
       - key: JWT_EXPIRES_IN

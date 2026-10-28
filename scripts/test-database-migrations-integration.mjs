@@ -44,7 +44,8 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
             'src/database/schemaBaseline.integration.test.ts',
             'src/database/ledgerLocks.integration.test.ts',
             'src/database/deployment.integration.test.ts',
-            'src/database/legacyDeployment.integration.test.ts'], {
+            'src/database/legacyDeployment.integration.test.ts',
+            'src/database/startCommand.integration.test.ts'], {
             cwd: fileURLToPath(new URL('..', import.meta.url)), stdio: 'inherit',
             env: {...process.env, NODE_ENV: 'test', DB_SSL: 'false'}
         });

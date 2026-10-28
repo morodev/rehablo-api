@@ -11,7 +11,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json && npm run copy-assets",
     "copy-assets": "node -e \"require('fs').cpSync('src/assets','dist/assets',{recursive:true})\"",
-    "start": "node dist/server.js",
+    "start": "npm run db:migrate && node dist/server.js",
     "lint": "tsc --noEmit",
     "test:startup": "tsx --test src/utils/serverStartup.test.ts src/utils/tenantMigrations.test.ts src/database/migrationStatus.test.ts src/database/publicMigrations.test.ts src/utils/tenantSchemaManaged.test.ts src/modules/auth/services/structureBackfill.service.test.ts",
     "test:activities:unit": "tsx --test scripts/activities-test-database.test.mjs src/modules/activities/utils/activityValidation.test.ts src/modules/activities/services/activityAccess.service.test.ts src/modules/activities/utils/activityCollaboration.test.ts src/modules/activities/services/activityDelivery.policy.test.ts",

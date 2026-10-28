@@ -7,8 +7,12 @@ The API uses Sequelize v6 and the standard Sequelize CLI. Shared tables live in 
 The Render blueprint configures:
 
 1. Build: `npm ci && npm run build`.
-2. Pre-deploy: `npm run db:migrate`.
+2. Pre-deploy: empty.
 3. Start: `npm start`; health check: `/health`.
+
+`npm start` runs `npm run db:migrate && node dist/server.js`. The service has a persistent disk: Render stops the preceding instance before running the replacement start command. This puts migrations after the old API has closed its database connections and released transaction locks, including the tenant lock used by its legacy model sync. The API starts only after the CLI succeeds; a migration failure prevents the listener from opening.
+
+For an existing Render service, clear **Settings > Build & Deploy > Pre-Deploy Command** and keep **Start Command** set to `npm start` when deploying this change. Updating `render.yaml` alone does not update manually configured services. Keep the existing disk mount, environment and database unchanged. The interruption includes migration time, within Render's 15-minute startup limit. This ordering relies on the attached persistent disk; a service without a disk needs a separately coordinated migration rollout.
 
 `db:migrate` runs `sequelize-cli db:migrate` using `migrations/config.cjs` and the migration files in `migrations/releases/`. The CLI records completed filenames in `public.SequelizeMeta` and runs only pending files. A migration error exits unsuccessfully and stops the deployment; never add a successful marker manually to bypass a failure.
 
@@ -16,7 +20,7 @@ The Render blueprint configures:
 
 The CLI uses the same `DATABASE_URL`, local fallback and `DB_SSL` interpretation as the application. Existing endpoint, database and environment settings do not need to change. Old `DATABASE_MIGRATION_PHASE` and `TENANT_SCHEMA_SYNC` settings do not select an alternative migration workflow.
 
-Run one migration process at a time. Render serializes deployments for this service; do not launch another CLI migration against the same database during its pre-deploy. There is no application-wide advisory lock or custom database release ledger in the active migration path.
+Run one migration process at a time. Render serializes deployments for this service; do not launch another CLI migration or a legacy schema writer against the same database during startup. Transaction-scoped tenant locks remain in place; changing the startup order avoids contention with this service's preceding instance instead of bypassing active writers. If the same lock timeout persists, another database session still owns the lock and must be identified; startup never terminates external sessions or marks failed migrations as applied.
 
 ## Local development
 
@@ -28,9 +32,9 @@ After installing dependencies, configuring the local `.env` and starting Postgre
 
 Public steps use explicit transactions; enum additions commit before later steps use the new values. Tenant schema changes and their per-tenant migration markers commit together. If a tenant fails, its transaction rolls back. Correct the cause and rerun `npm run db:migrate`; already completed tenant steps remain recorded.
 
-Startup reads `SequelizeMeta` to check that required global migrations have completed. It also adopts tenants whose schema has no `SequelizeMeta` table, including a tenant registered by a preceding API after pre-deploy. Existing tenant metadata is checked on access; startup does not repair missing rows in an existing `SequelizeMeta` table. Use `npm run db:check -- --tenants` for a read-only check of every tenant's migration markers. Health and application routes remain at HTTP 503 until initialization succeeds. Startup and ordinary requests never call `Model.sync`, `alter` or `force`.
+After the start command finishes migrations, the API bootstrap reads `SequelizeMeta` to check that required global migrations have completed. It also adopts legacy tenants whose schema has no `SequelizeMeta` table. Existing tenant metadata is checked on access; startup does not repair missing rows in an existing `SequelizeMeta` table. Use `npm run db:check -- --tenants` for a read-only check of every tenant's migration markers. During the CLI migration phase the HTTP listener is not running. Once the API starts, health and application routes remain at HTTP 503 until initialization succeeds. Migrations, API bootstrap and ordinary requests never call business `Model.sync`, `alter` or `force`.
 
-New tenant registration provisions its schema in the registration transaction. A failure rolls back the tenant and schema together. The configured Render service has a persistent disk, so its previous instance is retired before the replacement starts; do not describe this as a zero-downtime deployment. Keep migrations additive while preceding application code can still access the database.
+New tenant registration provisions its schema in the registration transaction. A failure rolls back the tenant and schema together. The configured Render service has a persistent disk, so deployments include downtime. Keep migrations additive and preserve compatibility with existing business data.
 
 ## Adding a migration
 
@@ -44,6 +48,6 @@ Keep applied migration files and frozen baseline/catalog artifacts unchanged. Th
 
 ## Verification
 
-`npm run test:database:integration` requires `TEST_MIGRATIONS_DATABASE_URL` for an empty disposable PostgreSQL database on localhost, named `<prefix>_migrations_test` or `<prefix>_migrations_test_<run>`. The test guard never substitutes `DATABASE_URL` and rejects the ordinary application database. Report PostgreSQL checks actually executed separately from unit tests.
+`npm run test:database:integration` requires `TEST_MIGRATIONS_DATABASE_URL` for an empty disposable PostgreSQL database on localhost, named `<prefix>_migrations_test` or `<prefix>_migrations_test_<run>`. The test guard never substitutes `DATABASE_URL` and rejects the ordinary application database. The startup integration test reproduces the reported `55P03` with a separate legacy writer process, verifies rollback and lock release after that process stops, then executes the real `npm start`, checks `/health`, and verifies a second start preserves data and migration history. It also checks that migration failure prevents API startup. Report PostgreSQL checks actually executed separately from unit tests.
 
-Official references: [Sequelize v6 migrations and SequelizeMeta](https://sequelize.org/docs/v6/other-topics/migrations/), [Sequelize transactions](https://sequelize.org/docs/v6/other-topics/transactions/), [Render pre-deploy commands](https://render.com/docs/deploys#pre-deploy-command).
+Official references: [Sequelize v6 migrations and SequelizeMeta](https://sequelize.org/docs/v6/other-topics/migrations/), [Sequelize transactions](https://sequelize.org/docs/v6/other-topics/transactions/), [Render pre-deploy commands](https://render.com/docs/deploys#pre-deploy-command), [Render persistent-disk deployment ordering](https://render.com/docs/disks#disk-limitations-and-considerations).

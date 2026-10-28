@@ -79,10 +79,15 @@ applica migrazioni automaticamente. Dettagli in [Database migrations](docs/DATAB
 
 ## Avvio e health check su Render
 
-Il listener apre subito su `0.0.0.0` alla porta indicata da `PORT`. Durante il bootstrap,
+Il servizio con disco persistente usa **Pre-Deploy Command vuoto** e **Start Command `npm start`**.
+Render ferma la vecchia istanza prima del nuovo avvio; `npm start` esegue Sequelize CLI e,
+solo se le migrazioni riescono, avvia l'API. Il fermo include il tempo delle migrazioni.
+Per i servizi configurati manualmente, svuotare il Pre-Deploy Command anche nel pannello Render.
+
+Dopo le migrazioni il listener apre su `0.0.0.0` alla porta indicata da `PORT`. Durante il bootstrap,
 `GET /health` restituisce `503 {"status":"starting"}` e tutte le rotte applicative,
 compresi webhook Stripe e link pubblici, rispondono `503` senza eseguire i controller.
-Dopo connessione al database, migrazioni tenant e attivazioni obbligatorie, il servizio
+Dopo connessione al database, verifica delle migrazioni e attivazioni obbligatorie, il servizio
 abilita le API e `/health` restituisce `200 {"status":"ok"}`. Un errore obbligatorio
 chiude il listener e termina il processo con codice 1.
 
@@ -93,7 +98,7 @@ I log `[startup]` e `[tenant-schema]` indicano fase, tenant, modello o migrazion
 l'ultima fase avviata senza completamento identifica il passaggio da indagare.
 
 Verifiche locali: `npm run build` e `npm run test:startup`. Dopo il deploy, verificare
-nei log l'apertura immediata della porta, il completamento dei tenant e il messaggio
+nei log il completamento della CLI, la successiva apertura della porta e il messaggio
 `bootstrap complete; accepting application traffic`.
 
 ## Da fare prima del go-live
