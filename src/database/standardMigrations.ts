@@ -10,6 +10,23 @@ const [initialSchemaName, appointmentRemindersName] = requiredMigrationNames;
 const reminderStep = legacyBaseline.tenantMigrations.find(step => step.name === '20261028-appointment-reminders-v1')!;
 const tenantBaselineSteps = legacyBaseline.tenantMigrations.filter(step => step !== reminderStep);
 
+/** Keep the original PostgreSQL error, and expose the blocked operation without logging bound data. */
+function migrationFailure(context: string, cause: unknown): Error {
+    const error = cause as Error & {sql?: string; original?: {code?: string}; parent?: {code?: string}};
+    const code = error.original?.code ?? error.parent?.code;
+    const sql = error.sql?.trim() ?? '';
+    const details: string[] = code ? ['SQLSTATE ' + code] : [];
+    if (/^SELECT\s+pg_advisory_xact_lock\(/i.test(sql)) details.push('tenant migration advisory lock');
+    else {
+        // Only SQL keywords and identifiers: INSERT/UPDATE values can contain business data.
+        const ddl = sql.match(/^(ALTER TABLE|CREATE TABLE(?: IF NOT EXISTS)?|CREATE SCHEMA(?: IF NOT EXISTS)?|LOCK TABLE)\s+((?:"(?:[^"]|"")+"|[a-z_][a-z0-9_$]*)(?:\.(?:"(?:[^"]|"")+"|[a-z_][a-z0-9_$]*))?)/i);
+        const command = sql.match(/^[a-z]+/i)?.[0];
+        if (ddl) details.push(ddl[1] + ' ' + ddl[2]);
+        else if (command) details.push(command.toUpperCase());
+    }
+    return new Error(`${context}: ${error.message}${details.length ? ' [' + details.join('; ') + ']' : ''}`, {cause});
+}
+
 /** Transaction-local limits apply to migration/provisioning SQL only. */
 async function configureTransaction(database: Sequelize, transaction: Transaction): Promise<void> {
     const statementTimeout = env.migrationStatementTimeoutMs;
@@ -38,10 +55,21 @@ async function prepareTenant(database: Sequelize, schema: string, transaction: T
 async function applyLegacySteps(database: Sequelize, schema: string, steps: MigrationStep[], transaction: Transaction): Promise<void> {
     const registry = schema === 'public' ? 'public."platform_schema_migrations"'
         : `${quoteTenantSchema(schema)}."schema_migrations"`;
-    await database.query(`CREATE TABLE IF NOT EXISTS ${registry} (
-        "version" VARCHAR(160) PRIMARY KEY, "appliedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(), "checksum" VARCHAR(128))`, {transaction});
-    await database.query(`ALTER TABLE ${registry} ADD COLUMN IF NOT EXISTS "checksum" VARCHAR(128)`, {transaction});
-    const [rows] = await database.query(`SELECT "version", "checksum" FROM ${registry}`, {transaction});
+    const [registries] = await database.query(`SELECT to_regclass(:registry) AS registry,
+        EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass(:registry)
+            AND attname='checksum' AND attnum>0 AND NOT attisdropped) AS "hasChecksum"`, {
+        transaction, replacements: {registry}
+    });
+    const existing = registries[0] as {registry: string | null; hasChecksum: boolean};
+    let hasChecksum = existing.hasChecksum;
+    if (!existing.registry) {
+        await database.query(`CREATE TABLE IF NOT EXISTS ${registry} (
+            "version" VARCHAR(160) PRIMARY KEY, "appliedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(), "checksum" VARCHAR(128))`, {transaction});
+        hasChecksum = true;
+    }
+    // The old two-column ledger is valid history. Adding optional bookkeeping would require
+    // ACCESS EXCLUSIVE, even with IF NOT EXISTS, and can block the still-running API's readers.
+    const [rows] = await database.query(`SELECT "version", ${hasChecksum ? '"checksum"' : 'NULL::text AS "checksum"'} FROM ${registry}`, {transaction});
     const applied = new Map((rows as Array<{version: string; checksum: string | null}>).map(row => [row.version, row.checksum]));
     for (const step of steps) {
         if (applied.has(step.name)) {
@@ -52,7 +80,8 @@ async function applyLegacySteps(database: Sequelize, schema: string, steps: Migr
         }
         console.log(`[migration] ${schema}: ${step.name}`);
         await step.up(database, schema, transaction);
-        await database.query(`INSERT INTO ${registry} ("version", "checksum") VALUES (:version, :checksum)`, {
+        await database.query(`INSERT INTO ${registry} (${hasChecksum ? '"version", "checksum"' : '"version"'})
+            VALUES (${hasChecksum ? ':version, :checksum' : ':version'})`, {
             transaction, replacements: {version: step.name, checksum: step.checksum}
         });
     }
@@ -88,10 +117,12 @@ async function tenantSchemas(database: Sequelize): Promise<string[]> {
 export async function migrateInitialSchema(database: Sequelize): Promise<void> {
     // Public enum additions must commit before later steps use their new values.
     for (const step of legacyBaseline.publicMigrations) {
-        await database.transaction(async transaction => {
-            await configureTransaction(database, transaction);
-            await applyLegacySteps(database, 'public', [step], transaction);
-        });
+        try {
+            await database.transaction(async transaction => {
+                await configureTransaction(database, transaction);
+                await applyLegacySteps(database, 'public', [step], transaction);
+            });
+        } catch (cause) {throw migrationFailure(`Initial public schema migration failed at ${step.name}`, cause);}
     }
     for (const schema of await tenantSchemas(database)) {
         try {
@@ -99,7 +130,7 @@ export async function migrateInitialSchema(database: Sequelize): Promise<void> {
                 await prepareTenant(database, schema, transaction);
                 await applyTenantBaseline(database, schema, transaction, await readMigrationNames(database, schema, transaction));
             });
-        } catch (cause) {throw new Error(`Initial schema migration failed for ${schema}: ${(cause as Error).message}`, {cause});}
+        } catch (cause) {throw migrationFailure(`Initial schema migration failed for ${schema}`, cause);}
     }
 }
 
@@ -114,7 +145,7 @@ export async function migrateAppointmentReminders(database: Sequelize): Promise<
                 await applyTenantBaseline(database, schema, transaction, applied);
                 await applyTenantReminders(database, schema, transaction, applied);
             });
-        } catch (cause) {throw new Error(`Appointment reminder migration failed for ${schema}: ${(cause as Error).message}`, {cause});}
+        } catch (cause) {throw migrationFailure(`Appointment reminder migration failed for ${schema}`, cause);}
     }
 }
 
