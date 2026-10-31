@@ -5,6 +5,7 @@ import {sequelize} from '../../../config/database.js';
 export class ActivityDelivery extends Model {
     declare id: string;
     declare alertId: string;
+    declare executionId: string | null;
     declare recipientUserId: string;
     declare scheduleVersion: number;
     declare channel: 'inApp' | 'push' | 'email';
@@ -26,6 +27,7 @@ export class ActivityDelivery extends Model {
 ActivityDelivery.init({
     id: {type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true},
     alertId: {type: DataTypes.UUID, allowNull: false},
+    executionId: {type: DataTypes.UUID, allowNull: true},
     recipientUserId: {type: DataTypes.UUID, allowNull: false},
     scheduleVersion: {type: DataTypes.INTEGER, allowNull: false, validate: {min: 1}},
     channel: {type: DataTypes.STRING(16), allowNull: false},

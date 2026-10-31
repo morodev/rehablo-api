@@ -5,6 +5,7 @@ import type {Activity, ActivityBoard} from '../models/index.js';
 import {ActivityError} from '../utils/activityErrors.js';
 import {parseActivityId} from '../utils/activityValidation.js';
 import {assignableActivityUsers} from './activityAccess.service.js';
+import {executionChildren, targetsPastExecution} from './activityExecutionTarget.service.js';
 import {cancelActivityDeliveries} from './activityDeliveryPersistence.service.js';
 import {activityInBoard, assertCapability, assertOrder, assertVersion, assignmentIds, models, mutationResponse,
     placementPosition, recordHistory, reviseBoard, writeOperation} from './activityPersistence.service.js';
@@ -35,8 +36,8 @@ export async function setActivityWorkflow(context: ActivityContext, board: Activ
         reviewApprovedAt: reviewStatus === 'approved' ? newlyApproved ? new Date() : activity.reviewApprovedAt : null,
         ...(status === 'COMPLETED' && from !== 'COMPLETED' ? {completedAt: new Date(), completedByUserId: context.userId} : {}),
         ...(from === 'COMPLETED' && status !== 'COMPLETED' ? {completedAt: null, completedByUserId: null} : {})}, {transaction});
-    if (status === 'COMPLETED' && from !== 'COMPLETED') {
-        const alert = await models(context).alert.findOne({where: {activityId: activity.id}, transaction});
+    if (status === 'COMPLETED' && from !== 'COMPLETED' && !targetsPastExecution(context)) {
+        const alert = await models(context).alert.findOne({where: {activityId: activity.id, ...executionChildren(context)}, transaction});
         if (alert?.enabled) {
             await alert.update({enabled: false, scheduleVersion: alert.scheduleVersion + 1}, {transaction});
             await cancelActivityDeliveries(context.schema, alert.id, transaction);
@@ -58,7 +59,7 @@ export async function invalidateActivityReview(context: ActivityContext, board: 
 /** Called only after changes to progress or checklist composition, never from reads or text edits. */
 export async function syncChecklistWorkflow(context: ActivityContext, board: ActivityBoard, activity: Activity,
     transaction: Transaction, forceInProgress = false): Promise<boolean> {
-    const items = await models(context).checklist.findAll({where: {activityId: activity.id}, attributes: ['checked'], transaction});
+    const items = await models(context).checklist.findAll({where: {activityId: activity.id, ...executionChildren(context)}, attributes: ['checked'], transaction});
     const checked = items.filter(item => item.checked).length;
     if (items.length && checked === items.length) {
         return setActivityWorkflow(context, board, activity, activity.reviewerUserId ? 'WAITING' : 'COMPLETED',
@@ -82,12 +83,12 @@ export async function reviewActivity(req: Request, activityId: string, input: Ac
     return writeOperation(req, {...input, activityId}, 'review.' + input.action, async (context, board, transaction) => {
         const activity = await activityInBoard(context, board.id, activityId, transaction);
         await assertCapability(context, activity, input.action === 'request' ? 'canRequestReview' : 'canReview', transaction);
-        assertVersion(activity, input.expectedVersion); assertOrder(board, input.expectedOrderRevision);
+        assertVersion(activity, input.expectedVersion); assertOrder(board, input.expectedOrderRevision, context);
         if (activity.checklistRevision !== input.expectedChecklistRevision) throw new ActivityError('CHECKLIST_VERSION_CONFLICT', 409,
             'La checklist è cambiata. Controllala prima di continuare.');
         if (!activity.reviewerUserId) throw new ActivityError('REVIEW_REQUIRED', 409, 'Seleziona un revisore prima di inviare l’attività.');
         await validateActivityReviewer(context, activity.reviewerUserId, await assignmentIds(context, activity.id, transaction), transaction);
-        if (input.action !== 'returnToProgress' && await models(context).checklist.count({where: {activityId, checked: false}, transaction})) {
+        if (input.action !== 'returnToProgress' && await models(context).checklist.count({where: {activityId, checked: false, ...executionChildren(context)}, transaction})) {
             throw new ActivityError('CHECKLIST_INCOMPLETE', 409, 'Completa tutti i passaggi prima di inviare o approvare la revisione.');
         }
         let status: ActivityStatus = 'WAITING', reviewStatus: ActivityReviewStatus = 'pending';
@@ -97,11 +98,11 @@ export async function reviewActivity(req: Request, activityId: string, input: Ac
             if (input.action === 'approveAndComplete') status = 'COMPLETED';
         } else if (input.action === 'returnToProgress') {
             status = 'IN_PROGRESS'; reviewStatus = 'not_requested'; event = 'REVIEW_RETURNED';
-            await models(context).comment.create({activityId, authorUserId: context.userId, text: input.comment!, version: 1}, {transaction});
+            await models(context).comment.create({activityId, ...executionChildren(context), authorUserId: context.userId, text: input.comment!, version: 1}, {transaction});
             await recordHistory(context, activityId, 'COMMENT_ADDED', {reason: 'REVIEW_RETURNED'}, transaction);
         }
         const orderChanged = await setActivityWorkflow(context, board, activity, status, reviewStatus, transaction, event);
-        await reviseBoard(board, transaction, orderChanged);
+        await reviseBoard(board, transaction, orderChanged, context);
         return mutationResponse(context, board, activity, transaction);
     });
 }

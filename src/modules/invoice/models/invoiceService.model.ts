@@ -5,7 +5,7 @@ export interface InvoiceServiceAttributes {
     socialSecurity?: any;
     id: string;
     InvoiceId: string;
-    ServiceId: string;
+    ServiceId: string | null;
     quantity?: number | null;
     servicePrice?: number | null;
     originalServicePrice?: number | null;
@@ -26,7 +26,7 @@ export class InvoiceService
     implements InvoiceServiceAttributes {
     declare id: string;
     declare InvoiceId: string;
-    declare ServiceId: string;
+    declare ServiceId: string | null;
     declare quantity: number | null;
     declare socialSecurity: any;
     declare servicePrice: number | null;
@@ -42,7 +42,7 @@ InvoiceService.init(
     {
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
         InvoiceId: { type: DataTypes.UUID, allowNull: false },
-        ServiceId: { type: DataTypes.UUID, allowNull: false },
+        ServiceId: { type: DataTypes.UUID, allowNull: true },
         quantity: DataTypes.INTEGER,
         socialSecurity: {type: DataTypes.JSONB, allowNull: true},
         servicePrice: DataTypes.DECIMAL(10, 2),

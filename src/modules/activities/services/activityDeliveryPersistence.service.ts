@@ -27,7 +27,7 @@ export async function materializeActivityDeliveries(schema: string, alert: Activ
     for (const assigned of assignments) for (const channel of channels) {
         const [delivery] = await ActivityDelivery.schema(schema).findOrCreate({
             where: {alertId: alert.id, recipientUserId: assigned.userId, scheduleVersion: alert.scheduleVersion, channel},
-            defaults: {alertId: alert.id, recipientUserId: assigned.userId, scheduleVersion: alert.scheduleVersion,
+            defaults: {alertId: alert.id, executionId: alert.executionId ?? null, recipientUserId: assigned.userId, scheduleVersion: alert.scheduleVersion,
                 channel, scheduledAt: alert.scheduledAt, nextAttemptAt: alert.scheduledAt, status: 'PENDING', attempts: 0}, transaction});
         // An explicitly restored recipient can receive a future alert; delivered receipts remain immutable.
         if (options.reactivateRecipients && delivery.status === 'CANCELLED' && alert.scheduledAt > (options.now ?? new Date()))

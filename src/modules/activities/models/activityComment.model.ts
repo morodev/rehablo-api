@@ -5,6 +5,7 @@ import {sequelize} from '../../../config/database.js';
 export class ActivityComment extends Model {
     declare id: string;
     declare activityId: string;
+    declare executionId: string | null;
     declare authorUserId: string;
     declare text: string | null;
     declare version: number;
@@ -17,6 +18,7 @@ export class ActivityComment extends Model {
 ActivityComment.init({
     id: {type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true},
     activityId: {type: DataTypes.UUID, allowNull: false},
+    executionId: {type: DataTypes.UUID, allowNull: true},
     authorUserId: {type: DataTypes.UUID, allowNull: false},
     text: {type: DataTypes.TEXT, allowNull: true, validate: {len: [1, 5000]}},
     version: {type: DataTypes.INTEGER, allowNull: false, defaultValue: 1, validate: {min: 1}},

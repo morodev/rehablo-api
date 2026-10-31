@@ -18,6 +18,7 @@ import { startAutomaticAppointmentCompletionSweep } from './modules/agenda/servi
 import {startReminderExternalDeliverySweep} from './modules/notes/services/reminderExternalDelivery.service.js';
 import {startPatientContactReminderSweep} from './modules/notes/services/patientContactReminder.service.js';
 import {startActivityDeliverySweep} from './modules/activities/services/activityDelivery.service.js';
+import {startActivityRecurrenceSweep} from './modules/activities/services/activityRecurrence.service.js';
 import activityNotificationsRoutes from './modules/activities/routes/activityNotifications.routes.js';
 import {createStartupReadiness, runStartupPhase, startHttpServer} from './utils/serverStartup.js';
 
@@ -139,6 +140,7 @@ async function initializeBackgroundJobs(): Promise<void> {
             await startReminderExternalDeliverySweep();
         }
         await startActivityDeliverySweep({initializeExistingTenants: false});
+        startActivityRecurrenceSweep();
     });
 }
 

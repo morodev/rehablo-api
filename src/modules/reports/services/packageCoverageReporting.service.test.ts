@@ -75,6 +75,18 @@ describe('contractual package session values', () => {
 });
 
 describe('package coverage projection and payment evidence', () => {
+    it('reports unpaid and partial quote purchases while keeping session coverage separate from collected money', () => {
+        const agreement = pack({templateId: null, quoteId: '44444444-4444-4444-8444-444444444444',
+            lines: [{id: '55555555-5555-4555-8555-555555555555', itemType: 'SERVICE', itemId: serviceA,
+                description: 'Fisioterapia', quantity: 10, unitPrice: 40, vatRate: 0, total: 400}]});
+        const initial = projectPackageCoverage([event()], evidence({packages: [agreement]})).get('event-1')!;
+        assert.equal(initial.packageSummary?.paymentStatus, 'unpaid');
+        assert.equal(initial.packageSessionValue, 40);
+        const partial = projectPackageCoverage([event()], evidence({packages: [agreement], payments: [receipt(),
+            receipt({id: 'clinical-coverage', agendaEventId: 'event-1', source: 'PACKAGE', amount: 400})]})).get('event-1')!;
+        assert.equal(partial.packageSummary?.paymentStatus, 'partial');
+        assert.equal(partial.packageSessionValue, 40);
+    });
     it('reports partial purchase payment without reducing the contractual session value', () => {
         const result = projectPackageCoverage([event()], evidence({payments: [receipt()]})).get('event-1')!;
         assert.equal(result.packageSessionValue, 40); assert.equal(result.packageSummary?.paymentStatus, 'partial');

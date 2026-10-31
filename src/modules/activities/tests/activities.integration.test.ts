@@ -108,11 +108,11 @@ test('a real tenant upgrade is additive, preserves notes/reminders and serialize
         dueAt: new Date('2020-02-03T08:09:10.123Z'), remindAt: new Date('2020-02-03T07:09:10.123Z')});
     const oldNote = note.get({plain: true});
     const oldReminder = reminder.get({plain: true});
-    const tables = ['activity_deliveries', 'activity_alerts', 'activity_operations', 'activity_history',
+    const tables = ['activity_deliveries', 'activity_alerts', 'activity_operations', 'activity_history', 'activity_executions',
         'activity_comments', 'activity_checklist_items', 'activity_assignments', 'activities', 'activity_boards'];
     for (const table of tables) await sequelize.query(`DROP TABLE "${schemas.b}"."${table}" CASCADE`);
     await sequelize.query(`DELETE FROM "${schemas.b}"."schema_migrations" WHERE "version" IN (:versions)`, {
-        replacements: {versions: [migrations.ACTIVITIES_FOUNDATION_VERSION, migrations.TENANT_MODEL_BASELINE_VERSION]}
+        replacements: {versions: [migrations.ACTIVITIES_FOUNDATION_VERSION, migrations.TENANT_MODEL_BASELINE_VERSION, '20261031-activity-recurrences']}
     });
     await sequelize.query(`INSERT INTO "${schemas.b}"."schema_migrations" ("version") VALUES (:version)
         ON CONFLICT ("version") DO NOTHING`, {replacements: {version: '20261010-tenant-model-baseline-v13'}});

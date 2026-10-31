@@ -17,8 +17,9 @@ import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import {Tenant, Structure} from '../../auth/models/index.js';
 import {FinancialOperation} from '../models/financialOperation.model.js';
-import {createCarePackage, createPackagePayment, createPackageInvoice, voidPackagePayment, getCarePackage, listCarePackages, setupCarePackageBooking} from './carePackage.controller.js';
+import {createCarePackage, createPackagePayment, createPackageInvoice, voidPackagePayment, getCarePackage, listCarePackages, setupCarePackageBooking, packagePaymentOptions} from './carePackage.controller.js';
 import {packageMoneySummary, packagePatientWhere} from '../services/carePackage.service.js';
+import {createPayment as createInvoicePayment} from '../../invoice/controllers/payment.controller.js';
 
 const id = (n: number) => `aaaaaaaa-aaaa-4aaa-8aaa-${String(n).padStart(12, '0')}`;
 const tenantId = id(1), structureId = id(2), patientId = id(3), templateId = id(4), serviceId = id(5), accountId = id(6), methodId = id(7);
@@ -123,6 +124,126 @@ function run(handler: any, req: any): Promise<{status: number; data: any; messag
         handler(req, res, (error: any) => resolve({status: error?.statusCode ?? 500, data: null, message: error?.message}));});
 }
 const receipt = (amount: number) => ({amount, accountId, paymentMethodId: methodId, paidAt: '2026-01-01'});
+const quotedPackage = (overrides: Record<string, any> = {}) => record({id: id(20), patientId, structureId, templateId: null,
+    quoteId: id(50), name: 'Percorso concordato', purchasedUnits: 10, remainingUnits: 8, totalPrice: 500,
+    status: 'ACTIVE', createdAt: '2025-12-01T10:00:00.000Z', invoiceId: null,
+    lines: [{id: 'line-fisio', itemType: 'SERVICE', itemId: serviceId, description: 'Fisioterapia concordata', quantity: 4, unitPrice: 50, total: 200, vatNature: 'N4'},
+        {id: 'line-tecar', itemType: 'SERVICE', itemId: null, description: 'Tecarterapia concordata', quantity: 6, unitPrice: 50, total: 300, vatNature: 'N4'}],
+    ...overrides});
+
+it('collects and invoices an existing multiple-service quote package without charging its sessions again', async t => {
+    const f = fixture(t), pack = quotedPackage(); f.packages.push(pack);
+    const detail = await run(getCarePackage, request({}, {id: pack.id}));
+    assert.equal(detail.status, 200, detail.message); assert.equal(detail.data.financialAvailable, true);
+    assert.equal(detail.data.legacy, true); assert.equal(detail.data.balance, 500); assert.equal(detail.data.paidAmount, 0);
+    assert.equal(detail.data.purchasedAt, pack.createdAt);
+    const paid = await run(createPackagePayment, request(receipt(100), {id: pack.id}, 'quoted-receipt-001'));
+    assert.equal(paid.status, 200, paid.message); assert.equal(paid.data.balance, 400);
+    const paymentId = f.payments[0].id;
+    assert.equal(f.payments[0].carePackageId, pack.id); assert.equal(f.payments[0].agendaEventId, null);
+    assert.equal(f.payments[0].source, 'PACKAGE_PURCHASE');
+    const repeated = await run(createPackagePayment, request(receipt(100), {id: pack.id}, 'quoted-receipt-001'));
+    assert.equal(repeated.status, 200, repeated.message); assert.equal(f.payments.length, 1); assert.equal(f.ledger.length, 1);
+    f.services[0].sellingPrice = 900; f.services[0].name = 'Catalogo modificato';
+    const emitted = await run(createPackageInvoice, request({}, {id: pack.id}, 'quoted-invoice-001'));
+    assert.equal(emitted.status, 201, emitted.message); assert.equal(f.invoices[0].invoiceNet, 500);
+    assert.equal(f.lines.length, 2); assert.equal(f.payments[0].id, paymentId);
+    assert.equal(f.payments[0].invoiceId, emitted.data.invoiceId); assert.equal(f.ledger.length, 1);
+    const retriedInvoice = await run(createPackageInvoice, request({}, {id: pack.id}, 'quoted-invoice-001'));
+    assert.equal(retriedInvoice.status, 200, retriedInvoice.message); assert.equal(f.invoices.length, 1);
+    const settled = await run(createPackagePayment, request(receipt(400), {id: pack.id}, 'quoted-receipt-002'));
+    assert.equal(settled.status, 200, settled.message); assert.equal(settled.data.balance, 0);
+    assert.equal(f.invoices[0].status, 'paid'); assert.equal(f.payments.length, 2);
+    assert.equal(f.ledger.reduce((sum, row) => sum + Number(row.amount), 0), 500);
+    assert.equal(pack.purchasedUnits, 10); assert.equal(pack.remainingUnits, 8); assert.equal(f.events.length, 0);
+});
+
+it('invoices a quoted package before its receipts and reverses only the recorded purchase money', async t => {
+    const f = fixture(t), pack = quotedPackage(); f.packages.push(pack);
+    const emitted = await run(createPackageInvoice, request({}, {id: pack.id}, 'quote-first-invoice-001'));
+    assert.equal(emitted.status, 201, emitted.message); assert.equal(f.payments.length, 0); assert.equal(f.ledger.length, 0);
+    const first = await run(createPackagePayment, request(receipt(100), {id: pack.id}, 'quote-after-invoice-001'));
+    assert.equal(first.status, 200, first.message); assert.equal(first.data.balance, 400);
+    assert.equal(f.payments[0].invoiceId, emitted.data.invoiceId);
+    const reversed = await run(voidPackagePayment, request({reason: 'Incasso registrato per errore'}, {id: pack.id, paymentId: f.payments[0].id}));
+    assert.equal(reversed.status, 200, reversed.message); assert.equal(reversed.data.balance, 500);
+    assert.equal(reversed.data.paidAmount, 0); assert.equal(f.ledger.length, 2);
+    assert.equal(pack.remainingUnits, 8);
+});
+
+it('updates the quote package balance when its invoice is paid directly without a second receipt ledger', async t => {
+    const f = fixture(t), pack = quotedPackage(); f.packages.push(pack);
+    const emitted = await run(createPackageInvoice, request({}, {id: pack.id}, 'direct-quote-invoice-001'));
+    assert.equal(emitted.status, 201, emitted.message);
+    const invoiceId = emitted.data.invoiceId;
+    for (const [index, amount] of [100, 400].entries()) {
+        const req = request(receipt(amount), {invoiceId}, `direct-quote-payment-${index}`);
+        const paid = await run(createInvoicePayment, req);
+        assert.equal(paid.status, 201, paid.message);
+        assert.equal(f.payments[index].carePackageId, pack.id);
+        assert.equal(f.payments[index].source, 'PACKAGE_PURCHASE');
+        const retry = await run(createInvoicePayment, req);
+        assert.equal(retry.status, 200, retry.message);
+        const detail = await run(getCarePackage, request({}, {id: pack.id}));
+        assert.equal(detail.data.balance, index === 0 ? 400 : 0);
+        assert.equal(detail.data.paidAmount, index === 0 ? 100 : 500);
+    }
+    assert.equal(f.invoices[0].status, 'paid'); assert.equal(f.payments.length, 2); assert.equal(f.ledger.length, 2);
+    assert.equal(f.ledger.reduce((sum, row) => sum + Number(row.amount), 0), 500);
+    assert.equal(pack.remainingUnits, 8);
+});
+
+it('keeps a documented zero-price quote settled without inventing a receipt', async t => {
+    const f = fixture(t), pack = quotedPackage({totalPrice: '0.00', lines: quotedPackage().lines.map((line: any) => ({...line, unitPrice: 0, total: 0}))});
+    f.packages.push(pack);
+    const detail = await run(getCarePackage, request({}, {id: pack.id}));
+    assert.equal(detail.status, 200, detail.message); assert.equal(detail.data.financialAvailable, true);
+    assert.equal(detail.data.totalPrice, 0); assert.equal(detail.data.balance, 0);
+    assert.equal(detail.data.paidAmount, 0); assert.equal(detail.data.paymentStatus, 'paid');
+    const emitted = await run(createPackageInvoice, request({}, {id: pack.id}, 'free-quote-invoice-001'));
+    assert.equal(emitted.status, 400, emitted.message); assert.equal(f.invoices.length, 0);
+    assert.equal(f.payments.length, 0); assert.equal(f.ledger.length, 0); assert.equal(pack.remainingUnits, 8);
+});
+
+it('requires quote read and payment permissions for a quote receipt and its account options', async t => {
+    const f = fixture(t), pack = quotedPackage(); f.packages.push(pack);
+    const req = request(receipt(100), {id: pack.id}, 'quote-rights-receipt-001');
+    req.user = {...req.user, isSuperAdmin: false, perms: ['quote:read:structure', 'payment:create:structure']};
+    const options = await run(packagePaymentOptions, {...req, query: {patientId}});
+    assert.equal(options.status, 200, options.message);
+    assert.equal((await run(createPackagePayment, req)).status, 200);
+    req.user.perms = ['quote:read:structure'];
+    assert.equal((await run(createPackagePayment, {...req, header: () => 'quote-denied-receipt-001'})).status, 403);
+    req.user.perms = ['payment:create:structure'];
+    assert.equal((await run(createPackagePayment, {...req, header: () => 'quote-no-read-receipt-001'})).status, 403);
+    assert.equal(f.payments.length, 1); assert.equal(f.ledger.length, 1);
+});
+
+it('keeps incomplete or unrelated historical packages financially unavailable', async t => {
+    const f = fixture(t), pack = quotedPackage({lines: [{itemType: 'SERVICE', quantity: 10}]}); f.packages.push(pack);
+    for (const data of [{quoteId: id(50)}, {quoteId: null, lines: quotedPackage().lines}]) {
+        await pack.update(data);
+        const detail = await run(getCarePackage, request({}, {id: pack.id}));
+        assert.equal(detail.status, 200, detail.message); assert.equal(detail.data.financialAvailable, false);
+        assert.equal(detail.data.paidAmount, null); assert.equal(detail.data.balance, null);
+        assert.equal((await run(createPackagePayment, request(receipt(100), {id: pack.id}, 'unavailable-receipt-001'))).status, 409);
+    }
+    assert.equal(f.payments.length, 0); assert.equal(f.ledger.length, 0);
+});
+
+it('projects the frozen quoted agreement for invoice review while keeping booking setup lines unchanged', async t => {
+    const f = fixture(t), pack = quotedPackage();
+    const agreedLines = pack.lines.map((line: any) => ({...line}));
+    pack.purchaseSnapshot = {quote: {id: pack.quoteId, total: 500, lines: agreedLines}};
+    pack.lines = pack.lines.map((line: any) => ({...line, description: 'Descrizione modificata', unitPrice: 100, total: line.quantity * 100}));
+    f.packages.push(pack);
+    const detail = await run(getCarePackage, request({}, {id: pack.id}));
+    assert.equal(detail.status, 200, detail.message); assert.equal(detail.data.financialAvailable, true);
+    assert.deepEqual(detail.data.lines, agreedLines);
+    assert.equal(detail.data.balance, 500);
+    assert.ok(detail.data.booking.setupLines.every((line: any) => line.description === 'Descrizione modificata'));
+    assert.equal(pack.lines[0].description, 'Descrizione modificata');
+});
 
 it('purchase, partial receipt, invoicing and final receipt retain exactly one cash ledger per receipt', async t => {
     const f = fixture(t);

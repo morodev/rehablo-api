@@ -5,6 +5,7 @@ import {sequelize} from '../../../config/database.js';
 export class ActivityChecklistItem extends Model {
     declare id: string;
     declare activityId: string;
+    declare executionId: string | null;
     declare createdByUserId: string;
     declare text: string;
     declare position: string;
@@ -19,6 +20,7 @@ export class ActivityChecklistItem extends Model {
 ActivityChecklistItem.init({
     id: {type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true},
     activityId: {type: DataTypes.UUID, allowNull: false},
+    executionId: {type: DataTypes.UUID, allowNull: true},
     createdByUserId: {type: DataTypes.UUID, allowNull: false},
     text: {type: DataTypes.STRING(300), allowNull: false, validate: {len: [1, 300]}},
     position: {type: DataTypes.BIGINT, allowNull: false, defaultValue: '0'},

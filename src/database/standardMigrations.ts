@@ -1,4 +1,5 @@
 import type {Sequelize, Transaction} from 'sequelize';
+import {createRequire} from 'node:module';
 import {env} from '../config/env.js';
 import {databaseManifest as legacyBaseline} from './migrationManifest.js';
 import {quoteTenantSchema, type MigrationStep} from './migrationTypes.js';
@@ -6,7 +7,9 @@ import {assertDatabaseReady, readMigrationNames, requiredMigrationNames} from '.
 
 export {requiredMigrationNames} from './migrationStatus.js';
 
-const [initialSchemaName, appointmentRemindersName] = requiredMigrationNames;
+const [initialSchemaName, appointmentRemindersName, quotePackageInvoicesName, activityRecurrencesName] = requiredMigrationNames;
+const quotePackageInvoiceLines = createRequire(import.meta.url)('../../migrations/20261031-quote-package-invoice-lines.js');
+const activityRecurrences = createRequire(import.meta.url)('../../migrations/20261031-activity-recurrences.js');
 const reminderStep = legacyBaseline.tenantMigrations.find(step => step.name === '20261028-appointment-reminders-v1')!;
 const tenantBaselineSteps = legacyBaseline.tenantMigrations.filter(step => step !== reminderStep);
 
@@ -87,7 +90,7 @@ async function applyLegacySteps(database: Sequelize, schema: string, steps: Migr
     }
 }
 
-/** New-tenant creation records the same two filenames atomically with its schema. */
+/** New-tenant creation records the release filenames atomically with its schema. */
 async function recordTenantMigration(database: Sequelize, schema: string, name: string, transaction: Transaction): Promise<void> {
     const registry = `${quoteTenantSchema(schema)}."SequelizeMeta"`;
     await database.query(`CREATE TABLE IF NOT EXISTS ${registry} ("name" VARCHAR(255) PRIMARY KEY NOT NULL)`, {transaction});
@@ -106,6 +109,18 @@ async function applyTenantReminders(database: Sequelize, schema: string, transac
     if (applied.includes(appointmentRemindersName)) return;
     await applyLegacySteps(database, schema, [reminderStep], transaction);
     await recordTenantMigration(database, schema, appointmentRemindersName, transaction);
+}
+
+async function applyTenantQuotePackageInvoices(database: Sequelize, schema: string, transaction: Transaction, applied: string[]): Promise<void> {
+    if (applied.includes(quotePackageInvoicesName)) return;
+    await quotePackageInvoiceLines.up(database.getQueryInterface(), {schema, transaction});
+    await recordTenantMigration(database, schema, quotePackageInvoicesName, transaction);
+}
+
+async function applyTenantActivityRecurrences(database: Sequelize, schema: string, transaction: Transaction, applied: string[]): Promise<void> {
+    if (applied.includes(activityRecurrencesName)) return;
+    await activityRecurrences.up(database.getQueryInterface(), {schema, transaction});
+    await recordTenantMigration(database, schema, activityRecurrencesName, transaction);
 }
 
 async function tenantSchemas(database: Sequelize): Promise<string[]> {
@@ -149,28 +164,68 @@ export async function migrateAppointmentReminders(database: Sequelize): Promise<
     }
 }
 
+/** Run the additive quote-package invoice migration without replaying frozen historical migrations. */
+export async function migrateQuotePackageInvoiceLines(database: Sequelize): Promise<void> {
+    for (const schema of await tenantSchemas(database)) {
+        try {
+            await database.transaction(async transaction => {
+                await prepareTenant(database, schema, transaction);
+                const applied = await readMigrationNames(database, schema, transaction);
+                await applyTenantBaseline(database, schema, transaction, applied);
+                await applyTenantReminders(database, schema, transaction, applied);
+                await applyTenantQuotePackageInvoices(database, schema, transaction, applied);
+            });
+        } catch (cause) {throw migrationFailure(`Quote package invoice migration failed for ${schema}`, cause);}
+    }
+}
+
+/** Additive recurrence release; previous migrations remain frozen. */
+export async function migrateActivityRecurrences(database: Sequelize): Promise<void> {
+    for (const schema of await tenantSchemas(database)) {
+        try {
+            await database.transaction(async transaction => {
+                await prepareTenant(database, schema, transaction);
+                const applied = await readMigrationNames(database, schema, transaction);
+                await applyTenantBaseline(database, schema, transaction, applied);
+                await applyTenantReminders(database, schema, transaction, applied);
+                await applyTenantQuotePackageInvoices(database, schema, transaction, applied);
+                await applyTenantActivityRecurrences(database, schema, transaction, applied);
+            });
+        } catch (cause) {throw migrationFailure(`Activity recurrence migration failed for ${schema}`, cause);}
+    }
+}
+
 /** Signup owns the transaction; no extra connection or global release lock is acquired. */
 export async function provisionTenantSchema(database: Sequelize, schema: string, transaction: Transaction): Promise<void> {
     await prepareTenant(database, schema, transaction);
     const applied = await readMigrationNames(database, schema, transaction);
     await applyTenantBaseline(database, schema, transaction, applied);
     await applyTenantReminders(database, schema, transaction, applied);
+    await applyTenantQuotePackageInvoices(database, schema, transaction, applied);
+    await applyTenantActivityRecurrences(database, schema, transaction, applied);
 }
 
-/** Adopt only tenants created by a legacy API after pre-deploy, once global CLI migrations succeeded. */
+/** Catch tenants registered by a preceding API after the CLI discovered its tenant list. */
 export async function reconcileTenantSchemas(database: Sequelize): Promise<number> {
     await assertDatabaseReady(database);
     const applied = await readMigrationNames(database);
     if (applied.some(name => !(requiredMigrationNames as readonly string[]).includes(name))) return 0;
-    // Completed schemas need no per-tenant reads. Only legacy registrations lack this metadata table:
-    // standard provisioning creates it in the same transaction as the tenant and its entire schema.
-    const [rows] = await database.query(`SELECT t.id FROM public.tenants t
+    const [rows] = await database.query(`SELECT t.id, c.oid IS NOT NULL AS "hasMetadata" FROM public.tenants t
         LEFT JOIN pg_namespace n ON n.nspname = 'rehablo_' || replace(t.id::text, '-', '')
         LEFT JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = 'SequelizeMeta' AND c.relkind = 'r'
-        WHERE c.oid IS NULL ORDER BY t.id`);
-    for (const {id} of rows as Array<{id: string}>) {
+        ORDER BY t.id`);
+    let reconciled = 0;
+    for (const {id, hasMetadata} of rows as Array<{id: string; hasMetadata: boolean}>) {
         const schema = 'rehablo_' + id.replaceAll('-', '');
+        if (hasMetadata) {
+            const names = await readMigrationNames(database, schema);
+            // Only upgrade the known preceding release; incomplete historical metadata still needs review.
+            if (names.includes(activityRecurrencesName) || !names.includes(initialSchemaName)
+                || !names.includes(appointmentRemindersName)
+                || names.some(name => !(requiredMigrationNames as readonly string[]).includes(name))) continue;
+        }
         await database.transaction(transaction => provisionTenantSchema(database, schema, transaction));
+        reconciled++;
     }
-    return rows.length;
+    return reconciled;
 }

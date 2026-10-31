@@ -3,7 +3,7 @@ import {
     ActivityAlertInput, ActivityArchiveInput, ActivityReviewInput, ActivityChanges, ActivityCreateInput,
     ActivityDue, ActivityDueFilter, ActivityMoveInput, ActivityPatchInput, ActivityPlacement,
     ActivityPriority, ActivityQuery, ActivityRecord, ActivityRestoreInput, ActivitySchedule,
-    ActivityStatus, ActivityView, ActivityChecklistCreateInput, ActivityChecklistPatchInput,
+    ActivityStatus, ActivityView, ActivityRecurrenceRule, ActivityRecurrenceTemplate, ActivityChecklistCreateInput, ActivityChecklistPatchInput,
     ActivityChecklistDeleteInput, ActivityChecklistMoveInput, ActivityChecklistPlacement,
     ActivityCommentCreateInput, ActivityCommentPatchInput, ActivityCommentDeleteInput, ActivityChildPageQuery
 } from '../activities.types.js';
@@ -58,51 +58,52 @@ function checklistPlacement(value: unknown): ActivityChecklistPlacement {
 }
 
 export function parseChecklistCreateInput(value: unknown): ActivityChecklistCreateInput {
-    const input = object(value, 'body'); whitelist(input, ['operationId', 'expectedChecklistRevision', 'text', 'placement']);
-    return {operationId: parseActivityId(input.operationId, 'operationId'),
+    const input = object(value, 'body'); whitelist(input, ['expectedExecutionId', 'operationId', 'expectedChecklistRevision', 'text', 'placement']);
+    return {...executionExpectation(input), operationId: parseActivityId(input.operationId, 'operationId'),
         expectedChecklistRevision: integer(input.expectedChecklistRevision, 'expectedChecklistRevision'),
         text: text(input.text, 'text', 300)!, placement: own(input, 'placement') ? checklistPlacement(input.placement) : {kind: 'end'}};
 }
 export function parseChecklistPatchInput(value: unknown): ActivityChecklistPatchInput {
-    const input = object(value, 'body'); whitelist(input, ['operationId', 'expectedVersion', 'changes', 'allowReopen', 'expectedActivityVersion']);
+    const input = object(value, 'body'); whitelist(input, ['expectedExecutionId', 'operationId', 'expectedVersion', 'changes', 'allowReopen', 'expectedActivityVersion']);
     const changes = object(input.changes, 'changes'); whitelist(changes, ['text', 'checked'], 'changes');
     if (!Object.keys(changes).length) activityValidationError('changes', 'Indica il testo oppure lo stato da aggiornare.');
-    return {operationId: parseActivityId(input.operationId, 'operationId'), expectedVersion: integer(input.expectedVersion, 'expectedVersion', 1),
+    return {...executionExpectation(input), operationId: parseActivityId(input.operationId, 'operationId'), expectedVersion: integer(input.expectedVersion, 'expectedVersion', 1),
         ...(own(input, 'allowReopen') ? {allowReopen: boolean(input.allowReopen, 'allowReopen')} : {}),
         ...(own(input, 'expectedActivityVersion') ? {expectedActivityVersion: integer(input.expectedActivityVersion, 'expectedActivityVersion', 1)} : {}),
         changes: {...(own(changes, 'text') ? {text: text(changes.text, 'changes.text', 300)!} : {}),
             ...(own(changes, 'checked') ? {checked: boolean(changes.checked, 'changes.checked')} : {})}};
 }
 export function parseChecklistDeleteInput(value: unknown): ActivityChecklistDeleteInput {
-    const input = object(value, 'body'); whitelist(input, ['operationId', 'expectedVersion', 'expectedChecklistRevision']);
-    return {operationId: parseActivityId(input.operationId, 'operationId'), expectedVersion: integer(input.expectedVersion, 'expectedVersion', 1),
+    const input = object(value, 'body'); whitelist(input, ['expectedExecutionId', 'operationId', 'expectedVersion', 'expectedChecklistRevision']);
+    return {...executionExpectation(input), operationId: parseActivityId(input.operationId, 'operationId'), expectedVersion: integer(input.expectedVersion, 'expectedVersion', 1),
         expectedChecklistRevision: integer(input.expectedChecklistRevision, 'expectedChecklistRevision')};
 }
 export function parseChecklistMoveInput(value: unknown): ActivityChecklistMoveInput {
-    const input = object(value, 'body'); whitelist(input, ['operationId', 'expectedChecklistRevision', 'placement']);
-    return {operationId: parseActivityId(input.operationId, 'operationId'),
+    const input = object(value, 'body'); whitelist(input, ['expectedExecutionId', 'operationId', 'expectedChecklistRevision', 'placement']);
+    return {...executionExpectation(input), operationId: parseActivityId(input.operationId, 'operationId'),
         expectedChecklistRevision: integer(input.expectedChecklistRevision, 'expectedChecklistRevision'), placement: checklistPlacement(input.placement)};
 }
 export function parseCommentCreateInput(value: unknown): ActivityCommentCreateInput {
-    const input = object(value, 'body'); whitelist(input, ['operationId', 'text']);
-    return {operationId: parseActivityId(input.operationId, 'operationId'), text: text(input.text, 'text', 5000)!};
+    const input = object(value, 'body'); whitelist(input, ['expectedExecutionId', 'operationId', 'text']);
+    return {...executionExpectation(input), operationId: parseActivityId(input.operationId, 'operationId'), text: text(input.text, 'text', 5000)!};
 }
 export function parseCommentPatchInput(value: unknown): ActivityCommentPatchInput {
-    const input = object(value, 'body'); whitelist(input, ['operationId', 'expectedVersion', 'text']);
-    return {operationId: parseActivityId(input.operationId, 'operationId'), expectedVersion: integer(input.expectedVersion, 'expectedVersion', 1),
+    const input = object(value, 'body'); whitelist(input, ['expectedExecutionId', 'operationId', 'expectedVersion', 'text']);
+    return {...executionExpectation(input), operationId: parseActivityId(input.operationId, 'operationId'), expectedVersion: integer(input.expectedVersion, 'expectedVersion', 1),
         text: text(input.text, 'text', 5000)!};
 }
 export function parseCommentDeleteInput(value: unknown): ActivityCommentDeleteInput {
-    const input = object(value, 'body'); whitelist(input, ['operationId', 'expectedVersion']);
-    return {operationId: parseActivityId(input.operationId, 'operationId'), expectedVersion: integer(input.expectedVersion, 'expectedVersion', 1)};
+    const input = object(value, 'body'); whitelist(input, ['expectedExecutionId', 'operationId', 'expectedVersion']);
+    return {...executionExpectation(input), operationId: parseActivityId(input.operationId, 'operationId'), expectedVersion: integer(input.expectedVersion, 'expectedVersion', 1)};
 }
 export function parseActivityChildPageQuery(value: Record<string, unknown>): ActivityChildPageQuery {
-    whitelist(value, ['limit', 'cursor', 'offset', 'pagination']);
+    whitelist(value, ['limit', 'cursor', 'offset', 'pagination', 'expectedExecutionId', 'scope']);
+    if (value.scope !== undefined && value.scope !== 'routine') activityValidationError('scope', 'Controlla la cronologia richiesta.');
     if (value.pagination !== undefined && value.pagination !== 'cursor') activityValidationError('pagination', 'Usa la paginazione con cursore.');
     const offsetValue = value.offset === undefined ? '0' : queryString(value.offset, 'offset');
     if (!/^\d+$/.test(offsetValue) || !Number.isSafeInteger(Number(offsetValue))) activityValidationError('offset', 'La pagina richiesta non è valida.');
     if (value.cursor !== undefined && Number(offsetValue)) activityValidationError('cursor', 'Usa il cursore per caricare la pagina successiva.');
-    return {limit: value.limit === undefined ? 20 : queryLimit(value.limit, 'limit'),
+    return {...(value.scope === 'routine' ? {scope: 'routine' as const} : {}), limit: value.limit === undefined ? 20 : queryLimit(value.limit, 'limit'),
         cursor: value.cursor === undefined ? null : cursor(value.cursor, 'cursor'), offset: Number(offsetValue)};
 }
 
@@ -190,10 +191,15 @@ export function parseActivityAlert(value: unknown): ActivityAlertInput | null {
     return {scheduledAt: parseActivityUtcInstant(alert.scheduledAt, 'alert.scheduledAt'), channels};
 }
 
-const CORE_FIELDS = ['title', 'description', 'priority', 'assigneeIds', 'due', 'alert', 'patientId', 'agendaEventId', 'reviewerUserId'] as const;
+const CORE_FIELDS = ['title', 'description', 'priority', 'assigneeIds', 'due', 'alert', 'patientId', 'agendaEventId', 'reviewerUserId', 'recurrence', 'recurrenceTemplate'] as const;
 
 function coreChanges(value: Record<string, unknown>, timezone: string): ActivityChanges {
     const changes: ActivityChanges = {};
+    if (own(value, 'recurrenceTemplate')) {
+        if (!own(value, 'recurrence')) activityValidationError('recurrenceTemplate', 'Indica anche la regola della ripetizione.');
+        changes.recurrenceTemplate = parseRecurrenceTemplate(value.recurrenceTemplate);
+    }
+    if (own(value, 'recurrence')) changes.recurrence = parseActivityRecurrence(value.recurrence);
     if (own(value, 'title')) changes.title = text(value.title, 'title', 200)!;
     if (own(value, 'description')) changes.description = text(value.description, 'description', 5000, false);
     if (own(value, 'priority')) changes.priority = choice(value.priority, ACTIVITY_PRIORITIES, 'priority');
@@ -208,7 +214,7 @@ function coreChanges(value: Record<string, unknown>, timezone: string): Activity
 
 export function parseCreateActivityInput(value: unknown, options: {timezone?: string; defaultAssigneeIds?: string[]} = {}): ActivityCreateInput {
     const input = object(value, 'body');
-    whitelist(input, [...CORE_FIELDS, 'operationId', 'status', 'checklist']);
+    whitelist(input, [...CORE_FIELDS.filter(field => field !== 'recurrenceTemplate'), 'operationId', 'status', 'checklist']);
     const changes = coreChanges(input, options.timezone ?? ACTIVITY_TIMEZONE);
     const checklist: Array<{text: string}> = [];
     if (own(input, 'checklist')) {
@@ -220,7 +226,7 @@ export function parseCreateActivityInput(value: unknown, options: {timezone?: st
         });
     }
     return {
-        operationId: parseActivityId(input.operationId, 'operationId'),
+        ...executionExpectation(input), operationId: parseActivityId(input.operationId, 'operationId'),
         title: changes.title ?? text(undefined, 'title', 200)!,
         description: changes.description ?? null,
         status: own(input, 'status') ? choice(input.status, ACTIVITY_STATUSES, 'status') : 'TODO',
@@ -231,18 +237,22 @@ export function parseCreateActivityInput(value: unknown, options: {timezone?: st
         alert: changes.alert ?? null,
         patientId: changes.patientId ?? null,
         agendaEventId: changes.agendaEventId ?? null,
-        checklist
+        checklist,
+        ...(changes.recurrence ? {recurrence: changes.recurrence} : {})
     };
 }
 
 export function parsePatchActivityInput(value: unknown, timezone = ACTIVITY_TIMEZONE): ActivityPatchInput {
     const input = object(value, 'body');
-    whitelist(input, ['operationId', 'expectedVersion', 'changes']);
+    whitelist(input, ['expectedExecutionId', 'operationId', 'expectedVersion', 'changes']);
     const changes = object(input.changes, 'changes');
     whitelist(changes, CORE_FIELDS, 'changes');
+    if (own(changes, 'recurrence') && Object.keys(changes).some(key => key !== 'recurrence' && key !== 'recurrenceTemplate')) {
+        activityValidationError('changes', 'Salva separatamente la configurazione della routine e le modifiche della giornata.');
+    }
     if (!Object.keys(changes).length) activityValidationError('changes', 'Indica almeno un campo da modificare.');
     return {
-        operationId: parseActivityId(input.operationId, 'operationId'),
+        ...executionExpectation(input), operationId: parseActivityId(input.operationId, 'operationId'),
         expectedVersion: integer(input.expectedVersion, 'expectedVersion', 1),
         changes: coreChanges(changes, timezone)
     };
@@ -250,9 +260,9 @@ export function parsePatchActivityInput(value: unknown, timezone = ACTIVITY_TIME
 
 function versionedCommand(value: unknown, extra: readonly string[] = []): {input: Record<string, unknown>; base: ActivityArchiveInput} {
     const input = object(value, 'body');
-    whitelist(input, ['operationId', 'expectedVersion', 'expectedOrderRevision', ...extra]);
+    whitelist(input, ['expectedExecutionId', 'operationId', 'expectedVersion', 'expectedOrderRevision', ...extra]);
     return {input, base: {
-        operationId: parseActivityId(input.operationId, 'operationId'),
+        ...executionExpectation(input), operationId: parseActivityId(input.operationId, 'operationId'),
         expectedVersion: integer(input.expectedVersion, 'expectedVersion', 1),
         expectedOrderRevision: integer(input.expectedOrderRevision, 'expectedOrderRevision')
     }};
@@ -285,7 +295,8 @@ export function parseMoveActivityInput(value: unknown): ActivityMoveInput {
 }
 
 export function parseArchiveActivityInput(value: unknown): ActivityArchiveInput {
-    return versionedCommand(value).base;
+    const {input, base} = versionedCommand(value, ['scope']);
+    return {...base, ...(own(input, 'scope') ? {scope: choice(input.scope, ['execution', 'routine'] as const, 'scope')} : {})};
 }
 export function parseRestoreActivityInput(value: unknown): ActivityRestoreInput {
     return versionedCommand(value).base;
@@ -330,7 +341,7 @@ export function parseActivityQuery(value: unknown): ActivityQuery {
     const requestedStatuses = input.statuses === undefined ? []
         : queryString(input.statuses, 'statuses').split(',').map(value => choice(value, ACTIVITY_STATUSES, 'statuses'));
     return {
-        view: input.view === undefined ? 'board' : choice(queryString(input.view, 'view'), ['board', 'list', 'archived'] as readonly ActivityView[], 'view'),
+        view: input.view === undefined ? 'board' : choice(queryString(input.view, 'view'), ['board', 'list', 'archived', 'recurring'] as readonly ActivityView[], 'view'),
         search: input.search === undefined ? '' : text(queryString(input.search, 'search'), 'search', 200, false) ?? '',
         mine: queryBoolean(input.mine, 'mine'),
         statuses: ACTIVITY_STATUSES.filter(status => requestedStatuses.includes(status)),
@@ -464,3 +475,24 @@ export function isActivityOverdue(due: ActivityDue, status: ActivityStatus, arch
     const deadline = effectiveDueAt(due);
     return !!deadline && !archivedAt && status !== 'COMPLETED' && deadline.getTime() < evaluationAt.getTime();
 }
+
+function executionExpectation(input: Record<string, unknown>): {expectedExecutionId?: string | null} {
+    return own(input, 'expectedExecutionId') ? {expectedExecutionId: nullableId(input.expectedExecutionId, 'expectedExecutionId')} : {};
+}
+
+export function parseActivityRecurrence(value: unknown): ActivityRecurrenceRule {
+    return parseActivityRecurrenceRule(value);
+}
+
+function parseRecurrenceTemplate(value: unknown): ActivityRecurrenceTemplate {
+    const input = object(value, 'recurrenceTemplate');
+    whitelist(input, ['title','description','priority','assigneeIds','reviewerUserId','patientId','agendaEventId','checklist'], 'recurrenceTemplate');
+    const changes = coreChanges(input, ACTIVITY_TIMEZONE);
+    if (!Array.isArray(input.checklist)) activityValidationError('recurrenceTemplate.checklist', 'Inserisci una checklist valida.');
+    return {title: text(input.title, 'recurrenceTemplate.title', 200)!, description: changes.description ?? null,
+        priority: changes.priority ?? 'NORMAL', assigneeIds: changes.assigneeIds ?? [], reviewerUserId: changes.reviewerUserId ?? null,
+        patientId: changes.patientId ?? null, agendaEventId: changes.agendaEventId ?? null,
+        checklist: input.checklist.map((raw, index) => {const item = object(raw, 'recurrenceTemplate.checklist.' + index);
+            whitelist(item, ['text']); return {text: text(item.text, 'recurrenceTemplate.checklist.' + index + '.text', 300)!};})};
+}
+import {parseActivityRecurrenceRule} from './activityRecurrence.policy.js';

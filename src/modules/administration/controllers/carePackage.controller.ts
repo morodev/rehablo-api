@@ -18,7 +18,7 @@ import {CarePackage, FinancialAccount, PackageConsumption, PackageTemplate, Paym
 import {treasuryError} from '../services/treasuryValidation.service.js';
 import {readFinancialOptions} from '../services/financialAccountResolver.service.js';
 import {lockPackageOperation, normalizePackageReceipt, packageAccessRequest, packageIdempotency,
-    packagePatient, packagePatientWhere, packageSelectedStructure, packageService, packageToday, packageUuid, recordPackageReceipt, scopedCarePackage} from '../services/carePackage.service.js';
+    packagePatient, packagePatientWhere, packageSelectedStructure, packageService, packageToday, packageUuid, recordPackageReceipt} from '../services/carePackage.service.js';
 
 import {decorateCarePackages} from '../services/carePackageProjection.service.js';
 import {configurePackageBooking} from '../services/packageBooking.service.js';
@@ -143,18 +143,22 @@ export const createCarePackage = asyncHandler(async (req, res) => {
 });
 export const createPackagePayment = asyncHandler(async (req, res) => {
     const id = packageUuid(req.params.id), input = normalizePackageReceipt(req.body), key = packageIdempotency(req);
-    const snapshot = await scopedCarePackage(req, id);
+    const snapshot = await scopedReadableCarePackage(req, id);
     await sequelize.transaction(async transaction => {
         await lockPackageOperation(req.tenantSchema!, key, transaction);
         await lockPatientSettlement(req.tenantSchema!, String(snapshot.get('patientId')), transaction);
-        const pack = await scopedCarePackage(req, id, transaction, true);
+        const pack = await scopedReadableCarePackage(req, id, transaction, true);
         await recordPackageReceipt(req, pack, input, key, transaction);
     });
     return sendSuccessResponse(res, 200, await carePackageDetail(req, id));
 });
 export const packagePaymentOptions = asyncHandler(async (req, res) => {
     const patient = await packagePatient(req, req.query.patientId, 'payment', 'create');
-    await packagePatient(req, req.query.patientId);
+    try {await packagePatient(req, req.query.patientId);}
+    catch (error) {
+        if (![403, 404].includes((error as {statusCode?: number}).statusCode ?? 0)) throw error;
+        await packagePatient(req, req.query.patientId, 'quote', 'read');
+    }
     const options = await readFinancialOptions(req.tenantSchema!, String(patient.get('structureId')));
     return sendSuccessResponse(res, 200, {...options, methods: options.paymentMethods});
 });
@@ -162,11 +166,11 @@ export const voidPackagePayment = asyncHandler(async (req, res) => {
     const id = packageUuid(req.params.id), paymentId = packageUuid(req.params.paymentId, 'Incasso');
     const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
     if (!reason || reason.length > 1000) treasuryError('Indica il motivo dell’annullamento (massimo 1000 caratteri)');
-    const snapshot = await scopedCarePackage(req, id);
+    const snapshot = await scopedReadableCarePackage(req, id);
     await packagePatient(req, snapshot.get('patientId'), 'payment_reversal', 'create');
     await sequelize.transaction(async transaction => {
         await lockPatientSettlement(req.tenantSchema!, String(snapshot.get('patientId')), transaction);
-        const pack = await scopedCarePackage(req, id, transaction, true);
+        const pack = await scopedReadableCarePackage(req, id, transaction, true);
         const payment = await InvoicePayment.schema(req.tenantSchema!).findOne({where: {id: paymentId, carePackageId: id}, transaction, lock: transaction.LOCK.UPDATE});
         if (!payment) treasuryError('Incasso del pacchetto non trovato', 404);
         if (payment.source !== 'PACKAGE_PURCHASE') treasuryError('Questa copertura non è un incasso del pacchetto', 409);

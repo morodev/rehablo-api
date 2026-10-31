@@ -2,7 +2,7 @@ import {
     ACTIVITY_ALERT_CHANNELS, ActivityAlertDto, ActivityAlertRecord, ActivityBoardDto,
     ActivityBoardRecord, ActivityCardDto, ActivityContext, ActivityRecord, ActivityUserSummary
 } from '../activities.types.js';
-import {activityCapabilities} from '../services/activityAccess.service.js';
+import {activityCapabilities, canManageActivityRecurrence} from '../services/activityAccess.service.js';
 import {dueFromActivity, isActivityOverdue} from './activityValidation.js';
 
 export interface ActivitySerializationOptions {
@@ -18,6 +18,7 @@ export interface ActivitySerializationOptions {
     evaluationAt?: Date;
     /** Supply only links returned by the current linked-resource access policy. */
     links?: {patientId: string | null; agendaEventId: string | null};
+    templateLinks?: {patientId: string | null; agendaEventId: string | null};
 }
 
 function iso(value: Date | string | null | undefined): string | null {
@@ -89,7 +90,18 @@ export function serializeActivity(
         isOverdue: isActivityOverdue(due, activity.status, archivedAt, options.evaluationAt),
         checklistProgress: {total: progress.total, checked: progress.checked},
         commentCount: options.commentCount ?? 0,
-        capabilities: activityCapabilities(context, activity, assigneeIds)
+        capabilities: activityCapabilities(context, activity, assigneeIds),
+        ...(activity.recurrence ? {recurrence: {frequency: activity.recurrence.frequency, interval: activity.recurrence.interval,
+            startsOn: activity.recurrence.startsOn, endsOn: activity.recurrence.endsOn, status: activity.recurrence.status,
+            nextDate: activity.recurrence.nextDate, blockedReason: activity.recurrence.blockedReason,
+            canManage: canManageActivityRecurrence(context, activity),
+            template: {...activity.recurrence.template,
+                assignees: activity.recurrence.template.assigneeIds.map(id => person(options.people?.get(id)) ?? {id, name: null, surname: null, eligible: false}),
+                reviewer: activity.recurrence.template.reviewerUserId ? person(options.people?.get(activity.recurrence.template.reviewerUserId))
+                    ?? {id: activity.recurrence.template.reviewerUserId, name: null, surname: null, eligible: false} : null,
+                patientId: options.templateLinks?.patientId ?? null, agendaEventId: options.templateLinks?.agendaEventId ?? null}},
+            currentExecutionId: activity.currentExecutionId ?? null, executionDate: activity.executionDate ?? null,
+            executionClosedAt: iso(activity.executionClosedAt), lateUpdatedAt: iso(activity.lateUpdatedAt)} : {})
     };
 }
 

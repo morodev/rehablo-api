@@ -4,13 +4,14 @@ import {frontendEmailLink, transporter} from '../../../services/email.service.js
 import type ReminderPushSubscription from '../../notes/models/reminderPushSubscription.model.js';
 import {getPushPublicKey} from '../../notes/services/reminderExternalDelivery.service.js';
 
-export interface ActivityDeliveryAddress {tenantId: string; structureId: string; activityId: string; deliveryId: string;}
+export interface ActivityDeliveryAddress {tenantId: string; structureId: string; activityId: string; deliveryId: string; executionId?: string;}
 export interface ActivityDeliveryTransport {
     email(to: string, address: ActivityDeliveryAddress): Promise<string | null>;
     push(subscription: ReminderPushSubscription, address: ActivityDeliveryAddress): Promise<string | null>;
 }
 export function activityNotificationPath(address: ActivityDeliveryAddress): string {
-    return 'activities/open?' + new URLSearchParams({tenantId: address.tenantId, structureId: address.structureId, activityId: address.activityId});
+    return 'activities/open?' + new URLSearchParams({tenantId: address.tenantId, structureId: address.structureId, activityId: address.activityId,
+        ...(address.executionId ? {executionId: address.executionId} : {})});
 }
 let vapidConfigured = false;
 const productionTransport: ActivityDeliveryTransport = {

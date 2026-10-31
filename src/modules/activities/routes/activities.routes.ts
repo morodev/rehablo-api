@@ -1,3 +1,4 @@
+import {getActivityExecutions} from '../services/activityExecutions.service.js';
 import {reviewActivity} from '../services/activityWorkflow.service.js';
 import {randomUUID} from 'node:crypto';
 import {Request, Response, Router} from 'express';
@@ -61,29 +62,33 @@ router.post('/activities', handle(async (req, res) => {
     return sendSuccessResponse(res, result.status, result.data, 'Attività creata.');
 }));
 
-router.get('/activities/:activityId/history', handle(async (req, res) =>
+router.get('/activities/:activityId/executions', handle(async (req, res) =>
+    sendSuccessResponse(res, 200, await getActivityExecutions(req, req.params.activityId))));
+router.get('/activities/:activityId/executions/:executionId', handle(async (req, res) =>
+    sendSuccessResponse(res, 200, await getActivity(req, req.params.activityId))));
+router.get(['/activities/:activityId/history', '/activities/:activityId/executions/:executionId/history'], handle(async (req, res) =>
     sendSuccessResponse(res, 200, await getActivityHistory(req, req.params.activityId))));
-router.get('/activities/:activityId/comments', handle(async (req, res) =>
+router.get(['/activities/:activityId/comments', '/activities/:activityId/executions/:executionId/comments'], handle(async (req, res) =>
     sendSuccessResponse(res, 200, await getActivityChildPage(req, req.params.activityId, 'comments'))));
-router.get('/activities/:activityId/checklist', handle(async (req, res) =>
+router.get(['/activities/:activityId/checklist', '/activities/:activityId/executions/:executionId/checklist'], handle(async (req, res) =>
     sendSuccessResponse(res, 200, await getActivityChecklist(req, req.params.activityId))));
-router.post('/activities/:activityId/checklist', handle(async (req, res) =>
+router.post(['/activities/:activityId/checklist', '/activities/:activityId/executions/:executionId/checklist'], handle(async (req, res) =>
     sendChildMutation(res, await addChecklistItem(req, req.params.activityId, parseChecklistCreateInput(req.body)))));
-router.patch('/activities/:activityId/checklist/:itemId', handle(async (req, res) =>
+router.patch(['/activities/:activityId/checklist/:itemId', '/activities/:activityId/executions/:executionId/checklist/:itemId'], handle(async (req, res) =>
     sendChildMutation(res, await patchChecklistItem(req, req.params.activityId, req.params.itemId, parseChecklistPatchInput(req.body)))));
-router.delete('/activities/:activityId/checklist/:itemId', handle(async (req, res) =>
+router.delete(['/activities/:activityId/checklist/:itemId', '/activities/:activityId/executions/:executionId/checklist/:itemId'], handle(async (req, res) =>
     sendChildMutation(res, await deleteChecklistItem(req, req.params.activityId, req.params.itemId, parseChecklistDeleteInput(req.body)))));
-router.post('/activities/:activityId/checklist/:itemId/move', handle(async (req, res) =>
+router.post(['/activities/:activityId/checklist/:itemId/move', '/activities/:activityId/executions/:executionId/checklist/:itemId/move'], handle(async (req, res) =>
     sendChildMutation(res, await moveChecklistItem(req, req.params.activityId, req.params.itemId, parseChecklistMoveInput(req.body)))));
-router.post('/activities/:activityId/comments', handle(async (req, res) =>
+router.post(['/activities/:activityId/comments', '/activities/:activityId/executions/:executionId/comments'], handle(async (req, res) =>
     sendChildMutation(res, await createActivityComment(req, req.params.activityId, parseCommentCreateInput(req.body)))));
-router.patch('/activities/:activityId/comments/:commentId', handle(async (req, res) =>
+router.patch(['/activities/:activityId/comments/:commentId', '/activities/:activityId/executions/:executionId/comments/:commentId'], handle(async (req, res) =>
     sendChildMutation(res, await updateActivityComment(req, req.params.activityId, req.params.commentId, parseCommentPatchInput(req.body)))));
-router.delete('/activities/:activityId/comments/:commentId', handle(async (req, res) =>
+router.delete(['/activities/:activityId/comments/:commentId', '/activities/:activityId/executions/:executionId/comments/:commentId'], handle(async (req, res) =>
     sendChildMutation(res, await updateActivityComment(req, req.params.activityId, req.params.commentId, parseCommentDeleteInput(req.body), true))));
-router.post('/activities/:activityId/review', handle(async (req, res) =>
+router.post(['/activities/:activityId/review', '/activities/:activityId/executions/:executionId/review'], handle(async (req, res) =>
     sendChildMutation(res, await reviewActivity(req, req.params.activityId, parseActivityReviewInput(req.body)))));
-router.post('/activities/:activityId/move', handle(async (req, res) => {
+router.post(['/activities/:activityId/move', '/activities/:activityId/executions/:executionId/move'], handle(async (req, res) => {
     const result = await moveActivity(req, req.params.activityId, parseMoveActivityInput(req.body));
     if (result.replayed) res.setHeader('Idempotent-Replayed', 'true');
     return sendSuccessResponse(res, result.status, result.data, 'Attività aggiornata.');
@@ -102,6 +107,7 @@ router.post('/activities/:activityId/restore', handle(async (req, res) => {
 router.put('/activities/:activityId/alert', handle(async (req, res) => {
     alertBody(req.body, true);
     const input = parsePatchActivityInput({operationId: req.body.operationId, expectedVersion: req.body.expectedVersion,
+        ...('expectedExecutionId' in req.body ? {expectedExecutionId: req.body.expectedExecutionId} : {}),
         changes: {alert: req.body.alert}});
     const result = await patchActivity(req, req.params.activityId, input, 'alert.configure');
     if (result.replayed) res.setHeader('Idempotent-Replayed', 'true');
@@ -109,14 +115,15 @@ router.put('/activities/:activityId/alert', handle(async (req, res) => {
 }));
 router.delete('/activities/:activityId/alert', handle(async (req, res) => {
     alertBody(req.body, false);
-    const input = parsePatchActivityInput({operationId: req.body.operationId, expectedVersion: req.body.expectedVersion, changes: {alert: null}});
+    const input = parsePatchActivityInput({operationId: req.body.operationId, expectedVersion: req.body.expectedVersion,
+        ...('expectedExecutionId' in req.body ? {expectedExecutionId: req.body.expectedExecutionId} : {}), changes: {alert: null}});
     const result = await patchActivity(req, req.params.activityId, input, 'alert.disable');
     if (result.replayed) res.setHeader('Idempotent-Replayed', 'true');
     return sendSuccessResponse(res, result.status, result.data, 'Avviso disattivato.');
 }));
 
 router.get('/activities/:activityId', handle(async (req, res) => sendSuccessResponse(res, 200, await getActivity(req, req.params.activityId))));
-router.patch('/activities/:activityId', handle(async (req, res) => {
+router.patch(['/activities/:activityId', '/activities/:activityId/executions/:executionId'], handle(async (req, res) => {
     const result = await patchActivity(req, req.params.activityId, parsePatchActivityInput(req.body));
     if (result.replayed) res.setHeader('Idempotent-Replayed', 'true');
     return sendSuccessResponse(res, result.status, result.data, 'Modifiche salvate.');
@@ -129,7 +136,7 @@ function sendChildMutation(res: Response, result: {status: number; replayed: boo
 
 function alertBody(value: unknown, enabled: boolean): asserts value is Record<string, unknown> {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ActivityError('INVALID_ALERT', 422, 'Controlla i dati dell’avviso.');
-    const permitted = enabled ? ['operationId', 'expectedVersion', 'alert'] : ['operationId', 'expectedVersion'];
+    const permitted = enabled ? ['operationId', 'expectedVersion', 'expectedExecutionId', 'alert'] : ['operationId', 'expectedVersion', 'expectedExecutionId'];
     if (Object.keys(value).some(key => !permitted.includes(key)) || (enabled && !(value as Record<string, unknown>).alert)) {
         throw new ActivityError('INVALID_ALERT', 422, 'Controlla i dati dell’avviso.', {alert: 'Indica la data e l’ora dell’avviso.'});
     }

@@ -13,7 +13,9 @@ import {getRolePermissions, isRoleCode, resolveEffectiveRole, RoleCode, ROLE_DEF
 import {hasPermission} from '../rbac/permissions.js';
 import {canChangeAssignedStructures, validateUserStructureSelection} from './userStructurePolicy.service.js';
 import {defaultCalendarEnabled} from './structureCalendar.service.js';
-import {Activity, ActivityAlert, ActivityAssignment, ActivityBoard, ActivityDelivery, ActivityHistory, ActivityOperation} from '../../activities/models/index.js';
+import {Activity, ActivityAlert, ActivityAssignment, ActivityBoard, ActivityDelivery, ActivityExecution, ActivityHistory, ActivityOperation} from '../../activities/models/index.js';
+import {captureCurrentExecution, sealActivityExecution} from '../../activities/services/activityRecurrence.service.js';
+import {activityLocalDate} from '../../activities/utils/activityValidation.js';
 import {assignableActivityUsers, isEligibleActivityRole} from '../../activities/services/activityAccess.service.js';
 import {invalidateActivityReview} from '../../activities/services/activityWorkflow.service.js';
 import {cancelActivityDeliveries, materializeActivityDeliveries} from '../../activities/services/activityDeliveryPersistence.service.js';
@@ -42,7 +44,7 @@ export interface TeamOffboardingImpact {
         structureName: string;
         appointments: Awaited<ReturnType<typeof getOperatorDeactivationImpact>>;
         activities: {
-            openAssignedCount: number; reviewCount?: number;
+            openAssignedCount: number; reviewCount?: number; recurringCount?: number;
             orphanCount: number;
             alertsDisabledCount: number;
             replacementOperators: Array<{id: string; fullName: string}>;
@@ -139,6 +141,7 @@ interface PreparedTeamChange {
     nextStructureIds: string[];
     impact: TeamOffboardingImpact;
     activityRows: Map<string, Activity[]>;
+    recurrenceRows: Map<string, Activity[]>;
     assignmentRows: Map<string, ActivityAssignment[]>;
     eligibleIds: Map<string, Set<string>>;
 }
@@ -197,6 +200,7 @@ async function prepare(
         return !after && (before || removed);
     }).map(row => row.structureId);
     const activityRows = new Map<string, Activity[]>();
+    const recurrenceRows = new Map<string, Activity[]>();
     const assignmentRows = new Map<string, ActivityAssignment[]>();
     const eligibleIds = new Map<string, Set<string>>();
     const impact: TeamOffboardingImpact = {fingerprint: '', structures: []};
@@ -215,9 +219,14 @@ async function prepare(
                 attributes: ['id', 'start', 'end', 'recurrence', 'status', 'updatedAt'], order: [['id', 'ASC']], transaction,
                 ...(lock ? {lock: transaction.LOCK.UPDATE} : {})})
         ]);
-        const rows = await Activity.schema(actor.schema).findAll({where: {boardId: board.id,
+        const rows = (await Activity.schema(actor.schema).findAll({where: {boardId: board.id,
             [Op.or]: [{id: {[Op.in]: assignments.map(row => row.activityId)}}, {reviewerUserId: targetUserId}],
-            archivedAt: null, status: {[Op.ne]: 'COMPLETED'}}, order: [['id', 'ASC']], transaction});
+            archivedAt: null, status: {[Op.ne]: 'COMPLETED'}}, order: [['id', 'ASC']], transaction}))
+            .filter(row => !row.recurrence || !!row.currentExecutionId && !!row.dueDate && row.dueDate >= activityLocalDate(new Date()));
+        const recurring = (await Activity.schema(actor.schema).findAll({where: {boardId: board.id,
+            archivedAt: null, recurrence: {[Op.ne]: null}}, order: [['id', 'ASC']], transaction}))
+            .filter(row => row.recurrence?.status === 'active' && (row.recurrence.template.assigneeIds.includes(targetUserId)
+                || row.recurrence.template.reviewerUserId === targetUserId));
         const allAssignments = rows.length ? await ActivityAssignment.schema(actor.schema).findAll({where: {
             activityId: {[Op.in]: rows.map(row => row.id)}}, order: [['activityId', 'ASC'], ['userId', 'ASC']], transaction}) : [];
         const enabledAlerts = rows.length ? await ActivityAlert.schema(actor.schema).findAll({where: {
@@ -225,6 +234,13 @@ async function prepare(
         const eligibleSet = new Set(eligible.filter(row => row.id !== targetUserId).map(row => row.id));
         const assignedRows = rows.filter(row => assignments.some(assignment => assignment.activityId === row.id));
         const orphaned = assignedRows.filter(row => !allAssignments.some(item => item.activityId === row.id && eligibleSet.has(item.userId)));
+        const recurringAssigned = recurring.filter(row => row.recurrence!.template.assigneeIds.includes(targetUserId));
+        const recurringOrphaned = recurringAssigned.filter(row => !row.recurrence!.template.assigneeIds.some(id => eligibleSet.has(id)));
+        const impactedRows = [...new Map([...rows, ...recurring].map(row => [row.id, row])).values()];
+        const orphanedIds = new Set([...orphaned, ...recurringOrphaned].map(row => row.id));
+        const assignedIds = new Set([...assignedRows, ...recurringAssigned].map(row => row.id));
+        const reviewIds = new Set([...rows.filter(row => row.reviewerUserId === targetUserId),
+            ...recurring.filter(row => row.recurrence!.template.reviewerUserId === targetUserId)].map(row => row.id));
         const visibleRole = resolveEffectiveRole(actor.role, actorStructures.find(row => row.structureId === structureId)?.role);
         const canReadDetails = actorStructures.some(row => row.structureId === structureId)
             && hasPermission(getRolePermissions(visibleRole), 'activity', 'read', 'structure');
@@ -233,22 +249,24 @@ async function prepare(
             order: [['id', 'ASC']], transaction, ...(lock ? {lock: transaction.LOCK.UPDATE} : {})}) : [];
         impact.structures.push({structureId, structureName: structures.find(row => row.id === structureId)?.get('name') as string ?? 'Sede',
             appointments: appointmentImpact,
-            activities: {openAssignedCount: assignedRows.length, reviewCount: rows.filter(row => row.reviewerUserId === targetUserId).length, orphanCount: orphaned.length,
+            activities: {openAssignedCount: assignedIds.size, reviewCount: reviewIds.size, recurringCount: recurring.length, orphanCount: orphanedIds.size,
                 alertsDisabledCount: enabledAlerts.filter(alert => orphaned.some(row => row.id === alert.activityId)).length,
                 replacementOperators: eligible.filter(row => row.id !== targetUserId).map(row => ({id: row.id,
                     fullName: [row.name, row.surname].filter(Boolean).join(' ') || 'Operatore'})),
-                canReadDetails, items: canReadDetails ? rows.map(row => ({id: row.id, title: row.title, wouldBecomeUnassigned: orphaned.includes(row)})) : []}});
+                canReadDetails, items: canReadDetails ? impactedRows.map(row => ({id: row.id, title: row.title, wouldBecomeUnassigned: orphanedIds.has(row.id)})) : []}});
         fingerprints.push({structureId, activities: rows.map(row => ({id: row.id, version: row.version, status: row.status})),
+            recurrences: recurring.map(row => ({id: row.id, version: row.version, recurrence: row.recurrence})),
             assignments: allAssignments.map(row => ({activityId: row.activityId, userId: row.userId, eligible: eligibleSet.has(row.userId)})),
             alerts: enabledAlerts.map(row => ({activityId: row.activityId, version: row.scheduleVersion})).sort((a, b) => a.activityId.localeCompare(b.activityId)),
             appointments: candidateEvents.map(row => row.get({plain: true})), exceptions: exceptions.map(row => row.get({plain: true})),
             appointmentCounts: {singles: appointmentImpact.futureSingleAppointments, series: appointmentImpact.futureRecurringSeries}});
-        activityRows.set(structureId, rows); assignmentRows.set(structureId, allAssignments); eligibleIds.set(structureId, eligibleSet);
+        activityRows.set(structureId, rows); recurrenceRows.set(structureId, recurring);
+        assignmentRows.set(structureId, allAssignments); eligibleIds.set(structureId, eligibleSet);
     }
     impact.fingerprint = hash({tenantId: actor.tenantId, structureId: actor.structureId, targetUserId, change, membership: {role: membership.role, active: !membership.deactivatedAt,
         globallyActive: !identity.get('deactivatedAt')}, structures: own.map(row => ({id: row.structureId, role: row.role})), fingerprints});
     return {actor, change, targetUserId, membership, identity, structures, memberships: own, boards,
-        affectedStructureIds: affected, nextRole, nextStructureIds, impact, activityRows, assignmentRows, eligibleIds};
+        affectedStructureIds: affected, nextRole, nextStructureIds, impact, activityRows, recurrenceRows, assignmentRows, eligibleIds};
 }
 
 async function allBoards(actor: TeamActor, transaction: Transaction, lock: boolean) {
@@ -306,20 +324,30 @@ async function applyOffboarding(prepared: PreparedTeamChange, resolutions: TeamS
             throw new TeamOffboardingError(409, 'INVALID_ASSIGNEE', 'Il nuovo responsabile non è più disponibile nella sede. Controlla le scelte.', prepared.impact);
         }
         const activities = prepared.activityRows.get(impact.structureId)!;
+        const recurring = prepared.recurrenceRows.get(impact.structureId) ?? [];
         const assignments = prepared.assignmentRows.get(impact.structureId)!;
         const board = prepared.boards.find(row => row.structureId === impact.structureId)!;
         const workflowContext: ActivityContext = {tenantId: actor.tenantId, structureId: impact.structureId, userId: actor.userId,
             schema: actor.schema, role: actor.role, permissions: getRolePermissions(actor.role), timezone: board.timezone};
         let orderChanged = false;
         for (const activity of activities) {
+            const execution = activity.currentExecutionId
+                ? await ActivityExecution.schema(actor.schema).findByPk(activity.currentExecutionId, {transaction}) : null;
+            if (execution) {
+                await sealActivityExecution(workflowContext, activity, execution, transaction, new Date());
+                if (execution.closedAt) continue;
+            }
             if (activity.reviewerUserId === targetUserId) {
                 await activity.update({version: activity.version + 1, updatedByUserId: actor.userId,
                     reviewStatus: activity.reviewStatus === 'approved' ? 'pending' : activity.reviewStatus,
                     reviewApprovedAt: null, reviewApprovedByUserId: null}, {transaction});
-                await ActivityHistory.schema(actor.schema).create({activityId: activity.id, actorUserId: actor.userId,
+                await ActivityHistory.schema(actor.schema).create({activityId: activity.id, executionId: activity.currentExecutionId ?? null, actorUserId: actor.userId,
                     eventType: 'REVIEWER_OFFBOARDED', data: {userId: targetUserId, reason: prepared.change.kind}}, {transaction});
             }
-            if (!assignments.some(row => row.activityId === activity.id && row.userId === targetUserId)) continue;
+            if (!assignments.some(row => row.activityId === activity.id && row.userId === targetUserId)) {
+                if (execution) await captureCurrentExecution(workflowContext, activity, transaction);
+                continue;
+            }
             const previous = assignments.filter(row => row.activityId === activity.id).map(row => row.userId);
             const next = previous.filter(id => id !== targetUserId);
             const orphan = !next.some(id => eligible.has(id));
@@ -339,16 +367,40 @@ async function applyOffboarding(prepared: PreparedTeamChange, resolutions: TeamS
                 if (orphan && activityDecision?.kind !== 'replace' && alert.enabled) {
                     await alert.update({enabled: false, scheduleVersion: alert.scheduleVersion + 1}, {transaction});
                     await cancelActivityDeliveries(actor.schema, alert.id, transaction);
-                    await ActivityHistory.schema(actor.schema).create({activityId: activity.id, actorUserId: actor.userId,
+                    await ActivityHistory.schema(actor.schema).create({activityId: activity.id, executionId: activity.currentExecutionId ?? null, actorUserId: actor.userId,
                         eventType: 'ALERT_CANCELLED', data: {reason: 'LAST_ELIGIBLE_ASSIGNEE_REMOVED'}}, {transaction});
                 }
             }
             if (alert?.enabled) await materializeActivityDeliveries(actor.schema, alert, transaction, {reactivateRecipients: true});
-            await ActivityHistory.schema(actor.schema).create({activityId: activity.id, actorUserId: actor.userId,
+            await ActivityHistory.schema(actor.schema).create({activityId: activity.id, executionId: activity.currentExecutionId ?? null, actorUserId: actor.userId,
                 eventType: 'ASSIGNEE_OFFBOARDED', data: {userId: targetUserId, reason: prepared.change.kind,
                     previousAssigneeIds: previous, assigneeIds: next, reassignmentRequired: activity.reassignmentRequired}}, {transaction});
+            if (execution) await captureCurrentExecution(workflowContext, activity, transaction);
         }
-        if (activities.length) {
+        for (const routine of recurring) {
+            // Re-read after current execution updates; do not reuse an older version of the stable card.
+            await routine.reload({transaction});
+            const recurrence = routine.recurrence;
+            if (!recurrence || recurrence.status !== 'active') continue;
+            const template = structuredClone(recurrence.template);
+            let blockedReason = recurrence.blockedReason;
+            if (template.assigneeIds.includes(targetUserId)) {
+                template.assigneeIds = template.assigneeIds.filter(id => id !== targetUserId);
+                const orphan = !template.assigneeIds.some(id => eligible.has(id));
+                if (orphan && activityDecision?.kind === 'replace') {
+                    if (activityDecision.userId === template.reviewerUserId) throw new TeamOffboardingError(409,
+                        'INVALID_ASSIGNEE', 'Il nuovo assegnatario è il revisore di una ripetizione: scegli un altro operatore.', prepared.impact);
+                    template.assigneeIds.push(activityDecision.userId);
+                } else if (orphan) blockedReason = 'ASSIGNEE_REASSIGNMENT_REQUIRED';
+            }
+            if (template.reviewerUserId === targetUserId) blockedReason = 'REVIEWER_REASSIGNMENT_REQUIRED';
+            await routine.update({recurrence: {...recurrence, template, blockedReason},
+                version: routine.version + 1, updatedByUserId: actor.userId}, {transaction});
+            await ActivityHistory.schema(actor.schema).create({activityId: routine.id, actorUserId: actor.userId,
+                eventType: 'RECURRENCE_TEAM_CHANGED', data: {userId: targetUserId, reason: prepared.change.kind,
+                    blockedReason, assigneeIds: template.assigneeIds}}, {transaction});
+        }
+        if (activities.length || recurring.length) {
             await board.update({snapshotRevision: board.snapshotRevision + 1,
                 orderRevision: board.orderRevision + (orderChanged ? 1 : 0)}, {transaction});
         }

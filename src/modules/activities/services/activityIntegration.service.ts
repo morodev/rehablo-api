@@ -14,7 +14,9 @@ export async function queryActivitySummary(req: Request, query: ActivitySummaryQ
         const board = await currentBoard(context, transaction);
         const evaluationAt = new Date(), day = activityLocalDate(evaluationAt);
         const end = effectiveDueAt({kind: 'allDay', date: day, timezone: context.timezone})!;
-        const clauses: WhereOptions[] = [{boardId: board.id, archivedAt: null, status: {[Op.ne]: 'COMPLETED'}}];
+        const clauses: WhereOptions[] = [{boardId: board.id, archivedAt: null, status: {[Op.ne]: 'COMPLETED'}},
+            {[Op.or]: [{recurrence: null}, {currentExecutionId: {[Op.ne]: null}}]},
+            literal('NOT EXISTS (SELECT 1 FROM "' + context.schema + '"."activity_executions" e WHERE e.id = "activity"."currentExecutionId" AND e."archivedAt" IS NOT NULL)')];
         if (query.mine) clauses.push(literal(`EXISTS (SELECT 1 FROM "${context.schema}"."activity_assignments" assigned WHERE assigned."activityId" = "activity"."id" AND assigned."userId" = ${sequelize.escape(context.userId)})`));
         const buckets: WhereOptions[] = [
             {[Op.or]: [{dueKind: 'timed', dueAt: {[Op.lt]: evaluationAt}}, {dueKind: 'allDay', dueDate: {[Op.lt]: day}}]},

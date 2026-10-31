@@ -12,7 +12,7 @@ import {PatientSettlementContext, PatientSettlementObligation, PatientSettlement
     loadPatientSettlementPosition, settlementFail, settlementPatientId} from './patientSettlementPolicy.service.js';
 import {canAccessAppointmentFinance} from '../../agenda/services/appointmentFinancialAccess.service.js';
 import {isAppointmentPaymentHistoryKnown, paymentMoney} from '../../invoice/services/appointmentPayment.service.js';
-import {packagePatient, packageSelectedStructure} from '../../administration/services/carePackage.service.js';
+import {isFinancialCarePackage, packagePatient, packageSelectedStructure} from '../../administration/services/carePackage.service.js';
 import {patientCoveragePosition} from './patientCoverage.service.js';
 export {verifiedSettlementCredit} from '../../administration/services/patientCreditBacking.service.js';
 
@@ -62,7 +62,7 @@ export function settlementRecordAccess(req: Request, context: AuthorizedSettleme
     kind: 'APPOINTMENT' | 'INVOICE' | 'CREDIT' | 'PACKAGE', record: Record<string, any>, action: Action): boolean {
     if (kind === 'PACKAGE') {
         if (action !== 'read') return false;
-        const scope = settlementScope(req, 'care_package', 'read');
+        const scope = settlementScope(req, record.templateId ? 'care_package' : 'quote', 'read');
         return !!scope && (scope === 'tenant' || (record.structureId === getSelectedStructureId(req)
             && (scope !== 'own' || context.patient.userId === getUserId(req) || !!context.ownPackagePatient)));
     }
@@ -181,13 +181,13 @@ export function settlementCanUseCredit(req: Request, context: AuthorizedSettleme
 
 /** Package payments use the same patient authorization as the package receipt endpoint. */
 async function packagePositionAccess(req: Request, context: AuthorizedSettlementContext, administrationEnabled: boolean,
-    transaction?: Transaction): Promise<{read: boolean; pay: boolean}> {
+    transaction?: Transaction, resource: 'care_package' | 'quote' = 'care_package'): Promise<{read: boolean; pay: boolean}> {
     const denied = (error: unknown): boolean => {
         const status = (error as {statusCode?: number})?.statusCode;
         return status === 403 || status === 404;
     };
     let patient;
-    try {patient = await packagePatient(req, context.patientId, 'care_package', 'read', transaction);}
+    try {patient = await packagePatient(req, context.patientId, resource, 'read', transaction);}
     catch (error) {if (denied(error)) return {read: false, pay: false}; throw error;}
     const selected = packageSelectedStructure(req);
     const read = selected === context.structureId && context.patient.structureId === selected
@@ -207,16 +207,21 @@ export async function patientSettlementPositionView(req: Request, context: Autho
     const cutoff = raw.referenceEvent ? Date.parse(raw.referenceEvent.start) : raw.referenceInvoice
         ? Date.parse(current?.orderDate ?? raw.referenceInvoice.emissionDate) : Infinity;
     const visibleRaw = raw.obligations.filter(row => row.isCurrent || Date.parse(row.orderDate) <= cutoff);
-    const packageAccess = visibleRaw.some(row => row.kind === 'PACKAGE')
-        ? await packagePositionAccess(req, context, administrationEnabled, options.transaction) : {read: false, pay: false};
+    const packageAccess = new Map<'care_package' | 'quote', {read: boolean; pay: boolean}>();
+    for (const resource of ['care_package', 'quote'] as const) {
+        if (visibleRaw.some(row => row.kind === 'PACKAGE' && (row.record.templateId ? 'care_package' : 'quote') === resource)) {
+            packageAccess.set(resource, await packagePositionAccess(req, context, administrationEnabled, options.transaction, resource));
+        }
+    }
+    const accessForPackage = (row: PatientSettlementObligation) => packageAccess.get(row.record.templateId ? 'care_package' : 'quote');
     const obligations = visibleRaw.filter(row => row.kind === 'PACKAGE'
-        ? packageAccess.read && row.record.structureId === context.structureId
+        ? accessForPackage(row)?.read && row.record.structureId === context.structureId
         : settlementCanRead(req, context, row)).map(row => ({
         key: row.key, kind: row.kind, targetId: row.targetId, title: row.title, date: row.date, orderDate: row.orderDate,
         balance: row.balance, expectedAmount: row.expectedAmount, paidAmount: row.paidAmount, isCurrent: row.isCurrent,
         invoiceNumber: row.invoiceNumber, linkedEventIds: row.linkedEventIds,
         canCash: settlementCanCash(req, context, row), canUseCredit: settlementCanUseCredit(req, context, row, administrationEnabled),
-        ...(row.kind === 'PACKAGE' ? {canPayPackage: packageAccess.pay && !!row.record.templateId && (row.balance ?? 0) > 0.009
+        ...(row.kind === 'PACKAGE' ? {canPayPackage: !!accessForPackage(row)?.pay && isFinancialCarePackage(row.record) && (row.balance ?? 0) > 0.009
             && row.record.structureId === context.structureId && row.record.patientId === context.patientId} : {})
     }));
     const first = raw.queue[0];
@@ -229,7 +234,7 @@ export async function patientSettlementPositionView(req: Request, context: Autho
     const prior = open.filter(row => !row.isCurrent);
     const creditVisible = administrationEnabled && settlementRecordAccess(req, context, 'CREDIT', {structureId: context.structureId}, 'read');
     const coverage = await patientCoveragePosition(req, context, {transaction: options.transaction, administrationEnabled,
-        ...(visibleRaw.some(row => row.kind === 'PACKAGE') ? {catalogAuthorized: packageAccess.read} : {})});
+        ...(packageAccess.has('care_package') ? {catalogAuthorized: packageAccess.get('care_package')!.read} : {})});
     const {creditsSummary, packagesSummary} = coverage;
     const event = raw.referenceEvent;
     const currentReadable = !!current && settlementCanRead(req, context, current);

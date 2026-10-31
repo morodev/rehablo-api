@@ -16,7 +16,7 @@ interface Cursor {
     queryKey: string;
     snapshotRevision: number;
     evaluationAt: string;
-    kind: 'board' | 'list' | 'archived';
+    kind: 'board' | 'list' | 'archived' | 'recurring';
     status: ActivityStatus;
     position: string;
     id: string;
@@ -82,21 +82,30 @@ export async function queryActivities(req: Request, query: ActivityQuery) {
 }
 
 function filterWhere(context: ActivityContext, boardId: string, query: ActivityQuery, evaluationAt: Date): WhereOptions {
+    const recurring = query.view === 'recurring';
+    const template = '"activity"."recurrence"->\'template\'';
     const clauses: WhereOptions[] = [{boardId, archivedAt: query.view === 'archived' ? {[Op.ne]: null} : null}];
+    if (query.view === 'recurring') clauses.push({recurrence: {[Op.ne]: null}});
+    else if (query.view !== 'archived') clauses.push({[Op.or]: [{recurrence: null}, {currentExecutionId: {[Op.ne]: null}}]},
+        literal('NOT EXISTS (SELECT 1 FROM "' + context.schema + '"."activity_executions" e WHERE e.id = "activity"."currentExecutionId" AND e."archivedAt" IS NOT NULL)'));
     if (query.statuses.length) clauses.push({status: {[Op.in]: query.statuses}});
-    if (query.priority) clauses.push({priority: query.priority});
+    if (query.priority) clauses.push(recurring ? literal(`(${template}->>'priority') = ${sequelize.escape(query.priority)}`) : {priority: query.priority});
     if (query.search) {
         const search = '%' + query.search.replace(/[\\%_]/g, character => '\\' + character) + '%';
-        clauses.push({[Op.or]: [{title: {[Op.iLike]: search}}, {description: {[Op.iLike]: search}}]});
+        clauses.push(recurring ? literal(`((${template}->>'title') ILIKE ${sequelize.escape(search)} OR (${template}->>'description') ILIKE ${sequelize.escape(search)})`)
+            : {[Op.or]: [{title: {[Op.iLike]: search}}, {description: {[Op.iLike]: search}}]});
     }
-    if (query.patientId) clauses.push({patientId: query.patientId});
-    if (query.agendaEventId) clauses.push({agendaEventId: query.agendaEventId});
+    if (query.patientId) clauses.push(recurring ? literal(`(${template}->>'patientId') = ${sequelize.escape(query.patientId)}`) : {patientId: query.patientId});
+    if (query.agendaEventId) clauses.push(recurring ? literal(`(${template}->>'agendaEventId') = ${sequelize.escape(query.agendaEventId)}`) : {agendaEventId: query.agendaEventId});
     if (query.reassignmentRequired) clauses.push({reassignmentRequired: true});
     const schema = '"' + context.schema + '"';
-    const assigned = (userId?: string) => literal(`EXISTS (SELECT 1 FROM ${schema}."activity_assignments" AS assigned WHERE assigned."activityId" = "activity"."id"${userId ? ' AND assigned."userId" = ' + sequelize.escape(userId) : ''})`);
+    const assigned = (userId: string) => recurring
+        ? literal(`(${template}->'assigneeIds') @> ${sequelize.escape(JSON.stringify([userId]))}::jsonb`)
+        : literal(`EXISTS (SELECT 1 FROM ${schema}."activity_assignments" AS assigned WHERE assigned."activityId" = "activity"."id" AND assigned."userId" = ${sequelize.escape(userId)})`);
     if (query.mine) clauses.push(assigned(context.userId));
     if (query.assigneeId) clauses.push(assigned(query.assigneeId));
-    if (query.unassigned) clauses.push(literal(`NOT EXISTS (SELECT 1 FROM ${schema}."activity_assignments" AS assigned WHERE assigned."activityId" = "activity"."id")`));
+    if (query.unassigned) clauses.push(recurring ? literal(`jsonb_array_length(${template}->'assigneeIds') = 0`)
+        : literal(`NOT EXISTS (SELECT 1 FROM ${schema}."activity_assignments" AS assigned WHERE assigned."activityId" = "activity"."id")`));
     const today = localDate(evaluationAt, context.timezone);
     if (query.due === 'none') clauses.push({dueKind: null});
     if (query.due === 'overdue') clauses.push({archivedAt: null, status: {[Op.ne]: 'COMPLETED'}, [Op.or]: [
@@ -116,10 +125,11 @@ function filterWhere(context: ActivityContext, boardId: string, query: ActivityQ
     if (query.due === 'upcoming') clauses.push({[Op.or]: [
         {dueKind: 'timed', dueAt: {[Op.gte]: evaluationAt}}, {dueKind: 'allDay', dueDate: {[Op.gte]: today}}
     ]});
-    if (query.view !== 'archived' && !query.includeAllCompleted) {
+    if (query.view !== 'archived' && query.view !== 'recurring' && !query.includeAllCompleted) {
         const cutoffDay = offsetDate(today, -30);
         const cutoff = new Date(effectiveDueAt({kind: 'allDay', date: cutoffDay, timezone: context.timezone})!.getTime() + 1);
-        clauses.push({[Op.or]: [{status: {[Op.ne]: 'COMPLETED'}}, {completedAt: {[Op.gte]: cutoff}}]});
+        clauses.push({[Op.or]: [{status: {[Op.ne]: 'COMPLETED'}}, {completedAt: {[Op.gte]: cutoff}},
+            literal('(\"activity\".\"recurrence\"->>\'status\') = \'active\'')]});
     }
     return and(...clauses);
 }

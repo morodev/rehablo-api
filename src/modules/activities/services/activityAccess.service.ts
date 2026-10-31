@@ -107,10 +107,12 @@ export async function validateActivityAssignees(
 }
 
 export interface ActivityAccessRecord {
+    id?: string;
     createdByUserId: string;
     status: string;
     reviewerUserId?: string | null; reviewStatus?: string;
     archivedAt?: Date | string | null;
+    recurrence?: unknown; currentExecutionId?: string | null; executionClosedAt?: Date | string | null;
 }
 
 export function activityCapabilities(
@@ -127,22 +129,33 @@ export function activityCapabilities(
         || resolveGrantedScope(context.permissions, 'activity', 'manage') === 'tenant');
     const reviewer = canRead && operational && !!scope && activity.reviewerUserId === context.userId;
     const reviewing = !!activity.reviewerUserId;
+    const currentClosed = !!activity.recurrence && !context.historicalExecution
+        && (!activity.currentExecutionId || !!activity.executionClosedAt
+            || (context.parentActivity?.id === activity.id && !!(context.execution?.closedAt || context.execution?.archivedAt)));
     return {
-        canEdit: canUpdate && !archived,
-        canMove: canUpdate && !archived,
+        canEdit: canUpdate && !archived && !currentClosed,
+        canMove: canUpdate && !archived && !currentClosed,
         canAssign: canUpdate && !archived,
-        canManageChecklist: canUpdate && !archived && activity.status !== 'COMPLETED',
-        canComment: canRead && operational && !archived && hasPermission(context.permissions, 'activity', 'create'),
+        canManageChecklist: canUpdate && !archived && !currentClosed && activity.status !== 'COMPLETED',
+        canComment: canRead && operational && !archived && !currentClosed && hasPermission(context.permissions, 'activity', 'create')
+            && (!context.historicalExecution || canUpdate || reviewer || manager),
         canArchive: canUpdate && !archived,
         canRestore: canUpdate && archived,
-        canRequestReview: canUpdate && !archived && activity.status !== 'COMPLETED' && reviewing,
-        canReview: !archived && activity.status === 'WAITING' && activity.reviewStatus === 'pending' && (reviewer || manager),
-        canComplete: !archived && activity.status !== 'COMPLETED' && (reviewing
+        canRequestReview: canUpdate && !archived && !currentClosed && activity.status !== 'COMPLETED' && reviewing,
+        canReview: !archived && !currentClosed && activity.status === 'WAITING' && activity.reviewStatus === 'pending' && (reviewer || manager),
+        canComplete: !archived && !currentClosed && activity.status !== 'COMPLETED' && (reviewing
             ? activity.reviewStatus === 'approved' && (manager || (canUpdate && assigneeIds.includes(context.userId)))
             : canUpdate),
         canAssignReviewer: !archived && (reviewing ? reviewer || manager : canUpdate),
-        canReopenChecklist: canUpdate && !archived && activity.status === 'COMPLETED'
+        canReopenChecklist: canUpdate && !archived && !currentClosed && activity.status === 'COMPLETED'
     };
+}
+
+export function canManageActivityRecurrence(context: ActivityContext, activity: {createdByUserId: string}): boolean {
+    return isEligibleActivityRole(context.role) && hasPermission(context.permissions, 'activity', 'read', 'structure')
+        && ((activity.createdByUserId === context.userId && hasPermission(context.permissions, 'activity', 'create'))
+            || hasPermission(context.permissions, 'activity', 'manage', 'structure')
+            || resolveGrantedScope(context.permissions, 'activity', 'manage') === 'tenant');
 }
 
 export function requireActivityCapability(

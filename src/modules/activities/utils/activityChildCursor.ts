@@ -10,7 +10,7 @@ interface ChildCursor {
 }
 const lifetime = 10 * 60_000;
 export function childQueryKey(context: ActivityContext, boardId: string, activityId: string, kind: ActivityChildKind): string {
-    return createHash('sha256').update(JSON.stringify({actorId: context.userId, boardId, activityId, kind})).digest('hex');
+    return createHash('sha256').update(JSON.stringify({actorId: context.userId, boardId, activityId, executionId: context.executionId ?? null, kind})).digest('hex');
 }
 export function childCursorExpired(): ActivityError {
     return new ActivityError('ACTIVITY_CURSOR_EXPIRED', 409, 'L’attività è stata aggiornata. Ricarica i commenti o la cronologia prima di continuare.');

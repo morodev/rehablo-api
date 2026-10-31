@@ -5,6 +5,7 @@ import {sequelize} from '../../../config/database.js';
 export class ActivityHistory extends Model {
     declare id: string;
     declare activityId: string;
+    declare executionId: string | null;
     declare actorUserId: string | null;
     declare eventType: string;
     declare data: Record<string, unknown>;
@@ -14,6 +15,7 @@ export class ActivityHistory extends Model {
 ActivityHistory.init({
     id: {type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true},
     activityId: {type: DataTypes.UUID, allowNull: false},
+    executionId: {type: DataTypes.UUID, allowNull: true},
     actorUserId: {type: DataTypes.UUID, allowNull: true},
     eventType: {type: DataTypes.STRING(64), allowNull: false},
     data: {type: DataTypes.JSONB, allowNull: false, defaultValue: {}}

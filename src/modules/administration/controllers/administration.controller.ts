@@ -423,7 +423,9 @@ const createPackageFromQuote = asyncHandler(async (req, res) => {
         const carePackage = await CarePackage.schema(req.tenantSchema!).create({
             quoteId: quote.get('id'), structureId: quote.get('structureId'), patientId: quote.get('patientId'),
             name: source['name'] ?? `Pacchetto preventivo ${quote.get('number')}`,
-            purchasedUnits: units, remainingUnits: units, totalPrice: quote.get('total'), lines: quote.get('lines'),
+            purchasedUnits: units, remainingUnits: units, totalPrice: quote.get('total'), lines: quote.get('lines'), purchasedAt: romeToday(),
+            purchaseSnapshot: {quote: {id: quote.get('id'), number: quote.get('number'), year: quote.get('year'),
+                total: quote.get('total'), lines: quote.get('lines')}},
             expiresAt: null, notes: source['notes'] ?? null
         }, { transaction });
         await ensurePackageBooking(carePackage, transaction, req.access?.userId);

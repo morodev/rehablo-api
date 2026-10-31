@@ -7,6 +7,7 @@ import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js
 import {appointmentPricesByEvent, isAppointmentPaymentHistoryKnown, paymentMoney, summarizeAppointmentPayments} from '../../invoice/services/appointmentPayment.service.js';
 import {summarizeInvoicePayments} from '../../invoice/services/payment.service.js';
 import {CarePackage} from '../../administration/models/index.js';
+import {isFinancialCarePackage} from '../../administration/services/carePackage.service.js';
 
 export type PatientSettlementKind = 'APPOINTMENT' | 'INVOICE' | 'PACKAGE';
 export interface PatientSettlementContext {
@@ -151,7 +152,7 @@ export function buildPatientSettlementPosition(
     const obligations: PatientSettlementObligation[] = [];
     const verification: PatientSettlementVerification[] = [];
     const issues: PatientSettlementIssue[] = [];
-    const packages = (sources.packages ?? []).filter(pack => pack.templateId && pack.patientId === context.patientId && pack.structureId === context.structureId);
+    const packages = (sources.packages ?? []).filter(pack => isFinancialCarePackage(pack) && pack.patientId === context.patientId && pack.structureId === context.structureId);
 
     events.forEach(event => {
         const isCurrent = event.id === context.referenceAgendaEventId && !currentInvoiceId;
@@ -228,7 +229,7 @@ export function buildPatientSettlementPosition(
         const anchors = linkedEventIds.map(id => time(eventById.get(id)?.start)).filter(value => value !== null) as number[];
         const emission = time(invoice.emissionDate);
         const packagePurchase = packages.find(pack => pack.invoiceId === invoice.id);
-        const anchor = packagePurchase ? time(packagePurchase.purchasedAt) : anchors.length ? Math.min(...anchors) : emission;
+        const anchor = packagePurchase ? time(packagePurchase.purchasedAt ?? packagePurchase.createdAt) : anchors.length ? Math.min(...anchors) : emission;
         if (anchor === null) return;
         const eligible = activeInvoices.has(invoice.id) && emission !== null && emission <= now;
         if (!isCurrent && (!eligible || summary.balance <= 0.009)) return;
@@ -247,11 +248,14 @@ export function buildPatientSettlementPosition(
     });
     packages.forEach(pack => {
         if (pack.invoiceId && activeInvoices.has(pack.invoiceId)) return;
+        const purchasedAt = pack.purchasedAt ?? pack.createdAt;
+        const purchasedTime = time(purchasedAt);
+        if (purchasedTime === null) return;
         const history = sources.payments.filter(payment => payment.carePackageId === pack.id);
         const summary = summarizeInvoicePayments({invoiceTotal: pack.totalPrice}, history);
         if (summary.balance <= 0.009) return;
         obligations.push({key: key('PACKAGE', pack.id), kind: 'PACKAGE', targetId: pack.id, title: pack.name,
-            date: pack.purchasedAt, orderDate: new Date(pack.purchasedAt).toISOString(), balance: summary.balance,
+            date: localDate(purchasedAt), orderDate: new Date(purchasedTime).toISOString(), balance: summary.balance,
             expectedAmount: paymentMoney(pack.totalPrice), paidAmount: summary.paidAmount, isCurrent: false,
             invoiceNumber: null, linkedEventIds: [], eligible: false,
             unavailableReason: 'Registra l’incasso dal dettaglio del pacchetto.', coverageSources: [], methods: [], hasUndatedPayments: false, record: pack});
@@ -280,7 +284,8 @@ export async function loadPatientSettlementPosition(
     const events = eventModels.map(row => row.get({plain: true}) as Record<string, any>);
     const invoices = invoiceModels.map(row => row.get({plain: true}) as Record<string, any>);
     const packages = (await CarePackage.schema(schema).findAll({where: {patientId: context.patientId,
-        structureId: context.structureId, templateId: {[Op.ne]: null}}, transaction})).map(row => row.get({plain: true}) as Record<string, any>);
+        structureId: context.structureId, [Op.or]: [{templateId: {[Op.ne]: null}}, {quoteId: {[Op.ne]: null}}]}, transaction}))
+        .map(row => row.get({plain: true}) as Record<string, any>).filter(isFinancialCarePackage);
     const packageIds = packages.map(row => row.id);
     const eventIds = events.map(row => row.id);
     const invoiceIds = invoices.map(row => row.id);

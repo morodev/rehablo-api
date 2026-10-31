@@ -1,10 +1,13 @@
 import {DataTypes, Model} from 'sequelize';
 import {sequelize} from '../../../config/database.js';
+import type {ActivityRecurrenceState} from '../utils/activityRecurrence.policy.js';
 
 /** Tenant-scoped; always use .schema(context.tenantSchema). */
 export class Activity extends Model {
     declare id: string;
     declare boardId: string;
+    declare currentExecutionId: string | null;
+    declare recurrence: ActivityRecurrenceState | null;
     declare title: string;
     declare description: string | null;
     declare status: 'TODO' | 'IN_PROGRESS' | 'WAITING' | 'COMPLETED';
@@ -36,6 +39,8 @@ export class Activity extends Model {
 Activity.init({
     id: {type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true},
     boardId: {type: DataTypes.UUID, allowNull: false},
+    currentExecutionId: {type: DataTypes.UUID, allowNull: true},
+    recurrence: {type: DataTypes.JSONB, allowNull: true},
     title: {type: DataTypes.STRING(200), allowNull: false, validate: {len: [1, 200]}},
     description: {type: DataTypes.TEXT, allowNull: true, validate: {len: [0, 5000]}},
     status: {type: DataTypes.STRING(16), allowNull: false, defaultValue: 'TODO', validate: {isIn: [['TODO', 'IN_PROGRESS', 'WAITING', 'COMPLETED']]}},

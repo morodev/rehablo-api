@@ -1,3 +1,7 @@
+import {serializeExecutionSummary} from './activityExecutions.service.js';
+import {executionChildren, prepareExecutionContext, targetsPastExecution} from './activityExecutionTarget.service.js';
+import {configureActivityRecurrence, stopActivityRecurrence} from './activityRecurrence.service.js';
+import {canManageActivityRecurrence} from './activityAccess.service.js';
 import {Request} from 'express';
 import {Op, Transaction} from 'sequelize';
 import {validateActivityReviewer, setActivityWorkflow, invalidateActivityReview, requireCompletionPermission} from './activityWorkflow.service.js';
@@ -88,17 +92,22 @@ function parseActivityLookupQuery(req: Request, resource: string): ActivityLooku
 export async function getActivity(req: Request, activityId: string) {
     requireActivityId(activityId);
     return read(req, async (context, board, transaction) => {
-        const activity = await activityInBoard(context, board.id, activityId, transaction);
+        const activity = await prepareExecutionContext(context, board, activityId, transaction, {executionId: req.params.executionId, expectedExecutionId: req.query.expectedExecutionId});
         const scoped = models(context);
         const [checklistRows, commentsPage, historyPage, links] = await Promise.all([
-            scoped.checklist.findAll({where: {activityId}, order: [['position', 'ASC'], ['id', 'ASC']], transaction}),
+            scoped.checklist.findAll({where: {activityId, ...executionChildren(context)}, order: [['position', 'ASC'], ['id', 'ASC']], transaction}),
             readActivityChildPage(context, board, activity, 'comments', {limit: 20, cursor: null, offset: 0}, transaction),
             readActivityChildPage(context, board, activity, 'history', {limit: 20, cursor: null, offset: 0}, transaction),
             visibleActivityLinkMetadata(context, activity, transaction)
         ]);
-        return {activity: (await serializeActivities(context, [activity], transaction))[0],
+        const card = (await serializeActivities(context, [activity], transaction))[0];
+        if (card.recurrence?.template) card.recurrence.template.links = await visibleActivityLinkMetadata(context, card.recurrence.template, transaction);
+        return {activity: card,
             checklist: await serializeChecklist(context, checklistRows, transaction), history: historyPage.items,
-            commentsPage, historyPage, links, orderRevision: board.get('orderRevision'), snapshotRevision: board.get('snapshotRevision')};
+            commentsPage, historyPage, links,
+            ...(context.execution ? {execution: await serializeExecutionSummary(context, context.execution, transaction),
+                isCurrentExecution: context.execution.id === context.parentActivity?.currentExecutionId} : {}),
+            orderRevision: board.get('orderRevision'), snapshotRevision: board.get('snapshotRevision')};
     });
 }
 
@@ -116,7 +125,9 @@ export async function createActivity(req: Request, input: ActivityCreateInput) {
         if (input.reviewerUserId && input.status === 'COMPLETED') throw new ActivityError('REVIEW_REQUIRED', 422, 'Crea l’attività aperta per inviarla al revisore.', {status: 'È necessaria la revisione.'});
         await requireActivityLinks(context, input, transaction);
         const now = new Date();
-        validateActivitySchedule({...input, archivedAt: null}, null, now, context.timezone);
+        if (input.recurrence && input.status !== 'TODO') throw new ActivityError('ACTIVITY_VALIDATION_FAILED', 422,
+            'Le ripetizioni iniziano in Da fare.', {recurrence: 'Controlla lo stato iniziale.'});
+        validateActivitySchedule({...input, due: input.recurrence ? null : input.due, archivedAt: null}, null, now, context.timezone);
         if (input.status === 'COMPLETED' && input.checklist.length) throw new ActivityError('ACTIVITY_VALIDATION_FAILED', 422,
             'Crea l’attività aperta e controlla la checklist prima di completarla.', {status: 'La checklist contiene elementi da completare.'});
         const position = await placementPosition(context, board.id, input.status, {kind: 'end'}, null, transaction);
@@ -125,7 +136,7 @@ export async function createActivity(req: Request, input: ActivityCreateInput) {
             boardId: board.id, title: input.title, description: input.description,
             reviewerUserId: input.reviewerUserId ?? null, reviewStatus: 'not_requested',
             status: input.status, priority: input.priority, position, version: 1,
-            checklistRevision: input.checklist.length ? 1 : 0, ...dueFields(input.due),
+            checklistRevision: input.recurrence ? 0 : input.checklist.length ? 1 : 0, ...dueFields(input.recurrence ? null : input.due),
             createdByUserId: context.userId, updatedByUserId: context.userId,
             patientId: input.patientId, agendaEventId: input.agendaEventId,
             completedAt: input.status === 'COMPLETED' ? now : null,
@@ -133,16 +144,28 @@ export async function createActivity(req: Request, input: ActivityCreateInput) {
             archivedAt: null, archivedByUserId: null, reassignmentRequired: false
         }, {transaction});
         await replaceAssignments(context, activity.id, input.assigneeIds, transaction);
-        if (input.checklist.length) await scoped.checklist.bulkCreate(input.checklist.map((item, index) => ({
+        if (!input.recurrence && input.checklist.length) await scoped.checklist.bulkCreate(input.checklist.map((item, index) => ({
             activityId: activity.id, text: item.text, position: String((index + 1) * 1024),
             checked: false, version: 1, createdByUserId: context.userId
         })), {transaction});
-        await persistAlert(context, activity.id, input.alert, transaction);
+        if (input.recurrence) {
+            await configureActivityRecurrence(activity, input.recurrence, {title: input.title, description: input.description, priority: input.priority,
+                assigneeIds: input.assigneeIds, reviewerUserId: input.reviewerUserId ?? null, patientId: input.patientId, agendaEventId: input.agendaEventId,
+                checklist: input.checklist}, board, context, transaction);
+            context.parentActivity = activity; context.executionId = activity.currentExecutionId;
+            if (activity.currentExecutionId) context.execution = await scoped.execution.findByPk(activity.currentExecutionId, {transaction}) ?? undefined;
+            if (input.alert) {
+                if (!activity.currentExecutionId) throw new ActivityError('ACTIVITY_EXECUTION_NOT_STARTED', 422,
+                    'Puoi configurare un avviso quando inizia la prima esecuzione.');
+                validateActivitySchedule({...input, due: dueFromActivity(activity.get({plain: true}) as ActivityRecord), archivedAt: null}, null, now, context.timezone);
+                await persistAlert(context, activity.id, input.alert, transaction);
+            }
+        } else await persistAlert(context, activity.id, input.alert, transaction);
         await recordHistory(context, activity.id, 'CREATED', {
             status: input.status, priority: input.priority, assigneeIds: input.assigneeIds,
             checklistCount: input.checklist.length
         }, transaction);
-        await reviseBoard(board, transaction, true);
+        await reviseBoard(board, transaction, true, context);
         return mutationResponse(context, board, activity, transaction);
     });
 }
@@ -152,6 +175,26 @@ export async function patchActivity(req: Request, activityId: string, input: Act
     return writeOperation(req, {...input, activityId}, command, async (context, board, transaction) => {
         requireAccess(context, 'update');
         const activity = await activityInBoard(context, board.id, activityId, transaction);
+        if (input.changes.recurrence) {
+            if (!activity.recurrence) throw new ActivityError('ACTIVITY_VALIDATION_FAILED', 422, 'Crea una nuova routine dal modello di questa attività.');
+            if (req.params.executionId || !canManageActivityRecurrence(context, activity)) throw new ActivityError('ACTIVITY_FORBIDDEN', 403, 'Non puoi modificare questa ripetizione.');
+            if (activity.archivedAt) throw new ActivityError('INVALID_TRANSITION', 409, 'Ripristina la routine prima di modificarla.');
+            assertVersion(activity, input.expectedVersion);
+            const template = input.changes.recurrenceTemplate ?? activity.recurrence?.template;
+            if (!template) throw new ActivityError('ACTIVITY_VALIDATION_FAILED', 422, 'Usa Crea ripetizione da questa attività per creare una nuova routine.');
+            await validateActivityAssignees(context, template.assigneeIds, transaction);
+            await validateActivityReviewer(context, template.reviewerUserId, template.assigneeIds, transaction);
+            await requireActivityLinks(context, template, transaction);
+            await configureActivityRecurrence(activity, input.changes.recurrence, template, board, context, transaction);
+            context.parentActivity = activity;
+            context.executionId = activity.currentExecutionId;
+            context.execution = activity.currentExecutionId ? await models(context).execution.findByPk(activity.currentExecutionId, {transaction}) ?? undefined : undefined;
+            await recordHistory({...context, executionId: null}, activity.id, 'RECURRENCE_UPDATED', {rule: input.changes.recurrence}, transaction);
+            await reviseBoard(board, transaction, false, context);
+            return mutationResponse(context, board, activity, transaction);
+        }
+        if (activity.recurrence && input.changes.due !== undefined) throw new ActivityError('ACTIVITY_VALIDATION_FAILED', 422,
+            'La scadenza di questa esecuzione è la fine del giorno previsto.', {due: 'La scadenza è gestita dalla ripetizione.'});
         const reviewerOnly = Object.keys(input.changes).every(key => key === 'reviewerUserId');
         await assertCapability(context, activity, activity.archivedAt ? 'canRestore' : reviewerOnly ? 'canAssignReviewer' : 'canEdit', transaction);
         if (activity.archivedAt) throw new ActivityError('INVALID_TRANSITION', 409, 'Ripristina l’attività prima di modificarla.');
@@ -206,7 +249,7 @@ export async function patchActivity(req: Request, activityId: string, input: Act
             fields: Object.keys(changes),
             ...(changes.assigneeIds !== undefined ? {previousAssigneeIds: original.assigneeIds, assigneeIds: changes.assigneeIds} : {})
         }, transaction);
-        await reviseBoard(board, transaction, workflowChanged);
+        await reviseBoard(board, transaction, workflowChanged, context);
         return mutationResponse(context, board, activity, transaction);
     });
 }
@@ -219,14 +262,14 @@ export async function moveActivity(req: Request, activityId: string, input: Acti
         await assertCapability(context, activity, activity.archivedAt ? 'canRestore' : 'canMove', transaction);
         if (activity.archivedAt) throw new ActivityError('INVALID_TRANSITION', 409, 'Ripristina l’attività prima di cambiarne lo stato.');
         assertVersion(activity, input.expectedVersion);
-        assertOrder(board, input.expectedOrderRevision);
+        assertOrder(board, input.expectedOrderRevision, context);
         const previousStatus = activity.status;
         const completing = input.targetStatus === 'COMPLETED' && previousStatus !== 'COMPLETED';
         if (completing) {
             await requireCompletionPermission(context, activity, transaction);
             if (input.expectedChecklistRevision !== activity.checklistRevision) throw new ActivityError('CHECKLIST_VERSION_CONFLICT', 409,
                 'La checklist è stata aggiornata. Controllala prima di completare l’attività.');
-            const incomplete = await models(context).checklist.count({where: {activityId, checked: false}, transaction});
+            const incomplete = await models(context).checklist.count({where: {activityId, checked: false, ...executionChildren(context)}, transaction});
             if (incomplete && !input.allowIncompleteChecklist) throw new ActivityError('CHECKLIST_INCOMPLETE', 409,
                 `Ci sono ancora ${incomplete} elementi da completare. Vuoi completare comunque l’attività?`);
         }
@@ -248,7 +291,7 @@ export async function moveActivity(req: Request, activityId: string, input: Acti
         if (completing) await persistAlert(context, activity.id, null, transaction);
         await recordHistory(context, activity.id, completing ? 'COMPLETED' : reopened ? 'REOPENED' : previousStatus === input.targetStatus ? 'REORDERED' : 'STATUS_CHANGED',
             {from: previousStatus, to: input.targetStatus, allowIncompleteChecklist: completing && input.allowIncompleteChecklist === true}, transaction);
-        await reviseBoard(board, transaction, true);
+        await reviseBoard(board, transaction, true, context);
         return mutationResponse(context, board, activity, transaction);
     });
 }
@@ -262,15 +305,29 @@ export async function archiveActivity(req: Request, activityId: string, input: A
             restore ? 'Questa attività è già nella bacheca.' : 'Questa attività è già archiviata.');
         await assertCapability(context, activity, restore ? 'canRestore' : 'canArchive', transaction);
         assertVersion(activity, input.expectedVersion);
-        assertOrder(board, input.expectedOrderRevision);
+        assertOrder(board, input.expectedOrderRevision, context);
+        if (activity.recurrence && !restore) {
+            if (input.scope === 'execution') {
+                if (!context.execution) throw new ActivityError('ACTIVITY_EXECUTION_NOT_STARTED', 409, 'La prima esecuzione non è ancora iniziata.');
+                if (input.expectedExecutionId !== context.execution.id) throw new ActivityError('ACTIVITY_EXECUTION_CHANGED', 409, 'Aggiorna la scheda prima di archiviare questa esecuzione.');
+                await context.execution.update({archivedAt: new Date(), archivedByUserId: context.userId, version: context.execution.version + 1}, {transaction});
+                await persistAlert(context, activity.id, null, transaction);
+                await recordHistory(context, activity.id, 'EXECUTION_ARCHIVED', {}, transaction);
+                await reviseBoard(board, transaction, true, context);
+                return mutationResponse(context, board, activity, transaction);
+            }
+            if (!canManageActivityRecurrence(context, activity)) throw new ActivityError('ACTIVITY_FORBIDDEN', 403, 'Non puoi interrompere questa ripetizione.');
+            await stopActivityRecurrence(activity, transaction);
+        }
         const position = restore ? await placementPosition(context, board.id, activity.status, {kind: 'end'}, activityId, transaction) : activity.position;
         await activity.update({
             archivedAt: restore ? null : new Date(), archivedByUserId: restore ? null : context.userId,
             version: activity.version + 1, updatedByUserId: context.userId, position
         }, {transaction});
         if (!restore) await persistAlert(context, activity.id, null, transaction);
-        await recordHistory(context, activity.id, restore ? 'RESTORED' : 'ARCHIVED', {status: activity.status}, transaction);
-        await reviseBoard(board, transaction, true);
+        await recordHistory(activity.recurrence ? {...context, executionId: null} : context, activity.id,
+            restore ? 'RESTORED' : 'ARCHIVED', {status: activity.status}, transaction);
+        await reviseBoard(board, transaction, true, context);
         return mutationResponse(context, board, activity, transaction);
     });
 }
@@ -294,7 +351,7 @@ export function dueFields(due: ActivityDue) {
 }
 
 async function currentSchedule(context: ActivityContext, activity: Activity, transaction: Transaction): Promise<ActivitySchedule> {
-    const alert = await models(context).alert.findOne({where: {activityId: activity.id}, transaction});
+    const alert = targetsPastExecution(context) ? null : await models(context).alert.findOne({where: {activityId: activity.id}, transaction});
     return {
         due: dueFromActivity(activity.get({plain: true}) as ActivityRecord),
         assigneeIds: await assignmentIds(context, activity.id, transaction),
@@ -306,6 +363,10 @@ async function currentSchedule(context: ActivityContext, activity: Activity, tra
 }
 
 async function replaceAssignments(context: ActivityContext, activityId: string, ids: string[], transaction: Transaction) {
+    if (context.historicalExecution && context.execution) {
+        await context.execution.update({assigneeIds: ids}, {transaction});
+        return;
+    }
     const assignment = models(context).assignment;
     await assignment.destroy({where: {activityId, ...(ids.length ? {userId: {[Op.notIn]: ids}} : {})}, transaction});
     if (ids.length) await assignment.bulkCreate(ids.map(userId => ({activityId, userId, assignedByUserId: context.userId})), {transaction, ignoreDuplicates: true});
@@ -317,6 +378,10 @@ async function replaceAssignments(context: ActivityContext, activityId: string, 
 }
 
 async function persistAlert(context: ActivityContext, activityId: string, input: ActivityAlertInput | null, transaction: Transaction) {
+    if (targetsPastExecution(context)) {
+        if (input) throw new ActivityError('INVALID_ALERT', 422, 'Gli avvisi non si attivano sulle esecuzioni passate.');
+        return;
+    }
     if (input) await ensureActivityDeliveryActivation(context.schema, transaction);
     const scoped = models(context);
     const existing = await scoped.alert.findOne({where: {activityId}, transaction});
@@ -329,11 +394,11 @@ async function persistAlert(context: ActivityContext, activityId: string, input:
     }
     let persisted = existing;
     if (existing) {
-        await existing.update({enabled: Boolean(input), scheduledAt: input ? new Date(input.scheduledAt) : existing.scheduledAt,
+        await existing.update({executionId: context.executionId ?? null, enabled: Boolean(input), scheduledAt: input ? new Date(input.scheduledAt) : existing.scheduledAt,
             channels: input?.channels ?? existing.channels, scheduleVersion: existing.scheduleVersion + 1}, {transaction});
         await cancelActivityDeliveries(context.schema, existing.id, transaction);
     } else {
-        persisted = await scoped.alert.create({activityId, enabled: true, scheduledAt: new Date(input!.scheduledAt), channels: input!.channels, scheduleVersion: 1}, {transaction});
+        persisted = await scoped.alert.create({activityId, executionId: context.executionId ?? null, enabled: true, scheduledAt: new Date(input!.scheduledAt), channels: input!.channels, scheduleVersion: 1}, {transaction});
     }
     if (persisted) await materializeActivityDeliveries(context.schema, persisted, transaction);
     await recordHistory(context, activityId, input ? 'ALERT_SCHEDULED' : 'ALERT_CANCELLED',

@@ -8,6 +8,7 @@ import type {
 } from '../activities.types.js';
 import type {Activity, ActivityBoard, ActivityChecklistItem, ActivityComment} from '../models/index.js';
 import {syncChecklistWorkflow, setActivityWorkflow, invalidateActivityReview} from './activityWorkflow.service.js';
+import {executionChildren, prepareExecutionContext} from './activityExecutionTarget.service.js';
 import {assertVersion, mutationResponse} from './activityPersistence.service.js';
 import {ActivityError} from '../utils/activityErrors.js';
 import {parseActivityId, parseActivityChildPageQuery} from '../utils/activityValidation.js';
@@ -19,20 +20,22 @@ import {activityInBoard, assertCapability, currentBoard, models, recordHistory, 
 export async function getActivityChildPage(req: Request, activityId: string, kind: ActivityChildKind) {
     parseActivityId(activityId, 'activityId');
     const query = parseActivityChildPageQuery(req.query);
+    if (query.scope && (kind !== 'history' || req.params.executionId)) throw new ActivityError('ACTIVITY_VALIDATION_FAILED', 422, 'La cronologia della routine si consulta dalla scheda principale.');
     return sequelize.transaction({isolationLevel: Transaction.ISOLATION_LEVELS.REPEATABLE_READ, readOnly: true}, async transaction => {
         const context = await resolveActivityContext(req, transaction); requireAccess(context, 'read');
         const board = await currentBoard(context, transaction);
-        const activity = await activityInBoard(context, board.id, activityId, transaction);
+        const activity = await prepareExecutionContext(context, board, activityId, transaction, {executionId: req.params.executionId, expectedExecutionId: req.query.expectedExecutionId});
         return readActivityChildPage(context, board, activity, kind, query, transaction);
     });
 }
 
 export async function readActivityChildPage(context: ActivityContext, board: ActivityBoard, activity: Activity,
     kind: ActivityChildKind, query: ActivityChildPageQuery, transaction: Transaction) {
+    if (query.scope === 'routine') context = {...context, executionId: null};
     const boardRecord = board.get({plain: true});
     const cursor = query.cursor ? decodeChildCursor(query.cursor, context, boardRecord, activity.id, kind) : null;
     const evaluationAt = cursor?.evaluationAt ?? new Date().toISOString();
-    const where: WhereOptions = {activityId: activity.id};
+    const where: WhereOptions = {activityId: activity.id, ...executionChildren(context)};
     const after: WhereOptions = cursor ? {[Op.or]: [{createdAt: {[Op.lt]: cursor.createdAt}},
         {createdAt: cursor.createdAt, id: {[Op.lt]: cursor.id}}]} : {};
     const scoped = models(context);
@@ -54,7 +57,7 @@ export async function getActivityChecklist(req: Request, activityId: string) {
     return sequelize.transaction({isolationLevel: Transaction.ISOLATION_LEVELS.REPEATABLE_READ, readOnly: true}, async transaction => {
         const context = await resolveActivityContext(req, transaction); requireAccess(context, 'read');
         const board = await currentBoard(context, transaction);
-        const activity = await activityInBoard(context, board.id, activityId, transaction);
+        const activity = await prepareExecutionContext(context, board, activityId, transaction, {executionId: req.params.executionId, expectedExecutionId: req.query.expectedExecutionId});
         const data = await checklistResponse(context, board, activity, null, transaction);
         return {items: data.checklist, checklistRevision: data.checklistRevision, snapshotRevision: data.snapshotRevision};
     });
@@ -69,21 +72,22 @@ function assertItemVersion(item: ActivityChecklistItem, expected: number) {
         'Questo elemento è stato modificato da un collega. Controllalo prima di salvare.');
 }
 async function itemInActivity(context: ActivityContext, activityId: string, itemId: string, transaction: Transaction) {
-    const item = await models(context).checklist.findOne({where: {id: itemId, activityId}, transaction});
+    const item = await models(context).checklist.findOne({where: {id: itemId, activityId, ...executionChildren(context)}, transaction});
     if (!item) throw new ActivityError('ACTIVITY_NOT_FOUND', 404, 'Questo elemento non è più disponibile nella checklist.');
     return item;
 }
-async function reviseChecklist(activity: Activity, board: ActivityBoard, transaction: Transaction, orderChanged = false) {
+async function reviseChecklist(context: ActivityContext, activity: Activity, board: ActivityBoard, transaction: Transaction, orderChanged = false) {
     await activity.update({checklistRevision: activity.checklistRevision + 1}, {transaction, silent: true});
-    await reviseBoard(board, transaction, orderChanged);
+    await reviseBoard(board, transaction, orderChanged, context);
 }
 async function checklistResponse(context: ActivityContext, board: ActivityBoard, activity: Activity, itemId: string | null, transaction: Transaction) {
-    const rows = await models(context).checklist.findAll({where: {activityId: activity.id}, order: [['position', 'ASC'], ['id', 'ASC']], transaction});
+    const rows = await models(context).checklist.findAll({where: {activityId: activity.id, ...executionChildren(context)}, order: [['position', 'ASC'], ['id', 'ASC']], transaction});
     const checklist = await serializeChecklist(context, rows, transaction);
     return {...await mutationResponse(context, board, activity, transaction), activityId: activity.id, item: checklist.find(item => item.id === itemId) ?? null, checklist,
         checklistRevision: activity.checklistRevision, snapshotRevision: board.snapshotRevision};
 }
-const checklistReceipt = {receipt: (data: Record<string, any>) => ({activityId: data.activityId, itemId: data.item?.id ?? null}),
+const checklistReceipt = {receipt: (data: Record<string, any>) => ({activityId: data.activityId,
+    ...(data.executionId ? {executionId: data.executionId} : {}), itemId: data.item?.id ?? null}),
     replay: async (context: ActivityContext, board: ActivityBoard, receipt: Record<string, any>, transaction: Transaction) => {
         const activity = await activityInBoard(context, board.id, receipt.activityId, transaction);
         return checklistResponse(context, board, activity, receipt.itemId, transaction);
@@ -95,10 +99,10 @@ export async function addChecklistItem(req: Request, activityId: string, input: 
         const activity = await activityInBoard(context, board.id, activityId, transaction);
         await assertCapability(context, activity, 'canManageChecklist', transaction); assertChecklistRevision(activity, input.expectedChecklistRevision);
         const position = await checklistPosition(context, activityId, input.placement, null, transaction);
-        const item = await models(context).checklist.create({activityId, text: input.text, position,
+        const item = await models(context).checklist.create({activityId, ...executionChildren(context), text: input.text, position,
             checked: false, version: 1, createdByUserId: context.userId}, {transaction});
         const orderChanged = await syncChecklistWorkflow(context, board, activity, transaction);
-        await reviseChecklist(activity, board, transaction, orderChanged);
+        await reviseChecklist(context, activity, board, transaction, orderChanged);
         await recordHistory(context, activityId, 'CHECKLIST_ITEM_ADDED', {itemId: item.id}, transaction);
         return checklistResponse(context, board, activity, item.id, transaction);
     }, {...checklistReceipt, status: 201});
@@ -123,7 +127,7 @@ export async function patchChecklistItem(req: Request, activityId: string, itemI
         }
         await item.update(values, {transaction});
         if (progressChanged) orderChanged = await syncChecklistWorkflow(context, board, activity, transaction, input.changes.checked === false) || orderChanged;
-        await reviseChecklist(activity, board, transaction, orderChanged);
+        await reviseChecklist(context, activity, board, transaction, orderChanged);
         await recordHistory(context, activityId, 'CHECKLIST_ITEM_UPDATED', {itemId, fields: Object.keys(input.changes)}, transaction);
         return checklistResponse(context, board, activity, itemId, transaction);
     }, checklistReceipt);
@@ -136,7 +140,7 @@ export async function deleteChecklistItem(req: Request, activityId: string, item
         const item = await itemInActivity(context, activityId, itemId, transaction); assertItemVersion(item, input.expectedVersion);
         await item.destroy({transaction});
         const orderChanged = await syncChecklistWorkflow(context, board, activity, transaction);
-        await reviseChecklist(activity, board, transaction, orderChanged);
+        await reviseChecklist(context, activity, board, transaction, orderChanged);
         await recordHistory(context, activityId, 'CHECKLIST_ITEM_DELETED', {itemId}, transaction);
         return checklistResponse(context, board, activity, null, transaction);
     }, checklistReceipt);
@@ -152,22 +156,24 @@ export async function moveChecklistItem(req: Request, activityId: string, itemId
         // holds the original value. Force the final UPDATE even when those values coincide.
         await models(context).checklist.update({position}, {where: {id: item.id, activityId}, transaction, silent: true});
         const orderChanged = await invalidateActivityReview(context, board, activity, transaction);
-        await reviseChecklist(activity, board, transaction, orderChanged);
+        await reviseChecklist(context, activity, board, transaction, orderChanged);
         await recordHistory(context, activityId, 'CHECKLIST_ITEM_MOVED', {itemId, placement: input.placement}, transaction);
         return checklistResponse(context, board, activity, itemId, transaction);
     }, checklistReceipt);
 }
 
 async function commentInActivity(context: ActivityContext, activityId: string, commentId: string, transaction: Transaction) {
-    const comment = await models(context).comment.findOne({where: {id: commentId, activityId}, transaction});
+    const comment = await models(context).comment.findOne({where: {id: commentId, activityId, ...executionChildren(context)}, transaction});
     if (!comment) throw new ActivityError('ACTIVITY_NOT_FOUND', 404, 'Questo commento non è più disponibile.');
     return comment;
 }
 async function commentResponse(context: ActivityContext, board: ActivityBoard, activity: Activity, commentId: string, transaction: Transaction) {
     const comment = await commentInActivity(context, activity.id, commentId, transaction);
-    return {activityId: activity.id, comment: (await serializeComments(context, activity, [comment], transaction))[0], snapshotRevision: board.snapshotRevision};
+    return {activityId: activity.id, ...(context.executionId ? {executionId: context.executionId} : {}),
+        comment: (await serializeComments(context, activity, [comment], transaction))[0], snapshotRevision: board.snapshotRevision};
 }
-const commentReceipt = {receipt: (data: Record<string, any>) => ({activityId: data.activityId, commentId: data.comment.id}),
+const commentReceipt = {receipt: (data: Record<string, any>) => ({activityId: data.activityId,
+    ...(data.executionId ? {executionId: data.executionId} : {}), commentId: data.comment.id}),
     replay: async (context: ActivityContext, board: ActivityBoard, receipt: Record<string, any>, transaction: Transaction) => {
         const activity = await activityInBoard(context, board.id, receipt.activityId, transaction);
         return commentResponse(context, board, activity, receipt.commentId, transaction);
@@ -177,8 +183,8 @@ export async function createActivityComment(req: Request, activityId: string, in
     return writeOperation(req, {...input, activityId}, 'comment.create', async (context, board, transaction) => {
         const activity = await activityInBoard(context, board.id, activityId, transaction);
         await assertCapability(context, activity, 'canComment', transaction);
-        const comment = await models(context).comment.create({activityId, text: input.text, authorUserId: context.userId, version: 1}, {transaction});
-        await reviseBoard(board, transaction, false);
+        const comment = await models(context).comment.create({activityId, ...executionChildren(context), text: input.text, authorUserId: context.userId, version: 1}, {transaction});
+        await reviseBoard(board, transaction, false, context);
         await recordHistory(context, activityId, 'COMMENT_ADDED', {commentId: comment.id}, transaction);
         return commentResponse(context, board, activity, comment.id, transaction);
     }, {...commentReceipt, status: 201});
@@ -196,7 +202,7 @@ export async function updateActivityComment(req: Request, activityId: string, co
             'Questo commento è stato modificato da un collega. Controllalo prima di salvare.');
         await comment.update(remove ? {text: null, deletedAt: new Date(), version: comment.version + 1}
             : {text: (input as ActivityCommentPatchInput).text, editedAt: new Date(), version: comment.version + 1}, {transaction});
-        await reviseBoard(board, transaction, false);
+        await reviseBoard(board, transaction, false, context);
         await recordHistory(context, activityId, remove ? 'COMMENT_DELETED' : 'COMMENT_EDITED', {commentId}, transaction);
         return commentResponse(context, board, activity, commentId, transaction);
     }, commentReceipt);
@@ -206,7 +212,7 @@ const gap = 1024n, minimum = -(2n ** 63n), maximum = 2n ** 63n - 1n;
 async function checklistPosition(context: ActivityContext, activityId: string, placement: ActivityChecklistPlacement,
     movingId: string | null, transaction: Transaction): Promise<string> {
     const scoped = models(context);
-    const rows = await scoped.checklist.findAll({where: {activityId}, order: [['position', 'ASC'], ['id', 'ASC']], transaction});
+    const rows = await scoped.checklist.findAll({where: {activityId, ...executionChildren(context)}, order: [['position', 'ASC'], ['id', 'ASC']], transaction});
     const remaining = rows.filter(row => row.id !== movingId);
     const anchorId = placement.kind === 'before' ? placement.itemId : null;
     if (placement.kind === 'before' && !remaining.some(row => row.id === placement.itemId)) {

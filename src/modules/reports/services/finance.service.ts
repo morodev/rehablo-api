@@ -15,6 +15,7 @@ import { PatientCreditMovement } from '../../administration/models/patientCredit
 import { clinicalCashFacts, ClinicalCashFact, CashDiagnosticIssue, dateOnly, FinancialWarning, validIssuedDocument } from './financialFacts.service.js';
 import { reportStructureWhere, ReportScope } from './reportScope.service.js';
 import {loadPackageCoverage, ReportPackageCoverage, unknownPackageCoverage} from './packageCoverageReporting.service.js';
+import {isFinancialCarePackage} from '../../administration/services/carePackage.service.js';
 
 export interface FinanceFilters {
     paymentStatus: 'all' | 'paid' | 'partial' | 'unpaid' | 'unknown';
@@ -95,7 +96,8 @@ export async function loadFinanceData(req: Request, query: FinanceQuery, scope: 
         eventWhere[Op.and] = [eventWhere[Op.and] ?? {}, { patientId }];
         invoiceWhere[Op.and] = [invoiceWhere[Op.and] ?? {}, { patientID: patientId }];
     }
-    const packageWhere = { ...eventWhere, templateId: { [Op.not]: null } };
+    const packageWhere = {...eventWhere, [Op.and]: [eventWhere[Op.and] ?? {},
+        {[Op.or]: [{templateId: {[Op.ne]: null}}, {quoteId: {[Op.ne]: null}}]}]};
     if (query.operatorId) eventWhere.calendarId = query.operatorId;
     if (query.eventTypeId) eventWhere.eventTypeId = query.eventTypeId;
     if (query.eventTypeIds?.length) eventWhere.eventTypeId = { [Op.in]: query.eventTypeIds };
@@ -107,7 +109,7 @@ export async function loadFinanceData(req: Request, query: FinanceQuery, scope: 
     ]);
     const events = eventModels.map(plain);
     const invoices = invoiceModels.map(plain);
-    const packages = packageModels.map(plain);
+    const packages = packageModels.map(plain).filter(isFinancialCarePackage);
     const packageIds = packages.map(pkg => pkg.id);
     const eventIds = events.map((event) => event.id);
     const invoiceIds = invoices.map((invoice) => invoice.id);

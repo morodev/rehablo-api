@@ -1,5 +1,6 @@
 import ActivityBoard from './activityBoard.model.js';
 import Activity from './activity.model.js';
+import ActivityExecution from './activityExecution.model.js';
 import ActivityAssignment from './activityAssignment.model.js';
 import ActivityChecklistItem from './activityChecklistItem.model.js';
 import ActivityComment from './activityComment.model.js';
@@ -17,6 +18,8 @@ export function registerActivitiesAssociations(): void {
     if (associationsRegistered) return;
     ActivityBoard.hasMany(Activity, {foreignKey: 'boardId', as: 'activities', onDelete: 'RESTRICT'});
     Activity.belongsTo(ActivityBoard, {foreignKey: 'boardId', as: 'board', onDelete: 'RESTRICT'});
+    Activity.hasMany(ActivityExecution, {foreignKey: 'activityId', as: 'executions', onDelete: 'RESTRICT'});
+    ActivityExecution.belongsTo(Activity, {foreignKey: 'activityId', onDelete: 'RESTRICT'});
     Activity.hasMany(ActivityAssignment, {foreignKey: 'activityId', as: 'assignments', onDelete: 'CASCADE'});
     ActivityAssignment.belongsTo(Activity, {foreignKey: 'activityId'});
     Activity.hasMany(ActivityChecklistItem, {foreignKey: 'activityId', as: 'checklist', onDelete: 'CASCADE'});
@@ -39,11 +42,11 @@ export function registerActivitiesAssociations(): void {
 
 /** Parent-before-child order is required by empty-tenant provisioning. */
 export const ACTIVITIES_MODELS = [
-    ActivityBoard, Activity, ActivityAssignment, ActivityChecklistItem, ActivityComment,
+    ActivityBoard, Activity, ActivityExecution, ActivityAssignment, ActivityChecklistItem, ActivityComment,
     ActivityHistory, ActivityAlert, ActivityDelivery, ActivityOperation, ActivityNotificationActivation, ActivityPushTarget
 ];
 
 export {
-    ActivityBoard, Activity, ActivityAssignment, ActivityChecklistItem, ActivityComment,
+    ActivityBoard, Activity, ActivityExecution, ActivityAssignment, ActivityChecklistItem, ActivityComment,
     ActivityHistory, ActivityAlert, ActivityDelivery, ActivityOperation, ActivityNotificationActivation, ActivityPushTarget
 };

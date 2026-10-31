@@ -33,6 +33,29 @@ it('keeps the purchase debt once and replaces it with the invoice without making
     assert.equal(after.queue[0].balance, 300); assert.equal(after.queue[0].orderDate, '2026-09-01T00:00:00.000Z');
 });
 
+it('keeps quote package installments on the purchase and transfers its residual to one invoice without charging visits', () => {
+    const pack = {id: 'pack', patientId, structureId, templateId: null, quoteId: 'aaaaaaaa-aaaa-4aaa-8aaa-000000000003',
+        name: 'Percorso da preventivo', totalPrice: 400, purchasedUnits: 10, remainingUnits: 9,
+        purchasedAt: null, createdAt: '2026-09-01T10:00:00Z', lines: [{id: 'aaaaaaaa-aaaa-4aaa-8aaa-000000000004',
+            itemType: 'SERVICE', itemId: 'aaaaaaaa-aaaa-4aaa-8aaa-000000000005', description: 'Fisioterapia',
+            quantity: 10, unitPrice: 40, discountType: 'PERCENTAGE', discountValue: 0, vatRate: 0, total: 400}]};
+    const covered = event('current', '2026-10-12T09:00:00Z', {carePackageId: pack.id, packageReservationStatus: 'CONSUMED'});
+    const payments = [{id: 'deposit', carePackageId: pack.id, amount: 100, status: 'POSTED', source: 'PACKAGE_PURCHASE'}];
+    const before = buildPatientSettlementPosition(context, sources({packages: [pack], events: [covered], payments}));
+    assert.equal(before.current!.balance, 0);
+    assert.equal(before.current!.eligible, false);
+    assert.equal(before.obligations.find(row => row.kind === 'PACKAGE')!.balance, 300);
+    assert.equal(before.obligations.find(row => row.kind === 'PACKAGE')!.orderDate, '2026-09-01T10:00:00.000Z');
+    assert.deepEqual(before.queue, []);
+    const after = buildPatientSettlementPosition(context, sources({packages: [{...pack, invoiceId: 'bill'}], events: [covered],
+        payments: payments.map(row => ({...row, invoiceId: 'bill'})),
+        invoices: [invoice('bill', '2026-10-01', {invoiceNet: 400, carePackageId: pack.id})]}));
+    assert.equal(after.current!.balance, 0);
+    assert.equal(after.obligations.filter(row => row.kind === 'PACKAGE').length, 0);
+    assert.deepEqual(after.queue.map(row => [row.kind, row.balance]), [['INVOICE', 300]]);
+    assert.equal(after.queue[0].orderDate, '2026-09-01T10:00:00.000Z');
+});
+
 it('includes autonomous prior invoices and blocks paying the current appointment first', () => {
     const position = buildPatientSettlementPosition(context, sources({invoices: [invoice('invoice', '2026-09-20')]}));
     assert.deepEqual(position.queue.map(row => row.key), ['INVOICE:invoice', 'APPOINTMENT:current']);

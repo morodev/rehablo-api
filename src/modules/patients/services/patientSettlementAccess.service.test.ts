@@ -9,7 +9,7 @@ import Patient from '../models/patient.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoiceAgendaEvent from '../../invoice/models/invoiceAgendaEvent.model.js';
-import {CarePackage} from '../../administration/models/index.js';
+import {CarePackage, PatientCredit} from '../../administration/models/index.js';
 
 beforeEach(t => {
     // Coverage summaries add a package read to positions; these authorization tests never use a database.
@@ -35,6 +35,9 @@ const packageRead = [...read, 'care_package:read:structure'];
 const packagePay = [...packageRead, 'payment:create:structure'];
 const purchasedPackage = (extra: Record<string, any> = {}) => ({id: packageId, patientId, structureId, templateId: 'template',
     name: '10 sedute', totalPrice: 400, purchasedAt: '2020-01-01', purchasedUnits: 10, remainingUnits: 10, status: 'ACTIVE', ...extra});
+const quotePackage = () => purchasedPackage({id: 'quote-package', templateId: null, quoteId: 'aaaaaaaa-aaaa-4aaa-8aaa-000000000030',
+    lines: [{id: 'aaaaaaaa-aaaa-4aaa-8aaa-000000000031', itemType: 'SERVICE', itemId: 'aaaaaaaa-aaaa-4aaa-8aaa-000000000032',
+        description: 'Fisioterapia', quantity: 10, unitPrice: 40, discountType: 'PERCENTAGE', discountValue: 0, vatRate: 0, total: 400}]});
 const packageRaw = (packages: Array<Record<string, any>>) => buildPatientSettlementPosition(context,
     {events: [{...event, appointmentPaymentHistoryKnown: true}], invoices: [], links: [], payments: [], packages,
         prices: new Map([['current', {amount: 60}]])});
@@ -70,6 +73,25 @@ it('keeps the package residual payable regardless of expiry, status or remaining
         assert.equal(purchase.canUseCredit, false);
         assert.equal(position.queue.some(row => row.kind === 'PACKAGE'), false);
     }
+});
+
+it('authorizes quote package receipts with quote read and payment create without exposing catalog purchases', async t => {
+    t.mock.method(PatientCredit, 'schema', (() => ({findAll: async () => []})) as any);
+    t.mock.method(Patient, 'schema', (() => ({findOne: async () => asRecord(context.patient)})) as any);
+    const position = packageRaw([purchasedPackage(), quotePackage()]);
+    const quoteRead = [...read, 'quote:read:structure'];
+    const view = await patientSettlementPositionView(req([...quoteRead, 'payment:create:structure']), context,
+        {raw: position, administrationEnabled: true});
+    const packages = view.obligations.filter(row => row.kind === 'PACKAGE');
+    assert.deepEqual(packages.map(row => row.targetId), ['quote-package']);
+    assert.equal(packages[0].canPayPackage, true);
+    assert.equal(packages[0].canCash, false);
+    assert.equal(packages[0].canUseCredit, false);
+    assert.equal(position.queue.some(row => row.kind === 'PACKAGE'), false);
+    const readOnly = await patientSettlementPositionView(req(quoteRead), context, {raw: position, administrationEnabled: true});
+    assert.equal(readOnly.obligations.find(row => row.kind === 'PACKAGE')!.canPayPackage, false);
+    const catalogOnly = await patientSettlementPositionView(req(packagePay), context, {raw: position, administrationEnabled: true});
+    assert.deepEqual(catalogOnly.obligations.filter(row => row.kind === 'PACKAGE').map(row => row.targetId), [packageId]);
 });
 
 it('does not offer package payment without the module, package read rights or payment creation rights', async t => {

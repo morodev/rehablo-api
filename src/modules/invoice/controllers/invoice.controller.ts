@@ -38,7 +38,9 @@ import { invoiceEmissionMonth, invoicePaymentMonth, parseInvoiceMonthFilter, inv
 import { decorateInvoicesWithPayments, syncInvoicePaymentStatus } from '../services/payment.service.js';
 import { appointmentPricesByEvent, ensureAppointmentPaymentHistory, isValidPaymentDate, linkAppointmentPayments } from '../services/appointmentPayment.service.js';
 import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
-import {packageToday, scopedCarePackage} from '../../administration/services/carePackage.service.js';
+import {isFinancialCarePackage, packageToday, scopedReadableCarePackage} from '../../administration/services/carePackage.service.js';
+import {quotePackageFinancialSnapshot} from '../../administration/services/quotePackageFinance.js';
+import {quotePackageInvoiceLines} from '../utils/quotePackageInvoice.js';
 import {treasuryError, nullableTreasuryUuid, validateTreasuryMethod} from '../../administration/services/treasuryValidation.service.js';
 import {beginFinancialOperation, financialOperationKey} from '../../administration/services/financialOperation.service.js';
 import {InvoicePaymentCreateOptions} from '../../administration/services/invoicePaymentTreasury.service.js';
@@ -119,7 +121,7 @@ async function unavailableCatalogId(
 
 interface ResolvedInvoiceLine {
     socialSecurity?: ContributionPolicy;
-    id: string;
+    id: string | null;
     quantity: number;
     unitPrice: number;
     originalUnitPrice?: number | null;
@@ -520,14 +522,16 @@ function applyFiscalRules(params: {
 export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     delete req.body.socialSecuritySnapshot;
-    const packagePurchase = req.body?.carePackageId ? await scopedCarePackage(req, req.body.carePackageId) : null;
+    const packagePurchase = req.body?.carePackageId ? await scopedReadableCarePackage(req, req.body.carePackageId) : null;
+    const quotePackage = packagePurchase && !packagePurchase.get('templateId')
+        ? quotePackageFinancialSnapshot(packagePurchase.get({plain: true})) : null;
     if (packagePurchase) {
-        if (!packagePurchase.get('templateId')) treasuryError('Il pacchetto storico richiede riconciliazione prima della fatturazione', 409);
+        if (!isFinancialCarePackage(packagePurchase.get({plain: true}))) treasuryError('Il pacchetto storico richiede riconciliazione prima della fatturazione', 409);
         if (packagePurchase.get('invoiceId')) return sendSuccessResponse(res, 200, {
             invoiceId: packagePurchase.get('invoiceId'), carePackageId: packagePurchase.get('id')});
         req.body = {carePackageId: packagePurchase.get('id'), patientID: packagePurchase.get('patientId'),
             documentType: 'fattura', emissionDate: packageToday(), products: [],
-            services: [{id: packagePurchase.get('serviceId'), quantity: 1}], stampChargedToPatient: false};
+            services: quotePackage ? [] : [{id: packagePurchase.get('serviceId'), quantity: 1}], stampChargedToPatient: false};
     }
     const {
         InvoiceScoped,
@@ -659,7 +663,11 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         try { contributionPolicy(fiscalProfile.socialSecurityFund, invoiceFields.socialSecurityPricingMode, fiscalProfile.socialSecurityRate); }
         catch (error) { return sendErrorResponse(res, 422, (error as Error).message); }
     }
-    if (packagePurchase) {
+    if (quotePackage) {
+        const frozenLines = quotePackageInvoiceLines(quotePackage.lines, fiscalProfile.appliesVat);
+        productLines.push(...frozenLines.products);
+        serviceLines.push(...frozenLines.services);
+    } else if (packagePurchase) {
         const snapshot = packagePurchase.get('purchaseSnapshot') as Record<string, any>;
         const vat = snapshot.serviceVat ?? null;
         const vatRate = fiscalProfile.appliesVat && Number.isFinite(Number(vat)) ? Number(vat) : 0;
@@ -775,7 +783,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             return {kind: 'created', invoice: previous} as const;
         }
         if (invoiceFields.patientID) await lockPatientSettlement(schema, invoiceFields.patientID, t);
-        const lockedPackage = packagePurchase ? await scopedCarePackage(req, packagePurchase.get('id'), t, true) : null;
+        const lockedPackage = packagePurchase ? await scopedReadableCarePackage(req, packagePurchase.get('id'), t, true) : null;
         if (lockedPackage?.get('invoiceId')) return {kind: 'package-reused', invoiceId: String(lockedPackage.get('invoiceId'))} as const;
         let agendaEvents: AgendaEvent[] = [];
         let appointmentPayments: InvoicePayment[] = [];

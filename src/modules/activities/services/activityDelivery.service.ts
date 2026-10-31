@@ -11,7 +11,8 @@ import StructureUser from '../../auth/models/structureUser.model.js';
 import {resolveEffectiveRole} from '../../auth/rbac/roles.js';
 import ReminderPushSubscription from '../../notes/models/reminderPushSubscription.model.js';
 import {getPushPublicKey} from '../../notes/services/reminderExternalDelivery.service.js';
-import {Activity, ActivityAlert, ActivityAssignment, ActivityBoard, ActivityDelivery, ActivityPushTarget, ActivityNotificationActivation} from '../models/index.js';
+import {Activity, ActivityAlert, ActivityAssignment, ActivityBoard, ActivityDelivery, ActivityExecution, ActivityPushTarget, ActivityNotificationActivation} from '../models/index.js';
+import {activityExecutionDeadline} from '../utils/activityRecurrence.policy.js';
 import ActivityNotificationPreference from '../models/activityNotificationPreference.model.js';
 import {isEligibleActivityRole} from './activityAccess.service.js';
 import {activitiesDeliveryEnabled, ensureActivityDeliveryActivation} from './activityDeliveryActivation.service.js';
@@ -20,6 +21,13 @@ import {activityRetryAt, aggregateActivityPushTargets, classifyActivityDeliveryF
 import {ActivityDeliveryAddress, ActivityDeliveryTransport, defaultActivityDeliveryTransport, withActivityProviderTimeout} from './activityDeliveryTransport.service.js';
 
 const BATCH_SIZE = 50, CONCURRENCY = 5, LEASE_MS = 120_000;
+async function currentAlertExecution(schema: string, activity: Activity, alert: ActivityAlert, now: Date, transaction: Transaction): Promise<boolean> {
+    if (!activity.recurrence) return !alert.executionId;
+    if (!alert.executionId || alert.executionId !== activity.currentExecutionId) return false;
+    const execution = await ActivityExecution.schema(schema).findByPk(alert.executionId, {transaction});
+    return !!execution && !execution.closedAt && !execution.archivedAt
+        && activityExecutionDeadline(execution.occurrenceDate, execution.dueTimezone ?? 'Europe/Rome') > now;
+}
 const quoteSchema = (schema: string) => {
     if (!/^rehablo_[a-f0-9]{32}$/i.test(schema)) throw new Error('Invalid tenant schema');
     return '"' + schema + '"';
@@ -32,6 +40,7 @@ export async function discoverActivityDeliveries(schema: string, tenantId: strin
         JOIN ${prefix}"activities" a ON a."id" = al."activityId"
         WHERE al."enabled" = true AND al."scheduledAt" > :activatedAt AND al."scheduledAt" <= :now
         AND a."archivedAt" IS NULL AND a."status" <> 'COMPLETED'
+        AND (a."recurrence" IS NULL OR al."executionId" = a."currentExecutionId")
         AND EXISTS (SELECT 1 FROM ${prefix}"activity_assignments" assigned
             CROSS JOIN unnest(ARRAY['inApp']::varchar[] || al."channels") channel
             WHERE assigned."activityId" = a."id" AND assigned."createdAt" <= al."scheduledAt" AND NOT EXISTS (
@@ -46,7 +55,7 @@ export async function discoverActivityDeliveries(schema: string, tenantId: strin
         await ActivityBoard.schema(schema).findByPk(activity.boardId, {transaction, lock: transaction.LOCK.UPDATE});
         await alert.reload({transaction, lock: transaction.LOCK.UPDATE});
         await activity.reload({transaction});
-        if (activity.archivedAt || activity.status === 'COMPLETED') return;
+        if (activity.archivedAt || activity.status === 'COMPLETED' || !await currentAlertExecution(schema, activity, alert, now, transaction)) return;
         await materializeActivityDeliveries(schema, alert, transaction);
     });
 }
@@ -116,12 +125,15 @@ async function currentRecipient(schema: string, tenantId: string, claim: Activit
         || !activation || delivery.scheduledAt <= activation.activatedAt
         || new Date(assignment.get('createdAt') as Date) > delivery.scheduledAt
         || activity.archivedAt || activity.status === 'COMPLETED' || !alert.enabled
+        || !await currentAlertExecution(schema, activity, alert, now, transaction)
+        || (delivery.executionId ?? null) !== (alert.executionId ?? null)
         || alert.scheduleVersion !== delivery.scheduleVersion || alert.scheduledAt?.getTime() !== delivery.scheduledAt.getTime()
         || !alert.channels.includes(delivery.channel)) {
         await cancelClaimed(schema, delivery, transaction, 'RECIPIENT_OR_SCHEDULE_NO_LONGER_CURRENT');
         return null;
     }
-    const address: ActivityDeliveryAddress = {tenantId, structureId: board.structureId, activityId: activity.id, deliveryId: delivery.id};
+    const address: ActivityDeliveryAddress = {tenantId, structureId: board.structureId, activityId: activity.id, deliveryId: delivery.id,
+        ...(delivery.executionId ? {executionId: delivery.executionId} : {})};
     return {delivery, user, address, now};
 }
 

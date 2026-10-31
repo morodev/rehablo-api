@@ -21,18 +21,20 @@ const migration = require('../../migrations/20261011-activities-foundation.js') 
 };
 const deliveryMigration = require('../../migrations/20261011-activities-delivery.js') as typeof migration;
 const reviewMigration = require('../../migrations/20261024-activities-review.js') as typeof migration;
+const recurrenceMigration = require('../../migrations/20261031-activity-recurrences.js') as typeof migration;
 const publicMigration = require('../../migrations/20261011-activities-notifications-public.js') as {
     VERSION: string; contract: {columns: Record<string, string[]>};
     up(queryInterface: ReturnType<typeof sequelize.getQueryInterface>, options?: {transaction?: Transaction}): Promise<void>;
 };
-const contract: FoundationContract = {
-    tables: [...migration.contract.tables, ...deliveryMigration.contract.tables],
-    columns: {...migration.contract.columns, ...Object.fromEntries(Object.entries(deliveryMigration.contract.columns)
-        .map(([table, columns]) => [table, [...(migration.contract.columns[table] ?? []), ...columns]])),
-        ...Object.fromEntries(Object.entries(reviewMigration.contract.columns).map(([table, columns]) => [table, [...(migration.contract.columns[table] ?? []), ...columns]]))},
-    constraints: [...migration.contract.constraints, ...deliveryMigration.contract.constraints, ...reviewMigration.contract.constraints],
-    indexes: [...migration.contract.indexes, ...deliveryMigration.contract.indexes]
-};
+const contract: FoundationContract = {tables: [], columns: {}, constraints: [], indexes: []};
+for (const source of [migration, deliveryMigration, reviewMigration, recurrenceMigration]) {
+    contract.tables.push(...source.contract.tables);
+    for (const [table, columns] of Object.entries(source.contract.columns)) {
+        contract.columns[table] = [...new Set([...(contract.columns[table] ?? []), ...columns])];
+    }
+    contract.constraints.push(...source.contract.constraints);
+    contract.indexes.push(...source.contract.indexes);
+}
 const SCHEMA_PATTERN = /^rehablo_[a-f0-9]{32}$/i;
 const quote = (value: string) => '"' + value.replaceAll('"', '""') + '"';
 type QueryConnection = {query(sql: string, options?: any): Promise<any>};
@@ -60,6 +62,7 @@ export interface ActivitiesReadiness {
     versionApplied: boolean;
     deliveryVersionApplied: boolean;
     reviewVersionApplied: boolean;
+    recurrenceVersionApplied: boolean;
     publicReady: boolean;
     missingPublicColumns: string[];
     missingTables: string[];
@@ -111,7 +114,7 @@ export async function inspectActivities(connection: QueryConnection, schema: str
         actual.table === expected.table && actual.name === expected.name && actual.valid
         && actual.unique === expected.unique && actual.columns.join(',') === expected.columns.join(',')
         && normalizePredicate(actual.predicate) === normalizePredicate(expected.predicate))).map(index => index.name);
-    let versionApplied = false, deliveryVersionApplied = false, reviewVersionApplied = false;
+    let versionApplied = false, deliveryVersionApplied = false, reviewVersionApplied = false, recurrenceVersionApplied = false;
     if (availableColumns.has('schema_migrations.version')) {
         const [rows] = await connection.query(`SELECT 1 FROM ${quote(schema)}."schema_migrations" WHERE "version" = :version`, {
             replacements: {version: migration.VERSION}
@@ -122,6 +125,16 @@ export async function inspectActivities(connection: QueryConnection, schema: str
         deliveryVersionApplied = deliveryRows.length > 0;
         const [reviewRows] = await connection.query(`SELECT 1 FROM ${quote(schema)}."schema_migrations" WHERE "version" = :version`, {replacements: {version: reviewMigration.VERSION}});
         reviewVersionApplied = reviewRows.length > 0;
+        const [recurrenceRows] = await connection.query(`SELECT 1 FROM ${quote(schema)}."schema_migrations" WHERE "version" = :version`, {replacements: {version: recurrenceMigration.VERSION}});
+        recurrenceVersionApplied = recurrenceRows.length > 0;
+    }
+    // The standard deployment runner records releases in the tenant's SequelizeMeta;
+    // this legacy feature CLI records its own version in schema_migrations.
+    if (!recurrenceVersionApplied && availableColumns.has('SequelizeMeta.name')) {
+        const [rows] = await connection.query(`SELECT 1 FROM ${quote(schema)}."SequelizeMeta" WHERE "name" = :name`, {
+            replacements: {name: '202610310002-activity-recurrences.js'}
+        });
+        recurrenceVersionApplied = rows.length > 0;
     }
     let missingBoards: number | null = null;
     if (availableColumns.has('activity_boards.structureId')) {
@@ -139,9 +152,9 @@ export async function inspectActivities(connection: QueryConnection, schema: str
     const missingPublicColumns = Object.entries(publicMigration.contract.columns).flatMap(([table, names]) =>
         names.filter(name => !availablePublic.has(table + '.' + name)).map(name => table + '.' + name));
     const publicReady = !missingPublicColumns.length;
-    return {schema, versionApplied, deliveryVersionApplied, reviewVersionApplied, publicReady, missingPublicColumns,
+    return {schema, versionApplied, deliveryVersionApplied, reviewVersionApplied, recurrenceVersionApplied, publicReady, missingPublicColumns,
         missingTables, missingColumns, missingConstraints, missingIndexes, missingBoards,
-        ready: versionApplied && deliveryVersionApplied && reviewVersionApplied && publicReady && !missingTables.length && !missingColumns.length
+        ready: versionApplied && deliveryVersionApplied && reviewVersionApplied && recurrenceVersionApplied && publicReady && !missingTables.length && !missingColumns.length
             && !missingConstraints.length && !missingIndexes.length && missingBoards === 0};
 }
 
@@ -151,6 +164,7 @@ async function applyForTenant(schema: string): Promise<ActivitiesReadiness> {
         await migration.up(sequelize.getQueryInterface(), {schema, transaction});
         await deliveryMigration.up(sequelize.getQueryInterface(), {schema, transaction});
         await reviewMigration.up(sequelize.getQueryInterface(), {schema, transaction});
+        await recurrenceMigration.up(sequelize.getQueryInterface(), {schema, transaction});
         await sequelize.query(`CREATE TABLE IF NOT EXISTS ${quote(schema)}."schema_migrations" (
             "version" VARCHAR(160) PRIMARY KEY, "appliedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )`, {transaction});
@@ -161,6 +175,8 @@ async function applyForTenant(schema: string): Promise<ActivitiesReadiness> {
             ON CONFLICT ("version") DO NOTHING`, {transaction, replacements: {version: deliveryMigration.VERSION}});
         await sequelize.query(`INSERT INTO ${quote(schema)}."schema_migrations" ("version") VALUES (:version) ON CONFLICT ("version") DO NOTHING`,
             {transaction, replacements: {version: reviewMigration.VERSION}});
+        await sequelize.query(`INSERT INTO ${quote(schema)}."schema_migrations" ("version") VALUES (:version) ON CONFLICT ("version") DO NOTHING`,
+            {transaction, replacements: {version: recurrenceMigration.VERSION}});
         const connection: QueryConnection = {
             query: (sql, options = {}) => sequelize.query(sql, {...options, transaction})
         };

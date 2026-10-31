@@ -10,7 +10,8 @@ const row=(values:any):any=>({...values,get(key:unknown){if(typeof key==='string
     async update(changes:any){Object.assign(this,changes);return this;}});
 function fixture(t:TestContext){
     const quote=row({id:id(1),patientId:id(2),structureId:id(3),number:8,status:'ACCEPTED',total:500,
-        lines:[{id:'a',itemType:'SERVICE',itemId:id(4),description:'Fisio',quantity:4},{id:'b',itemType:'SERVICE',itemId:id(5),description:'Tecar',quantity:6}]});
+        lines:[{id:'a',itemType:'SERVICE',itemId:id(4),description:'Fisio',quantity:4,unitPrice:50,total:200},
+            {id:'b',itemType:'SERVICE',itemId:id(5),description:'Tecar',quantity:6,unitPrice:50,total:300}]});
     const packages:any[]=[],consumptions:any[]=[],payments:any[]=[],reads:any[]=[];
     t.mock.method(Quote,'schema',(()=>({findOne:async(options:any)=>{reads.push(options);return options.where.status===quote.status?quote:null;}})) as any);
     t.mock.method(CarePackage,'schema',(()=>({findOne:async()=>packages[0]??null,create:async(values:any)=>{
@@ -29,6 +30,8 @@ it('creates an automatically bookable multiple-service quote package once withou
     assert.equal(created.code,201,created.message);assert.equal(f.packages.length,1);
     assert.deepEqual(f.packages[0].purchaseSnapshot.booking.services.map((service:any)=>[service.serviceId,service.remainingUnits]),[[id(4),4],[id(5),6]]);
     assert.equal(f.packages[0].totalPrice,500);assert.equal(f.packages[0].templateId,null);
+    assert.match(f.packages[0].purchasedAt,/^\d{4}-\d{2}-\d{2}$/);
+    assert.deepEqual(f.packages[0].purchaseSnapshot.quote,{id:f.quote.id,number:8,year:undefined,total:500,lines:f.quote.lines});
     assert.equal((await f.run(controller.createPackageFromQuote)).data.reused,true);
     assert.equal(f.packages.length,1);assert.equal(f.payments.length,0);assert.equal(f.consumptions.length,0);
     assert.ok(f.reads.every(options=>options.lock==='UPDATE'));
@@ -36,7 +39,8 @@ it('creates an automatically bookable multiple-service quote package once withou
 
 it('preserves a quote with missing service identifiers for explicit setup instead of matching descriptions',async t=>{
     const f=fixture(t);f.quote.lines[0].itemId=null;const created=await f.run(controller.createPackageFromQuote);
-    assert.equal(created.code,201);assert.equal(f.packages[0].purchaseSnapshot,undefined);assert.equal(f.payments.length,0);
+    assert.equal(created.code,201);assert.equal(f.packages[0].purchaseSnapshot.booking,undefined);
+    assert.deepEqual(f.packages[0].purchaseSnapshot.quote.lines,f.quote.lines);assert.equal(f.payments.length,0);
 });
 
 it('rejects the old manual consumption writer once quote booking has been activated',async t=>{

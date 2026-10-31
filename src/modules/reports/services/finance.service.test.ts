@@ -357,6 +357,36 @@ describe('therapy payment filters and pagination', () => {
 });
 
 describe('financial report loading and access boundaries', () => {
+    it('includes verified quote purchases and their real receipts before invoicing while excluding unknown legacy packages', async t => {
+        const site = '11111111-1111-4111-8111-111111111111';
+        const quote = {id: 'quote-package', structureId: site, patientId: 'patient-1', templateId: null,
+            quoteId: '22222222-2222-4222-8222-222222222222', totalPrice: 400, purchasedUnits: 10,
+            lines: [{id: '33333333-3333-4333-8333-333333333333', itemType: 'SERVICE', itemId: '44444444-4444-4444-8444-444444444444',
+                description: 'Fisioterapia', quantity: 10, unitPrice: 40, vatRate: 0, total: 400}]};
+        const model = (value: any) => ({get: () => value});
+        let packageWhere: any, paymentWhere: any;
+        for (const entity of [AgendaEvent, Invoice, InvoiceAgendaEvent, PatientCredit, TreasuryMovement]) {
+            t.mock.method(entity, 'schema', (() => ({findAll: async () => []})) as any);
+        }
+        t.mock.method(CarePackage, 'schema', (() => ({findAll: async ({where}: any) => {
+            packageWhere = where;
+            return [model(quote), model({...quote, id: 'unverified', quoteId: null, lines: []})];
+        }})) as any);
+        t.mock.method(InvoicePayment, 'schema', (() => ({findAll: async ({where}: any) => {
+            paymentWhere = where;
+            return [model(payment({agendaEventId: null, carePackageId: quote.id, source: 'PACKAGE_PURCHASE'}))];
+        }})) as any);
+        const scope = {tenantId: 'tenant', userId: 'user', scope: 'assigned' as const,
+            selectedStructureIds: [site], allowedStructureIds: [site], structures: []};
+        const loaded = await loadFinanceData({tenantSchema: 'test_tenant', query: {}} as any, query(), scope);
+        assert.deepEqual(packageWhere.structureId[Op.in], [site]);
+        assert.deepEqual(packageWhere[Op.and][1][Op.or], [{templateId: {[Op.ne]: null}}, {quoteId: {[Op.ne]: null}}]);
+        assert.deepEqual(paymentWhere[Op.or].find((where: any) => where.carePackageId).carePackageId[Op.in], [quote.id]);
+        assert.deepEqual(loaded.packages!.map(row => row.id), [quote.id]);
+        const report = aggregateFinance(loaded, query());
+        assert.equal(report.totals.collected, 100);
+        assert.equal(report.totals.packageOutstanding, 300);
+    });
     it('loads purchase receipts before any invoice within the authorized package site', async t => {
         const site = '11111111-1111-4111-8111-111111111111';
         let packageWhere: any, paymentWhere: any;

@@ -1,5 +1,20 @@
 import type {Permission} from '../auth/rbac/permissions.js';
 import type {RoleCode} from '../auth/rbac/roles.js';
+import type {Activity, ActivityExecution} from './models/index.js';
+
+export interface ActivityRecurrenceRule {
+    frequency: 'daily' | 'weekly'; interval: number; startsOn: string; endsOn: string | null;
+}
+export interface ActivityRecurrenceTemplate {
+    title: string; description: string | null; priority: ActivityPriority; assigneeIds: string[];
+    reviewerUserId: string | null; patientId: string | null; agendaEventId: string | null;
+    checklist: Array<{text: string}>;
+}
+export interface ActivityRecurrenceConfiguration extends ActivityRecurrenceRule {
+    status: 'active' | 'stopped' | 'ended'; nextDate: string | null; blockedReason: string | null;
+    template: ActivityRecurrenceTemplate;
+}
+export interface ActivityExecutionInput {expectedExecutionId?: string | null;}
 
 export const ACTIVITY_STATUSES = ['TODO', 'IN_PROGRESS', 'WAITING', 'COMPLETED'] as const;
 export type ActivityStatus = typeof ACTIVITY_STATUSES[number];
@@ -40,17 +55,18 @@ export interface ActivityCreateInput extends ActivityCoreFields {
     operationId: string;
     status: ActivityStatus;
     checklist: Array<{text: string}>;
+    recurrence?: ActivityRecurrenceRule;
 }
 
-export type ActivityChanges = Partial<ActivityCoreFields>;
-export interface ActivityPatchInput {
+export type ActivityChanges = Partial<ActivityCoreFields> & {recurrence?: ActivityRecurrenceRule; recurrenceTemplate?: ActivityRecurrenceTemplate};
+export interface ActivityPatchInput extends ActivityExecutionInput {
     operationId: string;
     expectedVersion: number;
     changes: ActivityChanges;
 }
 
 export type ActivityPlacement = {kind: 'start' | 'end'} | {kind: 'before'; activityId: string};
-export interface ActivityMoveInput {
+export interface ActivityMoveInput extends ActivityExecutionInput {
     operationId: string;
     expectedVersion: number;
     expectedOrderRevision: number;
@@ -60,14 +76,15 @@ export interface ActivityMoveInput {
     allowIncompleteChecklist?: boolean;
 }
 
-export interface ActivityArchiveInput {
+export interface ActivityArchiveInput extends ActivityExecutionInput {
     operationId: string;
     expectedVersion: number;
     expectedOrderRevision: number;
+    scope?: 'execution' | 'routine';
 }
 export type ActivityRestoreInput = ActivityArchiveInput;
 
-export type ActivityView = 'board' | 'list' | 'archived';
+export type ActivityView = 'board' | 'list' | 'archived' | 'recurring';
 export type ActivityDueFilter = 'today' | 'overdue' | 'todayOrOverdue' | 'upcoming' | 'none';
 export interface ActivityFilters {
     search: string;
@@ -99,6 +116,10 @@ export interface ActivityContext {
     role: RoleCode;
     permissions: Permission[];
     timezone: string;
+    executionId?: string | null;
+    execution?: ActivityExecution;
+    parentActivity?: Activity;
+    historicalExecution?: boolean;
 }
 
 export interface ActivityCapabilities {
@@ -174,6 +195,12 @@ export interface ActivityCardDto {
     checklistProgress: {total: number; checked: number};
     commentCount: number;
     capabilities: ActivityCapabilities;
+    recurrence?: (Omit<ActivityRecurrenceConfiguration, 'template'> & {canManage: boolean;
+        template?: ActivityRecurrenceTemplate & {assignees?: ActivityUserSummary[]; reviewer?: ActivityUserSummary | null; links?: ActivityLinksDto}}) | null;
+    currentExecutionId?: string | null;
+    executionDate?: string | null;
+    executionClosedAt?: string | null;
+    lateUpdatedAt?: string | null;
 }
 export interface ActivityChecklistItemDto {
     id: string;
@@ -192,14 +219,14 @@ export interface ActivityChecklistItemDto {
 }
 
 export type ActivityChecklistPlacement = {kind: 'start' | 'end'} | {kind: 'before'; itemId: string};
-export interface ActivityChecklistCreateInput {operationId: string; expectedChecklistRevision: number; text: string; placement: ActivityChecklistPlacement;}
-export interface ActivityChecklistPatchInput {operationId: string; expectedVersion: number; allowReopen?: boolean; expectedActivityVersion?: number; changes: {text?: string; checked?: boolean};}
-export interface ActivityChecklistDeleteInput {operationId: string; expectedVersion: number; expectedChecklistRevision: number;}
-export interface ActivityChecklistMoveInput {operationId: string; expectedChecklistRevision: number; placement: ActivityChecklistPlacement;}
-export interface ActivityCommentCreateInput {operationId: string; text: string;}
+export interface ActivityChecklistCreateInput extends ActivityExecutionInput {operationId: string; expectedChecklistRevision: number; text: string; placement: ActivityChecklistPlacement;}
+export interface ActivityChecklistPatchInput extends ActivityExecutionInput {operationId: string; expectedVersion: number; allowReopen?: boolean; expectedActivityVersion?: number; changes: {text?: string; checked?: boolean};}
+export interface ActivityChecklistDeleteInput extends ActivityExecutionInput {operationId: string; expectedVersion: number; expectedChecklistRevision: number;}
+export interface ActivityChecklistMoveInput extends ActivityExecutionInput {operationId: string; expectedChecklistRevision: number; placement: ActivityChecklistPlacement;}
+export interface ActivityCommentCreateInput extends ActivityExecutionInput {operationId: string; text: string;}
 export interface ActivityCommentPatchInput extends ActivityCommentCreateInput {expectedVersion: number;}
-export interface ActivityCommentDeleteInput {operationId: string; expectedVersion: number;}
-export interface ActivityChildPageQuery {limit: number; cursor: string | null; offset: number;}
+export interface ActivityCommentDeleteInput extends ActivityExecutionInput {operationId: string; expectedVersion: number;}
+export interface ActivityChildPageQuery {limit: number; cursor: string | null; offset: number; scope?: 'routine';}
 export interface ActivityCursorPage<T> {
     items: T[]; total: number; nextCursor: string | null; evaluationAt: string; queryKey: string; snapshotRevision: number;
 }
@@ -222,12 +249,14 @@ export interface ActivityHistoryDto {
     data: Record<string, unknown>;
     createdAt: string;
     actor?: ActivityUserSummary | null;
+    executionId?: string | null;
 }
 
 export interface ActivityMutationResponse {
     activity: ActivityCardDto;
     orderRevision: number;
     snapshotRevision: number;
+    executionId?: string | null;
 }
 
 export interface ActivityAgendaLinkDto {
@@ -285,7 +314,7 @@ export interface ActivityBoardResponse extends ActivityReadMetadata {
     columns: ActivityColumnDto[];
 }
 export interface ActivityListResponse extends ActivityReadMetadata {
-    view: 'list' | 'archived';
+    view: 'list' | 'archived' | 'recurring';
     total: number;
     items: ActivityCardDto[];
     nextCursor: string | null;
@@ -312,6 +341,11 @@ export interface ActivityRecord {
     position: string | number | bigint;
     version: number;
     checklistRevision: number;
+    recurrence?: ActivityRecurrenceConfiguration | null;
+    currentExecutionId?: string | null;
+    executionDate?: string | null;
+    executionClosedAt?: Date | string | null;
+    lateUpdatedAt?: Date | string | null;
     dueKind: 'timed' | 'allDay' | null;
     dueAt?: Date | string | null;
     dueDate?: string | null;

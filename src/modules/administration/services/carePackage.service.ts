@@ -15,6 +15,7 @@ import {InvoicePaymentCreateOptions} from './invoicePaymentTreasury.service.js';
 import {TREASURY_UUID, treasuryError, nullableTreasuryUuid, validateTreasuryMethod} from './treasuryValidation.service.js';
 import {resolveFinancialAccount} from './financialAccountResolver.service.js';
 import {beginFinancialOperation} from './financialOperation.service.js';
+import {quotePackageFinancialSnapshot} from './quotePackageFinance.js';
 
 export const packageToday = () => new Date().toLocaleDateString('en-CA', {timeZone: 'Europe/Rome'});
 export function packageUuid(value: unknown, label = 'Identificativo'): string {
@@ -87,10 +88,14 @@ export function packageMoneySummary(pack: Record<string, any>, payments: Array<R
     const paidAmount = paymentMoney(payments.filter(payment => payment.status === 'POSTED')
         .reduce((sum, payment) => sum + Number(payment.amount), 0));
     const balance = paymentMoney(Math.max(0, Number(pack.totalPrice) - paidAmount));
-    return {paidAmount, balance, paymentStatus: paidAmount <= 0 ? 'unpaid' : balance > 0 ? 'partial' : 'paid'};
+    return {paidAmount, balance, paymentStatus: balance <= 0 ? 'paid' : paidAmount > 0 ? 'partial' : 'unpaid'};
+}
+/** Financial eligibility is independent from the existing booking and origin permission buckets. */
+export function isFinancialCarePackage(pack: Record<string, any>): boolean {
+    return !!pack.templateId || quotePackageFinancialSnapshot(pack) !== null;
 }
 export async function recordPackageReceipt(req: Request, pack: Model, input: PackageReceiptInput, key: string, transaction: Transaction) {
-    if (!pack.get('templateId')) treasuryError('Gli incassi dei pacchetti storici devono essere riconciliati nel percorso storico', 409);
+    if (!isFinancialCarePackage(pack.get({plain: true}))) treasuryError('I dati economici del pacchetto non sono completi: verifica il preventivo prima di registrare un incasso', 409);
     await packagePatient(req, pack.get('patientId'), 'payment', 'create', transaction);
     const schema = req.tenantSchema!, id = String(pack.get('id'));
     const operation = await beginFinancialOperation(req, 'PACKAGE_RECEIPT', String(pack.get('structureId')), transaction);

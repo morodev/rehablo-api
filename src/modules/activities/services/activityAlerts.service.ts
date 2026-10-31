@@ -11,7 +11,7 @@ import {currentBoard, requireAccess, writeOperation} from './activityPersistence
 
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 interface FeedCursor {version: 1; tenantId: string; structureId: string; userId: string; boardId: string; asOf: string; sentAt: string; id: string;}
-interface FeedRow {id: string; activityId: string; title: string; scheduledAt: Date; sentAt: Date; readAt: Date | null; status: string; archived: boolean;}
+interface FeedRow {id: string; activityId: string; executionId: string | null; title: string; scheduledAt: Date; sentAt: Date; readAt: Date | null; status: string; archived: boolean;}
 
 function base(context: ActivityContext): string {
     // resolveActivityContext only produces validated UUID-derived schema names.
@@ -40,7 +40,7 @@ export async function getActivityAlerts(req: Request) {
         const cursor = req.query.cursor ? decode(req.query.cursor as string, context, board.id) : null;
         const asOf = cursor?.asOf ?? new Date().toISOString();
         const replacements = {boardId: board.id, userId: context.userId, asOf, sentAt: cursor?.sentAt, id: cursor?.id, limit: limit + 1};
-        const rows = await sequelize.query<FeedRow>(`SELECT d.id, a.id AS "activityId", a.title,
+        const rows = await sequelize.query<FeedRow>(`SELECT d.id, a.id AS "activityId", d."executionId", a.title,
             d."scheduledAt", d."sentAt", d."readAt", a.status, (a."archivedAt" IS NOT NULL) AS archived ${base(context)}
             AND d."sentAt"<=:asOf ${cursor ? 'AND (d."sentAt",d.id)<(:sentAt,:id)' : ''}
             ORDER BY d."sentAt" DESC,d.id DESC LIMIT :limit`, {type: QueryTypes.SELECT, replacements, transaction});

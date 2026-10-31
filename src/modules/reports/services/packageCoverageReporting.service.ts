@@ -3,7 +3,7 @@ import {Op} from 'sequelize';
 import {getGrantedPermissions, getSelectedStructureId, getUserId, patientScopeWhere} from '../../../middleware/rbac.js';
 import {resolveGrantedScope} from '../../auth/rbac/permissions.js';
 import {CarePackage, PackageConsumption} from '../../administration/models/index.js';
-import {packageMoneySummary, packageOriginReadWhere} from '../../administration/services/carePackage.service.js';
+import {isFinancialCarePackage, packageMoneySummary, packageOriginReadWhere} from '../../administration/services/carePackage.service.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import {summarizeInvoicePayments} from '../../invoice/services/payment.service.js';
@@ -140,7 +140,7 @@ export function projectPackageCoverage(events: Row[], evidence: PackageCoverageE
         const price = packageSessionValue(pack, identifier(event.carePackageServiceId) ?? identifier(trace?.serviceId));
         const validPayments = payments.every(payment => payment.status !== 'POSTED' || cents(payment.amount) !== null);
         const documentedZero = !!pack.quoteId && Array.isArray(pack.lines) && pack.lines.length > 0 && pack.lines.every((line: Row) => cents(line.total) === 0);
-        const moneyKnown = cents(pack.totalPrice) !== null && validPayments && (!!pack.templateId || payments.some(payment => payment.status === 'POSTED') || documentedZero);
+        const moneyKnown = cents(pack.totalPrice) !== null && validPayments && (isFinancialCarePackage(pack) || payments.some(payment => payment.status === 'POSTED') || documentedZero);
         const invoiceSummary = purchaseInvoice && validIssuedDocument(purchaseInvoice) && cents(purchaseInvoice.invoiceNet ?? purchaseInvoice.invoiceTotal) !== null && validPayments
             ? summarizeInvoicePayments(purchaseInvoice, payments) : null;
         const paymentStatus: ReportPackageSummary['paymentStatus'] = invoiceSummary && ['paid', 'partial', 'unpaid'].includes(invoiceSummary.paymentStatus)

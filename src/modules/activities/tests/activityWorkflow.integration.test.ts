@@ -142,15 +142,20 @@ test('the additive review migration upgrades an existing board idempotently with
     const id = randomUUID();
     await h.sequelize.query(`INSERT INTO "${schema}"."activities" ("id", "boardId", "title", "status", "priority", "position", "createdByUserId")
         VALUES (:id, :boardId, 'Lavoro preesistente', 'TODO', 'NORMAL', 1024, :userId)`, {replacements: {id, boardId: board.id, userId: h.ids.ownerA}});
-    await h.activities.ActivityChecklistItem.schema(schema).create({activityId: id, text: 'Già spuntata', position: '1024',
-        checked: true, checkedByUserId: h.ids.ownerA, checkedAt: new Date(), createdByUserId: h.ids.ownerA, version: 1});
+    // Exercise this migration against its original schema, without the current model's later columns.
+    await h.sequelize.query(`INSERT INTO "${schema}"."activity_checklist_items"
+        ("id", "activityId", "text", "position", "checked", "checkedByUserId", "checkedAt", "createdByUserId", "version")
+        VALUES (:itemId, :id, 'Già spuntata', 1024, TRUE, :userId, NOW(), :userId, 1)`,
+        {replacements: {itemId: randomUUID(), id, userId: h.ids.ownerA}});
     const require = createRequire(import.meta.url);
     const migration = require('../../../../migrations/20261024-activities-review.js');
     await migration.up(h.sequelize.getQueryInterface(), {schema});
     await migration.up(h.sequelize.getQueryInterface(), {schema});
-    const existing = await h.activities.Activity.schema(schema).findByPk(id);
-    assert.equal(existing!.status, 'TODO'); assert.equal(existing!.reviewerUserId, null);
-    assert.equal(existing!.reviewStatus, 'not_requested'); assert.equal(existing!.reviewApprovedAt, null);
+    const [rows] = await h.sequelize.query(`SELECT "status", "reviewerUserId", "reviewStatus", "reviewApprovedAt"
+        FROM "${schema}"."activities" WHERE "id"=:id`, {replacements: {id}});
+    const existing = rows[0] as {status: string; reviewerUserId: string | null; reviewStatus: string; reviewApprovedAt: Date | null};
+    assert.equal(existing.status, 'TODO'); assert.equal(existing.reviewerUserId, null);
+    assert.equal(existing.reviewStatus, 'not_requested'); assert.equal(existing.reviewApprovedAt, null);
 });
 
 test('removing the final check returns even an ordinary waiting activity to progress', async () => {

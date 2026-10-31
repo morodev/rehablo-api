@@ -11,7 +11,7 @@ import {canAccessAppointmentFinance} from '../../agenda/services/appointmentFina
 import {Quote} from '../models/index.js';
 import {quoteScopeWhere} from './quoteAccess.js';
 import {packageBookingState, PackageBookingState} from './packageBooking.service.js';
-import {CarePackageOrigin, carePackageOrigin, packageAccessRequest, packageMoneySummary, packagePatientIdentityWhere, packageToday} from './carePackage.service.js';
+import {CarePackageOrigin, carePackageOrigin, isFinancialCarePackage, packageAccessRequest, packageMoneySummary, packagePatientIdentityWhere, packageToday} from './carePackage.service.js';
 
 type Plain = Record<string, any>;
 export type PackageBookingRead = Omit<PackageBookingState, 'services'> & {
@@ -24,6 +24,7 @@ export interface CarePackageReadView extends Plain {
     quoteNumber: string | null; canOpenQuote: boolean; canOpen: boolean;
     purchasedUnits: number; remainingUnits: number; reservedUnits: number; availableUnits: number;
     totalPrice: number | null; paidAmount: number | null; balance: number | null; paymentStatus: string | null;
+    financialAvailable: boolean;
     expiresAt: string | null; serviceId: string | null; serviceName: string | null;
     booking: PackageBookingRead; canBook: boolean; canConfigureBooking: boolean; includedInSummary: boolean;
 }
@@ -90,14 +91,17 @@ export async function decorateCarePackages(req: Request, rows: Plain[], options:
         const quote = quotes.find(quote => quote.id === row.quoteId && quote.patientId === row.patientId && quote.structureId === row.structureId);
         const rawPrice = row.totalPrice == null || row.totalPrice === '' ? null : Number(row.totalPrice);
         const documentedZero = quote?.total != null && quote.total !== '' && Number(quote.total) === 0;
-        const totalPrice = rawPrice !== null && Number.isFinite(rawPrice) && rawPrice >= 0 && (rawPrice > 0 || !!row.templateId || documentedZero) ? rawPrice : null;
-        const money = row.templateId && totalPrice !== null ? packageMoneySummary({...row, totalPrice}, payments.filter(payment => payment.get('carePackageId') === row.id)
+        const financialAvailable = isFinancialCarePackage(row);
+        const totalPrice = rawPrice !== null && Number.isFinite(rawPrice) && rawPrice >= 0 && (rawPrice > 0 || financialAvailable || documentedZero) ? rawPrice : null;
+        const money = financialAvailable && totalPrice !== null ? packageMoneySummary({...row, totalPrice}, payments.filter(payment => payment.get('carePackageId') === row.id)
             .map(model => model.get({plain: true}))) : {paidAmount: null, balance: null, paymentStatus: null};
         const patient = patients.find(patient => patient.get('id') === row.patientId);
         return {...row, id: String(row.id), patientId: String(row.patientId), structureId: String(row.structureId), name: String(row.name),
             origin: carePackageOrigin(row), quoteId: row.quoteId ?? null, templateId: row.templateId ?? null,
             quoteNumber: quote && quote.number != null && quote.year != null ? `PRV-${quote.year}/${String(quote.number).padStart(4, '0')}` : null,
-            canOpenQuote: !!quote, legacy: !row.templateId, canOpen: true, status: expired ? 'EXPIRED' : row.status,
+            canOpenQuote: !!quote, legacy: !row.templateId, financialAvailable, canOpen: true, status: expired ? 'EXPIRED' : row.status,
+            purchasedAt: row.purchasedAt ?? row.createdAt ?? null,
+            lines: !row.templateId && financialAvailable ? row.purchaseSnapshot?.quote?.lines ?? row.lines : row.lines,
             patientName: patient ? [patient.get('name'), patient.get('surname')].filter(Boolean).join(' ') : row.patientName ?? null,
             purchasedUnits: Number(row.purchasedUnits) || 0, remainingUnits, reservedUnits, availableUnits, totalPrice, ...money, expiresAt,
             serviceId: row.serviceId ?? null, serviceName: row.serviceName ?? null, includedInSummary, booking, canConfigureBooking,
