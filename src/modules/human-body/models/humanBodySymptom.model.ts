@@ -8,7 +8,7 @@ export interface HumanBodySymptomAttributes {
     symptom: string;
     bodyPart: string;
     bodySubPart?: string | null;
-    value: number;
+    value: number | null;
     morningValue?: number | null;
     afternoonValue?: number | null;
     eveningValue?: number | null;
@@ -30,7 +30,7 @@ export class HumanBodySymptom
     declare symptom: string;
     declare bodyPart: string;
     declare bodySubPart: string | null;
-    declare value: number;
+    declare value: number | null;
     declare morningValue: number | null;
     declare afternoonValue: number | null;
     declare eveningValue: number | null;
@@ -48,7 +48,7 @@ HumanBodySymptom.init(
         symptom: { type: DataTypes.STRING, allowNull: false },
         bodyPart: { type: DataTypes.STRING, allowNull: false },
         bodySubPart: { type: DataTypes.STRING, allowNull: true },
-        value: { type: DataTypes.INTEGER, allowNull: false },
+        value: { type: DataTypes.INTEGER, allowNull: true },
         morningValue: { type: DataTypes.INTEGER, allowNull: true },
         afternoonValue: { type: DataTypes.INTEGER, allowNull: true },
         eveningValue: { type: DataTypes.INTEGER, allowNull: true },

@@ -39,6 +39,7 @@ export const publishEvaluation = asyncHandler(async (req: Request, res: Response
         ...scopeWhere(req, { ownerField: 'userId', structureField: 'structureId' })
     } });
     if (!row) return sendErrorResponse(res, 404, 'Valutazione non disponibile');
+    if (row.carePathId) return sendErrorResponse(res, 409, 'Pubblica i singoli programmi, documenti e referti dal percorso clinico');
     if (req.body.published && row.get('status') !== 'COMPLETED') return sendErrorResponse(res, 409, 'Concludi prima la valutazione');
     await row.update({ publishedToPatient: req.body.published });
     return sendSuccessResponse(res, 200, { published: row.get('publishedToPatient') });
@@ -48,7 +49,7 @@ export const staffContent = asyncHandler(async (req: Request, res: Response) => 
     if (!await staffPatient(req)) return sendErrorResponse(res, 404, 'Paziente non disponibile');
     const [evaluations, protocols] = await Promise.all([
         Evaluation.schema(req.tenantSchema!).findAll({ where: {
-            patientId: req.params.patientId, status: 'COMPLETED',
+            patientId: req.params.patientId, status: 'COMPLETED', carePathId: null,
             ...scopeWhere(req, { ownerField: 'userId', structureField: 'structureId' })
         }, attributes: ['id', 'title', 'date', 'publishedToPatient'], order: [['date', 'DESC']] }),
         ProtocolInstance.schema(req.tenantSchema!).findAll({ where: {

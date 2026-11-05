@@ -18,6 +18,7 @@ export enum RoleCode {
     ADMIN_SECRETARY = 'ADMIN_SECRETARY',
     /** Fisioterapista: cartella clinica e agenda dei propri pazienti. */
     THERAPIST = 'THERAPIST',
+    PERSONAL_TRAINER = 'PERSONAL_TRAINER',
     /** Medico fisiatra. */
     PHYSIATRIST = 'PHYSIATRIST',
     /** Medico ortopedico. */
@@ -203,6 +204,24 @@ export const ROLE_DEFINITIONS: Record<RoleCode, RoleDefinition> = {
             perm('user', 'read', 'structure'),
             perm('structure', 'read', 'structure'),
             perm('dashboard', 'read', 'own'),
+            perm('evaluation', 'export', 'own')
+        ]
+    },
+
+    [RoleCode.PERSONAL_TRAINER]: {
+        code: RoleCode.PERSONAL_TRAINER,
+        labelKey: 'role-personal-trainer',
+        actor: 'staff',
+        assignable: true,
+        permissions: [
+            ...perms('patient', ['read', 'create', 'update'], 'structure'),
+            ...crud('evaluation', 'own'), ...crud('protocol', 'own'),
+            ...crud('bodymap', 'own'), ...crud('measurement', 'own'),
+            ...crud('note', 'own'), ...crud('reminder', 'own'),
+            perm('activity', 'read', 'structure'), ...perms('activity', ['create', 'update'], 'own'),
+            perm('agenda', 'read', 'structure'), ...crud('agenda', 'own'),
+            perm('product', 'read', 'tenant'), perm('user', 'read', 'structure'),
+            perm('structure', 'read', 'structure'), perm('dashboard', 'read', 'own'),
             perm('evaluation', 'export', 'own')
         ]
     },

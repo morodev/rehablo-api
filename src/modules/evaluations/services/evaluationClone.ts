@@ -6,6 +6,7 @@ import HumanBodyEvent from '../../human-body/models/humanBodyEvent.model.js';
 import Observation from '../../measurements/models/observation.model.js';
 import {
     HumanBodyPoint,
+    HumanBodyArea,
     HumanBodySymptom,
     HumanBodyArticularity,
     HumanBodyStrength,
@@ -62,9 +63,13 @@ export async function cloneEvaluation(schema: string, sourceId: string, ctx: Clo
         title: sourceTitle ? `Copia di ${sourceTitle}` : null,
         notes: (source.get('notes') as string | null) ?? null,
         status: 'DRAFT',
-        parentEvaluationId: sourceId
+        parentEvaluationId: sourceId,
+        carePathId:source.carePathId??null,clinicalVisibility:source.clinicalVisibility??null,templateVersionId:source.templateVersionId??null,configurationSnapshot:source.configurationSnapshot??null
     }, { transaction });
     const newEvaluationId = newEvaluation.get('id') as string;
+
+    const areas=await HumanBodyArea.schema(schema).findAll({where:{evaluationId:sourceId},transaction});
+    for(const area of areas)await copyRow(HumanBodyArea as any,schema,transaction,area,p=>{p.evaluationId=newEvaluationId;delete p.idArea;});
 
     // --- Punti (con rimappatura id) + eventi del punto ---
     const points = await HumanBodyPoint.schema(schema).findAll({ where: { evaluationId: sourceId }, transaction });
@@ -129,6 +134,7 @@ export async function cloneEvaluation(schema: string, sourceId: string, ctx: Clo
         const oldId = si.get('id') as string;
         const newSi = await copyRow(UserScaleInstance as any, schema, transaction, si, (p) => {
             p.evaluationId = newEvaluationId;
+            remapPoint(p);
         });
         const newId = newSi.get('id') as string;
         const answers = await UserAnswer.schema(schema).findAll({ where: { userScaleInstanceId: oldId }, transaction });
@@ -144,6 +150,7 @@ export async function cloneEvaluation(schema: string, sourceId: string, ctx: Clo
     for (const ti of testInstances) {
         await copyRow(TestInstance as any, schema, transaction, ti, (p) => {
             p.evaluationId = newEvaluationId;
+            remapPoint(p);
         });
     }
 

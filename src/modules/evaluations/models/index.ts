@@ -2,6 +2,7 @@ import Evaluation from './evaluation.model.js';
 import Patient from '../../patients/models/patient.model.js';
 import {
     HumanBodyPoint,
+    HumanBodyArea,
     HumanBodySymptom,
     HumanBodyArticularity,
     HumanBodyStrength,
@@ -31,6 +32,9 @@ export function registerEvaluationAssociations(): void {
 
     // The human-body "points" placed during a session belong to the evaluation (FASE E): a new
     // evaluation starts from an empty body and its points are segregated by `evaluationId`.
+    Evaluation.hasMany(HumanBodyArea, {foreignKey:'evaluationId',onDelete:'NO ACTION'});
+    HumanBodyArea.belongsTo(Evaluation,{foreignKey:'evaluationId'});
+
     Evaluation.hasMany(HumanBodyPoint, { foreignKey: 'evaluationId', onDelete: 'cascade', hooks: true });
     HumanBodyPoint.belongsTo(Evaluation, { foreignKey: 'evaluationId' });
 
@@ -54,6 +58,7 @@ export function registerEvaluationAssociations(): void {
 }
 
 export {
+    HumanBodyArea,
     Evaluation,
     HumanBodyPoint,
     HumanBodySymptom,

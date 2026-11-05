@@ -1,3 +1,6 @@
+import clinicalRoutes from './modules/clinical/routes/clinical.routes.js';
+import clinicalMediaRoutes from './modules/clinical/routes/clinicalMedia.routes.js';
+import clinicalPortalRoutes from './modules/clinical/routes/clinicalPortal.routes.js';
 import billingRoutes from './modules/billing/routes/billing.routes.js';
 import {billingWebhook} from './modules/billing/controllers/billing.controller.js';
 import express from 'express';
@@ -81,6 +84,9 @@ async function bootstrap() {
     app.use(billingRoutes);
     app.use(authRoutes);
     app.use(patientPortalRoutes);
+    app.use(clinicalPortalRoutes);
+    app.use(clinicalMediaRoutes);
+    app.use(clinicalRoutes);
     // Handle Activities before the root-mounted routers for the other domains.
     app.use(activityNotificationsRoutes);
     app.use(activitiesRoutes);

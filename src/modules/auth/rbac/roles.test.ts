@@ -54,3 +54,13 @@ it('viewer keeps analytical exports without any monetary write', () => {
     assert.equal(hasPermission(perms, 'appointment_pricing', 'update'), false);
     assert.equal(hasPermission(perms, 'payment_reversal', 'create'), false);
 });
+
+it('personal trainer is assignable with own training data and no medical-wide access',()=>{
+    const permissions=getRolePermissions(RoleCode.PERSONAL_TRAINER);
+    assert.equal(resolveGrantedScope(permissions,'evaluation','read'),'own');
+    assert.equal(resolveGrantedScope(permissions,'measurement','create'),'own');
+    assert.equal(hasPermission(permissions,'clinical_content','manage'),false);
+    assert.equal(hasPermission(permissions,'tenant','update'),false);
+    assert.equal(hasPermission(permissions,'evaluation','read','structure'),false);
+    assert.equal(defaultCalendarEnabled(RoleCode.PERSONAL_TRAINER),true);
+});

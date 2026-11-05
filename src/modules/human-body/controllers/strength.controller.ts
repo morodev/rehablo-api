@@ -1,3 +1,6 @@
+import {visibleClinicalRows,assertClinicalRowRead} from '../../evaluations/services/clinicalReadGuard.js';
+import { assertClinicalWriteContext } from '../../evaluations/services/clinicalWriteGuard.js';
+import { updateClinicalRecord, deleteClinicalRecord } from '../../evaluations/services/clinicalRecordMutations.js';
 import { Request, Response } from 'express';
 import { sequelize } from '../../../config/database.js';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
@@ -15,6 +18,7 @@ export const saveStrength = asyncHandler(async (req: Request, res: Response) => 
         await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined, transaction);
         const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId, transaction);
         if (!humanBodyPointId) return null;
+        await assertClinicalWriteContext(req, {...req.body, humanBodyPointId}, transaction);
         return HumanBodyStrength.schema(schema).create({
             ...req.body,
             humanBodyPointId,
@@ -32,7 +36,7 @@ export const getAllStrengthByPoint = asyncHandler(async (req: Request, res: Resp
     const strength = await HumanBodyStrength.schema(schema).findAll({
         where: { humanBodyPointId: req.query.humanBodyPointId as string, ...patientResourceScopeWhere(req, schema) }
     });
-    return sendSuccessResponse(res, 200, strength, 'Human body strength loaded');
+    return sendSuccessResponse(res, 200, Array.isArray(strength)?await visibleClinicalRows(req,strength):(strength), 'Human body strength loaded');
 });
 
 /** Was previously an empty stub. Completed here. */
@@ -42,31 +46,23 @@ export const getStrengthById = asyncHandler(async (req: Request, res: Response) 
     if (!strength) {
         return sendErrorResponse(res, 404, 'Human body strength not found');
     }
+    await assertClinicalRowRead(req,strength);
     return sendSuccessResponse(res, 200, strength, 'Human body strength loaded');
 });
 
 /** Was previously an empty stub. Completed here as a real partial update. */
 export const updateStrength = asyncHandler(async (req: Request, res: Response) => {
-    const schema = req.tenantSchema!;
-    const id = req.params.strengthId;
-
-    const [rowsUpdated] = await HumanBodyStrength.schema(schema).update(req.body.strength ?? req.body, { where: { id, ...patientResourceScopeWhere(req, schema) } });
-    if (rowsUpdated === 0) {
-        return sendErrorResponse(res, 404, 'Human body strength not found');
-    }
-
-    const updated = await HumanBodyStrength.schema(schema).findByPk(id);
-    return sendSuccessResponse(res, 200, updated, 'Human body strength updated');
+    const input=req.body.strength && typeof req.body.strength==='object' ? req.body.strength:req.body;
+    const updated=await updateClinicalRecord(req,HumanBodyStrength,req.params.strengthId,input,["bodyPart","bodySubPart","valueStrength","strengthPain","valueStrengthPain","date"]);
+    if(!updated) return sendErrorResponse(res,404,'Clinical record not found');
+    return sendSuccessResponse(res,200,updated,'Clinical record updated');
 });
 
 /** Was previously an empty stub. Completed here as a real delete. */
 export const deleteStrength = asyncHandler(async (req: Request, res: Response) => {
-    const schema = req.tenantSchema!;
-    const removed = await HumanBodyStrength.schema(schema).destroy({ where: { id: req.params.strengthId, ...patientResourceScopeWhere(req, schema) } });
-    if (removed === 0) {
-        return sendErrorResponse(res, 404, 'Human body strength not found');
-    }
-    return sendSuccessResponse(res, 200, null, 'Human body strength deleted');
+    const removed=await deleteClinicalRecord(req,HumanBodyStrength,req.params.strengthId);
+    if(!removed) return sendErrorResponse(res,404,'Clinical record not found');
+    return sendSuccessResponse(res,200,null,'Clinical record deleted');
 });
 
 /** Was previously an empty stub. Completed here. */
@@ -83,7 +79,7 @@ export const getStrengthByBodyPart = asyncHandler(async (req: Request, res: Resp
     const strength = await HumanBodyStrength.schema(schema).findAll({
         where: withScope(patientResourceScopeWhere(req, schema), where)
     });
-    return sendSuccessResponse(res, 200, strength, 'Human body strength loaded');
+    return sendSuccessResponse(res, 200, Array.isArray(strength)?await visibleClinicalRows(req,strength):(strength), 'Human body strength loaded');
 });
 
 export default {

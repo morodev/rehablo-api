@@ -22,7 +22,7 @@ import {ActivityError} from '../utils/activityErrors.js';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const OPERATIONAL_ROLES = new Set<RoleCode>([
     RoleCode.OWNER, RoleCode.SECRETARY, RoleCode.ADMIN_SECRETARY, RoleCode.THERAPIST,
-    RoleCode.PHYSIATRIST, RoleCode.ORTHOPEDIST, RoleCode.EXTERNAL_COLLABORATOR
+    RoleCode.PHYSIATRIST, RoleCode.ORTHOPEDIST, RoleCode.PERSONAL_TRAINER, RoleCode.EXTERNAL_COLLABORATOR
 ]);
 
 /** Recheck inside mutation transactions. A signed but stale JWT is not current membership. */

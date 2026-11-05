@@ -41,7 +41,8 @@
     "db:status": "sequelize-cli db:migrate:status --config migrations/config.cjs --migrations-path migrations/releases",
     "db:check": "node dist/scripts/databaseMigrations.js check",
     "test:database": "tsx --test src/database/migrationStatus.test.ts src/database/publicMigrations.test.ts src/utils/tenantSchemaManaged.test.ts src/modules/auth/services/structureBackfill.service.test.ts src/database/quotePackageMigration.test.ts src/database/activityRecurrenceMigration.test.ts",
-    "test:database:integration": "node scripts/test-database-migrations-integration.mjs"
+    "test:database:integration": "node scripts/test-database-migrations-integration.mjs",
+    "test:clinical": "tsx --test src/modules/clinical/tests/clinical.policy.test.ts src/modules/clinical/tests/clinical.access.test.ts src/modules/clinical/tests/clinical.workflow.test.ts src/modules/clinical/tests/clinical.migration.test.ts src/modules/clinical/tests/clinicalPortal.routes.test.ts src/modules/clinical/services/clinicalMedia.policy.test.ts src/modules/clinical/tests/clinicalMedia.reliability.test.ts src/modules/evaluations/tests/clinicalTests.test.ts"
   },
   "author": "Luca Moro",
   "license": "UNLICENSED",
@@ -61,6 +62,7 @@
     "morgan": "^1.10.0",
     "multer": "^2.2.0",
     "nodemailer": "^6.9.13",
+    "pdfkit": "^0.20.2",
     "pg": "^8.11.5",
     "pg-hstore": "^2.3.4",
     "rrule": "^2.8.1",
@@ -80,6 +82,7 @@
     "@types/multer": "^1.4.11",
     "@types/node": "^20.14.2",
     "@types/nodemailer": "^6.4.15",
+    "@types/pdfkit": "^0.17.7",
     "@types/web-push": "^3.6.4",
     "tsx": "^4.15.4"
   }

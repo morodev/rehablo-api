@@ -1,3 +1,6 @@
+import type { Request } from 'express';
+import { getGrantedPermissions } from '../../../middleware/rbac.js';
+import { resolveGrantedScope } from '../../auth/rbac/permissions.js';
 import Evaluation from '../models/evaluation.model.js';
 import type { Transaction } from 'sequelize';
 
@@ -74,3 +77,13 @@ export function assertNotFutureDate(date?: string | Date | null): void {
     }
 }
 
+
+export function evaluationCapabilities(evaluation: Evaluation, req: Request) {
+    const permissions=getGrantedPermissions(req);
+    const updateScope=req.user?.isSuperAdmin?'tenant':resolveGrantedScope(permissions,'evaluation','update');
+    const createScope=req.user?.isSuperAdmin?'tenant':resolveGrantedScope(permissions,'evaluation','create');
+    const owns=evaluation.get('userId')===(req.access?.userId??req.user?.id);
+    const canUpdate=!!updateScope && (updateScope!=='own'||owns);
+    const lockReason=!canUpdate?'NOT_OWNER':evaluation.get('status')==='COMPLETED'?'COMPLETED':!isEvaluationEditable(evaluation)?'DAY_EXPIRED':null;
+    return {canEdit:lockReason===null,canReassess:!!createScope,lockReason};
+}

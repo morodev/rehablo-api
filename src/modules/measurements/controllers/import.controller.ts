@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { authorizedIngestion } from '../services/authorizedIngestion.service.js';
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
@@ -71,6 +73,7 @@ export const importCsv = asyncHandler(async (req: Request, res: Response) => {
     // e, quando presenti (FASE E), la valutazione e il punto del corpo umano.
     const inputs: ObservationInput[] = measurements.map((m) => ({
         patientId,
+        rawFileId:req.body.rawFileId??null,
         evaluationId: evaluationId ?? null,
         humanBodyPointId: humanBodyPointId ?? null,
         metricCode: m.metricCode,
@@ -85,7 +88,9 @@ export const importCsv = asyncHandler(async (req: Request, res: Response) => {
         metadata: { device: mapping.label, vendor: mapping.vendor }
     }));
 
-    const result = await ingestObservations(schema, inputs, { tenantId, operatorId });
+    const fingerprintInput={sourceId,patientId,csv,evaluationId:evaluationId??null,humanBodyPointId:humanBodyPointId??null,pointToCreate:req.body.pointToCreate??null,rawFileId:req.body.rawFileId??null};
+    const operationId=req.body.operationId??('csv:'+createHash('sha256').update(JSON.stringify(fingerprintInput)).digest('hex'));
+    const result=await authorizedIngestion(req,inputs,{operationId,pointToCreate:req.body.pointToCreate,fingerprintInput});
 
     return sendSuccessResponse(
         res,
@@ -94,7 +99,9 @@ export const importCsv = asyncHandler(async (req: Request, res: Response) => {
             imported: result.created.length,
             skipped: result.skipped,
             warnings,
-            observations: result.created
+            observations: result.created,
+            humanBodyPoint:result.humanBodyPoint,
+            replayed:result.replayed
         },
         `Import da ${mapping.label} completato`
     );

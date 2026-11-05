@@ -6,6 +6,8 @@ export interface TestInstanceAttributes {
     userId?: string | null;
     patientId?: string | null;
     evaluationId?: string | null;
+    humanBodyPointId?:string|null;
+    testSnapshot?:Record<string,unknown>|null;
     testId: string;
     notes?: string | null;
     isPositive?: boolean | null;
@@ -24,6 +26,8 @@ export class TestInstance
     declare userId: string | null;
     declare patientId: string | null;
     declare evaluationId: string | null;
+    declare humanBodyPointId:string|null;
+    declare testSnapshot:Record<string,unknown>|null;
     declare testId: string;
     declare notes: string | null;
     declare isPositive: boolean | null;
@@ -35,6 +39,8 @@ TestInstance.init(
         userId: { type: DataTypes.UUID, allowNull: true },
         patientId: { type: DataTypes.UUID, allowNull: true },
         evaluationId: { type: DataTypes.UUID, allowNull: true },
+        humanBodyPointId:{type:DataTypes.UUID,allowNull:true},
+        testSnapshot:{type:DataTypes.JSONB,allowNull:true},
         testId: { type: DataTypes.UUID, allowNull: false },
         notes: { type: DataTypes.TEXT, allowNull: true },
         isPositive: { type: DataTypes.BOOLEAN, allowNull: true }

@@ -53,6 +53,9 @@ export function registerHumanBodyAssociations(): void {
     HumanBodyAnswerInstance.belongsTo(HumanBodyQuestion, { foreignKey: 'humanBodyQuestionId', as: 'question' });
     HumanBodyAnswerInstance.belongsTo(HumanBodyAnswer, { foreignKey: 'humanBodyAnswerId', as: 'answer' });
 
+    HumanBodyPoint.hasMany(UserScaleInstance,{foreignKey:'humanBodyPointId',onDelete:'NO ACTION'});
+    UserScaleInstance.belongsTo(HumanBodyPoint,{foreignKey:'humanBodyPointId'});
+
     UserScaleInstance.hasMany(UserAnswer, { foreignKey: 'userScaleInstanceId' });
     UserAnswer.belongsTo(UserScaleInstance, { foreignKey: 'userScaleInstanceId' });
 
@@ -61,6 +64,8 @@ export function registerHumanBodyAssociations(): void {
     UserAnswer.belongsTo(QuestionScale, { foreignKey: 'questionScaleId', constraints: false });
     UserAnswer.belongsTo(AnswerScale, { foreignKey: 'answerScaleId', constraints: false });
 
+    HumanBodyPoint.hasMany(TestInstance,{foreignKey:'humanBodyPointId',onDelete:'NO ACTION'});
+    TestInstance.belongsTo(HumanBodyPoint,{foreignKey:'humanBodyPointId',onDelete:'NO ACTION'});
     TestInstance.belongsTo(Test, { foreignKey: 'testId', constraints: false });
 }
 

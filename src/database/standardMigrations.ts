@@ -1,3 +1,5 @@
+import {migrateClinicalTenant} from '../modules/clinical/services/clinical.migration.js';
+import {ensurePersonalTrainerRoleEnum} from '../modules/auth/services/personalTrainerRoleMigration.service.js';
 import type {Sequelize, Transaction} from 'sequelize';
 import {createRequire} from 'node:module';
 import {env} from '../config/env.js';
@@ -7,7 +9,7 @@ import {assertDatabaseReady, readMigrationNames, requiredMigrationNames} from '.
 
 export {requiredMigrationNames} from './migrationStatus.js';
 
-const [initialSchemaName, appointmentRemindersName, quotePackageInvoicesName, activityRecurrencesName] = requiredMigrationNames;
+const [initialSchemaName, appointmentRemindersName, quotePackageInvoicesName, activityRecurrencesName, clinicalWorkspaceName] = requiredMigrationNames;
 const quotePackageInvoiceLines = createRequire(import.meta.url)('../../migrations/20261031-quote-package-invoice-lines.js');
 const activityRecurrences = createRequire(import.meta.url)('../../migrations/20261031-activity-recurrences.js');
 const reminderStep = legacyBaseline.tenantMigrations.find(step => step.name === '20261028-appointment-reminders-v1')!;
@@ -123,6 +125,26 @@ async function applyTenantActivityRecurrences(database: Sequelize, schema: strin
     await recordTenantMigration(database, schema, activityRecurrencesName, transaction);
 }
 
+async function applyTenantClinicalWorkspace(database: Sequelize, schema: string, transaction: Transaction, applied: string[]): Promise<void> {
+    if (applied.includes(clinicalWorkspaceName)) return;
+    await migrateClinicalTenant(database, schema, transaction);
+    await recordTenantMigration(database, schema, clinicalWorkspaceName, transaction);
+}
+export async function migrateClinicalWorkspace(database: Sequelize): Promise<void> {
+    // PostgreSQL enum additions commit before any newly assigned role is used.
+    await database.transaction(transaction => ensurePersonalTrainerRoleEnum(database, transaction));
+    for (const schema of await tenantSchemas(database)) {
+        await database.transaction(async transaction => {
+            await prepareTenant(database, schema, transaction);
+            const applied = await readMigrationNames(database, schema, transaction);
+            await applyTenantBaseline(database, schema, transaction, applied);
+            await applyTenantReminders(database, schema, transaction, applied);
+            await applyTenantQuotePackageInvoices(database, schema, transaction, applied);
+            await applyTenantActivityRecurrences(database, schema, transaction, applied);
+            await applyTenantClinicalWorkspace(database, schema, transaction, applied);
+        });
+    }
+}
 async function tenantSchemas(database: Sequelize): Promise<string[]> {
     const [rows] = await database.query('SELECT id FROM public.tenants ORDER BY id');
     return (rows as Array<{id: string}>).map(({id}) => 'rehablo_' + id.replaceAll('-', ''));
@@ -203,6 +225,7 @@ export async function provisionTenantSchema(database: Sequelize, schema: string,
     await applyTenantReminders(database, schema, transaction, applied);
     await applyTenantQuotePackageInvoices(database, schema, transaction, applied);
     await applyTenantActivityRecurrences(database, schema, transaction, applied);
+    await applyTenantClinicalWorkspace(database, schema, transaction, applied);
 }
 
 /** Catch tenants registered by a preceding API after the CLI discovered its tenant list. */
@@ -220,7 +243,7 @@ export async function reconcileTenantSchemas(database: Sequelize): Promise<numbe
         if (hasMetadata) {
             const names = await readMigrationNames(database, schema);
             // Only upgrade the known preceding release; incomplete historical metadata still needs review.
-            if (names.includes(activityRecurrencesName) || !names.includes(initialSchemaName)
+            if (requiredMigrationNames.every(name => names.includes(name)) || !names.includes(initialSchemaName)
                 || !names.includes(appointmentRemindersName)
                 || names.some(name => !(requiredMigrationNames as readonly string[]).includes(name))) continue;
         }

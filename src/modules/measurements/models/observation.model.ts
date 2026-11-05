@@ -1,7 +1,7 @@
 import { DataTypes, Model, Optional } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 
-export type ObservationSide = 'LEFT' | 'RIGHT' | 'BILATERAL';
+export type ObservationSide = 'LEFT' | 'RIGHT' | 'BILATERAL' | 'UNSPECIFIED';
 export type ObservationAggregation = 'BEST' | 'MEAN' | 'RAW' | 'SINGLE';
 export type ObservationQuality = 'GOOD' | 'DOUBTFUL' | 'INVALID';
 /**
@@ -99,7 +99,7 @@ Observation.init(
         valueJson: { type: DataTypes.JSONB, allowNull: true },
         unit: { type: DataTypes.STRING, allowNull: false },
         side: {
-            type: DataTypes.ENUM('LEFT', 'RIGHT', 'BILATERAL'),
+            type: DataTypes.ENUM('LEFT', 'RIGHT', 'BILATERAL', 'UNSPECIFIED'),
             allowNull: false,
             defaultValue: 'BILATERAL'
         },

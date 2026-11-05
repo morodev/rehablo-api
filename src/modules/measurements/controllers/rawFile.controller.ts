@@ -1,3 +1,9 @@
+import {visibleClinicalRows} from '../../evaluations/services/clinicalReadGuard.js';
+import {getCurrentTenantId} from '../../../middleware/auth.js';
+import { ClinicalRecord } from '../../clinical/models/clinical.model.js';
+import { loadClinicalRecord } from '../../clinical/services/clinical.service.js';
+import Observation from '../models/observation.model.js';
+import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
 import { Request, Response } from 'express';
 import multer from 'multer';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -18,7 +24,7 @@ export const uploadMiddleware = multer({
 /** POST /raw-files (multipart/form-data, campo "file"): salva il file grezzo e ne ritorna i metadata. */
 export const upload = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
-    const tenantId = req.user!.tenants[0].id;
+    const tenantId = getCurrentTenantId(req);
     const operatorId = req.user!.id;
 
     if (!req.file) {
@@ -57,9 +63,24 @@ export const download = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 404, 'File non trovato');
     }
 
+    const documents=await ClinicalRecord.schema(schema).findAll({where:{kind:'DOCUMENT',data:{rawFileId:id}}});
+    if(documents.length){
+        let permitted=false;
+        for(const document of documents){
+            try {await loadClinicalRecord(req,document.id);permitted=true;break;}
+            catch(error){if(![403,404].includes(Number((error as any).statusCode)))throw error;}
+        }
+        if(!permitted)return sendErrorResponse(res,404,'File non trovato');
+    }else{
+        const linked=await Observation.schema(schema).findOne({where:{rawFileId:id},attributes:['id']});
+        if(linked){
+            const scoped=await Observation.schema(schema).findAll({where:{rawFileId:id,...patientResourceScopeWhere(req,schema,'patientId','operatorId')}});
+            if(!(await visibleClinicalRows(req,scoped)).length)return sendErrorResponse(res,404,'File non trovato');
+        }else if(rawFile.uploadedBy!==req.user!.id)return sendErrorResponse(res,404,'File non trovato');
+    }
     const buffer = await readRawFileBuffer(rawFile);
     res.setHeader('Content-Type', rawFile.mimeType || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${rawFile.originalName}"`);
+    res.setHeader('Content-Disposition', "attachment; filename*=UTF-8''"+encodeURIComponent(rawFile.originalName));
     return res.status(200).send(buffer);
 });
 

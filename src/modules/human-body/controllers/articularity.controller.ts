@@ -1,3 +1,6 @@
+import {visibleClinicalRows,assertClinicalRowRead} from '../../evaluations/services/clinicalReadGuard.js';
+import { assertClinicalWriteContext, clinicalInputError } from '../../evaluations/services/clinicalWriteGuard.js';
+import { updateClinicalRecord, deleteClinicalRecord } from '../../evaluations/services/clinicalRecordMutations.js';
 import { Request, Response } from 'express';
 import { sequelize } from '../../../config/database.js';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
@@ -11,13 +14,16 @@ import { assertEvaluationEditable } from '../../evaluations/services/evaluationG
 
 export const saveArticularity = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
+    if(!Array.isArray(req.body.articularities)||!req.body.articularities.length)throw clinicalInputError('Inserisci almeno una rilevazione articolare');
     const created = await sequelize.transaction(async transaction => {
         await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined, transaction);
         const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId, transaction);
         if (!humanBodyPointId) return null;
+        await assertClinicalWriteContext(req, {...req.body, humanBodyPointId}, transaction);
         const articularities = (req.body.articularities ?? []).map((art: Record<string, unknown>) => ({
-            evaluationId: req.body.evaluationId ?? null,
             ...art,
+            patientId: req.body.patientId,
+            evaluationId: req.body.evaluationId ?? null,
             humanBodyPointId,
             userId: req.access!.userId
         }));
@@ -34,7 +40,7 @@ export const getAllArticularityByPoint = asyncHandler(async (req: Request, res: 
     const articularity = await HumanBodyArticularity.schema(schema).findAll({
         where: { humanBodyPointId: req.query.humanBodyPointId as string, ...patientResourceScopeWhere(req, schema) }
     });
-    return sendSuccessResponse(res, 200, { articularity }, 'Human body articularity loaded');
+    return sendSuccessResponse(res, 200, { articularity:await visibleClinicalRows(req,articularity) }, 'Human body articularity loaded');
 });
 
 /** Was previously an empty stub. Completed here. */
@@ -44,33 +50,23 @@ export const getArticularityById = asyncHandler(async (req: Request, res: Respon
     if (!articularity) {
         return sendErrorResponse(res, 404, 'Human body articularity not found');
     }
+    await assertClinicalRowRead(req,articularity);
     return sendSuccessResponse(res, 200, articularity, 'Human body articularity loaded');
 });
 
 /** Was previously an empty stub. Completed here as a real partial update. */
 export const updateArticularity = asyncHandler(async (req: Request, res: Response) => {
-    const schema = req.tenantSchema!;
-    const id = req.params.articularityId;
-
-    const [rowsUpdated] = await HumanBodyArticularity.schema(schema).update(req.body.articularity ?? req.body, {
-        where: { id, ...patientResourceScopeWhere(req, schema) }
-    });
-    if (rowsUpdated === 0) {
-        return sendErrorResponse(res, 404, 'Human body articularity not found');
-    }
-
-    const updated = await HumanBodyArticularity.schema(schema).findByPk(id);
-    return sendSuccessResponse(res, 200, updated, 'Human body articularity updated');
+    const input=req.body.articularity && typeof req.body.articularity==='object' ? req.body.articularity:req.body;
+    const updated=await updateClinicalRecord(req,HumanBodyArticularity,req.params.articularityId,input,["articularity","movement","bodyPart","bodySubPart","passiveValue","activeValue","passivePain","activePain","passiveValuePain","activeValuePain","valueStrength","strengthPain","valueStrengthPain","date"]);
+    if(!updated) return sendErrorResponse(res,404,'Clinical record not found');
+    return sendSuccessResponse(res,200,updated,'Clinical record updated');
 });
 
 /** Was previously an empty stub. Completed here as a real delete. */
 export const deleteArticularity = asyncHandler(async (req: Request, res: Response) => {
-    const schema = req.tenantSchema!;
-    const removed = await HumanBodyArticularity.schema(schema).destroy({ where: { id: req.params.articularityId, ...patientResourceScopeWhere(req, schema) } });
-    if (removed === 0) {
-        return sendErrorResponse(res, 404, 'Human body articularity not found');
-    }
-    return sendSuccessResponse(res, 200, null, 'Human body articularity deleted');
+    const removed=await deleteClinicalRecord(req,HumanBodyArticularity,req.params.articularityId);
+    if(!removed) return sendErrorResponse(res,404,'Clinical record not found');
+    return sendSuccessResponse(res,200,null,'Clinical record deleted');
 });
 
 /** Was previously an empty stub. Completed here. */
@@ -87,7 +83,7 @@ export const getArticularityByBodyPart = asyncHandler(async (req: Request, res: 
     const articularity = await HumanBodyArticularity.schema(schema).findAll({
         where: withScope(patientResourceScopeWhere(req, schema), where)
     });
-    return sendSuccessResponse(res, 200, articularity, 'Human body articularity loaded');
+    return sendSuccessResponse(res, 200, Array.isArray(articularity)?await visibleClinicalRows(req,articularity):(articularity), 'Human body articularity loaded');
 });
 
 export default {

@@ -1,3 +1,6 @@
+import {visibleClinicalRows,assertClinicalRowRead} from '../../evaluations/services/clinicalReadGuard.js';
+import { assertClinicalWriteContext, clinicalInputError } from '../../evaluations/services/clinicalWriteGuard.js';
+import { validateClinicalAnswers } from '../../evaluations/services/clinicalAnswers.js';
 import { Request, Response } from 'express';
 import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -37,6 +40,9 @@ export const saveQuestionnaireInstance = asyncHandler(async (req: Request, res: 
         // articularity already are.
         const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId, transaction);
 
+        await assertClinicalWriteContext(req,{...req.body,humanBodyPointId},transaction);
+        if(!await HumanBodyQuestionnaire.schema(schema).findByPk(body.questionnaireId,{transaction})) throw clinicalInputError('Questionario non trovato',404);
+        await validateClinicalAnswers(body.questions??[],body.questionnaireId,HumanBodyQuestion.schema(schema),HumanBodyAnswer.schema(schema),'humanBodyQuestionnaireId','humanBodyQuestionId',transaction);
         const instance = await HumanBodyQuestionnaireInstance.schema(schema).create({
             userId: req.access!.userId,
             patientId: body.patientId,
@@ -87,7 +93,7 @@ export const getQuestionnaireInstances = asyncHandler(async (req: Request, res: 
         ]
     });
 
-    const simplified = instances.map((instance: any) => ({
+    const simplified = (await visibleClinicalRows(req,instances)).map((instance: any) => ({
         id: instance.id,
         userId: instance.userId,
         patientId: instance.patientId,
@@ -130,7 +136,7 @@ export const getQuestionnaireInstancesByPoint = asyncHandler(async (req: Request
         order: [['createdAt', 'DESC']]
     });
 
-    const simplified = instances.map((instance: any) => ({
+    const simplified = (await visibleClinicalRows(req,instances)).map((instance: any) => ({
         id: instance.id,
         createdAt: instance.createdAt,
         title: instance.humanBodyQuestionnaire?.title,

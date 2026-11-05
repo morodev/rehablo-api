@@ -1,3 +1,7 @@
+import {visibleClinicalRows,assertClinicalRowRead} from '../../evaluations/services/clinicalReadGuard.js';
+import HumanBodyPoint from '../models/humanBodyPoint.model.js';
+import { assertClinicalWriteContext } from '../../evaluations/services/clinicalWriteGuard.js';
+import { updateClinicalRecord, deleteClinicalRecord } from '../../evaluations/services/clinicalRecordMutations.js';
 import { Request, Response } from 'express';
 import { sequelize } from '../../../config/database.js';
 import { Op, fn, col, where as sequelizeWhere } from 'sequelize';
@@ -18,6 +22,7 @@ export const saveSymptom = asyncHandler(async (req: Request, res: Response) => {
         await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined, transaction);
         const humanBodyPointId = await resolveHumanBodyPointId(schema, req.body, req.access!.userId, transaction);
         if (!humanBodyPointId) return null;
+        await assertClinicalWriteContext(req, {...req.body, humanBodyPointId}, transaction);
         return HumanBodySymptom.schema(schema).create({
             ...req.body,
             humanBodyPointId,
@@ -27,7 +32,8 @@ export const saveSymptom = asyncHandler(async (req: Request, res: Response) => {
     if (!symptom) {
         return sendErrorResponse(res, 400, 'humanBodyPointId or pointToCreate is required');
     }
-    return sendSuccessResponse(res, 201, symptom, 'Human body symptom created');
+    const humanBodyPoint=await HumanBodyPoint.schema(schema).findByPk(symptom.get('humanBodyPointId'));
+    return sendSuccessResponse(res, 201, {...symptom.get({plain:true}),humanBodyPoint}, 'Human body symptom created');
 });
 
 export const getAllSymptomByPoint = asyncHandler(async (req: Request, res: Response) => {
@@ -38,7 +44,7 @@ export const getAllSymptomByPoint = asyncHandler(async (req: Request, res: Respo
             ...patientResourceScopeWhere(req, schema)
         }
     });
-    return sendSuccessResponse(res, 200, symptoms, 'Human body symptoms loaded');
+    return sendSuccessResponse(res, 200, await visibleClinicalRows(req,symptoms), 'Human body symptoms loaded');
 });
 
 export const getSymptomById = asyncHandler(async (req: Request, res: Response) => {
@@ -60,7 +66,7 @@ export const getSymptomById = asyncHandler(async (req: Request, res: Response) =
         order: [['date', 'DESC']]
     });
 
-    return sendSuccessResponse(res, 200, symptoms, 'Human body symptoms loaded');
+    return sendSuccessResponse(res, 200, await visibleClinicalRows(req,symptoms), 'Human body symptoms loaded');
 });
 
 /**
@@ -68,30 +74,17 @@ export const getSymptomById = asyncHandler(async (req: Request, res: Response) =
  * anything. Completed here as a real partial update.
  */
 export const updateSymptom = asyncHandler(async (req: Request, res: Response) => {
-    const schema = req.tenantSchema!;
-    const id = req.params.symptomId;
-
-    const [rowsUpdated] = await HumanBodySymptom.schema(schema).update(req.body.symptom ?? req.body, {
-        where: { id, ...patientResourceScopeWhere(req, schema) }
-    });
-    if (rowsUpdated === 0) {
-        return sendErrorResponse(res, 404, 'Human body symptom not found');
-    }
-
-    const updated = await HumanBodySymptom.schema(schema).findByPk(id);
-    return sendSuccessResponse(res, 200, updated, 'Human body symptom updated');
+    const input=req.body.symptom && typeof req.body.symptom==='object' ? req.body.symptom:req.body;
+    const updated=await updateClinicalRecord(req,HumanBodySymptom,req.params.symptomId,input,["symptom","bodyPart","bodySubPart","value","morningValue","afternoonValue","eveningValue","nightValue","date"]);
+    if(!updated) return sendErrorResponse(res,404,'Clinical record not found');
+    return sendSuccessResponse(res,200,updated,'Clinical record updated');
 });
 
 /** Was previously an empty stub. Completed here as a real delete. */
 export const deleteSymptom = asyncHandler(async (req: Request, res: Response) => {
-    const schema = req.tenantSchema!;
-    const removed = await HumanBodySymptom.schema(schema).destroy({
-        where: { id: req.params.symptomId, ...patientResourceScopeWhere(req, schema) }
-    });
-    if (removed === 0) {
-        return sendErrorResponse(res, 404, 'Human body symptom not found');
-    }
-    return sendSuccessResponse(res, 200, null, 'Human body symptom deleted');
+    const removed=await deleteClinicalRecord(req,HumanBodySymptom,req.params.symptomId);
+    if(!removed) return sendErrorResponse(res,404,'Clinical record not found');
+    return sendSuccessResponse(res,200,null,'Clinical record deleted');
 });
 
 /** Was previously an empty stub. Completed here as a real search by body part / sub part. */
@@ -108,7 +101,7 @@ export const getSymptomsByBodyPart = asyncHandler(async (req: Request, res: Resp
     const symptoms = await HumanBodySymptom.schema(schema).findAll({
         where: withScope(patientResourceScopeWhere(req, schema), where)
     });
-    return sendSuccessResponse(res, 200, symptoms, 'Human body symptoms loaded');
+    return sendSuccessResponse(res, 200, await visibleClinicalRows(req,symptoms), 'Human body symptoms loaded');
 });
 
 export default {

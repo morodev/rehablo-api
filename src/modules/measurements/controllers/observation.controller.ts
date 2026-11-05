@@ -1,7 +1,9 @@
+import {visibleClinicalRows} from '../../evaluations/services/clinicalReadGuard.js';
+import { authorizedIngestion } from '../services/authorizedIngestion.service.js';
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
-import { patientScopeWhere } from '../../../middleware/rbac.js';
+import { patientResourceScopeWhere } from '../../../middleware/rbac.js';
 import {
     ingestObservations,
     listObservations,
@@ -48,13 +50,7 @@ export const saveManual = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 400, 'patientId e almeno una misura sono obbligatori');
     }
 
-    await assertInputsEditable(
-        schema,
-        inputs,
-        req.access?.scope === 'own' ? req.access.userId : undefined
-    );
-
-    const result = await ingestObservations(schema, inputs, { tenantId, operatorId });
+    const result = await authorizedIngestion(req, inputs, {operationId:req.body?.operationId});
     return sendSuccessResponse(
         res,
         201,
@@ -75,13 +71,7 @@ export const ingestApi = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 400, 'patientId e almeno una misura sono obbligatori');
     }
 
-    await assertInputsEditable(
-        schema,
-        inputs,
-        req.access?.scope === 'own' ? req.access.userId : undefined
-    );
-
-    const result = await ingestObservations(schema, inputs, { tenantId, operatorId });
+    const result = await authorizedIngestion(req, inputs, {operationId:req.body?.operationId});
     return sendSuccessResponse(
         res,
         201,
@@ -112,9 +102,9 @@ export const list = asyncHandler(async (req: Request, res: Response) => {
         humanBodyPointId,
         evaluationId,
         // Le misure appartengono al paziente: l'ampiezza si eredita da quella sui pazienti.
-        scope: patientScopeWhere(req, schema)
+        scope: patientResourceScopeWhere(req,schema,'patientId','operatorId')
     });
-    return sendSuccessResponse(res, 200, observations, 'Misure caricate');
+    return sendSuccessResponse(res, 200, await visibleClinicalRows(req,observations), 'Misure caricate');
 });
 
 export default { saveManual, ingestApi, list };

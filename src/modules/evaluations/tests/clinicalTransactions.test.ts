@@ -1,3 +1,4 @@
+import Patient from '../../patients/models/patient.model.js';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { sequelize } from '../../../config/database.js';
@@ -13,7 +14,7 @@ const transaction = { LOCK: { SHARE: 'SHARE', UPDATE: 'UPDATE' } } as any;
 test('point helper propagates the caller transaction to lookup and creation', async t => {
     const options: any[] = [];
     t.mock.method(HumanBodyPoint, 'schema', (() => ({
-        findOne: async (value: any) => { options.push(value); return { get: () => 'existing' }; },
+        findOne: async (value: any) => { options.push(value); return { get: (key:string) => key==='id'?'existing':null }; },
         create: async (_value: any, option: any) => { options.push(option); return { get: () => 'created' }; }
     })) as any);
     assert.equal(await resolveHumanBodyPointId('fixture', { humanBodyPointId: 'existing' }, 'actor', transaction), 'existing');
@@ -40,6 +41,7 @@ test('evaluation guard locks the editable source for the caller transaction and 
 });
 
 test('point response is sent only after transaction commit completes', async t => {
+    t.mock.method(Patient,'schema',(()=>({findOne:async()=>({id:'patient'})})) as any);
     let releaseCommit!: () => void;
     let reachedCommit!: () => void;
     const committing = new Promise<void>(resolve => { reachedCommit = resolve; });
@@ -63,7 +65,7 @@ test('point response is sent only after transaction commit completes', async t =
     let reject!: (error: unknown) => void;
     const completed = new Promise<void>((resolve, fail) => { done = resolve; reject = fail; });
     res.json = () => { sent = true; done(); return res; };
-    createHumanBodyPoint({ tenantSchema: 'fixture', body: { humanBodyEvents: [{ eventType: 'fixture' }] },
+    createHumanBodyPoint({ tenantSchema: 'fixture', body: { patientId:'patient', humanBodyEvents: [{ eventType: 'fixture' }] },
         access: { userId: 'actor', scope: 'tenant' } } as any, res, reject);
     await committing;
     assert.equal(sent, false);
@@ -74,13 +76,14 @@ test('point response is sent only after transaction commit completes', async t =
 });
 
 test('point commit failure reaches the error handler without sending success', async t => {
+    t.mock.method(Patient,'schema',(()=>({findOne:async()=>({id:'patient'})})) as any);
     const error = new Error('commit failed');
     t.mock.method(sequelize, 'transaction', (async (callback: any) => { await callback(transaction); throw error; }) as any);
     t.mock.method(HumanBodyPoint, 'schema', (() => ({ create: async () => ({ get: () => 'point' }) })) as any);
     let sent = false;
     const res: any = { status() { sent = true; return res; }, json() { return res; } };
     const caught = await new Promise(resolve => createHumanBodyPoint({
-        tenantSchema: 'fixture', body: {}, access: { userId: 'actor', scope: 'tenant' }
+        tenantSchema: 'fixture', body: {patientId:'patient'}, access: { userId: 'actor', scope: 'tenant' }
     } as any, res, resolve));
     assert.equal(caught, error);
     assert.equal(sent, false);

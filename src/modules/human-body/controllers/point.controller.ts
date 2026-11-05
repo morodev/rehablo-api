@@ -1,3 +1,6 @@
+import {visibleClinicalRows,assertClinicalRowRead} from '../../evaluations/services/clinicalReadGuard.js';
+import { assertClinicalWriteContext } from '../../evaluations/services/clinicalWriteGuard.js';
+import { deleteClinicalRecord } from '../../evaluations/services/clinicalRecordMutations.js';
 import { Request, Response } from 'express';
 import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -21,6 +24,7 @@ export const createHumanBodyPoint = asyncHandler(async (req: Request, res: Respo
     const events: HumanBodyEventInput[] = req.body.humanBodyEvents ?? [];
     const point = await sequelize.transaction(async transaction => {
         await assertEvaluationEditable(schema, req.body?.evaluationId, req.access?.scope === 'own' ? req.access.userId : undefined, transaction);
+        await assertClinicalWriteContext(req,req.body,transaction);
         const point = await HumanBodyPoint.schema(schema).create({
             ...req.body,
             userId: req.access!.userId
@@ -59,7 +63,7 @@ export const getAllHumanBodyPointsWithEvents = asyncHandler(async (req: Request,
 
     // Keep only one point per (cx, cy) coordinate pair, exactly like the legacy microservice.
     const coordinates: Record<string, Record<string, boolean>> = {};
-    const uniquePoints = points.filter((item: any) => {
+    const uniquePoints = (await visibleClinicalRows(req,points)).filter((item: any) => {
         const cx = item.cxCoordinate;
         const cy = item.cyCoordinate;
         if (!coordinates[cx]?.[cy]) {
@@ -89,7 +93,7 @@ export const getAllHumanBodyPoints = asyncHandler(async (req: Request, res: Resp
         where: withScope(patientResourceScopeWhere(req, schema), where)
     });
 
-    return sendSuccessResponse(res, 200, { points }, 'Human body points loaded');
+    return sendSuccessResponse(res, 200, { points:await visibleClinicalRows(req,points) }, 'Human body points loaded');
 });
 
 export const getHumanBodyPointById = asyncHandler(async (req: Request, res: Response) => {
@@ -100,18 +104,14 @@ export const getHumanBodyPointById = asyncHandler(async (req: Request, res: Resp
     if (!point) {
         return sendErrorResponse(res, 404, 'Human body point not found');
     }
+    await assertClinicalRowRead(req,point);
     return sendSuccessResponse(res, 200, point, 'Human body point loaded');
 });
 
 export const deleteHumanBodyPoint = asyncHandler(async (req: Request, res: Response) => {
-    const schema = req.tenantSchema!;
-    const removed = await HumanBodyPoint.schema(schema).destroy({
-        where: { id: req.params.pointId, ...patientResourceScopeWhere(req, schema) }
-    });
-    if (removed === 0) {
-        return sendErrorResponse(res, 404, 'Human body point not found');
-    }
-    return sendSuccessResponse(res, 200, null, 'Human body point deleted');
+    const removed=await deleteClinicalRecord(req,HumanBodyPoint,req.params.pointId);
+    if(!removed) return sendErrorResponse(res,404,'Human body point not found');
+    return sendSuccessResponse(res,200,null,'Human body point deleted');
 });
 
 export default {

@@ -3,6 +3,8 @@ import { sequelize } from '../../../config/database.js';
 
 export interface HumanBodyAreaAttributes {
     id: string;
+    evaluationId?: string | null;
+    symptom?: Record<string,unknown> | null;
     patientId: string;
     userId: string;
     idArea?: string | null;
@@ -18,6 +20,8 @@ export class HumanBodyArea
     extends Model<HumanBodyAreaAttributes, HumanBodyAreaCreationAttributes>
     implements HumanBodyAreaAttributes {
     declare id: string;
+    declare evaluationId: string | null;
+    declare symptom: Record<string,unknown> | null;
     declare patientId: string;
     declare userId: string;
     declare idArea: string | null;
@@ -29,6 +33,8 @@ export class HumanBodyArea
 HumanBodyArea.init(
     {
         id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true, unique: true },
+        evaluationId: { type:DataTypes.UUID, allowNull:true },
+        symptom: {type:DataTypes.JSONB,allowNull:true},
         patientId: { type: DataTypes.UUID, allowNull: false },
         userId: { type: DataTypes.UUID, allowNull: false },
         idArea: { type: DataTypes.UUID, unique: true },

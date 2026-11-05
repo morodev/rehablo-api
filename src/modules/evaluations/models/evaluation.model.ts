@@ -24,6 +24,10 @@ export interface EvaluationAttributes {
      * riferisce l'origine qui. Nullable per le valutazioni create ex-novo.
      */
     parentEvaluationId?: string | null;
+    carePathId?: string | null;
+    clinicalVisibility?: 'CLINICAL'|'OPERATIONAL'|null;
+    templateVersionId?: string | null;
+    configurationSnapshot?: Record<string, unknown> | null;
 }
 
 export type EvaluationCreationAttributes = Optional<EvaluationAttributes, 'id' | 'date' | 'status'>;
@@ -47,6 +51,10 @@ export class Evaluation
     declare status: EvaluationStatus;
     declare publishedToPatient: boolean;
     declare parentEvaluationId: string | null;
+    declare carePathId: string | null;
+    declare clinicalVisibility: 'CLINICAL'|'OPERATIONAL'|null;
+    declare templateVersionId: string | null;
+    declare configurationSnapshot: Record<string, unknown> | null;
 }
 
 Evaluation.init(
@@ -64,6 +72,10 @@ Evaluation.init(
             defaultValue: 'COMPLETED'
         },
         parentEvaluationId: { type: DataTypes.UUID, allowNull: true },
+        carePathId: { type: DataTypes.UUID, allowNull: true },
+        clinicalVisibility: {type:DataTypes.STRING(16),allowNull:true},
+        templateVersionId: { type: DataTypes.UUID, allowNull: true },
+        configurationSnapshot: { type: DataTypes.JSONB, allowNull: true },
         publishedToPatient: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false }
     },
     { sequelize, modelName: 'evaluation', tableName: 'evaluations' }

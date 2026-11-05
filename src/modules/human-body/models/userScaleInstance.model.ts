@@ -6,6 +6,7 @@ export interface UserScaleInstanceAttributes {
     userId?: string | null;
     patientId?: string | null;
     evaluationId?: string | null;
+    humanBodyPointId?: string | null;
     scaleId: string;
 }
 
@@ -22,6 +23,7 @@ export class UserScaleInstance
     declare userId: string | null;
     declare patientId: string | null;
     declare evaluationId: string | null;
+    declare humanBodyPointId: string | null;
     declare scaleId: string;
 }
 
@@ -31,6 +33,7 @@ UserScaleInstance.init(
         userId: { type: DataTypes.UUID, allowNull: true },
         patientId: { type: DataTypes.UUID, allowNull: true },
         evaluationId: { type: DataTypes.UUID, allowNull: true },
+        humanBodyPointId: { type:DataTypes.UUID, allowNull:true },
         scaleId: { type: DataTypes.UUID, allowNull: false }
     },
     { sequelize, modelName: 'userScaleInstance', tableName: 'user_scale_instances' }

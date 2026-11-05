@@ -12,6 +12,7 @@ router.post('/evaluation', requirePermission('evaluation', 'create'), evaluation
 router.get('/evaluation', requirePermission('evaluation', 'read'), evaluationController.getEvaluations);
 router.get('/evaluation/:evaluationId', requirePermission('evaluation', 'read'), evaluationController.getEvaluationById);
 router.put('/evaluation/:evaluationId', requirePermission('evaluation', 'update'), evaluationController.updateEvaluation);
+router.post('/evaluation/:evaluationId/reassess', requirePermission('evaluation', 'create'), evaluationController.reassessEvaluation);
 router.post('/evaluation/:evaluationId/clone', requirePermission('evaluation', 'create'), evaluationController.cloneEvaluationHandler);
 router.delete('/evaluation/:evaluationId', requirePermission('evaluation', 'delete'), evaluationController.deleteEvaluation);
 

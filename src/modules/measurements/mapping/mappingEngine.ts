@@ -69,7 +69,7 @@ function resolveSide(row: Record<string, string>, rule: MappingRule, mapping: De
         const mapped = mapping.sideAliases?.[raw];
         if (mapped) return mapped;
         const up = raw.toUpperCase();
-        if (up === 'LEFT' || up === 'RIGHT' || up === 'BILATERAL') return up as ObservationSide;
+        if (up === 'LEFT' || up === 'RIGHT' || up === 'BILATERAL' || up === 'UNSPECIFIED') return up as ObservationSide;
     }
     return 'BILATERAL';
 }

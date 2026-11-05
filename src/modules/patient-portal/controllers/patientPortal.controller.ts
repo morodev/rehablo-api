@@ -1,3 +1,4 @@
+import {testInstanceDto} from '../../human-body/services/testSnapshot.js';
 import { Request, Response } from 'express';
 import { Op } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -175,7 +176,7 @@ export const overview = asyncHandler(async (req: Request, res: Response) => {
 
 export const evaluations = asyncHandler(async (req: Request, res: Response) => {
     const rows = await Evaluation.schema(req.tenantSchema!).findAll({
-        where: { patientId: context(req).patientId, status: 'COMPLETED', publishedToPatient: true },
+        where: { patientId: context(req).patientId, status: 'COMPLETED', publishedToPatient: true, carePathId: null },
         attributes: ['id', 'date', 'title', 'status', 'structureId'],
         order: [['date', 'DESC']],
         limit: pageLimit(req), offset: pageOffset(req)
@@ -187,7 +188,7 @@ export const evaluations = asyncHandler(async (req: Request, res: Response) => {
 export const evaluationDetail = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const evaluation = await Evaluation.schema(schema).findOne({
-        where: { id: req.params.evaluationId, patientId: context(req).patientId, status: 'COMPLETED', publishedToPatient: true },
+        where: { id: req.params.evaluationId, patientId: context(req).patientId, status: 'COMPLETED', publishedToPatient: true, carePathId: null },
         attributes: { exclude: ['notes', 'userId'] },
         include: [
             { model: HumanBodyPoint.schema(schema) },
@@ -240,8 +241,14 @@ export const evaluationDetail = asyncHandler(async (req: Request, res: Response)
         order: [['effectiveDateTime', 'DESC']]
     });
     await audit(req, 'evaluation', req.params.evaluationId);
+    const plain=evaluation.get({plain:true}) as Record<string,any>;
+    if(Array.isArray(plain.testInstances))plain.testInstances=plain.testInstances.map((instance:any)=>{
+        const dto=testInstanceDto(instance);
+        const publicDefinition=(definition:Record<string,unknown>|null|undefined)=>definition?Object.fromEntries(['id','name','description','patientText','type','isFullBody'].filter(key=>definition[key]!==undefined).map(key=>[key,definition[key]])):null;
+        return {...dto,test:publicDefinition(dto.test),testSnapshot:publicDefinition(dto.testSnapshot)};
+    });
     return sendSuccessResponse(res, 200, patientProjection({
-        ...evaluation.get({ plain: true }),
+        ...plain,
         observations
     }), 'Valutazione conclusa');
 });

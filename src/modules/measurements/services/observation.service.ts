@@ -1,3 +1,4 @@
+import type { Transaction } from 'sequelize';
 import MetricDefinition from '../models/catalog/metricDefinition.model.js';
 import Observation from '../models/observation.model.js';
 import { withScope } from '../../../utils/scopedWhere.js';
@@ -14,6 +15,7 @@ import type { MetricInfo } from '../mapping/types.js';
  */
 export interface ObservationInput {
     patientId: string;
+    rawFileId?: string | null;
     metricCode: string;
     value: number;
     unit?: string;
@@ -32,6 +34,7 @@ export interface ObservationInput {
 }
 
 export interface IngestContext {
+    transaction?: Transaction;
     tenantId: string;
     operatorId?: string | null;
 }
@@ -78,9 +81,12 @@ export async function ingestObservations(
             continue;
         }
         const numericValue = Number(input.value);
-        if (!Number.isFinite(numericValue)) {
+        if (input.value == null || typeof input.value==='boolean' || (typeof input.value==='string' && !String(input.value).trim()) || !Number.isFinite(numericValue)) {
             skipped.push({ input, reason: 'Valore numerico mancante o non valido' });
             continue;
+        }
+        if(input.side!=null&&!['LEFT','RIGHT','BILATERAL','UNSPECIFIED'].includes(input.side)){
+            skipped.push({input,reason:'Lato non valido'});continue;
         }
         const unit = input.unit ?? def.unit;
         if (unit !== def.unit) {
@@ -94,6 +100,7 @@ export async function ingestObservations(
         toCreate.push({
             tenantId: ctx.tenantId,
             patientId: input.patientId,
+            rawFileId: input.rawFileId??null,
             evaluationId: input.evaluationId ?? null,
             sessionId: input.sessionId ?? null,
             humanBodyPointId: input.humanBodyPointId ?? null,
@@ -114,7 +121,7 @@ export async function ingestObservations(
     }
 
     const created = toCreate.length
-        ? await Observation.schema(schema).bulkCreate(toCreate, { returning: true })
+        ? await Observation.schema(schema).bulkCreate(toCreate, { returning: true, transaction:ctx.transaction })
         : [];
 
     return { created, skipped };

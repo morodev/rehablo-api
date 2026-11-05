@@ -1,5 +1,6 @@
 import { registerTenantScopedModel } from './utils/tenantSchema.js';
 
+import {CarePath,CarePathMember,ClinicalRecord,EvaluationTemplate,EvaluationPreference,ClinicalOperation,ClinicalAudit,ClinicalPublication,ClinicalHomeFeedback} from './modules/clinical/models/clinical.model.js';
 import Patient from './modules/patients/models/patient.model.js';
 import {PatientContactFollowUp} from './modules/patients/models/patientContactFollowUp.model.js';
 import {PatientSettlementOperation} from './modules/patients/models/patientSettlementOperation.model.js';
@@ -100,6 +101,7 @@ export function registerTenantModels(): void {
     registerTenantScopedModel(PatientPortalAudit);
     registerTenantScopedModel(PatientAppointmentRequest);
     registerTenantScopedModel(PatientSharedDocument);
+    for (const model of [CarePath,CarePathMember,ClinicalRecord,EvaluationTemplate,EvaluationPreference,ClinicalOperation,ClinicalAudit,ClinicalPublication,ClinicalHomeFeedback]) registerTenantScopedModel(model);
     for (const model of ADMINISTRATION_MODELS) registerTenantScopedModel(model);
     registerTenantScopedModel(PatientCreditMovement);
     registerTenantScopedModel(Category);
