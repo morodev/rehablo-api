@@ -16,8 +16,12 @@ import Invoice from '../../invoice/models/invoice.model.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import {methodKey} from '../services/finance.service.js';
+import {getReportTransaction, liveReportReadsEnabled, withReportReadSnapshot} from '../services/reportReadContext.js';
 
 async function execute(req: Request, dataset: string, allRows: boolean): Promise<ReportDatasetResponse> {
+    if (['sessions', 'financial-summary'].includes(dataset) && liveReportReadsEnabled() && !getReportTransaction(req)) {
+        return withReportReadSnapshot(req, snapshot => execute(snapshot, dataset, allRows));
+    }
     if (dataset === 'financial-diagnostics') return financialDiagnosticsDataset(req, {allRows});
     if (dataset === 'operational-diagnostics') return operationalDiagnosticsDataset(req, {allRows});
     if ((FINANCIAL_DATASETS as readonly string[]).includes(dataset)) return financialDataset(req, dataset, {allRows});

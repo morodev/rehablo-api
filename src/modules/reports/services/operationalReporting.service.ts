@@ -13,8 +13,9 @@ import {StructureUser, StructureUserAvailability, StructureAvailability, TenantU
 import {resolveReportScope, resolvePersonalReportScope, resolveOptionalReportScope, type ReportScope} from './reportScope.service.js';
 import {addDays, aggregateActivity, AnalyticsQueryError, comparisonRange, documentDiscountRatio, loadOccurrences, localDateKey, localMinute,
     parseAnalyticsQuery, percentageChange, rangesOfRow, type AnalyticsQuery, type ReportOccurrence} from './analytics.service.js';
-import {aggregateTherapyPayments, loadFinanceData, parseFinanceFilters} from './finance.service.js';
+import {aggregateTherapyPayments, loadFinanceCashWarnings, loadFinanceData, parseFinanceFilters} from './finance.service.js';
 import {dateOnly, validIssuedDocument, documentSign} from './financialFacts.service.js';
+import {getReportTransaction, liveReportReadsEnabled} from './reportReadContext.js';
 import {withFinancialDiagnosticDrilldowns} from './financialDiagnostics.service.js';
 import {capacityValues, followupEligible, type Interval} from './operationalMetrics.js';
 import {paginateReport, type ReportDatasetResponse, type ReportColumn, type ReportSummaryItem, type ReportMeta} from './reporting.types.js';
@@ -83,7 +84,7 @@ export async function operationalDataset(req: Request, dataset: string, options:
     if (options.personal && !(PERSONAL_DATASETS as readonly string[]).includes(dataset)) throw new AnalyticsQueryError('Report non disponibile nel contesto personale');
     if (options.personal && ['paymentStatus', 'documentStatus', 'paymentMethod', 'noShowBillingDecision'].some(key => req.query[key] != null && req.query[key] !== '')) throw new AnalyticsQueryError('I filtri economici non sono disponibili nel contesto personale');
     const scope: ReportScope = (req as any).reportScope ?? await (options.personal ? resolvePersonalReportScope(req) : resolveReportScope(req, {resource: 'analytics', action: 'read'}));
-    const scopedReq = {...req, query: {...req.query}, reportScope: scope} as unknown as Request;
+    const scopedReq = Object.assign(Object.create(req), {query: {...req.query}, reportScope: scope}) as Request;
     const now = new Date(), today = localDateKey(now);
     if (dataset === 'capacity') {
         scopedReq.query = {...req.query, from: req.query.from ?? today, to: req.query.to ?? addDays(today, 27), compare: 'none'};
@@ -100,10 +101,21 @@ export async function operationalDataset(req: Request, dataset: string, options:
     if (options.personal) delete meta.effectiveFilters.noShowBillingDecision;
     if (dataset === 'capacity') return capacityDataset(req, query, scope, meta, page, size, !!options.allRows, now);
     if (dataset === 'patient-followups') return followupDataset(req, query, scope, meta, page, size, !!options.allRows, now, options.diagnosticCode);
-    const allOccurrences = await loadOccurrences(req.tenantSchema!, query);
+    const transaction = getReportTransaction(req);
+    const priorQuery = comparisonRange(query);
+    const [allOccurrences, priorOccurrences] = await Promise.all([
+        loadOccurrences(req.tenantSchema!, query, false, transaction),
+        priorQuery ? loadOccurrences(req.tenantSchema!, priorQuery, false, transaction) : []
+    ]);
+    let priorRows = selectSessions(priorOccurrences, filters, now);
     let rows = selectSessions(allOccurrences, filters, now);
     const financeQuery = dataset === 'sessions' && !options.personal ? {...query, ...parseFinanceFilters({...scopedReq, query: {...req.query, status: undefined}} as unknown as Request)} : null;
-    const finance = financeQuery ? await loadFinanceData(scopedReq, financeQuery, scope) : null;
+    const candidateIds = [...new Set([...rows, ...priorRows].map(row => row.sourceEventId ?? row.id))];
+    const [finance, globalCashWarnings] = financeQuery ? await Promise.all([
+        loadFinanceData(scopedReq, financeQuery, scope, liveReportReadsEnabled() ? candidateIds : undefined),
+        liveReportReadsEnabled() ? loadFinanceCashWarnings(scopedReq, financeQuery, scope) : null
+    ]) : [null, null];
+    if (finance && globalCashWarnings) finance.warnings = globalCashWarnings;
     const therapy = finance && financeQuery ? aggregateTherapyPayments(finance, financeQuery, rows, 1, Math.max(rows.length, 1)) : null;
     if (therapy) {
         const selected = new Set(therapy.details.map(row => row.id));
@@ -112,15 +124,14 @@ export async function operationalDataset(req: Request, dataset: string, options:
         meta.balanceAsOf = therapy.balanceAsOf;
         meta.warnings.push(...withFinancialDiagnosticDrilldowns(finance!.warnings ?? [], scopedReq, financeQuery!, scope, dataset), {code: 'SESSION_FINANCIAL_SNAPSHOT', message: 'Periodo per data seduta; pagamenti e residui aggiornati a oggi. Gli importi di fatture cumulative sono mostrati una sola volta nei totali documento, senza ripartizione sulle sedute.'});
     }
-    const activity = await aggregateActivity(req.tenantSchema!, query, rows);
-    const priorQuery = comparisonRange(query);
-    let priorRows = priorQuery ? selectSessions(await loadOccurrences(req.tenantSchema!, priorQuery), filters, now) : [];
+    const activityOptions = {includeCapacity: dataset === 'operators', transaction};
+    const activity = await aggregateActivity(req.tenantSchema!, query, rows, activityOptions);
     if (priorQuery && finance && financeQuery) {
         const priorTherapy = aggregateTherapyPayments(finance, {...financeQuery, ...priorQuery}, priorRows, 1, Math.max(priorRows.length, 1));
         const selected = new Set(priorTherapy.details.map(row => row.id));
         priorRows = priorRows.filter(row => selected.has(row.id));
     }
-    const previous = priorQuery ? await aggregateActivity(req.tenantSchema!, priorQuery, priorRows) : null;
+    const previous = priorQuery ? await aggregateActivity(req.tenantSchema!, priorQuery, priorRows, activityOptions) : null;
     meta.comparisonPeriod = priorQuery ? {from: priorQuery.from, to: priorQuery.to} : null;
     const totals = activity.totals, resolved = totals.completed + totals.cancelled + totals.noShow;
     const summary: ReportSummaryItem[] = [item('total', 'Sedute nel periodo', totals.total), item('completed', 'Effettuate', totals.completed),

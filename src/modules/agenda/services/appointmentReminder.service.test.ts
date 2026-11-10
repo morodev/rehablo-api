@@ -50,6 +50,31 @@ function fixture(t: TestContext) {
     return {req, event, patient, deliveries, sent, queries};
 }
 
+it('completed and other unavailable appointments keep the same reason in summaries and blocked actions', async t => {
+    const f = fixture(t);
+    f.event.start = new Date(Date.now() - 3_600_000).toISOString();
+    f.req.body.appointments = [{eventId: f.event.id}];
+    for (const [status, reason] of [
+        ['COMPLETED', 'Appuntamento già effettuato'],
+        ['CANCELLED', 'Appuntamento cancellato'],
+        ['NO_SHOW', 'Appuntamento segnato come mancato arrivo'],
+        ['REQUESTED', 'Promemoria non disponibile per lo stato dell’appuntamento'],
+    ]) {
+        f.event.status = status;
+        const summaries = await appointmentReminderSummaries(f.req);
+        assert.equal(summaries.length, 1);
+        for (const channel of ['whatsapp', 'email'] as const) {
+            assert.equal(summaries[0][channel].available, false);
+            assert.equal(summaries[0][channel].unavailableReason, reason);
+        }
+        await assert.rejects(sendAppointmentReminderEmail(f.req), {statusCode: 422, message: reason});
+        await assert.rejects(prepareAppointmentReminderWhatsApp(f.req), {statusCode: 422, message: reason});
+        assert.equal(f.event.status, status);
+    }
+    assert.equal(f.sent.length, 0);
+    assert.equal(f.deliveries.length, 0);
+});
+
 it('SMTP success is persisted and idempotent replay never sends again; explicit resend uses a new key', async t => {
     const f = fixture(t);
     const first = await sendAppointmentReminderEmail(f.req);

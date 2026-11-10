@@ -16,6 +16,15 @@ export interface ClinicalCashFact extends Row {
     paidAt: unknown; kind: 'receipt' | 'reversal' | 'refund';
 }
 const money = (value: unknown) => Math.round((Number(value) || 0) * 100) / 100;
+const financialDateFormatter = new Intl.DateTimeFormat('en-CA', {timeZone: 'Europe/Rome', year: 'numeric', month: '2-digit', day: '2-digit'});
+function groupRows(rows: Row[], key: string): Map<unknown, Row[]> {
+    const grouped = new Map<unknown, Row[]>();
+    for (const row of rows) {
+        const group = grouped.get(row[key]) ?? [];
+        group.push(row); grouped.set(row[key], group);
+    }
+    return grouped;
+}
 const cashSource = (row: Row) => !['PACKAGE', 'CREDIT', 'OPENING_BALANCE'].includes(row.source);
 
 /** A read projection only: never repairs dates, writes a mirror, or guesses a refund. */
@@ -24,11 +33,16 @@ export function clinicalCashFacts(payments: Row[], movements: Row[] = [], credit
     const originals = new Map(effective.filter(row => ['INVOICE_PAYMENT', 'INVOICE_PAYMENT_CORRECTION'].includes(row.sourceType) && row.direction === 'IN')
         .sort((left, right) => Number(left.sourceType === 'INVOICE_PAYMENT_CORRECTION') - Number(right.sourceType === 'INVOICE_PAYMENT_CORRECTION'))
         .map(row => [String(row.sourceId), row]));
+    const movementsById = new Map(effective.map(row => [row.id, row]));
+    const movementsByOriginal = groupRows(effective, 'reversalOfId');
+    const retainedByPayment = groupRows(credits.filter(row => row.sourceType === 'VOID_CREDIT'), 'sourceId');
+    const refundsByCredit = groupRows(creditMovements.filter(row => row.type === 'REFUND'), 'creditId');
+    const reversalsByRefund = groupRows(creditMovements.filter(row => row.type === 'REVERSE_REFUND'), 'reversalOfId');
     const facts: ClinicalCashFact[] = [];
     const warnings: FinancialWarning[] = [];
     const issues: CashDiagnosticIssue[] = [];
     const issue = (issueCode: CashDiagnosticCode, payment: Row, reasonCode: string, reason: string, treasuryMovementId?: string) => {
-        const movement = treasuryMovementId ? effective.find(row => row.id === treasuryMovementId) : undefined;
+        const movement = treasuryMovementId ? movementsById.get(treasuryMovementId) : undefined;
         issues.push({id: `${issueCode}:${treasuryMovementId ?? payment.id}`, issueCode, payment, reasonCode, reason,
             ...(treasuryMovementId ? {treasuryMovementId, treasuryDate: movement?.occurredAt, treasuryAmount: movement ? money(movement.amount) : undefined} : {})});
     };
@@ -37,7 +51,7 @@ export function clinicalCashFacts(payments: Row[], movements: Row[] = [], credit
         if (seen.has(payment.id) || !cashSource(payment)) continue;
         seen.add(payment.id);
         const original = originals.get(String(payment.id));
-        const reversals = original ? effective.filter(row => row.reversalOfId === original.id && row.direction === 'OUT'
+        const reversals = original ? (movementsByOriginal.get(original.id) ?? []).filter(row => row.direction === 'OUT'
             && row.accountId === original.accountId && money(row.amount) === money(original.amount)) : [];
         const verified = original && money(original.amount) === money(payment.amount);
         if (payment.status === 'VOID' && (!verified || !reversals.length)) {
@@ -60,21 +74,19 @@ export function clinicalCashFacts(payments: Row[], movements: Row[] = [], credit
             facts.push({ ...receipt, id: `treasury:${reversal.id}`, sourceId: reversal.id,
                 amount: -money(reversal.amount), paidAt: reversal.occurredAt, kind: 'reversal' });
         }
-        const retained = credits.filter(credit => credit.sourceType === 'VOID_CREDIT' && credit.sourceId === payment.id);
+        const retained = (retainedByPayment.get(payment.id) ?? []);
         for (const credit of retained) {
-            for (const refund of creditMovements.filter(row => row.creditId === credit.id && row.type === 'REFUND')) {
-                const cash = effective.find(row => row.id === refund.treasuryMovementId && row.direction === 'OUT'
-                    && row.sourceType === 'PATIENT_CREDIT_REFUND' && row.sourceId === refund.id
-                    && money(row.amount) === money(refund.amount));
-                if (!cash) continue;
+            for (const refund of (refundsByCredit.get(credit.id) ?? [])) {
+                const cash = movementsById.get(refund.treasuryMovementId);
+                if (!cash || cash.direction !== 'OUT' || cash.sourceType !== 'PATIENT_CREDIT_REFUND'
+                    || cash.sourceId !== refund.id || money(cash.amount) !== money(refund.amount)) continue;
                 facts.push({ ...receipt, id: `treasury:${cash.id}`, sourceId: cash.id,
                     amount: -money(cash.amount), paidAt: cash.occurredAt, kind: 'refund' });
-                for (const reverse of creditMovements.filter(row => row.creditId === credit.id && row.type === 'REVERSE_REFUND'
-                    && row.reversalOfId === refund.id && money(row.amount) === money(refund.amount))) {
-                    const restored = effective.find(row => row.id === reverse.treasuryMovementId && row.direction === 'IN'
-                        && row.sourceType === 'PATIENT_REFUND_VOID' && row.sourceId === refund.id
-                        && row.reversalOfId === cash.id && row.accountId === cash.accountId && money(row.amount) === money(cash.amount));
-                    if (restored) facts.push({...receipt, id: `treasury:${restored.id}`, sourceId: restored.id,
+                for (const reverse of (reversalsByRefund.get(refund.id) ?? []).filter(row => row.creditId === credit.id && money(row.amount) === money(refund.amount))) {
+                    const restored = movementsById.get(reverse.treasuryMovementId);
+                    if (restored && restored.direction === 'IN' && restored.sourceType === 'PATIENT_REFUND_VOID'
+                        && restored.sourceId === refund.id && restored.reversalOfId === cash.id
+                        && restored.accountId === cash.accountId && money(restored.amount) === money(cash.amount)) facts.push({...receipt, id: `treasury:${restored.id}`, sourceId: restored.id,
                         amount: money(restored.amount), paidAt: restored.occurredAt, kind: 'refund'});
                 }
             }
@@ -97,7 +109,7 @@ export function dateOnly(value: unknown): string {
     if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
     const date = new Date(value as string);
     if (Number.isNaN(date.getTime())) return '';
-    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Rome', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+    return financialDateFormatter.format(date);
 }
 export function inFinancialPeriod(value: unknown, from: string, to: string): boolean {
     const date = dateOnly(value);

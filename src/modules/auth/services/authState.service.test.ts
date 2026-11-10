@@ -154,3 +154,44 @@ it('billing database failures fail closed for staff but do not interrupt patient
         res, error => {assert.equal(error, undefined); patientAllowed = true;});
     assert.equal(patientAllowed, true);
 });
+
+it('shares one billing check across router guards but rereads billing on the next request', async t => {
+    fixture(t);
+    const account = {status: 'active', paidThrough: new Date(Date.now() + 60_000)};
+    const billing = t.mock.method(BillingAccount, 'findByPk', (async () => account) as any);
+    const token = jwt.sign(claims(), env.jwtSecret);
+    const makeRequest = (): any => ({path: '/reports/datasets/sessions', method: 'GET', header: () => token});
+    const req = makeRequest();
+    const res: any = {status() {return this;}, json() {return this;}};
+    let allowed = 0;
+    for (let guard = 0; guard < 12; guard++) {
+        await requireAuth(req, res, error => {assert.equal(error, undefined); allowed++;});
+    }
+    assert.equal(allowed, 12);
+    assert.equal(billing.mock.callCount(), 1, 'one request must not repeatedly read the billing account');
+    account.paidThrough = new Date(0);
+    let failure: any;
+    await requireAuth(makeRequest(), res, error => {failure = error;});
+    assert.equal(failure?.code, 'BILLING_ACCESS_REQUIRED');
+    assert.equal(billing.mock.callCount(), 2, 'billing revocation must apply to the next request');
+});
+
+it('shares an in-flight billing failure only within the current request and retries a new request', async t => {
+    fixture(t);
+    const unavailable = new Error('billing unavailable');
+    let rejectRead!: (error: Error) => void;
+    const billing = t.mock.method(BillingAccount, 'findByPk', (() => new Promise((_resolve, reject) => {rejectRead = reject;})) as any);
+    const token = jwt.sign(claims(), env.jwtSecret);
+    const req: any = {path: '/agenda-events', method: 'GET', header: () => token};
+    const res: any = {status() {return this;}, json() {return this;}};
+    const errors: unknown[] = [];
+    const first = requireAuth(req, res, error => {errors.push(error);});
+    const second = requireAuth(req, res, error => {errors.push(error);});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(billing.mock.callCount(), 1);
+    rejectRead(unavailable);
+    await Promise.all([first, second]);
+    assert.deepEqual(errors, [unavailable, unavailable]);
+    t.mock.method(BillingAccount, 'findByPk', (async () => null) as any);
+    await requireAuth({...req}, res, error => {assert.equal(error, undefined);});
+});

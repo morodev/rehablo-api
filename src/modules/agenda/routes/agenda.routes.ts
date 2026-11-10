@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { requireAuth } from '../../../middleware/auth.js';
 import { requirePermission } from '../../../middleware/rbac.js';
 import { resolveTenantSchema } from '../../../middleware/tenantSchema.js';
-import agendaController from '../controllers/agenda.controller.js';
+import agendaController, {therapistDayDashboard} from '../controllers/agenda.controller.js';
 import eventTypeController from '../controllers/eventType.controller.js';
 import timeOffController from '../controllers/timeOff.controller.js';
 import { listAppointmentPayments, createAppointmentPayment, createBulkAppointmentPayments, voidAppointmentPayment, updateAppointmentPricing } from '../controllers/appointmentPayment.controller.js';
@@ -12,6 +12,9 @@ import {getAppointmentReminderSummaries, emailAppointmentReminder,
 const router = Router();
 
 router.use(requireAuth, resolveTenantSchema);
+
+// Additive dashboard projection; same agenda authorization and tenant resolution.
+router.get('/dashboards/therapist/day', requirePermission('agenda', 'read'), therapistDayDashboard);
 
 // Agenda events
 router.get('/agenda-events', requirePermission('agenda', 'read'), agendaController.findAllAgendaEvents);

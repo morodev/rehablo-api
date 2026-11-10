@@ -1,5 +1,5 @@
 import { Request } from 'express';
-import { Op } from 'sequelize';
+import { Op, Transaction } from 'sequelize';
 import rrulePackage from 'rrule';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import AgendaEventException from '../../agenda/models/agendaEventException.model.js';
@@ -263,7 +263,8 @@ export function expandRecurringEvent(
 export async function loadOccurrences(
     schema: string,
     query: AnalyticsQuery,
-    includeTimeOff = false
+    includeTimeOff = false,
+    transaction?: Transaction
 ): Promise<ReportOccurrence[]> {
     // The stored timestamps are UTC while report days are Europe/Rome. A small padded SQL range
     // prevents losing appointments close to local midnight; `inDateRange` applies the exact cut.
@@ -282,11 +283,11 @@ export async function loadOccurrences(
     if (query.operatorId) where.calendarId = query.operatorId;
     if (query.eventTypeId) where.eventTypeId = query.eventTypeId;
 
-    const events = await AgendaEvent.schema(schema).findAll({ where });
+    const events = await AgendaEvent.schema(schema).findAll({ where, transaction });
     const plain = events.map((event) => event.get({ plain: true }) as Record<string, any>);
     const appointmentLinks = await getInvoiceAgendaLinksByEventIds(
         schema,
-        plain.map((event) => event.id as string)
+        plain.map((event) => event.id as string), transaction
     );
     const invoiceByEventId = new Map(
         appointmentLinks.map((link) => [link.agendaEventId, link.invoiceId])
@@ -296,7 +297,7 @@ export async function loadOccurrences(
     });
     const seriesIds = plain.filter((event) => event.recurrence).map((event) => event.id);
     const exceptions = seriesIds.length
-        ? await AgendaEventException.schema(schema).findAll({ where: { eventId: { [Op.in]: seriesIds } } })
+        ? await AgendaEventException.schema(schema).findAll({ transaction, where: { eventId: { [Op.in]: seriesIds } } })
         : [];
     const byEvent = new Map<string, Set<number>>();
     exceptions.forEach((exception) => {
@@ -464,9 +465,10 @@ async function operatorCapacity(
 export async function aggregateActivity(
     schema: string,
     query: AnalyticsQuery,
-    occurrences?: ReportOccurrence[]
+    occurrences?: ReportOccurrence[],
+    options: {includeCapacity?: boolean; transaction?: Transaction} = {}
 ) {
-    const rows = occurrences ?? await loadOccurrences(schema, query);
+    const rows = occurrences ?? await loadOccurrences(schema, query, false, options.transaction);
     const totals = blankActivityTotals();
     const series = new Map<string, ReturnType<typeof blankActivityTotals>>();
     const byOperator = new Map<string, ReturnType<typeof blankActivityTotals>>();
@@ -493,16 +495,16 @@ export async function aggregateActivity(
     // A zero-activity filter must never disclose a public user's name outside the selected sites.
     if (query.operatorId && !byOperator.has(query.operatorId)) {
         const sites = query.structureIds ?? (query.structureId ? [query.structureId] : []);
-        const memberships = sites.length ? await StructureUser.findAll({where: {userId: query.operatorId, structureId: {[Op.in]: sites}}, attributes: ['userId']}) : [];
+        const memberships = sites.length ? await StructureUser.findAll({transaction: options.transaction, where: {userId: query.operatorId, structureId: {[Op.in]: sites}}, attributes: ['userId']}) : [];
         if (memberships.length) byOperator.set(query.operatorId, blankActivityTotals());
     }
 
     const operatorIds = [...byOperator.keys()];
     const typeIds = [...byType.keys()].filter((id) => !id.startsWith('legacy:'));
     const [users, eventTypes, capacity] = await Promise.all([
-        operatorIds.length ? User.findAll({ where: { id: { [Op.in]: operatorIds } }, attributes: ['id', 'name', 'surname'] }) : [],
-        typeIds.length ? EventType.schema(schema).findAll({ where: { id: { [Op.in]: typeIds } }, attributes: ['id', 'title'] }) : [],
-        operatorCapacity(schema, query, operatorIds)
+        operatorIds.length ? User.findAll({transaction: options.transaction,  where: { id: { [Op.in]: operatorIds } }, attributes: ['id', 'name', 'surname'] }) : [],
+        typeIds.length ? EventType.schema(schema).findAll({transaction: options.transaction,  where: { id: { [Op.in]: typeIds } }, attributes: ['id', 'title'] }) : [],
+        options.includeCapacity === false ? new Map<string, number | null>() : operatorCapacity(schema, query, operatorIds)
     ]);
     const userNames = new Map<string, string>(users.map((user): [string, string] => [
         user.id,

@@ -19,6 +19,36 @@ it('reminders read live channel refusals, allow null consent and explain missing
     assert.equal(reminderAvailability(event, null, occurrence, 'email', now).available, false);
 });
 
+it('unavailable reminders describe the current appointment status for both channels', () => {
+    const cases = [
+        ['COMPLETED', 'Appuntamento già effettuato'],
+        ['completed', 'Appuntamento già effettuato'],
+        ['CANCELLED', 'Appuntamento cancellato'],
+        ['NO_SHOW', 'Appuntamento segnato come mancato arrivo'],
+        ['REQUESTED', 'Promemoria non disponibile per lo stato dell’appuntamento'],
+        ['', 'Promemoria non disponibile per lo stato dell’appuntamento'],
+    ];
+    for (const [status, reason] of cases) {
+        const appointment = {...event, status};
+        const original = JSON.stringify(appointment);
+        const occurrence = reminderOccurrence(appointment, null);
+        for (const currentTime of [now, Date.parse(start) + 3_600_000]) {
+            const summary = summarizeAppointmentReminders(appointment, patient, occurrence, [], currentTime);
+            for (const channel of ['whatsapp', 'email'] as const) {
+                assert.equal(summary[channel].available, false);
+                assert.equal(summary[channel].unavailableReason, reason);
+            }
+        }
+        assert.equal(JSON.stringify(appointment), original);
+    }
+    const occurrence = reminderOccurrence(event, null);
+    for (const channel of ['whatsapp', 'email'] as const) {
+        assert.equal(reminderAvailability(event, patient, occurrence, channel, now).available, true);
+        assert.equal(reminderAvailability(event, patient, occurrence, channel, Date.parse(start) + 1).unavailableReason,
+            'Appuntamento già iniziato');
+    }
+});
+
 it('recurrences validate the concrete occurrence and DST without treating series end as appointment time', () => {
     const recurring = {...event, start: '2026-10-23T08:00:00Z', end: '2026-11-27T23:00:00Z', recurrence: 'FREQ=WEEKLY;BYDAY=FR', duration: 45};
     const occurrence = reminderOccurrence(recurring, '2026-10-30T09:00:00Z');

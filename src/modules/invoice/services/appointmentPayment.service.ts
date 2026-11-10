@@ -63,6 +63,7 @@ export function resolveAppointmentPrice(
 export async function appointmentPricesByEvent(
     schema: string, events: Array<Record<string, any>>, transaction?: Transaction
 ): Promise<Map<string, AppointmentPrice>> {
+    if (!events.length) return new Map();
     const ids = [...new Set(events.map(event => event.eventTypeId).filter(Boolean))];
     const types = ids.length ? await EventType.schema(schema).findAll({
         where: { id: { [Op.in]: ids } }, transaction

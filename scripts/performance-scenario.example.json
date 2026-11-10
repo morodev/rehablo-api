@@ -1,0 +1,26 @@
+[
+  {
+    "name": "daily_agenda",
+    "path": "/agenda-events?start=2026-11-09T23%3A00%3A00.000Z&end=2026-11-10T22%3A59%3A59.999Z&includePatientPaymentPosition=true"
+  },
+  {
+    "name": "activity_summary",
+    "path": "/activities/summary?mine=false&limit=5"
+  },
+  {
+    "name": "overview",
+    "path": "/reports/overview?months=6&date=2026-11-10"
+  },
+  {
+    "name": "financial_summary",
+    "path": "/reports/datasets/financial-summary?from=2026-11-01&to=2026-11-10&granularity=day&compare=previous_period"
+  },
+  {
+    "name": "receivables",
+    "path": "/reports/receivables?from=2026-11-01&to=2026-11-10&size=5&page=1"
+  },
+  {
+    "name": "therapy_payments",
+    "path": "/reports/analytics/therapy-payments?from=2026-11-10&to=2026-11-10&size=100&page=1"
+  }
+]

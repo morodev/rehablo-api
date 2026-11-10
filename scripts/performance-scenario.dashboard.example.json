@@ -1,0 +1,10 @@
+[
+  {
+    "name": "therapist_day",
+    "path": "/dashboards/therapist/day?date=2026-11-10"
+  },
+  {
+    "name": "invoice_payment_summaries",
+    "path": "/invoice/payment-summaries?ids=10000000-0000-4000-8000-000000000001"
+  }
+]

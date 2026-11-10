@@ -7,6 +7,7 @@ import invoiceShareController from '../controllers/invoiceShare.controller.js';
 import reportsController from '../controllers/reports.controller.js';
 import {reportReadScope} from '../../reports/controllers/reporting.controller.js';
 import paymentController from '../controllers/payment.controller.js';
+import {invoicePaymentSummaries} from '../controllers/invoicePaymentSummary.controller.js';
 
 const router = Router();
 
@@ -29,6 +30,7 @@ router.post('/invoice/:invoiceId/send-email', requirePermission('invoice', 'expo
 
 router.post('/invoice', requirePermission('invoice', 'create'), invoiceController.saveInvoice);
 router.get('/invoice', requirePermission('invoice', 'read'), invoiceController.findAllInvoices);
+router.get('/invoice/payment-summaries', requirePermission('invoice', 'read'), invoicePaymentSummaries);
 router.get('/invoice/search', requirePermission('invoice', 'read'), invoiceController.searchInvoices);
 router.get('/invoice/eligible-appointments', requirePermission('invoice', 'create'), invoiceController.findEligibleAppointments);
 router.get('/invoice/export/sistema-ts', requirePermission('invoice', 'export'), invoiceController.exportSistemaTS);

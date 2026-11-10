@@ -5,7 +5,7 @@ import { sequelize } from '../../../config/database.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 import {canAccessAppointmentFinance} from '../services/appointmentFinancialAccess.service.js';
-import { getGrantedPermissions, scopeWhere } from '../../../middleware/rbac.js';
+import { getGrantedPermissions, getUserId, scopeWhere } from '../../../middleware/rbac.js';
 import { hasPermission } from '../../auth/rbac/permissions.js';
 import { getCurrentTenantId } from '../../../middleware/auth.js';
 import { sendNewEventMail } from '../../../services/email.service.js';
@@ -22,7 +22,8 @@ import Invoice from '../../invoice/models/invoice.model.js';
 import TimeOffRequest from '../models/timeOffRequest.model.js';
 import { StructureUser, TenantUser, User } from '../../auth/models/index.js';
 import { getInvoiceAgendaLinksByEventIds, getLinkedInvoiceId } from '../../invoice/services/invoiceAgendaEvent.service.js';
-import { patientPaymentPositionsByReferenceEvents } from '../services/patientPaymentPosition.service.js';
+import { PatientPaymentReadContext, patientPaymentPositionsByReferenceEvents } from '../services/patientPaymentPosition.service.js';
+import {loadLastTherapistSessions, therapistDashboardBounds} from '../services/therapistDashboard.service.js';
 import { overlayCurrentPatients } from '../services/currentPatientOverlay.service.js';
 import { boundedInteger, normalizeSearchQuery, searchTokens } from '../../../utils/search.js';
 import { itemAvailableInStructure } from '../../products-services/services/structureAvailability.service.js';
@@ -171,7 +172,8 @@ function missedArrivalReportError(event: AgendaEvent): {statusCode: number; mess
  */
 async function withInvoiceStatus(
     schema: string,
-    agendaEvents: AgendaEvent[]
+    agendaEvents: AgendaEvent[],
+    readContext?: PatientPaymentReadContext
 ): Promise<Record<string, any>[]> {
     let plainEvents = agendaEvents.map((event) =>
         event.get({ plain: true }) as Record<string, any>
@@ -201,6 +203,11 @@ async function withInvoiceStatus(
             })
             : Promise.resolve([])
     ]);
+    if (readContext) {
+        readContext.linkedEventIds = new Set(eventIds);
+        readContext.links = links;
+        readContext.prices = appointmentPrices;
+    }
     const linkedInvoiceByEventId = new Map(links.map((link) => [link.agendaEventId, link.invoiceId]));
     plainEvents = overlayCurrentPatients(
         plainEvents,
@@ -463,6 +470,22 @@ export const eventDashboardWithFilter = asyncHandler(async (req: Request, res: R
     return sendSuccessResponse(res, 200, agendaEvents, 'Load event group by month and calendar');
 });
 
+export const therapistDayDashboard = asyncHandler(async (req: Request, res: Response) => {
+    const date = typeof req.query.date === 'string' ? req.query.date : '';
+    const bounds = therapistDashboardBounds(date);
+    if (!bounds) return sendErrorResponse(res, 400, 'Data non valida: usare YYYY-MM-DD');
+    const operatorId = getUserId(req);
+    if (!operatorId) return sendErrorResponse(res, 401, 'unauthorized');
+    const schema = req.tenantSchema!;
+    const scope = {[Op.and]: [scopeWhere(req, AGENDA_SCOPE_FIELDS), {calendarId: operatorId}]};
+    const rows = await AgendaEvent.schema(schema).findAll({
+        where: {[Op.and]: [scope, {start: {[Op.between]: [bounds.start, bounds.end]}}]}
+    });
+    const events = await withInvoiceStatus(schema, rows);
+    const lastSessionByPatient = await loadLastTherapistSessions(schema, events, scope, bounds);
+    return sendSuccessResponse(res, 200, {events, lastSessionByPatient}, 'Therapist dashboard loaded');
+});
+
 export const findAllAgendaEvents = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const startDate = new Date(req.query.start as string).toISOString();
@@ -486,14 +509,16 @@ export const findAllAgendaEvents = asyncHandler(async (req: Request, res: Respon
         }
     });
 
-    let decoratedEvents = await withInvoiceStatus(schema, agendaEvents);
+    const readContext: PatientPaymentReadContext = {};
+    let decoratedEvents = await withInvoiceStatus(schema, agendaEvents, readContext);
     const canReadFinance = Boolean(req.user?.isSuperAdmin)
         || hasPermission(getGrantedPermissions(req), 'patient_balance', 'read', 'structure');
     if (req.query.includePatientPaymentPosition === 'true' && canReadFinance) {
         const positions = await patientPaymentPositionsByReferenceEvents(
             schema,
             decoratedEvents,
-            scopeWhere(req, AGENDA_SCOPE_FIELDS)
+            scopeWhere(req, AGENDA_SCOPE_FIELDS),
+            {readContext}
         );
         decoratedEvents = decoratedEvents.map(event => ({
             ...event,

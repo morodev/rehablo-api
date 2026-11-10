@@ -94,9 +94,9 @@ export async function assignedReminderIds(schema: string, userId: string): Promi
     return (rows as any[]).map(row => row.reminderId);
 }
 
-export async function visibleNoteWhere(req: Request): Promise<Record<symbol, unknown>> {
+export async function visibleNoteWhere(req: Request, preloadedAssignedIds?: string[]): Promise<Record<symbol, unknown>> {
     const userId = req.access!.userId;
-    const assignedIds = await assignedNoteIds(req.tenantSchema!, userId);
+    const assignedIds = preloadedAssignedIds ?? await assignedNoteIds(req.tenantSchema!, userId);
     const visibility = {[Op.or]: [{createdByUserId: userId}, {id: {[Op.in]: assignedIds}}]};
     const mayReadClinical = (await assignableUsers(req, 'CLINICAL')).some(user => user.id === userId);
     return mayReadClinical
@@ -104,9 +104,9 @@ export async function visibleNoteWhere(req: Request): Promise<Record<symbol, unk
         : {[Op.and]: [{type: {[Op.ne]: 'CLINICAL'}}, visibility]};
 }
 
-export async function visibleReminderWhere(req: Request): Promise<Record<symbol, unknown>> {
+export async function visibleReminderWhere(req: Request, preloadedAssignedIds?: string[]): Promise<Record<symbol, unknown>> {
     const userId = req.access!.userId;
-    const assignedIds = await assignedReminderIds(req.tenantSchema!, userId);
+    const assignedIds = preloadedAssignedIds ?? await assignedReminderIds(req.tenantSchema!, userId);
     return {[Op.or]: [{createdByUserId: userId}, {id: {[Op.in]: assignedIds}}]};
 }
 

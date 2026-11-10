@@ -2,8 +2,8 @@ import { Op, Transaction } from 'sequelize';
 import AgendaEvent from '../models/agendaEvent.model.js';
 import Invoice from '../../invoice/models/invoice.model.js';
 import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
-import { appointmentPricesByEvent, isAppointmentPaymentHistoryKnown, paymentMoney } from '../../invoice/services/appointmentPayment.service.js';
-import { getInvoiceAgendaLinksByEventIds } from '../../invoice/services/invoiceAgendaEvent.service.js';
+import { AppointmentPrice, appointmentPricesByEvent, isAppointmentPaymentHistoryKnown, paymentMoney } from '../../invoice/services/appointmentPayment.service.js';
+import { InvoiceAgendaLink, getInvoiceAgendaLinksByEventIds } from '../../invoice/services/invoiceAgendaEvent.service.js';
 import { getPaymentSummaries, InvoicePaymentSummary } from '../../invoice/services/payment.service.js';
 
 export type PatientPaymentPositionStatus = 'REGULAR' | 'DUE' | 'VERIFY';
@@ -37,7 +37,15 @@ export interface PatientPaymentPosition {
     items: PatientPaymentPositionItem[];
 }
 
+/** Request-local only: never reused across users, requests or financial transactions. */
+export interface PatientPaymentReadContext {
+    linkedEventIds?: Set<string>;
+    links?: InvoiceAgendaLink[];
+    prices?: Map<string, AppointmentPrice>;
+}
+
 export interface PatientPaymentPositionOptions {
+    readContext?: PatientPaymentReadContext;
     /** Agenda cards only need a preview; the payment panel requests the complete list. */
     itemLimit?: number | null;
     /** Invoice debts are visible only to actors with invoice read permission. */
@@ -109,6 +117,15 @@ export function buildPatientPaymentPositions(
     const invoiceIdByEventId = new Map(sources.invoiceIdByEventId);
     sources.invoices.forEach(invoice => { if (invoice.agendaEventId && String(invoice.status).toLowerCase() !== 'void') invoiceIdByEventId.set(invoice.agendaEventId, invoice.id); });
 
+    const historyByPatient = new Map<string, Array<Record<string, any>>>();
+    for (const event of sources.historicalEvents) {
+        const patientId = patientIdOf(event);
+        if (!patientId) continue;
+        const history = historyByPatient.get(patientId) ?? [];
+        history.push(event);
+        historyByPatient.set(patientId, history);
+    }
+
     return new Map(referenceEvents.map(reference => {
         const patientId = patientIdOf(reference);
         const referenceTime = timestamp(reference.start);
@@ -119,7 +136,7 @@ export function buildPatientPaymentPositions(
         const invoiceIds = new Set<string>();
         const referenceInvoiceId = reference.invoiceId ?? invoiceIdByEventId.get(reference.id) ?? null;
 
-        sources.historicalEvents.forEach(event => {
+        (historyByPatient.get(patientId) ?? []).forEach(event => {
             const eventTime = timestamp(event.start);
             if (!event.id || patientIdOf(event) !== patientId || event.id === reference.id || eventTime === null
                 || eventTime >= referenceTime || eventTime > now || event.recurrence || event.recurringEventId) return;
@@ -236,14 +253,18 @@ export async function patientPaymentPositionsByReferenceEvents(
     });
     const historicalEvents = eventModels.map(event => event.get({ plain: true }) as Record<string, any>);
     const allEventIds = [...new Set([...historicalEvents, ...references].map(event => event.id).filter(Boolean))] as string[];
-    const [links, prices, eventPaymentModels] = await Promise.all([
-        getInvoiceAgendaLinksByEventIds(schema, allEventIds, transaction),
-        appointmentPricesByEvent(schema, historicalEvents, transaction),
+    // Locked financial writes must always read authoritative sources in their own transaction.
+    const context = !transaction && !options.lockRows ? options.readContext : undefined;
+    const [loadedLinks, loadedPrices, eventPaymentModels] = await Promise.all([
+        getInvoiceAgendaLinksByEventIds(schema, allEventIds.filter(id => !context?.linkedEventIds?.has(id)), transaction),
+        appointmentPricesByEvent(schema, historicalEvents.filter(event => !context?.prices?.has(event.id)), transaction),
         historicalEvents.length ? InvoicePayment.schema(schema).findAll({
             where: { agendaEventId: { [Op.in]: historicalEvents.map(event => event.id) } },
             attributes: ['agendaEventId', 'amount', 'status'], transaction
         }) : Promise.resolve([])
     ]);
+    const links = [...(context?.links ?? []), ...loadedLinks];
+    const prices = new Map([...(context?.prices ?? []), ...loadedPrices]);
     const invoiceIdByEventId = new Map(links.map(link => [link.agendaEventId, link.invoiceId]));
     historicalEvents.forEach(event => {
         if (event.invoiceId) invoiceIdByEventId.set(event.id, event.invoiceId);

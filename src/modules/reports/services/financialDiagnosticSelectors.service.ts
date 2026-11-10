@@ -1,3 +1,4 @@
+import {getReportTransaction} from './reportReadContext.js';
 import type {Request} from 'express';
 import {Op} from 'sequelize';
 import {Expense, TreasuryMovement} from '../../administration/models/index.js';
@@ -37,8 +38,8 @@ export async function unassignedFinancialSelectors(req: Request, scope: ReportSc
         where: {structureId: null, incurredAt: dateRange}});
     if (['financial-summary', 'payments'].includes(dataset) && (!issueCode || issueCode === 'unassigned-payments')) {
         const [invoices, events] = await Promise.all([
-            Invoice.schema(req.tenantSchema!).findAll({where: {structureId: null}, attributes: ['id']}),
-            AgendaEvent.schema(req.tenantSchema!).findAll({where: {structureId: null}, attributes: ['id']})
+            Invoice.schema(req.tenantSchema!).findAll({where: {structureId: null}, attributes: ['id'], transaction: getReportTransaction(req)}),
+            AgendaEvent.schema(req.tenantSchema!).findAll({where: {structureId: null}, attributes: ['id'], transaction: getReportTransaction(req)})
         ]);
         specs.push({code: 'unassigned-payments', label: 'Registrazioni di incasso', model: InvoicePayment, current: false,
             where: {paidAt: dateRange, carePackageId: null, source: {[Op.notIn]: ['CREDIT', 'PACKAGE', 'OPENING_BALANCE']}, [Op.and]: [
@@ -51,7 +52,7 @@ export async function unassignedFinancialSelectors(req: Request, scope: ReportSc
 
 export async function unassignedFinancialWarnings(req: Request, scope: ReportScope, from: string, to: string, dataset = 'financial-summary'): Promise<FinancialWarning[]> {
     const specs = await unassignedFinancialSelectors(req, scope, from, to, dataset);
-    const counts = await Promise.all(specs.map(async spec => ({...spec, count: Number(await spec.model.schema(req.tenantSchema!).count({where: spec.where}))})));
+    const counts = await Promise.all(specs.map(async spec => ({...spec, count: Number(await spec.model.schema(req.tenantSchema!).count({where: spec.where, transaction: getReportTransaction(req)}))})));
     return counts.filter(row => row.count > 0).map(row => ({code: row.code, count: row.count,
         message: `${row.label} senza sede ${row.current ? 'nella situazione attuale' : 'nel periodo'}: esclusi dai totali; verificare l\u2019attribuzione della sede.`,
         drilldown: {dataset: 'financial-diagnostics', filters: {issueCode: row.code, sourceDataset: dataset, structureIds: scope.selectedStructureIds,

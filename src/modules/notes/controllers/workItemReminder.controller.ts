@@ -105,7 +105,8 @@ export const createReminder = asyncHandler(async (req: Request, res: Response) =
 export const getReminders = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const {q, status, patientId, agendaEventId, noteId, from, to, assignedToMe, createdByMe} = req.query as Record<string, string | undefined>;
-    const visibility = await visibleReminderWhere(req);
+    const assignedIds = assignedToMe === 'true' ? await assignedReminderIds(schema, req.access!.userId) : undefined;
+    const visibility = await visibleReminderWhere(req, assignedIds);
     const base: Record<string, unknown> = {
         structureId: req.access!.structureId,
         ...(status && STATUSES.includes(status as ReminderStatus) ? {status} : {}),
@@ -114,7 +115,7 @@ export const getReminders = asyncHandler(async (req: Request, res: Response) => 
         ...(noteId ? {noteId} : {}),
         ...(createdByMe === 'true' ? {createdByUserId: req.access!.userId} : {})
     };
-    if (assignedToMe === 'true') base.id = {[Op.in]: await assignedReminderIds(schema, req.access!.userId)};
+    if (assignedToMe === 'true') base.id = {[Op.in]: assignedIds!};
     const fromDate = parseDate(from);
     const toDate = parseDate(to);
     const dateRange = fromDate && toDate ? {[Op.between]: [fromDate, toDate]} : fromDate ? {[Op.gte]: fromDate} : toDate ? {[Op.lte]: toDate} : null;

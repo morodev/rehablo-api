@@ -17,6 +17,7 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
     const {provisionTenantSchema, requiredMigrationNames} = await import('./standardMigrations.js');
     const {quoteTenantSchema} = await import('./migrationTypes.js');
     const {registerDatabaseModels} = await import('./registerModels.js');
+    const {getTenantScopedModels} = await import('../utils/tenantSchema.js');
     const {sequelize: modelDatabase} = await import('../config/database.js');
     const database = new Sequelize(target.databaseUrl, {dialect: 'postgres', logging: false,
         dialectOptions: {ssl: false}, pool: {max: 3, min: 0, acquire: 15000}});
@@ -42,7 +43,7 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
         const [tables] = await database.query("SELECT tablename FROM pg_tables WHERE schemaname='public'");
         assert.equal(tables.length, 0, 'Baseline tests require an empty disposable database; existing tables are never removed');
 
-        await t.test('fresh public and tenant schemas match every frozen model column and survive reapplication', async () => withRollback(async transaction => {
+        await t.test('fresh public and tenant schemas match every frozen baseline column and survive reapplication', async () => withRollback(async transaction => {
             const schema = randomSchema();
             await applySchemaBaseline('public', 'public', database, transaction);
             await applySchemaBaseline('tenant', schema, database, transaction);
@@ -54,8 +55,12 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
                 for (const table of schemaBaseline[scope]) {
                     const model = modelDatabase.modelManager.models.find(candidate => candidate.tableName === table.name);
                     assert.ok(model, 'Frozen table must have a registered model: ' + table.name);
-                    const expected = Object.entries(model.rawAttributes).map(([name, attribute]) => attribute.field ?? name).sort();
-                    assert.deepEqual(table.columns.map(column => column.name).sort(), expected, 'Frozen model parity: ' + table.name);
+                    // Later application models evolve; the historical baseline must remain frozen.
+                    const actualNames = [...columns.values()].filter(column => column.table_name === table.name)
+                        .map(column => column.column_name).sort();
+                    // Historical attribute aliases can share one physical SQL column (for example widgets).
+                    const expectedNames = [...new Set(table.columns.map(column => column.name))].sort();
+                    assert.deepEqual(actualNames, expectedNames, 'Frozen baseline columns: ' + table.name);
                     for (const column of table.columns) {
                         const actual = columns.get(table.name + '.' + column.name);
                         assert.ok(actual, 'Fresh schema is missing ' + table.name + '.' + column.name);
@@ -268,13 +273,23 @@ test('PostgreSQL frozen baselines, legacy evidence and catalog seed compatibilit
             assert.deepEqual(rows[0], {enabled: false, rangeOneStart: null, rangeOneFinish: null});
         }));
 
-        await t.test('a fresh provision records both standard tenant migrations in the caller transaction', async () => withRollback(async transaction => {
+        await t.test('a fresh provision matches current tenant models and records every release in the caller transaction', async () => withRollback(async transaction => {
             const tenantId = randomUUID(), schema = 'rehablo_' + tenantId.replaceAll('-', '');
             await applySchemaBaseline('public', 'public', database, transaction);
             await database.query(`INSERT INTO public.tenants (id,license,"idStripe","maxUserQuantity","maxStructureQuantity","createdAt","updatedAt")
                 VALUES (:id,'synthetic-new-tenant','synthetic',1,1,NOW(),NOW())`, {transaction, replacements: {id: tenantId}});
             await provisionTenantSchema(database, schema, transaction);
             await verifySchemaBaseline('tenant', schema, database, transaction);
+            const [columns] = await database.query(`SELECT table_name,column_name FROM information_schema.columns
+                WHERE table_schema=:schema`, {transaction, replacements: {schema}});
+            for (const model of getTenantScopedModels()) {
+                const actual = (columns as Array<{table_name: string;column_name: string}>)
+                    .filter(column => column.table_name === model.tableName).map(column => column.column_name).sort();
+                // Multiple model attributes may map to the same physical field; compare SQL columns once.
+                const expected = [...new Set(Object.entries(model.rawAttributes)
+                    .map(([name, attribute]) => attribute.field ?? name))].sort();
+                assert.deepEqual(actual, expected, 'Migrated model parity: ' + model.tableName);
+            }
             const [markers] = await database.query(`SELECT name FROM ${quoteTenantSchema(schema)}."SequelizeMeta" ORDER BY name`, {transaction});
             assert.deepEqual((markers as Array<{name: string}>).map(row => row.name), requiredMigrationNames);
         }));

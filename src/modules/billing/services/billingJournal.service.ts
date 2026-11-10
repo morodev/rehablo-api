@@ -1,3 +1,4 @@
+import {instrumentDatabase} from '../../../observability/performance.js';
 import { QueryTypes, Sequelize } from 'sequelize';
 import { env } from '../../../config/env.js';
 
@@ -14,6 +15,8 @@ const journalDatabase = new Sequelize(env.databaseUrl, {
     dialectOptions: { ssl: env.dbSsl ? { require: true, rejectUnauthorized: false } : false },
     pool: { max: 1, min: 0, idle: 10000, acquire: 30000 }
 });
+
+instrumentDatabase(journalDatabase, 'billing-journal');
 
 export const billingJournal = {
     async saveProgress(operation: { id: string; tenantId: string; progress: Record<string, unknown> | null }): Promise<void> {

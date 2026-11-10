@@ -1,3 +1,4 @@
+import {initializePerformanceTelemetry, requestPerformance} from './observability/performance.js';
 import clinicalRoutes from './modules/clinical/routes/clinical.routes.js';
 import clinicalMediaRoutes from './modules/clinical/routes/clinicalMedia.routes.js';
 import clinicalPortalRoutes from './modules/clinical/routes/clinicalPortal.routes.js';
@@ -47,12 +48,15 @@ import treasuryIntegrityRoutes from './modules/administration/routes/treasuryInt
 import quoteShareRoutes from './modules/administration/routes/quoteShare.routes.js';
 
 async function bootstrap() {
+    await initializePerformanceTelemetry().catch(() => console.warn('[performance] Telemetry unavailable; HTTP startup continues.'));
     const app = express();
     const readiness = createStartupReadiness();
 
+    app.use(requestPerformance());
     app.use(helmet());
     app.use(
         cors({
+            exposedHeaders: ['X-Request-Id', 'Server-Timing'],
             origin(requestOrigin, callback) {
                 // Nessun header Origin (curl, health check, richieste server-to-server): consenti.
                 if (!requestOrigin) return callback(null, true);

@@ -1,5 +1,5 @@
 import {Request} from 'express';
-import {Op} from 'sequelize';
+import {Op, Transaction} from 'sequelize';
 import {getGrantedPermissions, getSelectedStructureId, getUserId, patientScopeWhere} from '../../../middleware/rbac.js';
 import {resolveGrantedScope} from '../../auth/rbac/permissions.js';
 import {CarePackage, PackageConsumption} from '../../administration/models/index.js';
@@ -161,11 +161,11 @@ export function projectPackageCoverage(events: Row[], evidence: PackageCoverageE
 }
 
 /** Batch enrichment for the selected therapies only. It deliberately does not extend FinanceData.packages/payments or cash facts. */
-export async function loadPackageCoverage(req: Request, events: Row[], legacyPayments: Row[] = []): Promise<Map<string, ReportPackageCoverage>> {
+export async function loadPackageCoverage(req: Request, events: Row[], legacyPayments: Row[] = [], transaction?: Transaction): Promise<Map<string, ReportPackageCoverage>> {
     if (!events.length) return new Map();
     const schema = req.tenantSchema!;
     const legacyIds = events.filter(event => activeEvent(event) && event.packageReservationStatus !== 'RELEASED' && !assigned(event)).map(event => event.id);
-    const consumptions = legacyIds.length ? (await PackageConsumption.schema(schema).findAll({where: {agendaEventId: {[Op.in]: legacyIds}, type: 'CONSUME', status: 'POSTED'},
+    const consumptions = legacyIds.length ? (await PackageConsumption.schema(schema).findAll({transaction, where: {agendaEventId: {[Op.in]: legacyIds}, type: 'CONSUME', status: 'POSTED'},
         attributes: ['id', 'packageId', 'agendaEventId', 'serviceId', 'units', 'status', 'type']})).map(plain) : [];
     const references = events.flatMap(event => {
         const traces = consumptions.filter(row => row.agendaEventId === event.id && row.status === 'POSTED' && row.type === 'CONSUME');
@@ -174,18 +174,18 @@ export async function loadPackageCoverage(req: Request, events: Row[], legacyPay
         return packageId && patientId && event.structureId ? [{id: packageId, patientId, structureId: event.structureId}] : [];
     });
     if (!references.length) return projectPackageCoverage(events, {packages: [], consumptions, payments: [], legacyPayments});
-    const packages = (await CarePackage.schema(schema).findAll({where: {[Op.or]: references},
+    const packages = (await CarePackage.schema(schema).findAll({transaction, where: {[Op.or]: references},
         attributes: ['id', 'patientId', 'structureId', 'name', 'templateId', 'quoteId', 'serviceId', 'purchasedUnits', 'totalPrice', 'lines', 'purchaseSnapshot', 'invoiceId']})).map(plain)
         .filter(pack => references.some(reference => reference.id === pack.id && identity(reference) === identity(pack)));
     const ids = packages.map(pack => pack.id);
     const invoiceReferences = packages.filter(pack => pack.invoiceId).map(pack => ({id: pack.invoiceId, patientID: pack.patientId,
         structureId: pack.structureId, [Op.or]: [{carePackageId: pack.id}, {carePackageId: null}]}));
-    const purchaseInvoices = invoiceReferences.length ? (await Invoice.schema(schema).findAll({where: {[Op.or]: invoiceReferences},
+    const purchaseInvoices = invoiceReferences.length ? (await Invoice.schema(schema).findAll({transaction, where: {[Op.or]: invoiceReferences},
         attributes: ['id', 'patientID', 'structureId', 'carePackageId', 'status', 'emissionDate', 'documentType', 'invoiceTotal', 'invoiceNet']})).map(plain)
         .filter(invoice => packages.some(pack => invoice.id === pack.invoiceId && invoiceIdentity(invoice) === identity(pack)
             && (!invoice.carePackageId || invoice.carePackageId === pack.id))) : [];
     const invoiceIds = purchaseInvoices.map(invoice => invoice.id);
-    const payments = ids.length ? (await InvoicePayment.schema(schema).findAll({where: {[Op.or]: [
+    const payments = ids.length ? (await InvoicePayment.schema(schema).findAll({transaction, where: {[Op.or]: [
         {carePackageId: {[Op.in]: ids}}, ...(invoiceIds.length ? [{invoiceId: {[Op.in]: invoiceIds}}] : [])]},
         attributes: ['id', 'carePackageId', 'invoiceId', 'amount', 'method', 'source', 'status']})).map(plain) : [];
     let openablePackageIds = new Set<string>();
@@ -193,14 +193,14 @@ export async function loadPackageCoverage(req: Request, events: Row[], legacyPay
         let where: Record<string | symbol, any> | null = null;
         try {where = packageOriginReadWhere(req);}
         catch (failure) {if (![403, 409].includes((failure as {statusCode?: number}).statusCode ?? 0)) throw failure;}
-        if (where) openablePackageIds = new Set((await CarePackage.schema(schema).findAll({where: {[Op.and]: [{id: {[Op.in]: ids}}, where]}, attributes: ['id']})).map(row => String(row.get('id'))));
+        if (where) openablePackageIds = new Set((await CarePackage.schema(schema).findAll({transaction, where: {[Op.and]: [{id: {[Op.in]: ids}}, where]}, attributes: ['id']})).map(row => String(row.get('id'))));
     }
     const granted = req.user?.isSuperAdmin ? 'tenant' : resolveGrantedScope(getGrantedPermissions(req), 'invoice', 'read');
     let invoiceReadablePatients = new Set<string>();
     let invoices: Row[] = [];
     if (granted && packages.length) {
         const invoiceRequest = Object.assign(Object.create(req), {access: {resource: 'invoice', action: 'read', scope: granted, userId: getUserId(req), structureId: getSelectedStructureId(req)}}) as Request;
-        const patients = (await Patient.schema(schema).findAll({where: {[Op.and]: [
+        const patients = (await Patient.schema(schema).findAll({transaction, where: {[Op.and]: [
             {id: {[Op.in]: [...new Set(packages.map(pack => pack.patientId))]}}, patientScopeWhere(invoiceRequest, schema, 'id')
         ]}, attributes: ['id', 'structureId']})).map(plain);
         invoiceReadablePatients = new Set(patients.map(patient => `${patient.id}:${patient.structureId}`));

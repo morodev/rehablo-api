@@ -1,7 +1,8 @@
+import {liveReportReadsEnabled, withReportReadSnapshot} from '../../reports/services/reportReadContext.js';
 import { Request, Response } from 'express';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
 import { sendSuccessResponse, sendErrorResponse } from '../../../utils/response.js';
-import { aggregateFinance, loadFinanceData, parseFinanceFilters, FinanceQuery } from '../../reports/services/finance.service.js';
+import { aggregateFinance, financialSelection, financialSelectionForPeriod, loadFinanceData, parseFinanceFilters, FinanceQuery } from '../../reports/services/finance.service.js';
 import { AnalyticsQueryError, localDateKey, parseAnalyticsQuery } from '../../reports/services/analytics.service.js';
 import Tenant from '../../auth/models/tenant.model.js';
 import { getMissingIssuerFields } from '../utils/issuer.js';
@@ -37,30 +38,36 @@ export const getOverview = asyncHandler(async (req: Request, res: Response) => {
         if (error instanceof AnalyticsQueryError) return sendErrorResponse(res, 400, error.message);
         throw error;
     }
-    const data = await loadFinanceData(req, query);
-    const monthlyReport = aggregateFinance(data, query);
-    const dailyReport = aggregateFinance(data, { ...query, from: reportDay, to: reportDay, granularity: 'day' });
-    const rangeStart = new Date(query.from + 'T12:00:00Z');
-    const monthly = Array.from({ length: months }, (_, offset) => {
-        const date = new Date(rangeStart); date.setUTCMonth(date.getUTCMonth() + offset);
-        const month = date.toISOString().slice(0, 7);
-        const bucket = monthlyReport.series.find((row) => row.bucket === month);
-        return { month, billed: bucket?.billedTotal ?? 0, collected: bucket?.collected ?? 0,
-            collectedFromAppointments: bucket?.collectedFromAppointments ?? 0,
-            collectedFromInvoices: bucket?.collectedFromInvoices ?? 0 };
-    });
-    const totals = dailyReport.totals;
-    return sendSuccessResponse(res, 200, {
-        day: reportDay,
-        today: { billed: totals.billedTotal, collected: totals.collected, toCollect: totals.issuedOutstanding,
-            collectedFromAppointments: totals.collectedFromAppointments, collectedFromInvoices: totals.collectedFromInvoices,
-            collectedFromPackages: totals.collectedFromPackages },
-        monthly, outstanding: totals.outstanding, invoiceOutstanding: totals.invoiceOutstanding,
-        appointmentOutstanding: totals.appointmentOutstanding, collectedUnbilled: totals.collectedUnbilled,
-        undatedLegacyPaid: totals.undatedLegacyPaid, unknownAppointmentCount: totals.unknownAppointmentCount,
-        excludedMixedInvoiceCount: totals.excludedMixedInvoiceCount,
-        balanceAsOf: dailyReport.balanceAsOf, attributionPolicy: dailyReport.attributionPolicy
-    }, 'Riepilogo economico caricato');
+    const readOverview = async (request: Request) => {
+        const data = await loadFinanceData(request, query, undefined, undefined, {summary: liveReportReadsEnabled()});
+        const selected = financialSelection(data, query);
+        const monthlyReport = aggregateFinance(data, query, selected);
+        const dailyQuery: FinanceQuery = { ...query, from: reportDay, to: reportDay, granularity: 'day' };
+        const dailyReport = aggregateFinance(data, dailyQuery, financialSelectionForPeriod(selected, dailyQuery));
+        const rangeStart = new Date(query.from + 'T12:00:00Z');
+        const monthly = Array.from({ length: months }, (_, offset) => {
+            const date = new Date(rangeStart); date.setUTCMonth(date.getUTCMonth() + offset);
+            const month = date.toISOString().slice(0, 7);
+            const bucket = monthlyReport.series.find((row) => row.bucket === month);
+            return { month, billed: bucket?.billedTotal ?? 0, collected: bucket?.collected ?? 0,
+                collectedFromAppointments: bucket?.collectedFromAppointments ?? 0,
+                collectedFromInvoices: bucket?.collectedFromInvoices ?? 0 };
+        });
+        const totals = dailyReport.totals;
+        return {
+            day: reportDay,
+            today: { billed: totals.billedTotal, collected: totals.collected, toCollect: totals.issuedOutstanding,
+                collectedFromAppointments: totals.collectedFromAppointments, collectedFromInvoices: totals.collectedFromInvoices,
+                collectedFromPackages: totals.collectedFromPackages },
+            monthly, outstanding: totals.outstanding, invoiceOutstanding: totals.invoiceOutstanding,
+            appointmentOutstanding: totals.appointmentOutstanding, collectedUnbilled: totals.collectedUnbilled,
+            undatedLegacyPaid: totals.undatedLegacyPaid, unknownAppointmentCount: totals.unknownAppointmentCount,
+            excludedMixedInvoiceCount: totals.excludedMixedInvoiceCount,
+            balanceAsOf: dailyReport.balanceAsOf, attributionPolicy: dailyReport.attributionPolicy
+        };
+    };
+    const payload = liveReportReadsEnabled() ? await withReportReadSnapshot(req, readOverview) : await readOverview(req);
+    return sendSuccessResponse(res, 200, payload, 'Riepilogo economico caricato');
 });
 
 /**

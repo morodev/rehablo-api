@@ -119,7 +119,8 @@ export const getNotes = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
     const {q, patientId, agendaEventId, evaluationId, type, assignedToMe, createdByMe} = req.query as Record<string, string | undefined>;
     const archived = parseBool(req.query.archived);
-    const visibility = await visibleNoteWhere(req);
+    const assignedIds = assignedToMe === 'true' ? await assignedNoteIds(schema, req.access!.userId) : undefined;
+    const visibility = await visibleNoteWhere(req, assignedIds);
     const base: Record<string, unknown> = {
         structureId: req.access!.structureId,
         ...(patientId ? {patientId} : {}),
@@ -129,7 +130,7 @@ export const getNotes = asyncHandler(async (req: Request, res: Response) => {
         ...(archived !== undefined ? {archived} : {archived: false}),
         ...(createdByMe === 'true' ? {createdByUserId: req.access!.userId} : {})
     };
-    if (assignedToMe === 'true') base.id = {[Op.in]: await assignedNoteIds(schema, req.access!.userId)};
+    if (assignedToMe === 'true') base.id = {[Op.in]: assignedIds!};
     const search = textSearchWhere(['title', 'contentText'], q);
     const whereParts: any[] = [visibility, base];
     if (search) whereParts.push(search);

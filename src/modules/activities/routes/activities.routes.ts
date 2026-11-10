@@ -31,7 +31,7 @@ router.use('/activities', requireAuth);
 type Handler = (req: Request, res: Response) => Promise<unknown>;
 function handle(handler: Handler) {
     return (req: Request, res: Response) => {
-        const requestId = randomUUID();
+        const requestId = String(res.getHeader('X-Request-Id') ?? randomUUID());
         res.setHeader('X-Request-Id', requestId);
         Promise.resolve(handler(req, res)).catch(error => {
             if (error instanceof ActivityError) return sendActivityError(res, error, requestId);

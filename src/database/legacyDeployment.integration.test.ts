@@ -174,8 +174,11 @@ Sequelize.prototype.sync = function() {throw new Error('Global model sync is for
         await database.transaction(async transaction => {
             await database.query(`CREATE SCHEMA ${quote(schema)}`, {transaction});
             const repair = await prepareTenantPaymentHistory(schema, database, transaction);
+            // Only pre-release tables belong to this historical sync fixture. New models
+            // (such as activity_executions) need the constraints supplied by their migration.
+            const historicalTables = new Set(schemaBaseline.tenant.map(table => table.name));
             for (const model of getTenantScopedModels()) {
-                if (model.tableName === 'appointment_reminder_deliveries') continue;
+                if (!historicalTables.has(model.tableName) || model.tableName === 'appointment_reminder_deliveries') continue;
                 await model.schema(schema).sync({alter: {drop: false}, transaction} as any);
             }
             // cc78bbc required invoiceId: Sequelize inferred DELETE/UPDATE CASCADE.
@@ -275,7 +278,8 @@ Sequelize.prototype.sync = function() {throw new Error('Global model sync is for
                 });
                 assert.equal(code, 1, 'Startup must fail while a global migration is pending: ' + output());
                 const [markers] = await database.query('SELECT name FROM public."SequelizeMeta" ORDER BY name');
-                assert.deepEqual((markers as Array<{name: string}>).map(row => row.name), [requiredMigrationNames[0]]);
+                assert.deepEqual((markers as Array<{name: string}>).map(row => row.name),
+                    requiredMigrationNames.filter(name => name !== requiredMigrationNames[1]));
                 assert.deepEqual(await snapshotBusinessData(), before);
             } finally {clearTimeout(timer); await stop(child);}
             await runCli();

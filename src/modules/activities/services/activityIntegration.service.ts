@@ -30,11 +30,16 @@ export async function queryActivitySummary(req: Request, query: ActivitySummaryQ
                 models(context).activity.count({where, transaction}),
                 models(context).activity.findAll({where, order: [[deadline, 'ASC'], [priority, 'DESC'], ['id', 'ASC']], limit: query.limit, transaction})
             ]);
-            return {total, items: await serializeActivities(context, rows, transaction, evaluationAt)};
+            return {total, rows};
         }));
+        // Both windows share one relation/people batch and the same transaction snapshot.
+        const uniqueRows = [...new Map(windows.flatMap(window => window.rows).map(row => [row.id, row])).values()];
+        const serialized = await serializeActivities(context, uniqueRows, transaction, evaluationAt);
+        const byId = new Map(serialized.map(item => [item.id, item]));
+        const results = windows.map(window => ({total: window.total, items: window.rows.map(row => byId.get(row.id)!)}));
         return {board: serializeBoard(board.get({plain: true})), evaluationAt: evaluationAt.toISOString(),
             serverNow: new Date().toISOString(), snapshotRevision: board.snapshotRevision,
-            overdue: windows[0], today: windows[1]};
+            overdue: results[0], today: results[1]};
     });
 }
 

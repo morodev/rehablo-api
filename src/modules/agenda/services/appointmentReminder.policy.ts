@@ -49,8 +49,12 @@ export function reminderOccurrence(event: Record<string, any>, requested: unknow
 export function reminderAvailability(event: Record<string, any>, patient: Record<string, any> | null,
     occurrence: ReminderOccurrence, channel: AppointmentReminderChannel, now = Date.now()): {available: boolean; unavailableReason: string | null; recipient: string | null} {
     let reason: string | null = null;
+    const status = String(event.status ?? '').toUpperCase();
     if (event.kind === 'TIME_OFF' || !occurrence.patientId) reason = 'Appuntamento senza paziente';
-    else if (String(event.status ?? '').toUpperCase() !== 'CONFIRMED') reason = 'Appuntamento non confermato';
+    else if (status === 'COMPLETED') reason = 'Appuntamento già effettuato';
+    else if (status === 'CANCELLED') reason = 'Appuntamento cancellato';
+    else if (status === 'NO_SHOW') reason = 'Appuntamento segnato come mancato arrivo';
+    else if (status !== 'CONFIRMED') reason = 'Promemoria non disponibile per lo stato dell’appuntamento';
     else if (Date.parse(occurrence.start) < now) reason = 'Appuntamento già iniziato';
     else if (!patient || patient.archivedAt) reason = 'Paziente non disponibile';
     else if (patient[channel === 'email' ? 'emailNotificationsConsent' : 'whatsappNotificationsConsent'] === false) {

@@ -1,5 +1,7 @@
+import {SUMMARY_EVENT_ATTRIBUTES, SUMMARY_PACKAGE_ATTRIBUTES} from './financialSummaryRead.service.js';
 import { Request } from 'express';
-import { Op } from 'sequelize';
+import { Op, Transaction } from 'sequelize';
+import {getReportTransaction, liveReportReadsEnabled} from './reportReadContext.js';
 import { patientScopeWhere } from '../../../middleware/rbac.js';
 import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import {packageCoversAppointment} from '../../agenda/services/packageAssignment.service.js';
@@ -34,7 +36,10 @@ export const methodKey = (method: unknown): string => {
 };
 const plain = (row: any): Record<string, any> => typeof row.get === 'function' ? row.get({ plain: true }) : row;
 const dateKey = dateOnly;
-const inPeriod = (date: unknown, query: AnalyticsQuery): boolean => !!date && dateKey(date) >= query.from && dateKey(date) <= query.to;
+const inPeriod = (date: unknown, query: AnalyticsQuery): boolean => {
+    const key = dateKey(date);
+    return !!key && key >= query.from && key <= query.to;
+};
 
 export function parseFinanceFilters(req: Request): FinanceFilters {
     if (['paymentStatus', 'documentStatus', 'status', 'eventTypeIds', 'agendaEventIds', 'patientId']
@@ -84,7 +89,7 @@ export function invoiceMatchesContext(events: Array<Record<string, any>>, query:
     );
 }
 
-export async function loadFinanceData(req: Request, query: FinanceQuery, scope: ReportScope | undefined = (req as any).reportScope): Promise<FinanceData> {
+export function financeReadWhere(req: Request, query: FinanceQuery, scope: ReportScope | undefined = (req as any).reportScope) {
     const schema = req.tenantSchema!;
     const eventWhere: Record<string | symbol, any> = scope ? reportStructureWhere(scope) : { ...patientScopeWhere(req, schema, 'patientId') };
     const invoiceWhere: Record<string | symbol, any> = scope ? reportStructureWhere(scope) : { ...patientScopeWhere(req, schema, 'patientID') };
@@ -101,24 +106,55 @@ export async function loadFinanceData(req: Request, query: FinanceQuery, scope: 
     if (query.operatorId) eventWhere.calendarId = query.operatorId;
     if (query.eventTypeId) eventWhere.eventTypeId = query.eventTypeId;
     if (query.eventTypeIds?.length) eventWhere.eventTypeId = { [Op.in]: query.eventTypeIds };
+    return {schema, eventWhere, invoiceWhere, packageWhere};
+}
+
+/** Candidate IDs are used by therapy/session detail, whose totals refer to those therapies.
+ * General reports retain their full scope, including current balances and global diagnostics. */
+export async function loadFinanceData(req: Request, query: FinanceQuery, scope: ReportScope | undefined = (req as any).reportScope,
+    candidateEventIds?: readonly string[], options: {summary?: boolean} = {}): Promise<FinanceData> {
+    const {schema, eventWhere, invoiceWhere, packageWhere} = financeReadWhere(req, query, scope);
+    const transaction = getReportTransaction(req);
+    if (candidateEventIds) {
+        const ids = [...new Set(candidateEventIds)];
+        if (!ids.length) return {events: [], invoices: [], packages: [], payments: [], cashFacts: [], cashIssues: [], warnings: [],
+            attributableInvoiceIds: new Set(), scopeCompleteInvoiceIds: new Set(), excludedMixedInvoiceIds: new Set(), excludedMixedInvoiceCount: 0};
+        eventWhere.id = {[Op.in]: ids};
+        const eventModels = await AgendaEvent.schema(schema).findAll({where: eventWhere, transaction});
+        const selectedIds = eventModels.map(event => event.id);
+        const links = await getInvoiceAgendaLinksByEventIds(schema, selectedIds, transaction);
+        const invoiceIds = [...new Set([...eventModels.map(event => event.invoiceId), ...links.map(link => link.invoiceId)].filter(Boolean))];
+        // Reverse-only legacy links are still supported. The invoice keeps its own authorization scope.
+        invoiceWhere[Op.or] = [{id: {[Op.in]: invoiceIds}}, {agendaEventId: {[Op.in]: selectedIds}}];
+        const invoices = selectedIds.length ? await Invoice.schema(schema).findAll({where: invoiceWhere, transaction,
+            attributes: ['id', 'patientID', 'structureId', 'documentNumber', 'documentYear', 'agendaEventId', 'carePackageId', 'emissionDate', 'invoiceTotal', 'invoiceNet', 'sellingPrice', 'discSellingPrice', 'status', 'documentType', 'paymentTerms']}) : [];
+        return enrichFinanceData(schema, query, scope, eventModels, invoices, [], links, transaction);
+    }
     const [eventModels, invoiceModels, packageModels] = await Promise.all([
-        AgendaEvent.schema(schema).findAll({ where: eventWhere }),
-        Invoice.schema(schema).findAll({ where: invoiceWhere,
+        AgendaEvent.schema(schema).findAll({ where: eventWhere, transaction, ...(options.summary ? {attributes: SUMMARY_EVENT_ATTRIBUTES, raw: true} : {}) }),
+        Invoice.schema(schema).findAll({ where: invoiceWhere, transaction,
             attributes: ['id', 'patientID', 'structureId', 'documentNumber', 'documentYear', 'agendaEventId', 'carePackageId', 'emissionDate', 'invoiceTotal', 'invoiceNet', 'sellingPrice', 'discSellingPrice', 'status', 'documentType', 'paymentTerms'] }),
-        CarePackage.schema(schema).findAll({ where: packageWhere })
+        CarePackage.schema(schema).findAll({ where: packageWhere, transaction, ...(options.summary ? {attributes: SUMMARY_PACKAGE_ATTRIBUTES, raw: true} : {}) })
     ]);
+    return enrichFinanceData(schema, query, scope, eventModels, invoiceModels, packageModels, undefined, transaction, options.summary);
+}
+
+async function enrichFinanceData(schema: string, query: FinanceQuery, scope: ReportScope | undefined,
+    eventModels: AgendaEvent[], invoiceModels: Invoice[], packageModels: CarePackage[],
+    knownEventLinks?: Awaited<ReturnType<typeof getInvoiceAgendaLinksByEventIds>>, transaction?: Transaction, summaryRead = false): Promise<FinanceData> {
     const events = eventModels.map(plain);
     const invoices = invoiceModels.map(plain);
     const packages = packageModels.map(plain).filter(isFinancialCarePackage);
     const packageIds = packages.map(pkg => pkg.id);
     const eventIds = events.map((event) => event.id);
     const invoiceIds = invoices.map((invoice) => invoice.id);
+    const needAttribution = !summaryRead || !!(query.operatorId || query.eventTypeId || query.eventTypeIds?.length);
     const [eventLinks, invoiceLinkModels, prices] = await Promise.all([
-        getInvoiceAgendaLinksByEventIds(schema, eventIds),
+        knownEventLinks ?? getInvoiceAgendaLinksByEventIds(schema, eventIds, transaction),
         // Fiscal cancellation releases active links but retains the audit links. They still
         // identify the context of USER cash received on that document before cancellation.
-        invoiceIds.length ? InvoiceAgendaEvent.schema(schema).findAll({ where: { invoiceId: { [Op.in]: invoiceIds } } }) : [],
-        appointmentPricesByEvent(schema, events)
+        needAttribution && invoiceIds.length ? InvoiceAgendaEvent.schema(schema).findAll({ transaction, where: { invoiceId: { [Op.in]: invoiceIds } } }) : [],
+        appointmentPricesByEvent(schema, events, transaction)
     ]);
     const invoiceLinks = invoiceLinkModels.map(plain);
     const invoiceIdByEvent = new Map(eventLinks.map((link) => [link.agendaEventId, link.invoiceId]));
@@ -129,7 +165,7 @@ export async function loadFinanceData(req: Request, query: FinanceQuery, scope: 
     ])];
     // Fetch all children of accessible documents before applying context filters. Otherwise a
     // mixed invoice could falsely look like a document belonging entirely to one operator.
-    const linkedModels = invoiceIds.length ? await AgendaEvent.schema(schema).findAll({
+    const linkedModels = needAttribution && invoiceIds.length ? await AgendaEvent.schema(schema).findAll({ transaction,
         where: { [Op.or]: [{ id: { [Op.in]: linkedEventIds } }, { invoiceId: { [Op.in]: invoiceIds } }] },
         attributes: ['id', 'calendarId', 'eventTypeId', 'invoiceId', 'structureId']
     }) : [];
@@ -154,30 +190,49 @@ export async function loadFinanceData(req: Request, query: FinanceQuery, scope: 
         event.expectedAmount = prices.get(event.id)?.amount ?? null;
         event.priceEstimated = prices.get(event.id)?.estimated ?? false;
     });
-    const paymentModels = invoiceIds.length || eventIds.length || packageIds.length ? await InvoicePayment.schema(schema).findAll({
+    const paymentModels = invoiceIds.length || eventIds.length || packageIds.length ? await InvoicePayment.schema(schema).findAll({ transaction,
         where: { [Op.or]: [{ invoiceId: { [Op.in]: invoiceIds } }, { agendaEventId: { [Op.in]: eventIds } }, { carePackageId: { [Op.in]: packageIds } }] }
     }) : [];
     const selectedEventIds = new Set(eventIds);
     const payments = paymentModels.map(plain);
-    const cash = await loadClinicalCash(schema, payments);
+    const cash = await loadClinicalCash(schema, payments, transaction);
     const excludedMixedInvoiceIds = new Set(invoices.filter(invoice => !attributableInvoiceIds.has(invoice.id) && invoice.status !== 'void'
         && [...(idsByInvoice.get(invoice.id) ?? [])].some(id => selectedEventIds.has(id))).map(invoice => invoice.id));
     return { events, invoices, packages, payments, cashFacts: cash.facts, cashIssues: cash.issues, warnings: cash.warnings, attributableInvoiceIds, scopeCompleteInvoiceIds,
         excludedMixedInvoiceCount: excludedMixedInvoiceIds.size, excludedMixedInvoiceIds };
 }
 
-async function loadClinicalCash(schema: string, payments: Array<Record<string, any>>) {
+async function loadClinicalCash(schema: string, payments: Array<Record<string, any>>, transaction?: Transaction) {
     const ids = payments.filter(row => !['PACKAGE', 'CREDIT', 'OPENING_BALANCE'].includes(row.source)).map(row => row.id);
     if (!ids.length) return clinicalCashFacts(payments);
-    const credits = (await PatientCredit.schema(schema).findAll({ where: { sourceType: 'VOID_CREDIT', sourceId: { [Op.in]: ids } } })).map(plain);
-    const refunds = credits.length ? (await PatientCreditMovement.schema(schema).findAll({
+    const credits = (await PatientCredit.schema(schema).findAll({ transaction, where: { sourceType: 'VOID_CREDIT', sourceId: { [Op.in]: ids } } })).map(plain);
+    const refunds = credits.length ? (await PatientCreditMovement.schema(schema).findAll({ transaction,
         where: { creditId: { [Op.in]: credits.map(row => row.id) }, type: {[Op.in]: ['REFUND', 'REVERSE_REFUND']} }
     })).map(plain) : [];
-    const movements = (await TreasuryMovement.schema(schema).findAll({ where: { [Op.or]: [
+    const movements = (await TreasuryMovement.schema(schema).findAll({ transaction, where: { [Op.or]: [
         { sourceType: { [Op.in]: ['INVOICE_PAYMENT', 'INVOICE_PAYMENT_CORRECTION', 'INVOICE_PAYMENT_DATE_VOID', 'INVOICE_PAYMENT_VOID'] }, sourceId: { [Op.in]: ids } },
         ...(refunds.length ? [{ id: { [Op.in]: refunds.map(row => row.treasuryMovementId).filter(Boolean) } }] : [])
     ] } })).map(plain);
     return clinicalCashFacts(payments, movements, credits, refunds);
+}
+
+/** Global cash diagnostics intentionally ignore the graph period and financial status filters.
+ * Read identity columns and ledger evidence only, not every appointment body, price or document link. */
+export async function loadFinanceCashWarnings(req: Request, query: FinanceQuery, scope: ReportScope): Promise<FinancialWarning[]> {
+    const {schema, eventWhere, invoiceWhere, packageWhere} = financeReadWhere(req, query, scope);
+    const transaction = getReportTransaction(req);
+    const [events, invoices, packages] = await Promise.all([
+        AgendaEvent.schema(schema).findAll({where: eventWhere, attributes: ['id'], transaction}),
+        Invoice.schema(schema).findAll({where: invoiceWhere, attributes: ['id'], transaction}),
+        CarePackage.schema(schema).findAll({where: packageWhere, attributes: ['id', 'templateId', 'quoteId', 'totalPrice', 'purchaseSnapshot', 'lines'], transaction})
+    ]);
+    const eventIds = events.map(row => row.id), invoiceIds = invoices.map(row => row.id);
+    const packageIds = packages.map(plain).filter(isFinancialCarePackage).map(row => row.id);
+    if (!eventIds.length && !invoiceIds.length && !packageIds.length) return [];
+    const payments = (await InvoicePayment.schema(schema).findAll({transaction,
+        where: {[Op.or]: [{invoiceId: {[Op.in]: invoiceIds}}, {agendaEventId: {[Op.in]: eventIds}}, {carePackageId: {[Op.in]: packageIds}}]},
+        attributes: ['id', 'invoiceId', 'agendaEventId', 'carePackageId', 'amount', 'status', 'source', 'paidAt', 'method']})).map(plain);
+    return (await loadClinicalCash(schema, payments, transaction)).warnings;
 }
 
 function financialIndex(data: FinanceData) {
@@ -185,8 +240,9 @@ function financialIndex(data: FinanceData) {
     const payments = [...new Map(data.payments.map((payment) => [payment.id, payment])).values()];
     const byEvent = new Map<string, Array<Record<string, any>>>();
     const byInvoice = new Map<string, Array<Record<string, any>>>();
+    const byPackage = new Map<string, Array<Record<string, any>>>();
     payments.forEach((payment) => {
-        for (const [map, id] of [[byEvent, payment.agendaEventId], [byInvoice, payment.invoiceId]] as const) {
+        for (const [map, id] of [[byEvent, payment.agendaEventId], [byInvoice, payment.invoiceId], [byPackage, payment.carePackageId]] as const) {
             if (!id) continue;
             const current = map.get(id) ?? []; current.push(payment); map.set(id, current);
         }
@@ -196,7 +252,7 @@ function financialIndex(data: FinanceData) {
     const invoiceIdByEvent = new Map<string, string>();
     data.invoices.forEach(invoice => { if (invoice.agendaEventId && String(invoice.status).toLowerCase() !== 'void') invoiceIdByEvent.set(invoice.agendaEventId, invoice.id); });
     data.events.forEach(event => { if (event.invoiceId) invoiceIdByEvent.set(event.id, event.invoiceId); });
-    return { payments, byEvent, byInvoice, invoiceById, summaries, invoiceIdByEvent };
+    return { payments, byEvent, byInvoice, byPackage, invoiceById, summaries, invoiceIdByEvent };
 }
 
 function eventFinance(event: Record<string, any>, index: ReturnType<typeof financialIndex>, coverageByEvent?: Map<string, ReportPackageCoverage>) {
@@ -278,8 +334,9 @@ export function financialSelection(data: FinanceData, query: FinanceQuery) {
     }
     // The sale has no defensible attribution to a therapist: future sessions may use different calendars.
     const packages: Array<Record<string, any>> = query.operatorId || query.eventTypeId || query.eventTypeIds?.length ? [] : (data.packages ?? []).map(pkg => {
-        const invoice = data.invoices.find(row => row.id === pkg.invoiceId && validIssuedDocument(row));
-        const paidAmount = money(index.payments.filter(row => row.carePackageId === pkg.id && row.status === 'POSTED')
+        const linkedInvoice = index.invoiceById.get(pkg.invoiceId);
+        const invoice = linkedInvoice && validIssuedDocument(linkedInvoice) ? linkedInvoice : undefined;
+        const paidAmount = money((index.byPackage.get(pkg.id) ?? []).filter(row => row.status === 'POSTED')
             .reduce((sum, row) => sum + Number(row.amount), 0));
         const balance = invoice ? index.summaries.get(invoice.id)!.balance : money(Math.max(Number(pkg.totalPrice) - paidAmount, 0));
         const paymentStatus = balance <= 0 ? 'paid' : paidAmount > 0 ? 'partial' : 'unpaid';
@@ -296,8 +353,14 @@ export function financialSelection(data: FinanceData, query: FinanceQuery) {
     return { index, eventById, financialByEvent, events, invoices, packages, payments, periodPayments, issued };
 }
 
-export function aggregateFinance(data: FinanceData, query: FinanceQuery) {
-    const { index, eventById, financialByEvent, events, invoices, packages, payments, periodPayments, issued } = financialSelection(data, query);
+/** Reuse only within one read and with unchanged non-date filters; no process-level cache. */
+export function financialSelectionForPeriod(selection: ReturnType<typeof financialSelection>, query: FinanceQuery) {
+    return {...selection, periodPayments: selection.payments.filter(payment => inPeriod(payment.paidAt, query)),
+        issued: selection.invoices.filter(invoice => inPeriod(invoice.emissionDate, query))};
+}
+
+export function aggregateFinance(data: FinanceData, query: FinanceQuery, selection = financialSelection(data, query)) {
+    const { index, eventById, financialByEvent, events, invoices, packages, payments, periodPayments, issued } = selection;
     const sign = (invoice: Record<string, any>) => invoice.documentType === 'nota_di_credito' ? -1 : 1;
     const today = localDateKey(new Date());
     const totals = {
@@ -407,9 +470,11 @@ export function aggregateTherapyPayments(data: FinanceData, query: FinanceQuery,
 }
 
 export async function therapyPaymentsPayload(req: Request, query: FinanceQuery, page: number, size: number) {
-    const [data, occurrences] = await Promise.all([loadFinanceData(req, query), loadOccurrences(req.tenantSchema!, query)]);
+    const transaction = getReportTransaction(req);
+    const occurrences = await loadOccurrences(req.tenantSchema!, query, false, transaction);
     const selectedSourceIds = new Set(occurrences.filter(occurrence => !query.agendaEventIds || query.agendaEventIds.includes(occurrence.id))
         .map(occurrence => occurrence.sourceEventId ?? occurrence.id));
-    data.packageCoverage = await loadPackageCoverage(req, data.events.filter(event => selectedSourceIds.has(event.id)), data.payments);
+    const data = await loadFinanceData(req, query, (req as any).reportScope, liveReportReadsEnabled() ? [...selectedSourceIds] : undefined);
+    data.packageCoverage = await loadPackageCoverage(req, data.events.filter(event => selectedSourceIds.has(event.id)), data.payments, transaction);
     return aggregateTherapyPayments(data, query, occurrences, page, size);
 }

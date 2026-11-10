@@ -27,6 +27,8 @@ import {
 
 import { aggregateFinance, loadFinanceData, parseFinanceFilters, therapyPaymentsPayload } from '../services/finance.service.js';
 import {validIssuedDocument} from '../services/financialFacts.service.js';
+import {readReceivablesPage} from '../services/receivablesLive.service.js';
+import {liveReportReadsEnabled, withReportReadSnapshot} from '../services/reportReadContext.js';
 
 const money = (value: unknown): number => Math.round((Number(value) || 0) * 100) / 100;
 
@@ -182,7 +184,10 @@ export const getTherapyPayments = asyncHandler(async (req: Request, res: Respons
     const financialQuery = { ...query, ...parseFinanceFilters(req) };
     const page = Math.max(parseInt(String(req.query.page ?? '1'), 10) || 1, 1);
     const size = Math.min(Math.max(parseInt(String(req.query.size ?? '25'), 10) || 25, 1), 100);
-    return sendSuccessResponse(res, 200, await therapyPaymentsPayload(req, financialQuery, page, size), 'Incassi terapie caricati');
+    const result = liveReportReadsEnabled()
+        ? await withReportReadSnapshot(req, snapshot => therapyPaymentsPayload(snapshot, financialQuery, page, size))
+        : await therapyPaymentsPayload(req, financialQuery, page, size);
+    return sendSuccessResponse(res, 200, result, 'Incassi terapie caricati');
 });
 
 export const getFinance = asyncHandler(async (req: Request, res: Response) => {
@@ -354,6 +359,11 @@ export const getReceivables = asyncHandler(async (req: Request, res: Response) =
     const validBuckets = ['all', 'overdue', 'today', 'next7', 'no_due'];
     if (!validBuckets.includes(bucket)) return sendErrorResponse(res, 400, 'Filtro scadenza non valido');
 
+    const reportScope = (req as any).reportScope;
+    if (reportScope && liveReportReadsEnabled()) {
+        const result = await readReceivablesPage(req.tenantSchema!, reportScope.selectedStructureIds, {...query, ...parseFinanceFilters(req), patientId: req.query.patientId}, page, size, bucket);
+        return sendSuccessResponse(res, 200, result, 'Scadenze fatture caricate');
+    }
     const attributionWhere = await invoiceAttributionWhere(req, query);
     const rows = await Invoice.schema(req.tenantSchema!).findAll({
         where: invoiceWhere(req, query, {

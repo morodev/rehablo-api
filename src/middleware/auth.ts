@@ -1,3 +1,4 @@
+import {measurePerformancePhase} from '../observability/performance.js';
 import {assertBillingAccess} from '../modules/billing/services/billingAccess.service.js';
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
@@ -64,6 +65,8 @@ export function extractToken(req: Request): string | undefined {
 // Solo request-local: middleware ripetuti sui router condividono la verifica, la richiesta
 // successiva rilegge sempre versione, membership e assegnazione correnti dal database.
 const principalByRequest = new WeakMap<Request, Map<boolean, Promise<AuthTokenPayload>>>();
+// Share billing I/O only across guards of this request; the next request must recheck revocation.
+const billingByRequest = new WeakMap<Request, Map<string, Promise<void>>>();
 
 function authenticate(identityOnly: boolean) {
     return (req: Request, res: Response, next: NextFunction) => {
@@ -74,7 +77,7 @@ function authenticate(identityOnly: boolean) {
             let decoded: AuthTokenPayload;
             try { decoded = jwt.verify(token, env.jwtSecret) as AuthTokenPayload; }
             catch { return sendErrorResponse(res, 401, 'invalid or expired token'); }
-            pending = resolveApplicationPrincipal(decoded, { identityOnly });
+            pending = measurePerformancePhase('auth', () => resolveApplicationPrincipal(decoded, { identityOnly }));
             const entries = principalByRequest.get(req) ?? new Map();
             entries.set(identityOnly, pending);
             principalByRequest.set(req, entries);
@@ -85,7 +88,16 @@ function authenticate(identityOnly: boolean) {
             // Patients retain their portal access; an unpaid staff account cannot call operational APIs.
             if (!identityOnly && principal.actor !== 'patient' && !isBillingRecoveryRequest(req)) {
                 const tenantId = principal.tid ?? principal.tenants?.[0]?.id;
-                if (tenantId) await assertBillingAccess(tenantId);
+                if (tenantId) {
+                    const checks = billingByRequest.get(req) ?? new Map<string, Promise<void>>();
+                    billingByRequest.set(req, checks);
+                    let check = checks.get(tenantId);
+                    if (!check) {
+                        check = measurePerformancePhase('billing', () => assertBillingAccess(tenantId));
+                        checks.set(tenantId, check);
+                    }
+                    await check;
+                }
             }
             next();
         }).catch(error => {

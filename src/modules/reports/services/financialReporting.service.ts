@@ -1,3 +1,5 @@
+import {getReportTransaction, liveReportReadsEnabled} from './reportReadContext.js';
+import {loadTreasurySummaries} from './financialSummaryRead.service.js';
 import { Request } from 'express';
 import {appointmentBalanceIssues, withFinancialDiagnosticDrilldowns} from './financialDiagnostics.service.js';
 import {unassignedFinancialWarnings} from './financialDiagnosticSelectors.service.js';
@@ -7,8 +9,7 @@ import { Expense, PaymentMethod, TreasuryMovement } from '../../administration/m
 import Patient from '../../patients/models/patient.model.js';
 import { balanceEffectiveMovements } from '../../administration/services/treasuryLedger.service.js';
 import {economicMovements} from '../../administration/services/financialMovementPolicy.service.js';
-import { summarizeInvoicePayments } from '../../invoice/services/payment.service.js';
-import { aggregateFinance, FinanceQuery, financialSelection, loadFinanceData, money, parseFinanceFilters } from './finance.service.js';
+import { aggregateFinance, FinanceQuery, financialSelection, financialSelectionForPeriod, loadFinanceData, money, parseFinanceFilters } from './finance.service.js';
 import { comparisonRange, parseAnalyticsQuery, percentageChange } from './analytics.service.js';
 import { dateOnly, documentSign, FinancialWarning, inFinancialPeriod, validIssuedDocument } from './financialFacts.service.js';
 import { reportStructureWhere, ReportScope, resolveReportScope } from './reportScope.service.js';
@@ -105,10 +106,15 @@ export async function financialDataset(req: Request, dataset: string, options: {
     if (!Number.isInteger(page) || page < 1 || !Number.isInteger(size) || size < 1 || size > 200) fail('Paginazione non valida');
     const needClinic = !['treasury', 'expenses'].includes(dataset);
     const needTreasury = ['treasury', 'expenses', 'financial-summary'].includes(dataset) && !contextual;
-    const [data, movementModels, expenseModels] = await Promise.all([
-        needClinic ? loadFinanceData(scopedRequest, query, scope) : null,
-        needTreasury ? TreasuryMovement.schema(req.tenantSchema!).findAll({ where: reportStructureWhere(scope) }) : [],
-        needTreasury ? Expense.schema(req.tenantSchema!).findAll({ where: reportStructureWhere(scope) }) : []
+    const transaction = getReportTransaction(req);
+    const liveSummary = dataset === 'financial-summary' && liveReportReadsEnabled() && !!transaction;
+    const comparisonPeriod = comparisonRange(query);
+    const [data, movementModels, expenseModels, liveTreasury] = await Promise.all([
+        needClinic ? loadFinanceData(scopedRequest, query, scope, undefined, {summary: liveSummary}) : null,
+        needTreasury && !liveSummary ? TreasuryMovement.schema(req.tenantSchema!).findAll({ where: reportStructureWhere(scope), transaction }) : [],
+        needTreasury && !liveSummary ? Expense.schema(req.tenantSchema!).findAll({ where: reportStructureWhere(scope), transaction }) : [],
+        needTreasury && liveSummary ? loadTreasurySummaries(req, scope, [{key: 'current', from: query.from, to: query.to},
+            ...(comparisonPeriod ? [{key: 'previous', ...comparisonPeriod}] : [])]) : null
     ]);
     const movements = movementModels.map(plain), expenses = expenseModels.map(plain);
     let paymentMethodIds: Array<string | null> | undefined;
@@ -117,10 +123,11 @@ export async function financialDataset(req: Request, dataset: string, options: {
             where: /^[\da-f]{8}(-[\da-f]{4}){3}-[\da-f]{12}$/i.test(query.paymentMethod) ? { id: query.paymentMethod } : { label: query.paymentMethod }
         })).map(row => String(row.get('id')));
     }
-    const treasury = treasuryProjection(movements, expenses, query.from, query.to, { accountId, category, paymentMethodIds, direction });
-    const finance = data ? aggregateFinance(data, query) : null;
+    const treasury = liveTreasury?.has('current') ? {...liveTreasury.get('current')!, rows: [] as Row[], costs: [] as Row[]}
+        : treasuryProjection(movements, expenses, query.from, query.to, { accountId, category, paymentMethodIds, direction });
     const selected = data ? financialSelection(data, query) : null;
-    const patients = data ? [...new Set([...data.invoices.map(row => row.patientID), ...data.events.map(row => row.patientId), ...(data.packages ?? []).map(row => row.patientId)].filter(Boolean))] : [];
+    const finance = data && selected ? aggregateFinance(data, query, selected) : null;
+    const patients = data && ['documents', 'payments', 'receivables'].includes(dataset) ? [...new Set([...data.invoices.map(row => row.patientID), ...data.events.map(row => row.patientId), ...(data.packages ?? []).map(row => row.patientId)].filter(Boolean))] : [];
     const patientModels = patients.length ? await Patient.schema(req.tenantSchema!).findAll({ where: { id: { [Op.in]: patients } }, attributes: ['id', 'name', 'surname'] }) : [];
     const names = new Map(patientModels.map(plain).map(row => [row.id, `${row.name ?? ''} ${row.surname ?? ''}`.trim()]));
     const structures = new Map(scope.structures.map(row => [row.id, row.name]));
@@ -139,15 +146,18 @@ export async function financialDataset(req: Request, dataset: string, options: {
     }
     let rows: Row[] = [], columns: ReportColumn[] = [], summary: ReportSummaryItem[] = [];
     let dateBasis = 'current';
+    const invoicesById = new Map(data?.invoices.map(row => [row.id, row]) ?? []);
+    const eventsById = new Map(data?.events.map(row => [row.id, row]) ?? []);
+    const packagesById = new Map(data?.packages?.map(row => [row.id, row]) ?? []);
     const documentRows = (selection = selected!) => selection.issued.map(row => ({ sourceId: row.id, targetType: 'invoice', structureId: row.structureId,
         number: row.documentNumber == null ? 'Senza numero' : `${row.documentNumber}/${row.documentYear ?? ''}`,
         date: dateOnly(row.emissionDate), patient: names.get(row.patientID) ?? 'Paziente non disponibile',
         structure: structures.get(row.structureId) ?? 'Sede non disponibile', documentType: row.documentType,
         amount: money(documentSign(row) * Number(row.invoiceTotal ?? 0)), payable: money(documentSign(row) * Number(row.invoiceNet ?? row.invoiceTotal ?? 0)) })).filter(matchesSearch);
     const paymentRows = (selection = selected!) => selection.periodPayments.filter(row => !kind || row.kind === kind).map(row => {
-        const invoice = data!.invoices.find(invoice => invoice.id === row.invoiceId);
-        const event = data!.events.find(event => event.id === row.agendaEventId);
-        const pkg = data!.packages?.find(pkg => pkg.id === row.carePackageId);
+        const invoice = invoicesById.get(row.invoiceId);
+        const event = eventsById.get(row.agendaEventId);
+        const pkg = packagesById.get(row.carePackageId);
         return { id: row.id, sourceId: invoice?.id ?? pkg?.id ?? event?.id ?? row.sourceId, targetType: invoice ? 'invoice' : pkg ? 'package' : event ? 'appointment' : 'treasury',
             structureId: invoice?.structureId ?? pkg?.structureId ?? event?.structureId ?? null,
             structure: structures.get(invoice?.structureId ?? pkg?.structureId ?? event?.structureId) ?? 'Sede non disponibile',
@@ -200,8 +210,8 @@ export async function financialDataset(req: Request, dataset: string, options: {
         for (const item of summary) if (drilldowns[item.key]) item.drilldown = drilldowns[item.key];
         const previousQuery = comparisonRange(query);
         if (previousQuery) {
-            const previous = aggregateFinance(data!, { ...query, ...previousQuery }).totals as Row;
-            const previousTreasury = treasuryProjection(movements, expenses, previousQuery.from, previousQuery.to) as Row;
+            const previous = aggregateFinance(data!, { ...query, ...previousQuery }, financialSelectionForPeriod(selected!, { ...query, ...previousQuery })).totals as Row;
+            const previousTreasury = liveTreasury?.get('previous') ?? treasuryProjection(movements, expenses, previousQuery.from, previousQuery.to) as Row;
             for (const item of summary) if (!['outstanding', 'undatedLegacyPaid', 'invoiceOutstanding', 'appointmentOutstanding', 'packageOutstanding', 'overdue', 'collectedUnbilled', 'issuedOutstanding'].includes(item.key)) {
                 item.previousValue = previous[item.key] ?? previousTreasury[item.key] ?? 0;
                 item.change = percentageChange(item.value ?? 0, item.previousValue ?? 0);
@@ -234,7 +244,7 @@ export async function financialDataset(req: Request, dataset: string, options: {
     } else {
         dateBasis = 'current';
         rows = selected!.invoices.flatMap(invoice => {
-            const balance = summarizeInvoicePayments(invoice, data!.payments.filter(row => row.invoiceId === invoice.id)).balance;
+            const balance = selected!.index.summaries.get(invoice.id)!.balance;
             return balance > 0 ? [{ sourceId: invoice.id, targetType: 'invoice', structureId: invoice.structureId, patient: names.get(invoice.patientID) ?? 'Paziente non disponibile',
                 description: `Documento ${invoice.documentNumber ?? ''}/${invoice.documentYear ?? ''}`, dueDate: invoice.paymentTerms ?? null,
                 overdue: !!invoice.paymentTerms && dateOnly(invoice.paymentTerms) < dateOnly(new Date()), amount: balance, amountBasis: 'Documento emesso' }] : [];
@@ -267,7 +277,7 @@ export async function financialDataset(req: Request, dataset: string, options: {
     }
     const comparison = dataset === 'receivables' ? null : comparisonRange(query);
     if (comparison && dataset !== 'financial-summary') {
-        const previousSelection = data ? financialSelection(data, { ...query, ...comparison }) : null;
+        const previousSelection = data ? financialSelectionForPeriod(selected!, { ...query, ...comparison }) : null;
         const previousTreasury = treasuryProjection(movements, expenses, comparison.from, comparison.to, { accountId, category, paymentMethodIds, direction });
         const previous: Row = { ...previousTreasury,
             ...(dataset === 'documents' ? { issued: sum(documentRows(previousSelection!), 'amount') } : {}),
