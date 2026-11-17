@@ -24,6 +24,7 @@ import InvoiceAgendaEvent from '../models/invoiceAgendaEvent.model.js';
 import { getInvoiceAgendaLinksByEventIds } from '../services/invoiceAgendaEvent.service.js';
 import { evalTotals, EvalTotalsResult, toPersistedTotals } from '../utils/evalTotals.js';
 import { applyAppointmentPriceSnapshot } from '../utils/appointmentInvoicePrice.js';
+import {manualAppointmentInvoiceLine, parseManualAppointmentService} from '../utils/manualAppointmentInvoice.js';
 import { normalizeSearchQuery } from '../../../utils/search.js';
 import { buildIssuerSnapshot, getMissingIssuerFields } from '../utils/issuer.js';
 import { buildRecipientSnapshot } from '../utils/recipient.js';
@@ -125,7 +126,7 @@ interface ResolvedInvoiceLine {
     quantity: number;
     unitPrice: number;
     originalUnitPrice?: number | null;
-    /** Aliquota/natura IVA presa dal catalogo (es. "22", "N4"), mai dal client. */
+    /** IVA risolta server-side dal catalogo o dall'accordo fiscale della seduta, mai dal client. */
     vat: string | null;
     name: string | null;
     percentageDiscount: number | null;
@@ -521,6 +522,9 @@ function applyFiscalRules(params: {
 
 export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const schema = req.tenantSchema!;
+    const manualRequest = parseManualAppointmentService(req.body);
+    if (manualRequest.error) return sendErrorResponse(res, 400, manualRequest.error);
+    const manualService = manualRequest.value;
     delete req.body.socialSecuritySnapshot;
     const packagePurchase = req.body?.carePackageId ? await scopedReadableCarePackage(req, req.body.carePackageId) : null;
     const quotePackage = packagePurchase && !packagePurchase.get('templateId')
@@ -546,6 +550,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const {
         products: requestedProducts = [],
         services: requestedServices = [],
+        manualService: _manualService,
         appointments: requestedAppointments,
         agendaEventId,
         paymentDate,
@@ -607,9 +612,10 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
         return sendErrorResponse(res, 409, 'La nota di credito rettifica un documento: non pu? fatturare nuove sedute');
     }
 
-    // Nel nuovo flusso le prestazioni degli appuntamenti sono risolte e aggiunte server-side;
-    // `services` continua a contenere esclusivamente le righe manuali. Il vecchio flusso agenda,
-    // che invia un singolo `agendaEventId`, ha già il servizio in `services` e resta invariato.
+    // Nel flusso multi-appuntamento le prestazioni sono risolte e aggiunte server-side;
+    // `services` contiene le righe selezionate dal catalogo. Il vecchio flusso agenda invia
+    // un singolo `agendaEventId` con servizio in `services`; `manualService` è l'alternativa
+    // esplicita senza catalogo, validata separatamente e mai combinata con queste righe.
     const servicesWithAppointments = hasExplicitAppointments
         ? [
             ...requestedServices,
@@ -654,6 +660,7 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     const issuerData = issuerTenant!.get({ plain: true }) as any;
     const issuer = buildIssuerSnapshot(issuerData);
     const fiscalProfile = resolveFiscalProfile(issuerData);
+    if (manualService) serviceLines.push(manualAppointmentInvoiceLine(manualService, fiscalProfile));
     // Explicit legacy flags retain their old contract. New clients and agenda use the versioned policy.
     if (invoiceFields.socialSecurityPricingMode === undefined && invoiceFields.isRivals === undefined)
         invoiceFields.socialSecurityPricingMode = fiscalProfile.socialSecurityPricingMode;
@@ -899,9 +906,11 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             for (const [index, selection] of appointmentSelections.entries()) {
                 const price = prices.get(selection.agendaEventId);
                 const line = serviceLines[hasExplicitAppointments ? requestedServices.length + index : 0];
-                if (line) Object.assign(line, applyAppointmentPriceSnapshot(price, line, fiscalProfile.appliesVat));
+                if (line) Object.assign(line, manualService
+                    ? manualAppointmentInvoiceLine(manualService, fiscalProfile, price)
+                    : applyAppointmentPriceSnapshot(price, line, fiscalProfile.appliesVat));
                 const event = eventsById.get(selection.agendaEventId)!;
-                if (line && event.appointmentPriceAdjustment === 'DISCOUNT' && event.appointmentOriginalAmount != null) {
+                if (!manualService && line && event.appointmentPriceAdjustment === 'DISCOUNT' && event.appointmentOriginalAmount != null) {
                     line.originalUnitPrice = applyAppointmentPriceSnapshot({ ...price!,
                         amount: Number(event.appointmentOriginalAmount), netAmount: null
                     }, line, fiscalProfile.appliesVat).unitPrice;
@@ -922,6 +931,12 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
                 fiscal.totals
             );
             if (financialError) return { kind: 'invalid-financials', message: financialError } as const;
+            if (manualService && (fiscal.totals.invoiceTotal > 99999999.99 || fiscal.totals.invoiceNet > 99999999.99)) {
+                return {kind: 'invalid-financials', message: 'Il totale della fattura, incluso l’eventuale bollo, non può superare 99.999.999,99 €'} as const;
+            }
+            if (manualService && Math.abs(money(fiscal.totals.invoiceTotal - fiscal.totals.stampChargedAmount) - manualService.amount) > 0.009) {
+                return {kind: 'invalid-financials', message: 'L’importo inserito non coincide con il totale della prestazione: verifica importo e impostazioni fiscali'} as const;
+            }
             const appointmentPaidTotal = money(
                 appointmentPayments.reduce((sum, payment) => sum + Number(payment.amount), 0)
             );
