@@ -371,9 +371,33 @@ async function effectiveMovementRows(req: Request, period: AdministrationDateRan
 const romeMonth = (value: unknown): string => new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Europe/Rome', year: 'numeric', month: '2-digit'
 }).format(new Date(value as string));
-const romeDay = (value: unknown): string => new Intl.DateTimeFormat('en-CA', {
+const romeDayFormatter = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Europe/Rome', year: 'numeric', month: '2-digit', day: '2-digit'
-}).format(new Date(value as string));
+});
+const romeDay = (value: unknown): string => romeDayFormatter.format(new Date(value as string));
+
+function dailyOverviewChart(documents: Plain[], movements: Plain[], from: string, to: string): Plain[] {
+    const issued = new Map<string, number>();
+    const collected = new Map<string, number>();
+    // Aggregate once per row: formatting every receipt for every day creates thousands
+    // of native Intl objects and stalls the API on ordinary monthly ledgers.
+    for (const row of documents) {
+        const day = String(row.emissionDate).slice(0, 10);
+        issued.set(day, (issued.get(day) ?? 0)
+            + (row.documentType === 'nota_di_credito' ? -1 : 1) * Number(row.invoiceTotal ?? 0));
+    }
+    for (const row of movements) {
+        if (row.direction !== 'IN') continue;
+        const day = romeDay(row.occurredAt);
+        collected.set(day, (collected.get(day) ?? 0) + Number(row.amount));
+    }
+    return dayBuckets(from, to).map(bucket => ({
+        label: bucket.label,
+        issued: money(issued.get(bucket.key) ?? 0),
+        collected: money(collected.get(bucket.key) ?? 0),
+    }));
+}
+
 async function buildReport(req: Request, requestedPeriod?: AdministrationDateRange): Promise<Plain> {
     const today = romeToday();
     const period = requestedPeriod ?? resolveAdministrationDateRange(
@@ -456,15 +480,7 @@ export const overview = asyncHandler(async (req, res) => {
     // così si vede un vero andamento invece di un singolo punto; mensile per periodi lunghi.
     const rangeDays = (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) / 86_400_000;
     const chart = rangeDays >= 0 && rangeDays <= 62
-        ? dayBuckets(from, to).map(bucket => ({
-            label: bucket.label,
-            issued: money(validDocuments
-                .filter(row => String(row.emissionDate).slice(0, 10) === bucket.key)
-                .reduce((sum, row) => sum + (row.documentType === 'nota_di_credito' ? -1 : 1) * Number(row.invoiceTotal ?? 0), 0)),
-            collected: money(economic
-                .filter(row => row.direction === 'IN' && romeDay(row.occurredAt) === bucket.key)
-                .reduce((sum, row) => sum + Number(row.amount), 0)),
-        }))
+        ? dailyOverviewChart(validDocuments, economic, from, to)
         : report.series.map((row: Plain) => ({ label: row.label, issued: row.issued, collected: row.collected }));
     return sendSuccessResponse(res, 200, {
         period: { from, to }, generatedAt: report.generatedAt, balanceAsOf: report.balanceAsOf,

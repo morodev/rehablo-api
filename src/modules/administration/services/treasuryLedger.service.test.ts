@@ -3,7 +3,7 @@ import { it, TestContext } from 'node:test';
 import { sequelize } from '../../../config/database.js';
 import { Op } from 'sequelize';
 import { Structure, Tenant } from '../../auth/models/index.js';
-import { Invoice } from '../../invoice/models/index.js';
+import { Invoice, InvoicePayment } from '../../invoice/models/index.js';
 import { listFinancialAccounts, reports, overview } from '../controllers/administration.view.controller.js';
 import { DailyClosing, Expense, FinancialAccount, FiscalSubmission, Quote, TreasuryMovement } from '../models/index.js';
 import controller from '../controllers/administration.controller.js';
@@ -301,6 +301,81 @@ it('overview cash totals include all selected movements rather than just the lat
     assert.equal(result.data.cashFlow, 27);
     assert.equal(result.data.accounts[0].balance, 47);
     assert.equal(result.data.activities.length, 8);
+});
+
+it('overview renders a full month of 100 receipts without allocating a date formatter per receipt and day', async t => {
+    fixture(t, Array.from({ length: 100 }, (_, index) => original({
+        id: 'receipt-' + index, amount: '1.25',
+        occurredAt: new Date(`2026-01-${String(index % 31 + 1).padStart(2, '0')}T12:00:00Z`)
+    })));
+    fiscalReadFixture(t);
+    const NativeDateTimeFormat = Intl.DateTimeFormat;
+    let formatterConstructions = 0;
+    t.mock.method(Intl, 'DateTimeFormat', (function (
+        locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions
+    ) {
+        formatterConstructions++;
+        return new NativeDateTimeFormat(locales, options);
+    }) as any);
+
+    const result = await runView(overview, { from: '2026-01-01', to: '2026-01-31' });
+    assert.equal(result.code, 200, result.error);
+    assert.equal(result.data.income, 125);
+    assert.equal(result.data.collected, 125);
+    assert.equal(result.data.accounts[0].balance, 145);
+    assert.deepEqual(result.data.chart.map((row: any) => row.collected),
+        Array.from({ length: 31 }, (_, index) => index < 7 ? 5 : 3.75));
+    assert.ok(formatterConstructions < 200,
+        `100 receipts across 31 days constructed ${formatterConstructions} date formatters; reuse formatters instead of allocating them in the daily scan`);
+});
+
+it('overview daily chart preserves Rome midnight and month boundaries, credit notes and compensated movement policies', async t => {
+    fixture(t, [
+        original({ id: 'before-month', amount: 900, occurredAt: '2026-06-30T21:59:59Z' }),
+        original({ id: 'first-midnight', amount: '10.10', occurredAt: new Date('2026-06-30T22:00:00Z') }),
+        original({ id: 'first-evening', amount: '20.20', occurredAt: '2026-07-01T21:59:59Z' }),
+        original({ id: 'second-midnight', amount: '30.30', occurredAt: '2026-07-01T22:00:00Z' }),
+        original({ id: 'last-evening', amount: '40.40', occurredAt: new Date('2026-07-31T21:59:59Z') }),
+        original({ id: 'after-month', amount: 800, occurredAt: '2026-07-31T22:00:00Z' }),
+        original({ status: 'VOID', amount: 50, occurredAt: '2026-07-15T12:00:00Z' }),
+        original({ id: 'receipt-reversal', direction: 'OUT', amount: 50, reversalOfId: movementId,
+            occurredAt: '2026-08-01T12:00:00Z' }),
+        original({ id: 'expense', direction: 'OUT', amount: 7, status: 'VOID', sourceType: 'EXPENSE_PAYMENT',
+            occurredAt: '2026-07-15T12:00:00Z' }),
+        original({ id: 'expense-reversal', amount: 7, reversalOfId: 'expense', sourceType: 'EXPENSE_PAYMENT_VOID',
+            occurredAt: '2026-07-15T12:00:00Z' }),
+        original({ id: 'unpaired-void', amount: 500, status: 'VOID', occurredAt: '2026-07-15T12:00:00Z' }),
+        original({ id: 'transfer-out', direction: 'OUT', amount: 200, sourceType: 'TRANSFER_OUT',
+            occurredAt: '2026-07-15T12:00:00Z' }),
+        original({ id: 'transfer-in', amount: 200, sourceType: 'TRANSFER_IN', occurredAt: '2026-07-15T12:00:00Z' })
+    ]);
+    fiscalReadFixture(t);
+    const invoices = [
+        { id: 'invoice', emissionDate: '2026-07-01', documentType: 'fattura', invoiceTotal: '100.50', status: 'unpaid' },
+        { id: 'credit', emissionDate: '2026-07-01', documentType: 'nota_di_credito', invoiceTotal: '10.25', status: 'unpaid' },
+        { id: 'receipt', emissionDate: '2026-07-02', documentType: 'ricevuta', invoiceTotal: '15.00', status: 'paid' },
+        { id: 'last-invoice', emissionDate: '2026-07-31', documentType: 'fattura', invoiceTotal: '30.00', status: 'unpaid' },
+        { id: 'draft', emissionDate: '2026-07-01', documentType: 'fattura', invoiceTotal: 1000, status: 'draft' },
+        { id: 'void', emissionDate: '2026-07-01', documentType: 'fattura', invoiceTotal: 1000, status: 'void' }
+    ].map((row, index) => ({ ...row, structureId, documentNumber: index + 1, documentYear: 2026 }));
+    t.mock.method(Invoice, 'schema', (() => ({ findAll: async () => invoices.map(row => ({
+        get: (key: any) => typeof key === 'string' ? (row as any)[key] : { ...row }
+    })) })) as any);
+    t.mock.method(InvoicePayment, 'schema', (() => ({ findAll: async () => [] })) as any);
+
+    const result = await runView(overview, { from: '2026-07-01', to: '2026-07-31' });
+    assert.equal(result.code, 200, result.error);
+    assert.equal(result.data.income, 158);
+    assert.equal(result.data.outcome, 7);
+    assert.equal(result.data.cashFlow, 151);
+    assert.equal(result.data.accounts[0].balance, 1821);
+    assert.equal(result.data.issued, 135.25);
+    assert.equal(result.data.collected, 158);
+    assert.deepEqual(result.data.chart, Array.from({ length: 31 }, (_, index) => ({
+        label: `${String(index + 1).padStart(2, '0')} lug`,
+        issued: index === 0 ? 90.25 : index === 1 ? 15 : index === 30 ? 30 : 0,
+        collected: index === 0 ? 30.30 : index === 1 ? 30.30 : index === 14 ? 57 : index === 30 ? 40.40 : 0
+    })));
 });
 
 it('overview includes compensated receipts and expense payments once and excludes transfers from economic totals', async t => {
