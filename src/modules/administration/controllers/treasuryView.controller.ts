@@ -13,6 +13,8 @@ import { balanceEffectiveMovements } from '../services/treasuryLedger.service.js
 import {decorateExpensePayments} from '../services/financialOperations.service.js';
 import {economicMovements} from '../services/financialMovementPolicy.service.js';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
+import {classificationFilters, decorateTreasuryClassification, matchesClassification} from '../services/treasuryClassification.service.js';
+import {isInternalTransfer} from '../services/financialMovementPolicy.service.js';
 import { sendErrorResponse, sendSuccessResponse } from '../../../utils/response.js';
 
 type Plain = Record<PropertyKey, any>;
@@ -105,6 +107,7 @@ function readableDescription(row: Plain, documentLabel: string | null, documentA
 /** Readable, scoped first-notice records; filtering and totals apply before pagination. */
 export const listTreasuryMovements = asyncHandler(async (req, res) => {
     const filters = treasuryFilters(req);
+    const classification = classificationFilters(req.query);
     const schema = req.tenantSchema!;
     const scope = movementScope(req, filters);
     if (req.access?.scope === 'tenant' && filters.selection.kind === 'structure') {
@@ -114,7 +117,7 @@ export const listTreasuryMovements = asyncHandler(async (req, res) => {
     // A legacy VOID original can still affect the balance when a later posted reversal compensates it.
     // Resolve that relationship before period/status filters, including reversals outside the requested dates.
     const where: Plain = { ...scope, ...(filters.accountId ? { accountId: filters.accountId } : {}) };
-    const ledger = (await TreasuryMovement.schema(schema).findAll({ where, order: [['occurredAt', 'DESC'], ['id', 'DESC']] })).map(plain);
+    const ledger = await decorateTreasuryClassification(req, (await TreasuryMovement.schema(schema).findAll({ where, order: [['occurredAt', 'DESC'], ['id', 'DESC']] })).map(plain));
     const effectiveIds = new Set(balanceEffectiveMovements(ledger).map(row => String(row.id)));
     const { fromInstant, toInstant } = filters.period;
     const rows = ledger.filter(row => {
@@ -217,7 +220,7 @@ export const listTreasuryMovements = asyncHandler(async (req, res) => {
             documentLabel, documentAccessible, hasDocument, affectsBalance: effectiveIds.has(String(row.id)),
             reconciled: matched.has(String(row.id))
         };
-    }).filter(row => !filters.query || [
+    }).filter(row => matchesClassification(row, classification)).filter(row => !filters.query || [
         row.description, row.counterparty, row.documentLabel, row.accountName, row.paymentMethodName,
         row.structureName, row.categoryLabel
     ].some(value => String(value ?? '').toLocaleLowerCase('it').includes(filters.query!)));
@@ -228,7 +231,8 @@ export const listTreasuryMovements = asyncHandler(async (req, res) => {
         items: enriched.slice(filters.offset, filters.offset + filters.limit), total: enriched.length,
         limit: filters.limit, offset: filters.offset,
         summary: { income, outcome, net: money(income - outcome), postedCount: enriched.filter(row => row.status === 'POSTED').length,
-            unlinkedCount: enriched.filter(row => !row.hasDocument).length }
+            unlinkedCount: enriched.filter(row => !row.hasDocument).length,
+            unclassifiedCount: enriched.filter(row => !row.businessCategoryId && !isInternalTransfer(row)).length }
     });
 });
 

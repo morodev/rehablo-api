@@ -1,4 +1,5 @@
 import {migrateClinicalTenant} from '../modules/clinical/services/clinical.migration.js';
+import {migrateTreasuryClassificationTenant} from './treasuryClassificationMigration.js';
 import {ensurePersonalTrainerRoleEnum} from '../modules/auth/services/personalTrainerRoleMigration.service.js';
 import type {Sequelize, Transaction} from 'sequelize';
 import {createRequire} from 'node:module';
@@ -9,7 +10,7 @@ import {assertDatabaseReady, readMigrationNames, requiredMigrationNames} from '.
 
 export {requiredMigrationNames} from './migrationStatus.js';
 
-const [initialSchemaName, appointmentRemindersName, quotePackageInvoicesName, activityRecurrencesName, clinicalWorkspaceName] = requiredMigrationNames;
+const [initialSchemaName, appointmentRemindersName, quotePackageInvoicesName, activityRecurrencesName, clinicalWorkspaceName, treasuryClassificationName] = requiredMigrationNames;
 const quotePackageInvoiceLines = createRequire(import.meta.url)('../../migrations/20261031-quote-package-invoice-lines.js');
 const activityRecurrences = createRequire(import.meta.url)('../../migrations/20261031-activity-recurrences.js');
 const reminderStep = legacyBaseline.tenantMigrations.find(step => step.name === '20261028-appointment-reminders-v1')!;
@@ -145,6 +146,29 @@ export async function migrateClinicalWorkspace(database: Sequelize): Promise<voi
         });
     }
 }
+async function applyTenantTreasuryClassification(database: Sequelize, schema: string, transaction: Transaction, applied: string[]): Promise<void> {
+    if (applied.includes(treasuryClassificationName)) return;
+    await migrateTreasuryClassificationTenant(database, schema, transaction);
+    await recordTenantMigration(database, schema, treasuryClassificationName, transaction);
+}
+
+/** Adds catalogues and metadata in one transaction for each existing tenant. */
+export async function migrateTreasuryClassification(database: Sequelize): Promise<void> {
+    for (const schema of await tenantSchemas(database)) {
+        try {
+            await database.transaction(async transaction => {
+                await prepareTenant(database, schema, transaction);
+                const applied = await readMigrationNames(database, schema, transaction);
+                await applyTenantBaseline(database, schema, transaction, applied);
+                await applyTenantReminders(database, schema, transaction, applied);
+                await applyTenantQuotePackageInvoices(database, schema, transaction, applied);
+                await applyTenantActivityRecurrences(database, schema, transaction, applied);
+                await applyTenantClinicalWorkspace(database, schema, transaction, applied);
+                await applyTenantTreasuryClassification(database, schema, transaction, applied);
+            });
+        } catch (cause) {throw migrationFailure(`Treasury classification migration failed for ${schema}`, cause);}
+    }
+}
 async function tenantSchemas(database: Sequelize): Promise<string[]> {
     const [rows] = await database.query('SELECT id FROM public.tenants ORDER BY id');
     return (rows as Array<{id: string}>).map(({id}) => 'rehablo_' + id.replaceAll('-', ''));
@@ -226,6 +250,7 @@ export async function provisionTenantSchema(database: Sequelize, schema: string,
     await applyTenantQuotePackageInvoices(database, schema, transaction, applied);
     await applyTenantActivityRecurrences(database, schema, transaction, applied);
     await applyTenantClinicalWorkspace(database, schema, transaction, applied);
+    await applyTenantTreasuryClassification(database, schema, transaction, applied);
 }
 
 /** Catch tenants registered by a preceding API after the CLI discovered its tenant list. */

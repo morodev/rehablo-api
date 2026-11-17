@@ -7,6 +7,7 @@ import * as views from '../controllers/administration.view.controller.js';
 import { requireAdministrationFeature } from '../middleware/administrationFeature.js';
 import * as quoteDelivery from '../controllers/quoteDelivery.controller.js';
 import { getTreasuryExpense } from '../controllers/treasuryView.controller.js';
+import {getTreasuryTaxonomy, saveTreasuryCategory, saveTreasuryTag, classifyTreasuryMovement, getTreasuryCategoryAnalysis} from '../controllers/treasuryClassification.controller.js';
 import { getDailyClosing, listDailyClosings, previewDailyClosing } from '../controllers/dailyClosing.controller.js';
 import { previewFiscalSubmission, transmitFiscal } from '../controllers/fiscalSimulation.controller.js';
 
@@ -94,6 +95,13 @@ router.post('/administration/patient-credits/:id/movements/:movementId/void', re
 crud('/administration/payment-methods', 'paymentMethods', 'treasury');
 crud('/administration/financial-accounts', 'financialAccounts', 'treasury', views.listFinancialAccounts);
 crud('/administration/treasury-movements', 'treasuryMovements', 'treasury', views.listTreasuryMovements);
+router.get('/administration/treasury-taxonomy', requirePermission('treasury', 'read'), getTreasuryTaxonomy);
+router.post('/administration/treasury-categories', requirePermission('tenant', 'update', 'tenant'), saveTreasuryCategory);
+router.patch('/administration/treasury-categories/:id', requirePermission('tenant', 'update', 'tenant'), saveTreasuryCategory);
+router.post('/administration/treasury-tags', requirePermission('tenant', 'update', 'tenant'), saveTreasuryTag);
+router.patch('/administration/treasury-tags/:id', requirePermission('tenant', 'update', 'tenant'), saveTreasuryTag);
+router.patch('/administration/treasury-movements/:id/classification', requirePermission('treasury', 'update'), classifyTreasuryMovement);
+router.get('/administration/treasury-category-analysis', requirePermission('analytics', 'read'), requirePermission('treasury', 'read'), getTreasuryCategoryAnalysis);
 router.post('/administration/treasury-movements/:id/void', requirePermission('treasury', 'update'), controller.voidMovement);
 router.post('/administration/transfers', requirePermission('treasury', 'create'), financialOperations.createTransfer);
 router.post('/administration/transfers/:id/void', requirePermission('treasury', 'update'), financialOperations.reverseTransfer);

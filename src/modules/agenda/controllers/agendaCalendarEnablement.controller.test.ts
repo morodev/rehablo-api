@@ -450,3 +450,120 @@ it('complete-if-untouched rejects inaccessible appointments without looking up t
     const packages=t.mock.method(CarePackage,'schema',(()=>{throw Error('must not read packages');}) as any);
     assert.equal((await run(completeAppointmentIfUntouched,f.req)).status,404);assert.equal(packages.mock.callCount(),0);
 });
+
+
+it('explicitly reopens and reschedules a completed appointment in one transaction without inventing a missed arrival', async t => {
+    const f = fixture(t); f.assignments[0].calendarEnabled = true; f.current.status = 'COMPLETED';
+    f.req.body = {id: eventId, event: {...f.newEvent, reopenForReschedule: true}};
+    const result = await run(updateAgendaEvent, f.req);
+    assert.equal(result.status, 200); assert.equal(f.current.status, 'CONFIRMED');
+    assert.equal(f.current.start, f.newEvent.start); assert.equal(f.updated.length, 1);
+    assert.equal(f.current.missedArrivalReportedAt, undefined);
+    assert.equal(f.current.reopenForReschedule, undefined);
+    const write = f.trace.find(entry => entry.kind === 'event-save');
+    assert.equal(write.transaction, f.transactionContext);
+    assert.ok(f.trace.find(entry => entry.kind === 'event-lock' && entry.lock === 'UPDATE'));
+});
+for (const requestedStatus of ['COMPLETED', 'CONFIRMED']) {
+    it('requires explicit reopening before moving a completed appointment into the future with status ' + requestedStatus, async t => {
+        const f = fixture(t); f.assignments[0].calendarEnabled = true; f.current.status = 'COMPLETED';
+        f.req.body = {id: eventId, event: {...f.newEvent, status: requestedStatus}};
+        const result = await run(updateAgendaEvent, f.req);
+        assert.equal(result.status, 409); assert.match(result.body.message, /riapertura/i);
+        assert.equal(f.updated.length, 0); assert.equal(f.current.status, 'COMPLETED');
+    });
+}
+it('ordinary confirmed rescheduling remains available without reopening', async t => {
+    const f = fixture(t); f.assignments[0].calendarEnabled = true;
+    f.req.body = {id: eventId, event: {...f.newEvent}};
+    assert.equal((await run(updateAgendaEvent, f.req)).status, 200);
+    assert.equal(f.current.status, 'CONFIRMED'); assert.equal(f.current.missedArrivalReportedAt, undefined);
+});
+it('historical completed notes and explicit attendance corrections retain their behavior', async t => {
+    const f = fixture(t); f.current.status = 'COMPLETED';
+    f.req.body = {id: eventId, event: {description: 'Nota storica', status: 'COMPLETED'}};
+    assert.equal((await run(updateAgendaEvent, f.req)).status, 200);
+    assert.equal(f.current.missedArrivalReportedAt, undefined);
+    f.req.body = {id: eventId, event: {status: 'CONFIRMED'}};
+    assert.equal((await run(updateAgendaEvent, f.req)).status, 200);
+    assert.ok(f.current.missedArrivalReportedAt); assert.equal(f.current.missedArrivalResolvedAt, null);
+    assert.equal(f.current.description, 'Nota storica');
+});
+it('rescheduling preserves existing resolved attendance history instead of erasing it', async t => {
+    const f = fixture(t); f.assignments[0].calendarEnabled = true;
+    Object.assign(f.current, {status: 'COMPLETED', missedArrivalReportedAt: '2025-01-02T09:15:00Z',
+        missedArrivalResolvedAt: '2025-01-02T09:30:00Z', missedArrivalResolution: 'COMPLETED'});
+    f.req.body = {id: eventId, event: {...f.newEvent, reopenForReschedule: true, missedArrivalReportedAt: null}};
+    assert.equal((await run(updateAgendaEvent, f.req)).status, 200);
+    assert.equal(f.current.missedArrivalReportedAt, '2025-01-02T09:15:00Z');
+    assert.equal(f.current.missedArrivalResolvedAt, '2025-01-02T09:30:00Z');
+});
+it('rescheduling checks automatic completion again under the event lock and refuses an unconfirmed reopen', async t => {
+    const f = fixture(t); f.assignments[0].calendarEnabled = true;
+    f.req.body = {id: eventId, event: {...f.newEvent}};
+    const model = AgendaEvent.schema('rehablo_test');
+    t.mock.method(AgendaEvent, 'schema', (() => ({...model, findOne: async (options: any) => {
+        if (options.lock) f.current.status = 'COMPLETED';
+        return model.findOne(options);
+    }})) as any);
+    const result = await run(updateAgendaEvent, f.req);
+    assert.equal(result.status, 409); assert.equal(f.updated.length, 0); assert.equal(f.current.status, 'COMPLETED');
+});
+it('explicit reopening rejects a stale status changed by another operator under lock', async t => {
+    const f = fixture(t); f.assignments[0].calendarEnabled = true; f.current.status = 'COMPLETED';
+    f.req.body = {id: eventId, event: {...f.newEvent, reopenForReschedule: true}};
+    const model = AgendaEvent.schema('rehablo_test');
+    t.mock.method(AgendaEvent, 'schema', (() => ({...model, findOne: async (options: any) => {
+        if (options.lock) f.current.status = 'CANCELLED';
+        return model.findOne(options);
+    }})) as any);
+    assert.equal((await run(updateAgendaEvent, f.req)).status, 409); assert.equal(f.updated.length, 0);
+    assert.equal(f.current.status, 'CANCELLED');
+});
+for (const invalid of [
+    {start: '2025-01-03T09:00:00Z', end: '2025-01-03T09:30:00Z'},
+    {start: 'invalid'}, {end: 'invalid'}, {end: '2035-01-02T08:30:00Z'},
+    {status: 'COMPLETED'}, {recurrence: 'FREQ=WEEKLY'}, {recurringEventId: id(99)},
+]) {
+    it('refuses invalid explicit rescheduling ' + JSON.stringify(invalid), async t => {
+        const f = fixture(t); f.assignments[0].calendarEnabled = true; f.current.status = 'COMPLETED';
+        f.req.body = {id: eventId, event: {...f.newEvent, reopenForReschedule: true, ...invalid}};
+        assert.equal((await run(updateAgendaEvent, f.req)).status, 409); assert.equal(f.updated.length, 0);
+    });
+}
+it('explicit rescheduling preserves the registered collection lock', async t => {
+    const f = fixture(t); f.assignments[0].calendarEnabled = true; f.current.status = 'COMPLETED';
+    f.current.appointmentPaidAmount = 20;
+    f.req.body = {id: eventId, event: {...f.newEvent, reopenForReschedule: true}};
+    assert.equal((await run(updateAgendaEvent, f.req)).status, 409); assert.equal(f.updated.length, 0);
+});
+it('explicit rescheduling preserves the invoice lock', async t => {
+    const f = fixture(t); f.assignments[0].calendarEnabled = true; f.current.status = 'COMPLETED';
+    f.current.invoiceId = id(80);
+    f.req.body = {id: eventId, event: {...f.newEvent, reopenForReschedule: true}};
+    assert.equal((await run(updateAgendaEvent, f.req)).status, 409); assert.equal(f.updated.length, 0);
+});
+it('a failed package transition rolls back explicit rescheduling without altering the appointment', async t => {
+    const f = fixture(t); f.assignments[0].calendarEnabled = true; f.current.status = 'COMPLETED';
+    Object.assign(f.current, {carePackageId: id(50), packageReservationStatus: 'CONSUMED'});
+    f.req.user.isSuperAdmin = true;
+    f.req.body = {id: eventId, event: {...f.newEvent, reopenForReschedule: true}};
+    t.mock.method(CarePackage, 'schema', (() => ({findAll: async (options: any) => {
+        assert.equal(options.transaction, f.transactionContext); assert.equal(options.lock, 'UPDATE');
+        throw Object.assign(new Error('Package transition rejected'), {statusCode: 422});
+    }})) as any);
+    const result = await run(updateAgendaEvent, f.req);
+    assert.equal(result.status, 422); assert.equal(f.updated.length, 0);
+    assert.equal(f.current.status, 'COMPLETED'); assert.equal(f.current.start, '2025-01-02T09:00:00.000Z');
+    assert.equal(f.current.missedArrivalReportedAt, undefined);
+});
+
+it('normalizing seconds within the same future minute preserves a completed appointment during a notes edit', async t => {
+    const f = fixture(t); f.assignments[0].calendarEnabled = true;
+    Object.assign(f.current, {status: 'COMPLETED', start: '2035-01-02T09:00:30.000Z', end: '2035-01-02T09:30:30.000Z'});
+    f.req.body = {id: eventId, event: {start: '2035-01-02T09:00:00.000Z', end: '2035-01-02T09:30:00.000Z',
+        status: 'COMPLETED', description: 'Nota aggiornata'}};
+    const result = await run(updateAgendaEvent, f.req);
+    assert.equal(result.status, 200); assert.equal(f.current.status, 'COMPLETED');
+    assert.equal(f.current.description, 'Nota aggiornata'); assert.equal(f.current.missedArrivalReportedAt, undefined);
+});

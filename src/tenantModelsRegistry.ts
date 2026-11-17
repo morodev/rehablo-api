@@ -5,6 +5,7 @@ import Patient from './modules/patients/models/patient.model.js';
 import {PatientContactFollowUp} from './modules/patients/models/patientContactFollowUp.model.js';
 import {PatientSettlementOperation} from './modules/patients/models/patientSettlementOperation.model.js';
 import {FinancialOperation} from './modules/administration/models/financialOperation.model.js';
+import {TREASURY_CLASSIFICATION_MODELS} from './modules/administration/models/treasuryClassification.model.js';
 import { registerProductsServicesAssociations, Category, Product, ProductStructure, Service, ServiceStructure } from './modules/products-services/models/index.js';
 import { registerInvoiceAssociations, Invoice, InvoiceProduct, InvoiceService, InvoicePayment, InvoiceAgendaEvent } from './modules/invoice/models/index.js';
 import EventType from './modules/agenda/models/eventType.model.js';
@@ -103,6 +104,7 @@ export function registerTenantModels(): void {
     registerTenantScopedModel(PatientSharedDocument);
     for (const model of [CarePath,CarePathMember,ClinicalRecord,EvaluationTemplate,EvaluationPreference,ClinicalOperation,ClinicalAudit,ClinicalPublication,ClinicalHomeFeedback]) registerTenantScopedModel(model);
     for (const model of ADMINISTRATION_MODELS) registerTenantScopedModel(model);
+    for (const model of TREASURY_CLASSIFICATION_MODELS) registerTenantScopedModel(model);
     registerTenantScopedModel(PatientCreditMovement);
     registerTenantScopedModel(Category);
     registerTenantScopedModel(Product);

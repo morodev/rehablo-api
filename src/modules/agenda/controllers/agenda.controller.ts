@@ -39,6 +39,7 @@ import {
 } from '../services/missedArrivalAutomation.service.js';
 import { lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
 import {syncPackageAssignment} from '../services/packageAssignment.service.js';
+import {appointmentRescheduleError} from '../services/appointmentReschedule.policy.js';
 import {completeLockedUntouchedAppointment} from '../services/automaticAppointmentCompletion.service.js';
 import {PackageConsumption} from '../../administration/models/administration.model.js';
 
@@ -679,6 +680,11 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
     const schema = req.tenantSchema!;
     const id = req.body.id;
     const event = { ...req.body.event };
+    const reopenForReschedule = event.reopenForReschedule === true;
+    if (event.reopenForReschedule !== undefined && typeof event.reopenForReschedule !== 'boolean') {
+        return sendErrorResponse(res, 400, 'Conferma di riprogrammazione non valida');
+    }
+    delete event.reopenForReschedule;
     delete event.id;
     delete event.invoiceId;
     delete event.packageReservationStatus;
@@ -706,30 +712,7 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
         if (!APPOINTMENT_STATUSES.has(status)) {
             return sendErrorResponse(res, 400, 'Stato appuntamento non valido');
         }
-        if (status === 'NO_SHOW' && normalizedStatus(current.get('status')) !== 'NO_SHOW') {
-            return sendErrorResponse(res, 409, 'Usa la gestione del mancato arrivo per registrare un no-show');
-        }
         event.status = status;
-
-        // Se una seduta terminata viene riaperta da COMPLETED a CONFIRMED, si tratta
-        // di una correzione della presenza. Apriamo contestualmente la verifica così
-        // il job automatico non la richiude prima della scelta del no-show.
-        if (shouldOpenAttendanceCorrection(current.get({ plain: true }), status)) {
-            event.missedArrivalReportedAt = new Date();
-            event.missedArrivalReportedBy = req.access!.userId;
-            event.missedArrivalResolvedAt = null;
-            event.missedArrivalResolvedBy = null;
-            event.missedArrivalResolution = null;
-            event.noShowBillingDecision = null;
-        }
-
-        // Compatibilita' con i client precedenti: se una segnalazione aperta viene chiusa
-        // direttamente come effettuata o cancellata, manteniamo comunque l'audit completo.
-        if (hasOpenMissedArrival(current) && (status === 'COMPLETED' || status === 'CANCELLED')) {
-            event.missedArrivalResolvedAt = new Date();
-            event.missedArrivalResolvedBy = req.access!.userId;
-            event.missedArrivalResolution = status;
-        }
     }
 
     if (typeof event.title !== 'string' && event.title !== undefined) {
@@ -778,6 +761,34 @@ export const updateAgendaEvent = asyncHandler(async (req: Request, res: Response
         if (Number(locked.appointmentPaidAmount) > 0.009 || Number(await InvoicePayment.schema(schema).sum('amount', {
             where: { agendaEventId: id, status: 'POSTED' }, transaction
         })) > 0.009) return 'paid';
+        // Recheck the current state under the same row lock used by automatic completion.
+        // A future reschedule is an explicit reopening, not a correction of historical attendance.
+        const rescheduleError = appointmentRescheduleError(locked.get({plain: true}), event, reopenForReschedule);
+        if (rescheduleError) {
+            sendErrorResponse(res, 409, rescheduleError);
+            return 'rejected';
+        }
+        if (event.status !== undefined) {
+            const status = event.status;
+            if (status === 'NO_SHOW' && normalizedStatus(locked.get('status')) !== 'NO_SHOW') {
+                sendErrorResponse(res, 409, 'Usa la gestione del mancato arrivo per registrare un no-show');
+                return 'rejected';
+            }
+            if (!reopenForReschedule && shouldOpenAttendanceCorrection(locked.get({plain: true}), status)) {
+                event.missedArrivalReportedAt = new Date();
+                event.missedArrivalReportedBy = req.access!.userId;
+                event.missedArrivalResolvedAt = null;
+                event.missedArrivalResolvedBy = null;
+                event.missedArrivalResolution = null;
+                event.noShowBillingDecision = null;
+            }
+            // Preserve the existing audit when a report is resolved through the status command.
+            if (hasOpenMissedArrival(locked) && (status === 'COMPLETED' || status === 'CANCELLED')) {
+                event.missedArrivalResolvedAt = new Date();
+                event.missedArrivalResolvedBy = req.access!.userId;
+                event.missedArrivalResolution = status;
+            }
+        }
         const financialContextChanged = ['patientId', 'structureId', 'eventTypeId'].some(field =>
             event[field] !== undefined && String(event[field] ?? '') !== String(locked.get(field as any) ?? '')
         );

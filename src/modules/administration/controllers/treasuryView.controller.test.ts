@@ -9,6 +9,7 @@ import { AgendaEvent } from '../../agenda/models/agendaEvent.model.js';
 import Patient from '../../patients/models/patient.model.js';
 import { Expense, FinancialAccount, PaymentMethod, PurchaseDocument, Reconciliation, Supplier, TreasuryMovement } from '../models/index.js';
 import { listTreasuryMovements, getTreasuryExpense } from './treasuryView.controller.js';
+import {TreasuryCategory, TreasuryClassification, TreasuryMovementTag} from '../models/treasuryClassification.model.js';
 
 const uuid = (n: number) => '11111111-1111-4111-8111-' + String(n).padStart(12, '0');
 const tenantId = uuid(1), structureId = uuid(2), otherStructure = uuid(3), accountId = uuid(4), methodId = uuid(5);
@@ -52,6 +53,7 @@ function fixture(t: TestContext) {
     const expenses: any[] = [{ id: expenseId, description: 'Materiale studio', supplierId, purchaseDocumentId: purchaseId, structureId }];
     const reconciliations: any[] = [];
     const payments: any[] = [], appointments: any[] = [];
+    const businessCategories: any[] = [], classifications: any[] = [], movementTags: any[] = [];
     const structures: any[] = [{ id: structureId, name: 'Sede centro', tenantId }, { id: otherStructure, name: 'Altra sede', tenantId }];
     function stub(model: any, name: string, rows: any[]) {
         queries[name] = [];
@@ -60,6 +62,9 @@ function fixture(t: TestContext) {
         } })) as any);
     }
     stub(TreasuryMovement, 'movements', movements);
+    stub(TreasuryCategory, 'businessCategories', businessCategories);
+    stub(TreasuryClassification, 'classifications', classifications);
+    stub(TreasuryMovementTag, 'movementTags', movementTags);
     stub(Invoice, 'invoices', invoices);
     stub(InvoicePayment, 'payments', payments);
     stub(AgendaEvent, 'appointments', appointments);
@@ -75,9 +80,35 @@ function fixture(t: TestContext) {
     const req: any = { tenantSchema: schema, user: { tid: tenantId, sub: userId, sid: structureId,
         perms: ['treasury:read:tenant', 'invoice:read:tenant', 'expense:read:tenant'] },
         access: { resource: 'treasury', action: 'read', scope: 'tenant', userId, structureId }, query: {} };
-    return { req, movements, invoices, expenses, reconciliations, queries, payments, appointments };
+    return { req, movements, invoices, expenses, reconciliations, queries, payments, appointments, businessCategories, classifications, movementTags };
 }
 describe('treasury readable list and filters', () => {
+    it('filters the editable classification queue before pagination even when reversals fill the first page', async t => {
+        const f=fixture(t),originals=Array.from({length:60},(_,index)=>({...f.movements[0],id:uuid(110+index),amount:'10',status:'VOID',direction:'IN'}));
+        const reversals=originals.map((original,index)=>({...original,id:uuid(200+index),status:'POSTED',direction:'OUT',category:'PAYMENT_VOID',sourceType:'INVOICE_PAYMENT_VOID',reversalOfId:original.id}));
+        f.movements.splice(0,f.movements.length,...reversals,...originals);
+        f.req.user.perms.push('treasury:update:tenant');
+        f.req.query={classificationState:'unclassified',classificationEditable:'true',limit:'25'};
+        const result=(await run(f.req)).body.data;
+        assert.equal(result.total,60);assert.equal(result.items[0].id,originals[0].id);assert.equal(result.summary.unclassifiedCount,60);
+        delete f.req.query.classificationEditable;
+        const ordinary=(await run(f.req)).body.data;
+        assert.equal(ordinary.total,120);assert.equal(ordinary.items.length,25);
+    });
+    it('applies business-category and overlapping tag filters before pagination and summary', async t => {
+        const f = fixture(t), categoryId = uuid(901), tagA = uuid(902), tagB = uuid(903);
+        f.businessCategories.push({id: categoryId, name: 'Prestazioni', direction: 'IN', color: '#6366f1', isActive: true});
+        f.movements.push({...f.movements[0],id:uuid(101),amount:'10.25'}, {...f.movements[0],id:uuid(102),amount:'99'});
+        f.classifications.push({movementId:uuid(100),businessCategoryId:categoryId},{movementId:uuid(101),businessCategoryId:categoryId});
+        f.movementTags.push({movementId:uuid(100),tagId:tagA},{movementId:uuid(100),tagId:tagB},{movementId:uuid(101),tagId:tagB});
+        f.req.query = {businessCategoryId:categoryId,tagIds:tagA+','+tagB,limit:'1'};
+        const filtered = (await run(f.req)).body.data;
+        assert.equal(filtered.total,2);assert.equal(filtered.items.length,1);assert.equal(filtered.summary.income,70.75);
+        assert.equal(filtered.items[0].businessCategory.name,'Prestazioni');assert.equal(filtered.items[0].category,'INVOICE_PAYMENT');
+        f.req.query = {classificationState:'unclassified'};
+        const missing = (await run(f.req)).body.data;
+        assert.equal(missing.total,1);assert.equal(missing.summary.unclassifiedCount,1);assert.equal(missing.summary.income,99);
+    });
     it('returns invoice number, patient, method, account and structure without UUID in text', async t => {
         const f = fixture(t);
         const result = await run(f.req);
@@ -207,7 +238,7 @@ describe('treasury readable list and filters', () => {
         const result = (await run(f.req)).body.data;
         assert.equal(result.items.length, 100);
         assert.equal(result.total, 232);
-        assert.deepEqual(result.summary, { income: 232.3, outcome: 2, net: 230.3, postedCount: 231, unlinkedCount: 0 });
+        assert.deepEqual(result.summary, { income: 232.3, outcome: 2, net: 230.3, postedCount: 231, unlinkedCount: 0, unclassifiedCount: 232 });
         assert.deepEqual(f.queries.movements[0].order, [['occurredAt', 'DESC'], ['id', 'DESC']]);
         f.req.query.limit = '999';
         assert.equal((await run(f.req)).body.data.limit, 200);
