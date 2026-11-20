@@ -24,7 +24,11 @@ export class TreasuryClassification extends Model {}
 TreasuryClassification.init({
     movementId: {type: DataTypes.UUID, primaryKey: true},
     businessCategoryId: {type: DataTypes.UUID, allowNull: true},
-    updatedByUserId: {type: DataTypes.UUID, allowNull: false},
+    updatedByUserId: {type: DataTypes.UUID, allowNull: true},
+    allocations: {type: DataTypes.JSONB, allowNull: true},
+    origin: {type: DataTypes.STRING(24), allowNull: false, defaultValue: 'MANUAL'},
+    sourceKind: {type: DataTypes.STRING(24), allowNull: true},
+    sourceId: {type: DataTypes.STRING(100), allowNull: true},
 }, {sequelize, modelName: 'treasuryClassification', tableName: 'treasury_classifications'});
 
 export class TreasuryMovementTag extends Model {}
@@ -33,4 +37,19 @@ TreasuryMovementTag.init({
     tagId: {type: DataTypes.UUID, primaryKey: true},
 }, {sequelize, modelName: 'treasuryMovementTag', tableName: 'treasury_movement_tags', timestamps: false});
 
-export const TREASURY_CLASSIFICATION_MODELS = [TreasuryCategory, TreasuryTag, TreasuryClassification, TreasuryMovementTag];
+export class TreasuryCategoryDefault extends Model {}
+TreasuryCategoryDefault.init({
+    sourceKind: {type: DataTypes.STRING(24), primaryKey: true},
+    sourceId: {type: DataTypes.STRING(100), primaryKey: true},
+    businessCategoryId: {type: DataTypes.UUID, allowNull: true},
+    updatedByUserId: {type: DataTypes.UUID, allowNull: false},
+}, {sequelize, modelName: 'treasuryCategoryDefault', tableName: 'treasury_category_defaults'});
+
+export class TreasuryCategorySnapshot extends Model {}
+TreasuryCategorySnapshot.init({
+    sourceKind: {type: DataTypes.STRING(24), primaryKey: true},
+    sourceId: {type: DataTypes.STRING(100), primaryKey: true},
+    weights: {type: DataTypes.JSONB, allowNull: false},
+}, {sequelize, modelName: 'treasuryCategorySnapshot', tableName: 'treasury_category_snapshots'});
+
+export const TREASURY_CLASSIFICATION_MODELS = [TreasuryCategory, TreasuryTag, TreasuryClassification, TreasuryMovementTag, TreasuryCategoryDefault, TreasuryCategorySnapshot];

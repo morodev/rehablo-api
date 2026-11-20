@@ -10,6 +10,9 @@ import InvoicePayment from '../../invoice/models/invoicePayment.model.js';
 import {PatientCredit} from '../../administration/models/index.js';
 import {PatientCreditMovement} from '../../administration/models/patientCreditMovement.model.js';
 import {validateTreasuryAccount, validateTreasuryMethod} from '../../administration/services/treasuryValidation.service.js';
+import {assertTreasuryClassificationChoice} from '../../administration/services/treasuryAutomation.service.js';
+import {normalizeTreasuryClassificationChoice, TreasuryClassificationChoice} from '../../administration/services/treasuryAutomation.policy.js';
+import {treasuryClassificationAllocator} from '../../administration/services/treasuryPaymentClassification.policy.js';
 import {InvoicePaymentCreateOptions} from '../../administration/services/invoicePaymentTreasury.service.js';
 import {appointmentPricesByEvent, ensureAppointmentPaymentHistory, isValidPaymentDate, paymentMoney,
     appointmentPriceFields, syncAppointmentPaymentStatus, isAppointmentPaymentHistoryKnown} from '../../invoice/services/appointmentPayment.service.js';
@@ -37,7 +40,7 @@ export interface PatientSettlementRequest {
     allocations: PatientSettlementAllocation[];
     credits: Array<{creditId: string; amount: number}>;
     cash: {amount: number; paidAt: string | null; method: string | null; note: string | null;
-        accountId: string | null; paymentMethodId: string | null};
+        accountId: string | null; paymentMethodId: string | null; classification?: TreasuryClassificationChoice};
     completeReference: boolean;
     pricing?: AppointmentPricingInput;
     openingBalances: PatientSettlementOpeningBalance[];
@@ -114,7 +117,8 @@ export function normalizePatientSettlementRequest(body: Record<string, any>): Pa
     }
     const result: PatientSettlementRequest = {referenceAgendaEventId: optionalUuid(body.referenceAgendaEventId),
         referenceInvoiceId: optionalUuid(body.referenceInvoiceId), structureId: optionalUuid(body.structureId), allocations, credits,
-        cash: {amount: cashAmount, paidAt, method: note(cash.method, 255), note: note(cash.note), accountId, paymentMethodId},
+        cash: {amount: cashAmount, paidAt, method: note(cash.method, 255), note: note(cash.note), accountId, paymentMethodId,
+            ...(cash.classification !== undefined ? {classification: normalizeTreasuryClassificationChoice(cash.classification)} : {})},
         completeReference: body.completeReference === true, openingBalances};
     if (body.pricing != null) {
         const pricing = body.pricing;
@@ -243,6 +247,8 @@ export async function executePatientSettlement(req: Request) {
     if (!/^[a-zA-Z0-9_-]{8,128}$/.test(idempotencyKey)) settlementFail(400, 'Identificativo della registrazione obbligatorio e non valido');
     const schema = req.tenantSchema!;
     const initialContext = await resolvePatientSettlementContext(req, request);
+    assertTreasuryClassificationChoice(req, request.cash.classification, initialContext.structureId);
+    const classifyAmount = treasuryClassificationAllocator(request.cash.classification, request.cash.amount);
     // Keep the retry identity of requests recorded before opening balances were supported.
     const {openingBalances: openingFingerprint, ...existingFingerprint} = request;
     const requestHash = createHash('sha256').update(JSON.stringify({patientId: initialContext.patientId,
@@ -372,7 +378,7 @@ export async function executePatientSettlement(req: Request) {
                 const paymentId = randomUUID();
                 const options: InvoicePaymentCreateOptions = {transaction, treasuryContext: {
                     accountId: request.cash.accountId ?? undefined, structureId: context.structureId,
-                    paymentMethodId: request.cash.paymentMethodId, idempotencyKey: `settlement_${operationId}_${paymentId}`}};
+                    paymentMethodId: request.cash.paymentMethodId, idempotencyKey: `settlement_${operationId}_${paymentId}`, classification: classifyAmount(split.cash)}};
                 const payment = await InvoicePayment.schema(schema).create({id: paymentId,
                     invoiceId: row.kind === 'INVOICE' ? row.targetId : null, agendaEventId: row.kind === 'APPOINTMENT' ? row.targetId : null,
                     carePackageId: row.kind === 'INVOICE' ? invoices.get(row.targetId)?.carePackageId ?? null : null,

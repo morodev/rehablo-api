@@ -118,6 +118,31 @@ it('normalizes one total and refuses unmatched credit/cash, duplicate targets an
     assert.throws(() => normalizePatientSettlementRequest({...body, allocations: [...body.allocations, ...body.allocations]}), /una sola volta/);
     assert.throws(() => normalizePatientSettlementRequest({...body, referenceOccurrenceStart: '2020-01-10T09:00:00Z'}), /consultazione/);
 });
+
+it('passes manual classification only to fresh settlement cash and preserves retry identity', async t => {
+    const f = fixture(t);
+    (f.req.user as any).perms.push('treasury:update:structure');
+    const choice = {businessCategoryId: uid(20)};
+    f.req.body.cash.classification = choice;
+    await executePatientSettlement(f.req);
+    const writes = f.writeOptions.filter(row => row.table === 'payments');
+    assert.equal(writes[0].options.treasuryContext, undefined, 'existing credit is not new money');
+    assert.deepEqual(writes[1].options.treasuryContext.classification, choice);
+    const replay = await executePatientSettlement(f.req);
+    assert.equal(replay.replayed, true);
+    f.req.body.cash.classification = {businessCategoryId: null};
+    await assert.rejects(executePatientSettlement(f.req), /dati diversi/);
+    assert.equal(f.tables.payments.length, 2);
+});
+
+it('does not grant category overrides to an operator who can collect but cannot classify', async t => {
+    const f = fixture(t);
+    f.req.body.cash.classification = {businessCategoryId: uid(20)};
+    await assert.rejects(executePatientSettlement(f.req), {statusCode: 403});
+    assert.equal(f.tables.payments.length, 0);
+    delete f.req.body.cash.classification;
+    assert.equal((await executePatientSettlement(f.req)).cashAmount, 40);
+});
 it('reserves credit for a target without cash permission', () => {
     const plan = settlementFundingPlan([{key: 'old', amount: 60, canCash: true, canUseCredit: true},
         {key: 'invoice', amount: 40, canCash: false, canUseCredit: true}], 40);

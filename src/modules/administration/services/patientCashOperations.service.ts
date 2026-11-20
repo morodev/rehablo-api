@@ -11,6 +11,7 @@ import {assertFinancialAccess, financialPlain} from './financialOperations.servi
 import {cents, financialDate, financialMoney, financialNote, positiveFinancialAmount} from './financialMovementPolicy.service.js';
 import {nullableTreasuryUuid, treasuryError, validateTreasuryMethod} from './treasuryValidation.service.js';
 import {verifiedSettlementCredit} from './patientCreditBacking.service.js';
+import {assertTreasuryClassificationChoice, classifyTreasuryMovement} from './treasuryAutomation.service.js';
 import {dateOnly} from '../../reports/services/financialFacts.service.js';
 
 function requiredPatientId(value: unknown): string {
@@ -29,6 +30,7 @@ export async function recordPatientAdvance(req: Request) {
         const structureId = String(patient.get('structureId'));
         assertFinancialAccess(req, 'quote', 'create', structureId, patient.get('userId'));
         assertFinancialAccess(req, 'treasury', 'create', structureId, getUserId(req));
+        const classification = assertTreasuryClassificationChoice(req, body.classification, structureId);
         const operation = await beginFinancialOperation(req, 'PATIENT_ADVANCE', structureId, transaction);
         if (operation.replay) return operation.replay;
         const key = req.header('Idempotency-Key')!.trim(), Movement = TreasuryMovement.schema(req.tenantSchema!);
@@ -48,6 +50,8 @@ export async function recordPatientAdvance(req: Request) {
         const movement = await Movement.create({accountId, structureId, direction: 'IN', category: 'PATIENT_ADVANCE', amount, occurredAt,
             status: 'POSTED', paymentMethodId: method, counterparty: [patient.get('name'), patient.get('surname')].filter(Boolean).join(' '),
             description: 'Anticipo paziente', sourceType: 'PATIENT_ADVANCE', sourceId: credit.get('id'), idempotencyKey: key, createdByUserId: getUserId(req)}, {transaction});
+        await classifyTreasuryMovement({schema: req.tenantSchema!, movementId: String(movement.get('id')), amount, direction: 'IN',
+            actorId: getUserId(req), source: {kind: 'OPERATION', id: 'PATIENT_ADVANCE'}, classification}, transaction);
         await credit.update({sourceId: movement.get('id')}, {transaction});
         const result = financialPlain(credit); await operation.complete(result); return result;
     });
@@ -67,6 +71,7 @@ export async function recordPatientRefund(req: Request) {
         await lockPatientSettlement(req.tenantSchema!, patientId, transaction);
         const credit = await Credit.findByPk(creditId, {transaction, lock: transaction.LOCK.UPDATE});
         if (!credit || credit.get('patientId') !== patientId || credit.get('structureId') !== structureId) treasuryError('Il credito e cambiato: ricarica', 409);
+        const classification = assertTreasuryClassificationChoice(req, body.classification, structureId);
         const operation = await beginFinancialOperation(req, 'PATIENT_CREDIT_REFUND', structureId, transaction);
         if (operation.replay) return operation.replay;
         const Ledger = PatientCreditMovement.schema(req.tenantSchema!), key = req.header('Idempotency-Key')!.trim();
@@ -93,6 +98,8 @@ export async function recordPatientRefund(req: Request) {
         const cash = await TreasuryMovement.schema(req.tenantSchema!).create({accountId, structureId, direction: 'OUT', category: 'PATIENT_CREDIT_REFUND',
             amount, occurredAt, status: 'POSTED', paymentMethodId: method, description: note ?? 'Rimborso credito paziente',
             sourceType: 'PATIENT_CREDIT_REFUND', sourceId: ledger.get('id'), idempotencyKey: `credit-refund-${ledger.get('id')}`, createdByUserId: getUserId(req)}, {transaction});
+        await classifyTreasuryMovement({schema: req.tenantSchema!, movementId: String(cash.get('id')), amount, direction: 'OUT',
+            actorId: getUserId(req), source: {kind: 'OPERATION', id: 'PATIENT_REFUND'}, classification}, transaction);
         await ledger.update({treasuryMovementId: cash.get('id')}, {transaction});
         const remainingAmount = financialMoney(Number(credit.get('remainingAmount')) - amount);
         await credit.update({remainingAmount, status: remainingAmount === 0 ? 'EXHAUSTED' : 'ACTIVE'}, {transaction});

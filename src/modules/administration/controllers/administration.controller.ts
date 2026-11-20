@@ -19,6 +19,7 @@ import {
     TreasuryMovement
 } from '../models/index.js';
 import { treasuryError } from '../services/treasuryValidation.service.js';
+import {saveSourceTreasuryDefault} from '../services/treasuryAutomation.service.js';
 import {protectAccountChange, protectExpenseChange, recordManualMovement, voidManualMovement} from '../services/financialOperations.service.js';
 import {economicMovements, positiveFinancialAmount} from '../services/financialMovementPolicy.service.js';
 import { balanceEffectiveMovements, createTreasuryClosing } from '../services/treasuryLedger.service.js';
@@ -180,7 +181,12 @@ function create(name: SpecName) {
             const pricingError = await snapshotQuotePriceList(req, payload);
             if (pricingError) return sendErrorResponse(res, 409, pricingError);
         }
-        const entity = await schemaModel(req, name).create(payload);
+        const entity = name === 'expenses' && bodySource(req).treasuryCategoryId !== undefined
+            ? await sequelize.transaction(async transaction => {
+                const created = await schemaModel(req, name).create(payload, {transaction});
+                await saveSourceTreasuryDefault(req, 'EXPENSE', String(created.get('id')), bodySource(req).treasuryCategoryId, transaction, String(created.get('structureId')));
+                return created;
+            }) : await schemaModel(req, name).create(payload);
         if (name === 'priceLists' && payload['isDefault'] === true) {
             await PriceList.schema(req.tenantSchema!).update(
                 { isDefault: false },

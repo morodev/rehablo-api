@@ -15,6 +15,7 @@ import AgendaEvent from '../../agenda/models/agendaEvent.model.js';
 import { syncInvoicePaymentStatus } from '../services/payment.service.js';
 import { syncAppointmentPaymentStatus } from '../services/appointmentPayment.service.js';
 import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
+import {assertTreasuryClassificationChoice, copyTreasuryClassification} from '../../administration/services/treasuryAutomation.service.js';
 import {beginFinancialOperation, financialOperationKey} from '../../administration/services/financialOperation.service.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -111,6 +112,7 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
             if (!structure) treasuryError('La sede selezionata non è disponibile');
         }
         if (!structureId) treasuryError('Seleziona la sede dell’incasso', 422);
+        const classification = assertTreasuryClassificationChoice(req, req.body?.classification, structureId);
         const operation = await beginFinancialOperation(req, 'INVOICE_PAYMENT', structureId, transaction);
         if (operation.replay) {
             const payment = await InvoicePayment.schema(schema).findOne({where: {id: operation.replay.paymentId, invoiceId: invoice.id}, transaction});
@@ -134,7 +136,7 @@ export const createPayment = asyncHandler(async (req: Request, res: Response) =>
             return {kind: 'replayed', payment, summary: await syncInvoicePaymentStatus(schema, invoice.id, transaction)} as const;
         }
         const createOptions: InvoicePaymentCreateOptions = { transaction, treasuryContext: {
-            accountId: accountId ?? undefined, structureId, paymentMethodId, idempotencyKey
+            accountId: accountId ?? undefined, structureId, paymentMethodId, idempotencyKey, classification
         }};
         const summary = await syncInvoicePaymentStatus(schema, invoice.id, transaction);
         if (amount > summary.balance + 0.009) {
@@ -303,9 +305,10 @@ export const setLegacyPaymentDate = asyncHandler(async (req: Request, res: Respo
                 await TreasuryMovement.schema(req.tenantSchema!).create({...common, direction:'OUT', category:'PAYMENT_DATE_CORRECTION',
                     occurredAt: original.get('occurredAt'), reversalOfId: original.get('id'), sourceType:'INVOICE_PAYMENT_DATE_VOID',
                     description:'Rettifica data incasso precedente', idempotencyKey:`legacy_date_${payment.id}_void`}, {transaction});
-                await TreasuryMovement.schema(req.tenantSchema!).create({...common, direction:'IN', category:'INVOICE_PAYMENT',
+                const corrected = await TreasuryMovement.schema(req.tenantSchema!).create({...common, direction:'IN', category:'INVOICE_PAYMENT',
                     occurredAt:new Date(`${paidAt}T12:00:00.000Z`), sourceType:'INVOICE_PAYMENT_CORRECTION',
                     description:'Data incasso precedente completata', idempotencyKey:`legacy_date_${payment.id}_corrected`}, {transaction});
+                await copyTreasuryClassification(req.tenantSchema!, String(original.get('id')), String(corrected.get('id')), getUserId(req), transaction);
             }
         }
         await payment.update({ paidAt: new Date(`${paidAt}T12:00:00.000Z`) }, { transaction, completeHistoricalDate: true } as any);

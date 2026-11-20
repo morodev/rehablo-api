@@ -1,3 +1,4 @@
+import {treasuryOperationSource} from './treasuryPaymentClassification.policy.js';
 import {randomUUID} from 'node:crypto';
 import {Request} from 'express';
 import {Model, Op, Transaction} from 'sequelize';
@@ -10,6 +11,7 @@ import {beginFinancialOperation} from './financialOperation.service.js';
 import {lockFinancialAccounts, resolveFinancialAccount} from './financialAccountResolver.service.js';
 import {nullableTreasuryUuid, treasuryError, validateManualTreasuryMovement, validateTreasuryMethod} from './treasuryValidation.service.js';
 import {cents, financialDate, financialMoney, financialNote, positiveFinancialAmount} from './financialMovementPolicy.service.js';
+import {assertTreasuryClassificationChoice, classifyTreasuryMovement, saveSourceTreasuryDefault} from './treasuryAutomation.service.js';
 import {dateOnly} from '../../reports/services/financialFacts.service.js';
 
 type Row = Record<string, any>;
@@ -71,6 +73,7 @@ export async function recordExpensePayment(req: Request): Promise<Row> {
     const requestedAccount = nullableTreasuryUuid(body.accountId, 'Conto'), paymentMethodId = nullableTreasuryUuid(body.paymentMethodId, 'Metodo');
     return sequelize.transaction(async transaction => {
         const expense = await lockedExpense(req, transaction), structureId = String(expense.get('structureId'));
+        const classification = assertTreasuryClassificationChoice(req, body.classification, structureId);
         const operation = await beginFinancialOperation(req, 'EXPENSE_PAYMENT', structureId, transaction);
         if (operation.replay) return operation.replay;
         if (['VOID', 'CANCELLED'].includes(String(expense.get('status')).toUpperCase())) treasuryError('La spesa è annullata', 409);
@@ -79,10 +82,12 @@ export async function recordExpensePayment(req: Request): Promise<Row> {
         if (cents(amount) > cents(view.balance)) treasuryError('Il pagamento supera il residuo della spesa', 409);
         const accountId = await resolveFinancialAccount(req.tenantSchema!, structureId, requestedAccount, transaction);
         await validateTreasuryMethod(req.tenantSchema!, paymentMethodId, transaction);
-        await TreasuryMovement.schema(req.tenantSchema!).create({id: randomUUID(), accountId, structureId,
+        const movement = await TreasuryMovement.schema(req.tenantSchema!).create({id: randomUUID(), accountId, structureId,
             direction: 'OUT', category: 'SUPPLIER_PAYMENT', amount, occurredAt, status: 'POSTED', expenseId: expense.get('id'),
             paymentMethodId, description: note ?? String(expense.get('description') ?? 'Pagamento spesa'), sourceType: 'EXPENSE_PAYMENT',
             sourceId: randomUUID(), createdByUserId: getUserId(req)}, {transaction});
+        await classifyTreasuryMovement({schema: req.tenantSchema!, movementId: String(movement.get('id')), amount, direction: 'OUT',
+            actorId: getUserId(req), source: {kind: 'EXPENSE', id: String(expense.get('id'))}, classification}, transaction);
         const paid = financialMoney(Number(view.paidAmount) + amount), balance = financialMoney(Number(expense.get('amount')) - paid);
         await expense.update({status: balance <= 0 ? 'PAID' : 'PARTIAL', paidAt: balance <= 0 ? dateOnly(occurredAt) : null}, {transaction});
         const result = await expenseView(req, expense, transaction); await operation.complete(result); return result;
@@ -117,6 +122,7 @@ export async function recordManualMovement(req: Request, source: Row): Promise<R
     if (payload.expenseId) treasuryError('Usa Paga spesa per collegare un pagamento alla spesa', 422);
     const structureId = requiredId(payload.structureId, 'Sede');
     assertFinancialAccess(req, 'treasury', 'create', structureId, getUserId(req));
+    const classification = assertTreasuryClassificationChoice(req, (req.body?.data ?? req.body)?.classification, structureId);
     const occurredAt = financialDate(payload.occurredAt);
     payload.amount = positiveFinancialAmount(payload.amount);
     payload.occurredAt = occurredAt.toISOString();
@@ -137,6 +143,8 @@ export async function recordManualMovement(req: Request, source: Row): Promise<R
         }
         const movement = await TreasuryMovement.schema(req.tenantSchema!).create({...payload, status: 'POSTED',
             idempotencyKey: key, createdByUserId: getUserId(req)}, {transaction});
+        await classifyTreasuryMovement({schema: req.tenantSchema!, movementId: String(movement.get('id')), amount: Number(payload.amount),
+            direction: payload.direction, actorId: getUserId(req), source: {kind: 'OPERATION', id: treasuryOperationSource(payload.category, payload.direction)}, classification}, transaction);
         const result = financialPlain(movement); await operation.complete(result); return result;
     });
 }
@@ -243,6 +251,7 @@ export async function protectExpenseChange(req: Request, id: string, changes: Ro
             const position = expensePaymentPosition(financialPlain(expense), ledger.map(financialPlain));
             if (['VOID', 'CANCELLED'].includes(String(changes.status)) && (position.paidAmount === null || position.paidAmount > 0)) treasuryError('Storna prima i pagamenti della spesa', 409);
             await expense.update(changes, {transaction});
+            await saveSourceTreasuryDefault(req, 'EXPENSE', id, (req.body?.data ?? req.body)?.treasuryCategoryId, transaction, String(expense.get('structureId')));
         } else await expense.destroy({transaction});
         return expense;
     });

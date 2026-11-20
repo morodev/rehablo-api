@@ -1,3 +1,4 @@
+import {mockTreasuryAutomation} from './treasuryAutomation.fixture.js';
 import assert from 'node:assert/strict';
 import {it, TestContext} from 'node:test';
 import {Request} from 'express';
@@ -41,10 +42,11 @@ function matches(value: Row, where: any): boolean {
     });
 }
 function fixture(t: TestContext) {
+    const automation = mockTreasuryAutomation(t);
     const accounts: Row[] = [account1, account2].map((id, i) => ({id, structureId: site, isActive: true, currency: 'EUR', type: i ? 'BANK' : 'CASH', openingBalance: 0, name: 'Conto ' + i}));
     const expenses: Row[] = [{id: expenseId, structureId: site, amount: 100, status: 'OPEN', createdByUserId: actor, description: 'Affitto'}];
     const treasury: Row[] = [], credits: Row[] = [], movements: Row[] = [], operations: Row[] = [], closings: Row[] = [], reconciliations: Row[] = [], payments: Row[] = [];
-    const tables = [accounts, expenses, treasury, credits, movements, operations, closings, reconciliations, payments];
+    const tables = [accounts, expenses, treasury, credits, movements, operations, closings, reconciliations, payments, ...automation.tables];
     const locks = new Map<string, Promise<void>>();
     const acquire = async (tx: any, key: string) => {
         if (tx.held.has(key)) return;
@@ -88,16 +90,60 @@ function fixture(t: TestContext) {
     t.mock.method(Tenant, 'findByPk', (async () => model({administrationSettings: {}})) as any);
     t.mock.method(Structure, 'findOne', (async () => model({id: site})) as any);
     t.mock.method(Patient, 'schema', (() => ({findByPk: async () => model({id: patient, structureId: site, userId: actor, name: 'Mario', surname: 'Rossi'})})) as any);
-    t.mock.method(sequelize, 'query', (async (_sql: string, options: any) => {await acquire(options.transaction, options.replacements.lockKey); return [[], {}];}) as any);
+    t.mock.method(sequelize, 'query', (async (sql: string, options: any) => {
+        await acquire(options.transaction, options.replacements?.lockKey ?? options.replacements?.key ?? sql);
+        if (sql.includes('FROM ') && sql.includes('.\"expenses\"')) return [expenses.filter(row => row.id === options.replacements.id), {}];
+        return [[], {}];
+    }) as any);
     t.mock.method(sequelize, 'transaction', (async (work: any) => {
         const snapshots = tables.map(rows => structuredClone(rows));
         const tx = {LOCK: {UPDATE: 'UPDATE'}, held: new Set<string>(), releases: [] as Array<() => void>};
         try {return await work(tx);} catch (error) {tables.forEach((rows, i) => rows.splice(0, rows.length, ...snapshots[i])); throw error;}
         finally {tx.releases.forEach(release => release());}
     }) as any);
-    return {accounts, expenses, treasury, credits, movements, operations, closings, payments, state};
+    return {accounts, expenses, treasury, credits, movements, operations, closings, payments, state, automation};
 }
 const payment = (amount: number, accountId: string | undefined = account1) => ({amount, paidAt: day, ...(accountId ? {accountId} : {})});
+
+it('classifies a manual cash movement atomically with its chosen category and tags, and freezes retry intent', async t => {
+    const f = fixture(t), categoryId = ids[10], tagId = ids[11];
+    f.automation.categories.push({id: categoryId, name: 'Prestazioni', direction: 'IN', isActive: true});
+    f.automation.tags.push({id: tagId, name: 'Sala 1', isActive: true});
+    const body = {structureId: site, accountId: account1, direction: 'IN', category: 'OTHER', amount: 25,
+        occurredAt: day, description: 'Incasso', classification: {businessCategoryId: categoryId, tagIds: [tagId]}};
+    const result = await recordManualMovement(request(body), body);
+    assert.equal(f.treasury.length, 1);
+    assert.equal(f.automation.classifications[0].movementId, result.id);
+    assert.deepEqual(f.automation.classifications[0].allocations, [{businessCategoryId: categoryId, amount: 25}]);
+    assert.deepEqual(f.automation.links, [{movementId: result.id, tagId}]);
+    await recordManualMovement(request(body), body);
+    assert.equal(f.treasury.length, 1); assert.equal(f.automation.classifications.length, 1);
+    const changed = {...body, classification: {businessCategoryId: null, tagIds: [tagId]}};
+    await assert.rejects(recordManualMovement(request(changed), changed), {statusCode: 409});
+});
+
+it('rolls back the financial write when an explicit category is incompatible with its direction', async t => {
+    const f = fixture(t), categoryId = ids[10];
+    f.automation.categories.push({id: categoryId, direction: 'OUT', isActive: true});
+    const body = {structureId: site, accountId: account1, direction: 'IN', category: 'OTHER', amount: 25,
+        occurredAt: day, description: 'Incasso', classification: {businessCategoryId: categoryId}};
+    await assert.rejects(recordManualMovement(request(body), body), {statusCode: 422});
+    assert.equal(f.treasury.length, 0); assert.equal(f.operations.length, 0); assert.equal(f.automation.classifications.length, 0);
+});
+
+it('inherits an expense category for partial payments without changing money or subsequent category snapshots', async t => {
+    const f = fixture(t), first = ids[10], second = ids[11];
+    f.automation.categories.push({id: first, direction: 'OUT', isActive: true}, {id: second, direction: 'OUT', isActive: true});
+    f.automation.defaults.push({sourceKind: 'EXPENSE', sourceId: expenseId, businessCategoryId: first});
+    await recordExpensePayment(request(payment(30)));
+    assert.equal(f.automation.classifications[0].businessCategoryId, first);
+    assert.equal(f.automation.classifications[0].allocations[0].amount, 30);
+    f.automation.defaults[0].businessCategoryId = second;
+    await recordExpensePayment(request(payment(70), 'expense-second-payment'));
+    assert.equal(f.automation.classifications[1].businessCategoryId, first);
+    assert.equal(f.automation.classifications[1].allocations[0].amount, 70);
+    assert.equal(f.expenses[0].status, 'PAID'); assert.equal(f.treasury.length, 2);
+});
 
 it('records partial/full expense payments once and reverses one payment without losing the other', async t => {
     const f = fixture(t);

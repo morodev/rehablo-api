@@ -9,6 +9,7 @@ import * as quoteDelivery from '../controllers/quoteDelivery.controller.js';
 import { getTreasuryExpense } from '../controllers/treasuryView.controller.js';
 import {getTreasuryTaxonomy, saveTreasuryCategory, saveTreasuryTag, classifyTreasuryMovement, getTreasuryCategoryAnalysis} from '../controllers/treasuryClassification.controller.js';
 import { getDailyClosing, listDailyClosings, previewDailyClosing } from '../controllers/dailyClosing.controller.js';
+import * as treasuryAutomation from '../controllers/treasuryAutomation.controller.js';
 import { previewFiscalSubmission, transmitFiscal } from '../controllers/fiscalSimulation.controller.js';
 
 import { getFiscalSettings, updateFiscalSettings, getStsCredentials, updateStsCredentials } from '../controllers/fiscalSettings.controller.js';
@@ -96,6 +97,14 @@ crud('/administration/payment-methods', 'paymentMethods', 'treasury');
 crud('/administration/financial-accounts', 'financialAccounts', 'treasury', views.listFinancialAccounts);
 crud('/administration/treasury-movements', 'treasuryMovements', 'treasury', views.listTreasuryMovements);
 router.get('/administration/treasury-taxonomy', requirePermission('treasury', 'read'), getTreasuryTaxonomy);
+// Options expose category names only, without balances, counts or access to the ledger.
+router.get('/administration/treasury-category-options', treasuryAutomation.categoryOptions);
+router.post('/administration/payment-classification/preview', treasuryAutomation.paymentClassificationPreview);
+router.get('/administration/treasury-category-defaults', treasuryAutomation.categoryDefaults);
+router.patch('/administration/treasury-category-defaults', requirePermission('tenant','update','tenant'), treasuryAutomation.saveCategoryDefaults);
+router.patch('/administration/treasury-category-defaults/:kind/:sourceId', requirePermission('tenant','update','tenant'), treasuryAutomation.saveCategoryDefaults);
+router.post('/administration/treasury-classification-history/preview', requirePermission('treasury','read'), requirePermission('treasury','update'), treasuryAutomation.historyPreview);
+router.post('/administration/treasury-classification-history/apply', requirePermission('treasury','read'), requirePermission('treasury','update'), treasuryAutomation.historyApply);
 router.post('/administration/treasury-categories', requirePermission('tenant', 'update', 'tenant'), saveTreasuryCategory);
 router.patch('/administration/treasury-categories/:id', requirePermission('tenant', 'update', 'tenant'), saveTreasuryCategory);
 router.post('/administration/treasury-tags', requirePermission('tenant', 'update', 'tenant'), saveTreasuryTag);

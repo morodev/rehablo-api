@@ -43,6 +43,7 @@ import {isFinancialCarePackage, packageToday, scopedReadableCarePackage} from '.
 import {quotePackageFinancialSnapshot} from '../../administration/services/quotePackageFinance.js';
 import {quotePackageInvoiceLines} from '../utils/quotePackageInvoice.js';
 import {treasuryError, nullableTreasuryUuid, validateTreasuryMethod} from '../../administration/services/treasuryValidation.service.js';
+import {assertTreasuryClassificationChoice} from '../../administration/services/treasuryAutomation.service.js';
 import {beginFinancialOperation, financialOperationKey} from '../../administration/services/financialOperation.service.js';
 import {InvoicePaymentCreateOptions} from '../../administration/services/invoicePaymentTreasury.service.js';
 
@@ -781,6 +782,8 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
     // Numerazione progressiva + creazione fattura + creazione righe in un'UNICA transazione:
     // se una qualsiasi parte fallisce, non deve restare un numero "bruciato" senza fattura, né
     // una fattura senza le sue righe.
+    const paymentClassification = paidIntent ? assertTreasuryClassificationChoice(req,
+        req.body?.classification !== undefined ? req.body.classification : req.body?.invoice?.classification, invoiceStructureId ?? '') : undefined;
     const transactionResult = await sequelize.transaction(async (t) => {
         const operation = paidIntent ? await beginFinancialOperation(req, 'INVOICE_CREATE_PAID', invoiceStructureId ?? '', t) : null;
         if (operation?.replay) {
@@ -1057,7 +1060,8 @@ export const saveInvoice = asyncHandler(async (req: Request, res: Response) => {
             if (!invoiceStructureId) treasuryError('Seleziona la sede dell’incasso', 422);
             const paymentOptions: InvoicePaymentCreateOptions = {transaction: t, treasuryContext: {
                 structureId: invoiceStructureId, accountId: nullableTreasuryUuid(requestedAccountId, 'Conto') ?? undefined,
-                paymentMethodId, idempotencyKey: financialOperationKey(req)}};
+                paymentMethodId, idempotencyKey: financialOperationKey(req),
+                classification: paymentClassification}};
             await InvoicePaymentScoped.create(
                 {
                     invoiceId,

@@ -1,3 +1,4 @@
+import {mockTreasuryAutomation} from '../../administration/services/treasuryAutomation.fixture.js';
 import assert from 'node:assert/strict';
 import { describe, it, TestContext } from 'node:test';
 import { Request, Response, NextFunction } from 'express';
@@ -41,6 +42,7 @@ function run(handler: (req: Request, res: Response, next: NextFunction) => void,
 }
 
 function fixture(t: TestContext) {
+    const automation = mockTreasuryAutomation(t);
     const operations = mockFinancialOperations(t);
     t.mock.method(CarePackage, 'schema', (() => ({findAll: async () => []})) as any);
     const invoice = record({ id, structureId, patientID: userId, invoiceTotal: 100, status: 'unpaid', documentType: 'fattura',
@@ -136,7 +138,7 @@ function fixture(t: TestContext) {
         body: { amount: 60, paidAt: '2025-01-15', accountId, paymentMethodId: methodId, note: 'Acconto' },
         header: () => 'receipt-test-1'
     };
-    return { req, invoice, invoices, appointments, accounts, payments, movements, credits, queries, invoiceWhere, operations,
+    return { automation, req, invoice, invoices, appointments, accounts, payments, movements, credits, queries, invoiceWhere, operations,
         failMovement: () => { failMovement = true; }, failCorrection: () => {failCorrection = true;} };
 }
 
@@ -558,6 +560,18 @@ describe('completing legacy receipt dates without rewriting the posted ledger', 
         assert.equal((await run(setLegacyPaymentDate,f.req)).status,500);
         assert.equal(f.movements.length,1);assert.equal(f.movements[0].status,'POSTED');assert.equal(f.payment.paidAt,null);
         assert.equal(treasuryBalance(balanceEffectiveMovements(f.movements)),60);
+    });
+    it('carries mixed categories and tags to the replacement when completing a historical payment date', async t => {
+        const f = await legacy(t), original = f.movements[0];
+        const allocations = [{businessCategoryId: methodId, amount: 40}, {businessCategoryId: null, amount: 20}];
+        f.automation.classifications.push({movementId: original.id, businessCategoryId: null, allocations,
+            origin: 'MANUAL', updatedByUserId: userId});
+        f.automation.links.push({movementId: original.id, tagId: tenantId});
+        assert.equal((await run(setLegacyPaymentDate, f.req)).status, 200);
+        const corrected = f.movements.find(row => row.sourceType === 'INVOICE_PAYMENT_CORRECTION');
+        assert.deepEqual(f.automation.classifications.find(row => row.movementId === corrected.id)?.allocations, allocations);
+        assert.deepEqual(f.automation.links.find(row => row.movementId === corrected.id), {movementId: corrected.id, tagId: tenantId});
+        assert.equal(treasuryBalance(balanceEffectiveMovements(f.movements)), 60);
     });
     it('records an unknown historical date without inventing an account receipt',async t=>{
         const f=await legacy(t);f.movements.length=0;

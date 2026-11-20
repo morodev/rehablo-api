@@ -67,6 +67,37 @@ describe('unified operational dataset', () => {
         assert.deepEqual(result.rows.map(row => row.id), ['selected']);
         assert.equal(result.summary.find(row => row.key === 'noShow')?.value, 1);
     });
+    it('keeps attendance issue details aligned with their slot, including unresolved past sessions but not completed or future bookings', async t => {
+        t.mock.timers.enable({apis: ['Date'], now: new Date('2026-08-12T12:00:00Z')});
+        fixtures(t, [event('completed'), event('cancelled', {status: 'CANCELLED'}), event('absent', {status: 'NO_SHOW'}),
+            event('unresolved', {status: 'CONFIRMED'}),
+            event('future', {status: 'CONFIRMED', start: '2026-08-17T08:00:00Z', end: '2026-08-17T09:00:00Z'}),
+            event('other-hour', {status: 'CANCELLED', start: '2026-08-10T10:00:00Z', end: '2026-08-10T11:00:00Z'})]);
+        const slots = await operationalDataset(request(), 'attendance-slots');
+        const slot = slots.rows.find(row => row.weekday === 0 && row.hour === 10)!;
+        assert.equal(slot.cancelled, 1); assert.equal(slot.noShow, 1); assert.equal(slot.unresolved, 1);
+        assert.equal(slot.completed, 1); assert.equal(slot.resolved, 3);
+        assert.deepEqual(slot.drilldown, {dataset: 'sessions', filters: {weekday: 0, hour: 10, status: 'ATTENDANCE_ISSUES'}});
+        const query = {weekday: '0', hour: '10', status: 'ATTENDANCE_ISSUES', size: '1'};
+        const paged = await operationalDataset(request(query), 'sessions');
+        const exported = await operationalDataset(request(query), 'sessions', {allRows: true});
+        const expected = ['absent', 'cancelled', 'unresolved'];
+        assert.equal(paged.pagination.total, 3); assert.equal(paged.rows.length, 1);
+        assert.deepEqual(exported.rows.map(row => row.id).sort(), expected);
+        assert.equal(exported.meta.effectiveFilters.status, 'ATTENDANCE_ISSUES');
+        assert.equal(exported.summary.find(row => row.key === 'completed')?.value, 0);
+        const snapshot = reportExportSnapshot('sessions', exported);
+        assert.equal(snapshot.filters.status, 'ATTENDANCE_ISSUES');
+        assert.deepEqual(snapshot.rows.map(row => row.id).sort(), expected);
+        const csv = reportCsv(exported);
+        assert.equal(csv.split('\r\n').filter(line => line.includes("'=Mario Test")).length, 3);
+        const personal = await operationalDataset(request(query), 'sessions', {personal: true, allRows: true});
+        assert.deepEqual(personal.rows.map(row => row.id).sort(), expected);
+        const cancelled = await operationalDataset(request({...query, status: 'CANCELLED'}), 'sessions', {allRows: true});
+        assert.deepEqual(cancelled.rows.map(row => row.id), ['cancelled']);
+        const ordinary = await operationalDataset(request({...query, status: ''}), 'sessions', {allRows: true});
+        assert.deepEqual(ordinary.rows.map(row => row.id).sort(), ['absent', 'cancelled', 'completed', 'future', 'unresolved']);
+    });
     it('zero-fills the time axis and does not invent a rate or comparison without a denominator', async t => {
         fixtures(t, []);
         const result = await operationalDataset(request({from: '2026-08-01', to: '2026-08-03'}), 'activity-summary');

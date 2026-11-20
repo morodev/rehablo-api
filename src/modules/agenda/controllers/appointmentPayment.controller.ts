@@ -16,6 +16,8 @@ import {
 } from '../../invoice/services/appointmentPayment.service.js';
 import { patientPaymentPositionsByReferenceEvents } from '../services/patientPaymentPosition.service.js';
 import { assertPatientSettlementAllocations, lockPatientSettlement } from '../../patients/services/patientSettlementPolicy.service.js';
+import {assertTreasuryClassificationChoice} from '../../administration/services/treasuryAutomation.service.js';
+import {treasuryClassificationAllocator} from '../../administration/services/treasuryPaymentClassification.policy.js';
 import {beginFinancialOperation, financialOperationKey} from '../../administration/services/financialOperation.service.js';
 import {InvoicePaymentCreateOptions} from '../../administration/services/invoicePaymentTreasury.service.js';
 import {nullableTreasuryUuid, validateTreasuryMethod} from '../../administration/services/treasuryValidation.service.js';
@@ -141,6 +143,7 @@ async function writePayment(req: Request, res: Response, cumulative: boolean, pr
             });
             if (!event) return fail(404, 'Appuntamento non trovato o non accessibile');
             if (patientIdOf(event.get({ plain: true })) !== lockedPatientId) fail(409, 'Il paziente della seduta è cambiato: ricarica la posizione');
+            const classification = pricingOnly ? undefined : assertTreasuryClassificationChoice(req, req.body?.classification, settlementContext(req, event).structureId);
             const operation = pricingOnly ? null : await beginFinancialOperation(req, cumulative ? 'APPOINTMENT_PAYMENT_COMPAT' : 'APPOINTMENT_PAYMENT',
                 settlementContext(req, event).structureId, transaction);
             if (operation?.replay) return operation.replay as any;
@@ -229,7 +232,7 @@ async function writePayment(req: Request, res: Response, cumulative: boolean, pr
                 const options: InvoicePaymentCreateOptions = {transaction, treasuryContext: {
                     structureId: settlementContext(req, event).structureId,
                     accountId: nullableTreasuryUuid(req.body.accountId, 'Conto') ?? undefined,
-                    paymentMethodId, idempotencyKey: financialOperationKey(req)}};
+                    paymentMethodId, idempotencyKey: financialOperationKey(req), classification}};
                 payment = await InvoicePayment.schema(schema).create({
                     invoiceId: null, agendaEventId: event.id, amount,
                     paidAt: new Date(req.body.paidAt + 'T12:00:00.000Z'),
@@ -300,6 +303,8 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
             const referencePatientId = patientIdOf(reference.get({ plain: true }));
             if (!referencePatientId) fail(422, 'L’incasso richiede una seduta con paziente');
             if (referencePatientId !== lockedPatientId) fail(409, 'Il paziente della seduta è cambiato: ricarica la posizione');
+            const classification = assertTreasuryClassificationChoice(req, req.body?.classification, settlementContext(req, reference).structureId);
+            const classifyAmount = treasuryClassificationAllocator(classification, allocations.reduce((sum, item) => sum + item.amount, 0));
             const operation = await beginFinancialOperation(req, 'APPOINTMENT_PAYMENTS_BULK', settlementContext(req, reference).structureId, transaction);
             if (operation.replay) return operation.replay as any;
             const referenceTime = Date.parse(reference.start ?? '');
@@ -410,7 +415,7 @@ export const createBulkAppointmentPayments = asyncHandler(async (req: Request, r
                     source: 'APPOINTMENT', status: 'POSTED', createdByUserId: getUserId(req)
                 }, {transaction, treasuryContext: {structureId: settlementContext(req, reference).structureId,
                     accountId: accountId ?? undefined, paymentMethodId,
-                    idempotencyKey: `${financialOperationKey(req)}_${event.id}`}} as InvoicePaymentCreateOptions);
+                    idempotencyKey: `${financialOperationKey(req)}_${event.id}`, classification: classifyAmount(allocation.amount)}} as InvoicePaymentCreateOptions);
                 if (req.body?.markReferenceCompleted === true && event.id === reference.id) {
                     if (!canAccessAppointmentFinance(req, event.get({plain: true}), 'agenda', 'update')) fail(403, 'Non puoi modificare la presenza della seduta');
                     await completeAppointmentAfterPayment(event, getUserId(req), transaction);

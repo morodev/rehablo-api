@@ -1,3 +1,4 @@
+import {saveSourceTreasuryDefault} from '../../administration/services/treasuryAutomation.service.js';
 import { Request, Response } from 'express';
 import { fn, col, Op } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -13,7 +14,7 @@ import {
 
 function catalogPayload(body: any): Record<string, any> {
     const source = body?.product ?? body ?? {};
-    const {structureIds: _structureIds, availableInCurrentStructure: _available, ...payload} = source;
+    const {structureIds: _structureIds, availableInCurrentStructure: _available, treasuryCategoryId: _treasuryCategoryId, ...payload} = source;
     return payload;
 }
 
@@ -37,6 +38,7 @@ export const saveProduct = asyncHandler(async (req: Request, res: Response) => {
         await syncMappedStructures(
             ProductStructure, schema, 'productId', product.id, mode, structureIds, transaction
         );
+        await saveSourceTreasuryDefault(req, 'PRODUCT', product.id, source.treasuryCategoryId, transaction);
         return product;
     });
     const [product] = await decorate(req, [created]);
@@ -112,6 +114,7 @@ export const updateProduct = asyncHandler(async (req: Request, res: Response) =>
     await sequelize.transaction(async transaction => {
         await current.update({...catalogPayload(req.body), availabilityMode: mode}, {transaction});
         await syncMappedStructures(ProductStructure, schema, 'productId', id, mode, structureIds, transaction);
+        await saveSourceTreasuryDefault(req, 'PRODUCT', id, source.treasuryCategoryId, transaction);
     });
     const updated = await Product.schema(schema).findByPk(id);
     const [decorated] = await decorate(req, updated ? [updated] : []);

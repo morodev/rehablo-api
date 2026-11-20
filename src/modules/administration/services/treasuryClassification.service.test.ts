@@ -84,6 +84,16 @@ describe('business classification metadata',()=>{
         f.req.user.perms=['treasury:update:own'];
         await assert.rejects(saveClassification(f.req),(e:any)=>e.statusCode===403);assert.equal(f.writes.length,0);
     });
+    it('preserves automatic provenance when editing only tags, including unchanged mixed allocations',async t=>{
+        const f=fixture(t);const allocations=[{businessCategoryId:null,amount:2.35},{businessCategoryId:categoryId,amount:10}];
+        f.rows.classifications.push({movementId,businessCategoryId:null,allocations,origin:'SNAPSHOT',sourceKind:'EXPENSE',sourceId:uuid(44)});
+        f.req.body={businessCategoryId:null,tagIds:[tagId]};
+        await saveClassification(f.req);assert.equal(f.rows.classifications[0].origin,'SNAPSHOT');assert.deepEqual(f.rows.classifications[0].allocations,allocations);
+        f.req.body={businessCategoryId:null,allocations:[...allocations].reverse(),tagIds:[secondTag]};
+        await saveClassification(f.req);assert.equal(f.rows.classifications[0].origin,'SNAPSHOT');
+        f.req.body={businessCategoryId:categoryId,allocations:[],tagIds:[secondTag]};
+        await saveClassification(f.req);assert.equal(f.rows.classifications[0].origin,'MANUAL');
+    });
     it('rejects a category absent from the tenant, incompatible direction or archived new assignments',async t=>{
         const f=fixture(t);f.req.body.businessCategoryId=uuid(999);
         await assert.rejects(saveClassification(f.req),/Categoria non disponibile/);

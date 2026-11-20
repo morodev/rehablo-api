@@ -2,10 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { Transaction } from 'sequelize';
 import { sequelize } from '../../../config/database.js';
 import {resolveFinancialAccount} from './financialAccountResolver.service.js';
+import {classifyTreasuryMovement} from './treasuryAutomation.service.js';
+import type {TreasuryClassificationChoice} from './treasuryAutomation.policy.js';
 import {treasuryError} from './treasuryValidation.service.js';
 
 export interface InvoicePaymentTreasuryContext {
     accountId?: string;
+    classification?: TreasuryClassificationChoice;
     structureId: string;
     paymentMethodId: string | null;
     idempotencyKey?: string | null;
@@ -19,6 +22,7 @@ interface PaymentSnapshot {
     source?: string;
     id: string;
     invoiceId?: string | null;
+    carePackageId?: string | null;
     agendaEventId?: string | null;
     amount: number;
     paidAt?: Date | string | null;
@@ -58,12 +62,12 @@ export async function mirrorInvoicePaymentToTreasury(
     if (!structureId) treasuryError('La sede dell’incasso non è disponibile', 422);
     const accountId = await resolveFinancialAccount(String(schema), structureId, context?.accountId, transaction);
 
-    await sequelize.query(`INSERT INTO ${prefix}."treasury_movements"
+    const [inserted] = await sequelize.query(`INSERT INTO ${prefix}."treasury_movements"
         ("id","accountId","structureId","direction","category","amount","occurredAt","status",
          "counterparty","description","invoiceId","sourceType","sourceId","createdByUserId","paymentMethodId","idempotencyKey","createdAt","updatedAt")
         VALUES (:id,:accountId,:structureId,'IN','INVOICE_PAYMENT',:amount,:occurredAt,'POSTED',NULL,
                 :description,:invoiceId,'INVOICE_PAYMENT',:sourceId,:createdByUserId,:paymentMethodId,:idempotencyKey,NOW(),NOW())
-        ON CONFLICT ("sourceType","sourceId") DO NOTHING`, {
+        ON CONFLICT ("sourceType","sourceId") DO NOTHING RETURNING "id"`, {
         transaction,
         replacements: {
             id: randomUUID(), accountId, structureId, amount: payment.amount,
@@ -73,6 +77,12 @@ export async function mirrorInvoicePaymentToTreasury(
             paymentMethodId: context?.paymentMethodId ?? null, idempotencyKey: context?.idempotencyKey ?? null
         }
     });
+    const movementId = (inserted[0] as {id: string} | undefined)?.id;
+    if (movementId) await classifyTreasuryMovement({schema: String(schema), movementId, amount: Number(payment.amount),
+        direction: 'IN', actorId: payment.createdByUserId ?? null, classification: context?.classification,
+        source: payment.carePackageId ? {kind: 'PACKAGE', id: payment.carePackageId}
+            : payment.agendaEventId ? {kind: 'APPOINTMENT', id: payment.agendaEventId}
+                : payment.invoiceId ? {kind: 'INVOICE', id: payment.invoiceId} : {kind: 'OPERATION', id: 'INVOICE_PAYMENT'}}, transaction!);
 }
 
 export async function mirrorVoidedInvoicePaymentToTreasury(

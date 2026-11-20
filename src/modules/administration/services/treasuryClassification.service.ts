@@ -4,12 +4,13 @@ import {sequelize} from '../../../config/database.js';
 import {getGrantedPermissions, getSelectedStructureId, getUserId} from '../../../middleware/rbac.js';
 import {resolveGrantedScope} from '../../auth/rbac/permissions.js';
 import {TreasuryMovement} from '../models/index.js';
-import {TreasuryCategory, TreasuryTag, TreasuryClassification, TreasuryMovementTag} from '../models/treasuryClassification.model.js';
+import {TreasuryCategory, TreasuryTag, TreasuryClassification, TreasuryMovementTag, TreasuryCategoryDefault, TreasuryCategorySnapshot} from '../models/treasuryClassification.model.js';
 import {isInternalTransfer} from './financialMovementPolicy.service.js';
 import {assertFinancialAccess} from './financialOperations.service.js';
 import {balanceEffectiveMovements} from './treasuryLedger.service.js';
 import {resolveAdministrationDateRange, resolveAdministrationStructure} from './administrationQuery.service.js';
 import {TREASURY_UUID, treasuryError} from './treasuryValidation.service.js';
+import {choiceShares, groupTreasuryShares, normalizeTreasuryClassificationChoice, TreasuryShare} from './treasuryAutomation.policy.js';
 
 type Row = Record<string, any>;
 const plain = (row: Model): Row => row.get({plain: true});
@@ -43,14 +44,16 @@ export function taxonomyValue(value: unknown, category: boolean, creating: boole
     }
     return result;
 }
-export function classificationValue(value: unknown): {businessCategoryId: string | null; tagIds: string[]} {
+export function classificationValue(value: unknown): {businessCategoryId: string | null; tagIds: string[]; allocations?: TreasuryShare[]} {
     if (!value || typeof value !== 'object' || Array.isArray(value)) treasuryError('Classificazione non valida', 422);
     const source = value as Row;
-    if (Object.keys(source).some(key => !['businessCategoryId', 'tagIds'].includes(key))) treasuryError('La classificazione non può modificare il movimento', 422);
+    if (Object.keys(source).some(key => !['businessCategoryId', 'tagIds', 'allocations'].includes(key))) treasuryError('La classificazione non può modificare il movimento', 422);
     if (source.businessCategoryId !== null && typeof source.businessCategoryId !== 'string') treasuryError('Indica la categoria o lascia Da classificare', 422);
     if (!Array.isArray(source.tagIds) || source.tagIds.length > 50) treasuryError('Seleziona al massimo 50 tag', 422);
+    const shares = source.allocations === undefined ? undefined : Array.isArray(source.allocations) && !source.allocations.length
+        ? [] : normalizeTreasuryClassificationChoice({businessCategoryId: source.businessCategoryId, allocations: source.allocations})!.allocations;
     return {businessCategoryId: source.businessCategoryId === null ? null : id(source.businessCategoryId, 'Categoria'),
-        tagIds: [...new Set<string>(source.tagIds.map((value: unknown) => id(value, 'Tag')))].sort()};
+        tagIds: [...new Set<string>(source.tagIds.map((value: unknown) => id(value, 'Tag')))].sort(), ...(shares !== undefined ? {allocations: shares} : {})};
 }
 export function classificationFilters(query: Row): {businessCategoryId: string | null; unclassified: boolean; tagIds: string[]; editableOnly: boolean} {
     if (query.classificationState != null && !['', 'unclassified'].includes(query.classificationState)) treasuryError('Filtro classificazione non valido', 400);
@@ -64,8 +67,8 @@ export function classificationFilters(query: Row): {businessCategoryId: string |
     return {businessCategoryId, unclassified: query.classificationState === 'unclassified', tagIds: [...new Set(tagIds.map(value => value.toLowerCase()))], editableOnly: query.classificationEditable === 'true'};
 }
 export function matchesClassification(row: Row, filters: ReturnType<typeof classificationFilters>): boolean {
-    return (!filters.businessCategoryId || row.businessCategoryId === filters.businessCategoryId)
-        && (!filters.unclassified || (!row.businessCategoryId && !isInternalTransfer(row)))
+    return (!filters.businessCategoryId || row.businessCategoryId === filters.businessCategoryId || row.classificationAllocations?.some((share:Row) => share.businessCategoryId === filters.businessCategoryId))
+        && (!filters.unclassified || ((row.classificationState ? row.classificationState !== 'classified' : !row.businessCategoryId) && !isInternalTransfer(row)))
         && (!filters.editableOnly || row.classificationEditable === true)
         && (!filters.tagIds.length || filters.tagIds.some(tag => row.tagIds?.includes(tag)));
 }
@@ -108,7 +111,12 @@ export async function decorateTreasuryClassification(req: Request, rows: Row[], 
     return rows.map(row => {
         const key = sourceId(row) ?? '', transfer = isInternalTransfer(row);
         const businessCategoryId = transfer ? null : byMovement.get(key)?.businessCategoryId ?? null;
+        const metadata = byMovement.get(key);
+        const allocations = !transfer && Array.isArray(metadata?.allocations) ? metadata.allocations.map((share:TreasuryShare) => ({...share,businessCategory:share.businessCategoryId?byCategory.get(share.businessCategoryId)??null:null})) : [];
+        const classified = allocations.length ? allocations.every((share:TreasuryShare)=>!!share.businessCategoryId) : !!businessCategoryId;
+        const partial = !classified && allocations.some((share:TreasuryShare)=>!!share.businessCategoryId);
         return {...row, businessCategoryId, businessCategory: byCategory.get(businessCategoryId) ?? null,
+            classificationAllocations: allocations, classificationOrigin: metadata?.origin ?? (metadata ? 'MANUAL' : null), classificationState: classified ? 'classified' : partial ? 'partial' : 'unclassified',
             tagIds: transfer ? [] : [...new Set(tags.get(key) ?? [])].sort(), classificationEditable: classificationEditable(req, row)};
     });
 }
@@ -126,7 +134,7 @@ export async function readTaxonomy(req: Request): Promise<{categories: Row[]; ta
         TreasuryMovement.schema(schema).findAll({where: treasuryClassificationScope(req)})
     ]);
     const rows = await decorateTreasuryClassification(req, movements.map(plain));
-    return {categories: categories.map(row => taxonomyDto(plain(row), rows.filter(item => item.businessCategoryId === String(row.get('id'))).length)),
+    return {categories: categories.map(row => taxonomyDto(plain(row), rows.filter(item => item.businessCategoryId === String(row.get('id')) || item.classificationAllocations?.some((share:Row)=>share.businessCategoryId===String(row.get('id')))).length)),
         tags: tags.map(row => taxonomyDto(plain(row), rows.filter(item => item.tagIds.includes(String(row.get('id')))).length))};
 }
 
@@ -138,7 +146,10 @@ export async function saveTaxonomy(req: Request, category: boolean): Promise<Row
             const current = req.params.id ? await model.schema(schema).findByPk(id(req.params.id, 'Voce'), {transaction, lock: transaction.LOCK.UPDATE}) : null;
             if (req.params.id && !current) treasuryError('Voce non disponibile', 404);
             if (current && category && value.direction && value.direction !== current.get('direction')) {
-                if (await TreasuryClassification.schema(schema).count({where: {businessCategoryId: current.get('id')}, transaction})) treasuryError('La categoria è già utilizzata. Crea una nuova categoria per un ambito diverso.', 409);
+                const categoryId=current.get('id');
+                if (await TreasuryClassification.schema(schema).count({where: {[Op.or]: [{businessCategoryId:categoryId},{allocations:{[Op.contains]:[{businessCategoryId:categoryId}]}}]}, transaction})
+                    || await TreasuryCategoryDefault.schema(schema).count({where:{businessCategoryId:categoryId},transaction})
+                    || await TreasuryCategorySnapshot.schema(schema).count({where:{weights:{[Op.contains]:[{businessCategoryId:categoryId}]}},transaction})) treasuryError('La categoria è già utilizzata. Crea una nuova categoria per un ambito diverso.', 409);
             }
             const row = current ? await current.update(value, {transaction}) : await model.schema(schema).create(value, {transaction});
             return taxonomyDto(plain(row));
@@ -169,7 +180,20 @@ export async function saveClassification(req: Request): Promise<Row> {
             const tag = await TreasuryTag.schema(schema).findByPk(tagId, {transaction, lock: transaction.LOCK.UPDATE});
             if (!tag || (!tag.get('isActive') && !existingTags.some(link => link.get('tagId') === tagId))) treasuryError('Tag non disponibile', 422);
         }
-        const metadata = {businessCategoryId: value.businessCategoryId, updatedByUserId: getUserId(req)};
+        const previousShares = current?.get('allocations') as TreasuryShare[] | undefined;
+        // Editing tags on a mixed movement must not silently erase its allocation.
+        const preserveShares = value.allocations === undefined && value.businessCategoryId === null && !current?.get('businessCategoryId') && previousShares?.length;
+        const allocations = preserveShares ? previousShares! : value.allocations?.length
+            ? choiceShares(Number(row.amount), {businessCategoryId: null, allocations:value.allocations})
+            : [{businessCategoryId:value.businessCategoryId,amount:Number(row.amount)}];
+        for (const share of allocations) if (share.businessCategoryId && share.businessCategoryId !== value.businessCategoryId) {
+            const selected = await TreasuryCategory.schema(schema).findByPk(share.businessCategoryId,{transaction,lock:transaction.LOCK.UPDATE});
+            const wasSelected = current?.get('businessCategoryId') === share.businessCategoryId || previousShares?.some(item=>item.businessCategoryId===share.businessCategoryId);
+            if (!selected || selected.get('direction') !== row.direction || (!selected.get('isActive') && !wasSelected)) treasuryError('Categoria non disponibile per questo movimento',422);
+        }
+        const priorAllocation=previousShares?.length?previousShares:[{businessCategoryId:current?.get('businessCategoryId') as string|null??null,amount:Number(row.amount)}];
+        const unchanged=current&&JSON.stringify(groupTreasuryShares(allocations))===JSON.stringify(groupTreasuryShares(priorAllocation));
+        const metadata = {businessCategoryId: allocations.length === 1 ? allocations[0].businessCategoryId : null, allocations, origin:unchanged ? current?.get('origin')??'MANUAL' : 'MANUAL', updatedByUserId: getUserId(req)};
         if (current) await current.update(metadata, {transaction});
         else await TreasuryClassification.schema(schema).create({movementId, ...metadata}, {transaction});
         await TreasuryMovementTag.schema(schema).destroy({where: {movementId}, transaction});
@@ -185,14 +209,20 @@ export function categoryAnalysis(rows: Row[], direction: 'IN' | 'OUT'): Row {
     const outcome = economic.filter(row => row.direction === 'OUT').reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0) / 100;
     const selected = economic.filter(row => row.direction === direction), groups = new Map<string | null, Row>();
     for (const row of selected) {
-        const key = row.businessCategoryId ?? null;
-        const group = groups.get(key) ?? {categoryId: key, name: row.businessCategory?.name ?? 'Da classificare', color: row.businessCategory?.color ?? '#d97706', amount: 0, movementCount: 0};
-        group.amount += Math.round(Number(row.amount) * 100); group.movementCount++; groups.set(key, group);
+        const shares = row.classificationAllocations?.length ? row.classificationAllocations : [{businessCategoryId:row.businessCategoryId,businessCategory:row.businessCategory,amount:row.amount}];
+        const counted = new Set<string|null>();
+        for (const share of shares) {
+            const key=share.businessCategoryId??null;
+            const group=groups.get(key)??{categoryId:key,name:share.businessCategory?.name??'Da classificare',color:share.businessCategory?.color??'#d97706',amount:0,movementCount:0};
+            group.amount+=Math.round(Number(share.amount)*100);
+            if(!counted.has(key)){group.movementCount++;counted.add(key);}groups.set(key,group);
+        }
     }
-    const unclassified = selected.filter(row => !row.businessCategoryId);
+    const unclassified = selected.filter(row => row.classificationAllocations?.length ? row.classificationAllocations.some((share:Row)=>!share.businessCategoryId) : !row.businessCategoryId);
+    const unclassifiedCents = unclassified.reduce((sum,row)=>sum+(row.classificationAllocations?.length ? row.classificationAllocations.filter((share:Row)=>!share.businessCategoryId).reduce((total:number,share:Row)=>total+Math.round(Number(share.amount)*100),0) : Math.round(Number(row.amount)*100)),0);
     return {income, outcome, net: Math.round((income - outcome) * 100) / 100,
         movementCount: selected.length, classifiedCount: selected.length - unclassified.length,
-        unclassifiedCount: unclassified.length, unclassifiedAmount: unclassified.reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0) / 100,
+        unclassifiedCount: unclassified.length, unclassifiedAmount: unclassifiedCents / 100,
         groups: [...groups.values()].map((group): Row => ({...group, amount: group.amount / 100})).sort((a, b) => b.amount - a.amount || a.name.localeCompare(b.name, 'it'))};
 }
 export async function readCategoryAnalysis(req: Request, scope: Row): Promise<Row> {

@@ -1,5 +1,6 @@
 import {contributionPolicy} from '../../invoice/utils/socialSecurity.js';
 import Tenant from '../../auth/models/tenant.model.js';
+import {saveSourceTreasuryDefault} from '../services/treasuryAutomation.service.js';
 import {Request} from 'express';
 import {Op} from 'sequelize';
 import {sequelize} from '../../../config/database.js';
@@ -66,7 +67,9 @@ export const savePackageTemplate = asyncHandler(async (req, res) => {
         const service = await packageService(req, source.serviceId, String(structureId), transaction);
         const data = {structureId, name, serviceId: service.id, serviceName: service.name || 'Prestazione', sessionCount,
             totalPrice, validityDays, isActive: source.isActive ?? true};
-        return current ? current.update(data, {transaction}) : PackageTemplate.schema(req.tenantSchema!).create(data, {transaction});
+        const saved = current ? await current.update(data, {transaction}) : await PackageTemplate.schema(req.tenantSchema!).create(data, {transaction});
+        await saveSourceTreasuryDefault(req, 'PACKAGE_TEMPLATE', String(saved.get('id')), source.treasuryCategoryId, transaction, String(structureId));
+        return saved;
     });
     return sendSuccessResponse(res, req.params.id ? 200 : 201, plain(result));
 });

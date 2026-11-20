@@ -1,3 +1,4 @@
+import {saveSourceTreasuryDefault} from '../../administration/services/treasuryAutomation.service.js';
 import { Request, Response } from 'express';
 import { fn, col, Op, Transaction } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -26,6 +27,7 @@ function eventTypePayload(body: any): Record<string, any> {
         structureIds: _structureIds,
         defaultStructureIds: _defaultStructureIds,
         availableInCurrentStructure: _available,
+        treasuryCategoryId: _treasuryCategoryId,
         ...payload
     } = source;
     return payload;
@@ -172,6 +174,7 @@ export const createEventType = asyncHandler(async (req: Request, res: Response) 
         await syncEventMappings(
             schema, created.id, config.mode, config.structureIds, config.defaultStructureIds, transaction
         );
+        await saveSourceTreasuryDefault(req, 'EVENT_TYPE', created.id, source.treasuryCategoryId, transaction);
         return created;
     });
     const [decorated] = await decorate(req, [eventType]);
@@ -236,6 +239,7 @@ export const updateEventType = asyncHandler(async (req: Request, res: Response) 
             isDefault: config.defaultStructureIds.length > 0
         }, {transaction});
         await syncEventMappings(schema, id, config.mode, config.structureIds, config.defaultStructureIds, transaction);
+        await saveSourceTreasuryDefault(req, 'EVENT_TYPE', id, source.treasuryCategoryId, transaction);
     });
     const updated = await EventType.schema(schema).findByPk(id);
     const [decorated] = await decorate(req, updated ? [updated] : []);

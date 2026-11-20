@@ -502,6 +502,21 @@ describe('invoicing appointment concessions through the HTTP handlers', () => {
         assert.equal(response.code, 201); assert.equal(state.receipts.length, 0);
     });
 
+    it('passes an authorized classification to the paid-invoice receipt and checks the permission again on replay', async context => {
+        const state = setup(context, 'DISCOUNT', false);
+        const classification = {businessCategoryId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'};
+        const payload = {patientID: patientId, documentType: 'fattura', emissionDate: '2026-01-10', status: 'paid',
+            classification, appointments: [{agendaEventId: eventId, serviceId}]};
+        await assert.rejects(state.invoke(saveInvoice, payload), (error: any) => error.statusCode === 403);
+        assert.equal(state.receipts.length, 0); assert.deepEqual(state.tenant.lastDocumentNumberByYear, {});
+        state.user.perms.push('treasury:update:tenant');
+        assert.equal((await state.invoke(saveInvoice, payload)).code, 201);
+        assert.deepEqual(state.writeOptions[0].treasuryContext.classification, classification);
+        state.user.perms = ['invoice:create:tenant', 'payment:create:tenant'];
+        await assert.rejects(state.invoke(saveInvoice, payload), (error: any) => error.statusCode === 403);
+        assert.equal(state.receipts.length, 1); assert.equal(state.lines.length, 1);
+    });
+
     it('keeps package invoice reuse without cash creation rights because it only links existing receipts', async context => {
         const state = setup(context, 'DISCOUNT');
         state.user.sid = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';

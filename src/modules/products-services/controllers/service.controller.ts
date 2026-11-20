@@ -1,3 +1,4 @@
+import {saveSourceTreasuryDefault} from '../../administration/services/treasuryAutomation.service.js';
 import { Request, Response } from 'express';
 import { fn, col, Op } from 'sequelize';
 import { asyncHandler } from '../../../utils/asyncHandler.js';
@@ -16,7 +17,7 @@ import {
 
 function catalogPayload(body: any): Record<string, any> {
     const source = body?.service ?? body ?? {};
-    const {structureIds: _structureIds, availableInCurrentStructure: _available, ...payload} = source;
+    const {structureIds: _structureIds, availableInCurrentStructure: _available, treasuryCategoryId: _treasuryCategoryId, ...payload} = source;
     return payload;
 }
 
@@ -55,6 +56,7 @@ export const saveService = asyncHandler(async (req: Request, res: Response) => {
             {...catalogPayload(req.body), availabilityMode: mode}, {transaction}
         );
         await syncMappedStructures(ServiceStructure, schema, 'serviceId', service.id, mode, structureIds, transaction);
+        await saveSourceTreasuryDefault(req, 'SERVICE', service.id, source.treasuryCategoryId, transaction);
         return service;
     });
     const [service] = await decorate(req, [created]);
@@ -126,6 +128,7 @@ export const updateService = asyncHandler(async (req: Request, res: Response) =>
     await sequelize.transaction(async transaction => {
         await current.update({...catalogPayload(req.body), availabilityMode: mode}, {transaction});
         await syncMappedStructures(ServiceStructure, schema, 'serviceId', id, mode, structureIds, transaction);
+        await saveSourceTreasuryDefault(req, 'SERVICE', id, source.treasuryCategoryId, transaction);
     });
     const updated = await Service.schema(schema).findByPk(id);
     const [decorated] = await decorate(req, updated ? [updated] : []);

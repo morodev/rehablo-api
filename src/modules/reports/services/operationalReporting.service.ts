@@ -53,7 +53,7 @@ function sessionFilters(req: Request) {
         if (req.query[key] != null && typeof req.query[key] !== 'string') throw new AnalyticsQueryError(`${key}: valore non valido`);
     }
     const status = req.query.status == null || req.query.status === '' ? null : String(req.query.status).toUpperCase();
-    if (status && !['COMPLETED', 'CANCELLED', 'NO_SHOW', 'CONFIRMED', 'UNRESOLVED'].includes(status)) throw new AnalyticsQueryError('Stato seduta non valido');
+    if (status && !['COMPLETED', 'CANCELLED', 'NO_SHOW', 'CONFIRMED', 'UNRESOLVED', 'ATTENDANCE_ISSUES'].includes(status)) throw new AnalyticsQueryError('Stato seduta non valido');
     const query = req.query.query == null ? '' : String(req.query.query).trim();
     if (query.length > 200) throw new AnalyticsQueryError('Ricerca troppo lunga');
     return {status, noShowBillingDecision: billing ? String(billing) : null, patientId: optionalId(req, 'patientId'), query,
@@ -63,7 +63,9 @@ function selectSessions(rows: ReportOccurrence[], filters: ReturnType<typeof ses
     return rows.filter(row => (!filters.noShowBillingDecision || row.status === 'NO_SHOW' &&
         (filters.noShowBillingDecision === 'INVOICED' ? !!row.invoiceId : filters.noShowBillingDecision === 'WAIVED'
             ? !row.invoiceId && row.noShowBillingDecision === 'WAIVED' : !row.invoiceId && row.noShowBillingDecision !== 'WAIVED')) && (!filters.status || (filters.status === 'UNRESOLVED'
-        ? row.status === 'CONFIRMED' && row.end < now : row.status === filters.status)) &&
+        ? row.status === 'CONFIRMED' && row.end < now : filters.status === 'ATTENDANCE_ISSUES'
+            ? row.status === 'CANCELLED' || row.status === 'NO_SHOW' || row.status === 'CONFIRMED' && row.end < now
+            : row.status === filters.status)) &&
         (!filters.patientId || row.patientId === filters.patientId) &&
         (!filters.query || `${row.patientName} ${row.title ?? ''}`.toLocaleLowerCase('it').includes(filters.query.toLocaleLowerCase('it'))) &&
         (filters.weekday < 0 || weekday(row.start) === filters.weekday) && (filters.hour < 0 || Math.floor(localMinute(row.start) / 60) === filters.hour));
@@ -307,7 +309,7 @@ export async function operationalDataset(req: Request, dataset: string, options:
     });
     const output = [...slots.values()].sort((a, b) => a.weekday - b.weekday || a.hour - b.hour).map(row => {const denominator = row.completed + row.cancelled + row.noShow;
         return {...row, resolved: denominator, cancellationRate: denominator ? round(row.cancelled / denominator * 100) : null, noShowRate: denominator ? round(row.noShow / denominator * 100) : null,
-            drilldown: {dataset: 'sessions', filters: {weekday: row.weekday, hour: row.hour}}};});
+            drilldown: {dataset: 'sessions', filters: {weekday: row.weekday, hour: row.hour, status: 'ATTENDANCE_ISSUES'}}};});
     meta.warnings.push({code: 'SCHEDULED_TIME', message: 'Le fasce si riferiscono alla data e all’ora previste della seduta, non al momento della disdetta.'});
     return {meta, summary, columns: [col('slot', 'Giorno e fascia', 'text'), col('resolved', 'Sedute con esito'), col('cancelled', 'Disdette'), col('cancellationRate', 'Disdette %', 'percent'), col('noShow', 'Assenze'), col('noShowRate', 'Assenze %', 'percent'), col('unresolved', 'Da verificare'), col('cancelledMinutes', 'Minuti disdetti'), col('noShowMinutes', 'Minuti assenze')], ...paginateReport(output, page, size, options.allRows)};
 }

@@ -232,7 +232,7 @@ export const listTreasuryMovements = asyncHandler(async (req, res) => {
         limit: filters.limit, offset: filters.offset,
         summary: { income, outcome, net: money(income - outcome), postedCount: enriched.filter(row => row.status === 'POSTED').length,
             unlinkedCount: enriched.filter(row => !row.hasDocument).length,
-            unclassifiedCount: enriched.filter(row => !row.businessCategoryId && !isInternalTransfer(row)).length }
+            unclassifiedCount: enriched.filter(row => (row.classificationState ? row.classificationState !== 'classified' : !row.businessCategoryId) && !isInternalTransfer(row)).length }
     });
 });
 

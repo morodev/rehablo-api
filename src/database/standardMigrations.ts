@@ -1,5 +1,6 @@
 import {migrateClinicalTenant} from '../modules/clinical/services/clinical.migration.js';
 import {migrateTreasuryClassificationTenant} from './treasuryClassificationMigration.js';
+import {migrateTreasuryAutomationTenant} from './treasuryAutomationMigration.js';
 import {ensurePersonalTrainerRoleEnum} from '../modules/auth/services/personalTrainerRoleMigration.service.js';
 import type {Sequelize, Transaction} from 'sequelize';
 import {createRequire} from 'node:module';
@@ -10,7 +11,7 @@ import {assertDatabaseReady, readMigrationNames, requiredMigrationNames} from '.
 
 export {requiredMigrationNames} from './migrationStatus.js';
 
-const [initialSchemaName, appointmentRemindersName, quotePackageInvoicesName, activityRecurrencesName, clinicalWorkspaceName, treasuryClassificationName] = requiredMigrationNames;
+const [initialSchemaName, appointmentRemindersName, quotePackageInvoicesName, activityRecurrencesName, clinicalWorkspaceName, treasuryClassificationName, treasuryAutomationName] = requiredMigrationNames;
 const quotePackageInvoiceLines = createRequire(import.meta.url)('../../migrations/20261031-quote-package-invoice-lines.js');
 const activityRecurrences = createRequire(import.meta.url)('../../migrations/20261031-activity-recurrences.js');
 const reminderStep = legacyBaseline.tenantMigrations.find(step => step.name === '20261028-appointment-reminders-v1')!;
@@ -174,6 +175,19 @@ async function tenantSchemas(database: Sequelize): Promise<string[]> {
     return (rows as Array<{id: string}>).map(({id}) => 'rehablo_' + id.replaceAll('-', ''));
 }
 
+async function applyTenantTreasuryAutomation(database: Sequelize, schema: string, transaction: Transaction, applied: string[]): Promise<void> {
+    if (applied.includes(treasuryAutomationName)) return;
+    await migrateTreasuryAutomationTenant(database, schema, transaction);
+    await recordTenantMigration(database, schema, treasuryAutomationName, transaction);
+}
+
+export async function migrateTreasuryAutomation(database: Sequelize): Promise<void> {
+    for (const schema of await tenantSchemas(database)) {
+        try {await database.transaction(async transaction => {await provisionTenantSchema(database, schema, transaction);});}
+        catch (cause) {throw migrationFailure(`Treasury automation migration failed for ${schema}`,cause);}
+    }
+}
+
 /** Called by the first standard Sequelize CLI migration's up(queryInterface, Sequelize). */
 export async function migrateInitialSchema(database: Sequelize): Promise<void> {
     // Public enum additions must commit before later steps use their new values.
@@ -251,6 +265,7 @@ export async function provisionTenantSchema(database: Sequelize, schema: string,
     await applyTenantActivityRecurrences(database, schema, transaction, applied);
     await applyTenantClinicalWorkspace(database, schema, transaction, applied);
     await applyTenantTreasuryClassification(database, schema, transaction, applied);
+    await applyTenantTreasuryAutomation(database, schema, transaction, applied);
 }
 
 /** Catch tenants registered by a preceding API after the CLI discovered its tenant list. */

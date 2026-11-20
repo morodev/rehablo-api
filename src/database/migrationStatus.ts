@@ -8,7 +8,8 @@ export const requiredMigrationNames = [
     '202610310001-quote-package-invoice-lines.js',
     '202610310002-activity-recurrences.js',
     '202611050001-clinical-workspace.js',
-    '202611170001-treasury-classification.js'
+    '202611170001-treasury-classification.js',
+    '202611190001-treasury-automation.js'
 ] as const;
 
 /** Read Sequelize's migration history without creating tables or running migrations. */
